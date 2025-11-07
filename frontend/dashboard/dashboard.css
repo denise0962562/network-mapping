@@ -1,0 +1,24 @@
+
+.chart-show-label {
+    margin-left: 5px;
+    fill: rgb(110, 129, 146);
+}
+.chart-show-label:hover {
+    fill: rgb(51, 51, 51);
+}
+
+.card-system-status {
+    height: 300px;
+    /* width: 34.5%; */
+    flex: 1;
+}
+
+.card-system-status-column {
+    display: flex;
+    flex-direction: row;
+}
+
+.card-main {
+    height: 330px;
+    width: 67%;
+}

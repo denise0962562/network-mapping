@@ -1,0 +1,28 @@
+[server]
+host = "0.0.0.0"
+port = 9999
+
+[log]
+directory = "logs"
+file_name = "server.json"
+file_rolling = 0                                        # daliy: 0, hourly: 1, minutely: 2, never: 3
+debug_mode = false #false or true
+
+[templates]
+templates_directory = "templates/**/*.html"
+templates_name = "error.html"
+
+[scan_target_generated]
+generated_mode = "sequence" # sequence 和random
+
+[database]
+host = "192.168.1.6"
+port = 54321
+database_type = "postgresql"
+username = "wsj"
+password = "123456789"
+db_name = "nmap"
+tls = false # true or false
+
+init_database_file = "source/database/init.sql"          #用于初始化数据库表的sql文件位置
+sql_file_path = "source/database/"                       #用于指定sql文件目录，通常为相对路径
