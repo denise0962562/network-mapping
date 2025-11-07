@@ -416,6 +416,7 @@ async fn get_db_conn(
     }
 }
 
+///获取服务器运行时间
 fn get_server_uptime() -> u64 {
     sysinfo::System::uptime()
 }
@@ -575,6 +576,7 @@ pub fn path_secure_join(root: &str, input: &str) -> Option<PathBuf> {
 
 }
 
+///向数据库插入系统数据
 pub async fn insert_system_status(
     pool: deadpool_postgres::Pool, 
     db_name: String,
