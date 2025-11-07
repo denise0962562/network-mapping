@@ -1,4 +1,4 @@
 /target
 scanner/
-logs/
+/logs/
 .vscode/
