@@ -8,7 +8,8 @@ pub mod admin;
 pub mod handlers;
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use actix_web::web;
+use actix_web::dev::ConnectionInfo;
+use actix_web::{HttpRequest, web};
 use tracing::{warn, error};
 use std::path::{Path, PathBuf};
 use tera::{Tera, Context};
@@ -121,7 +122,19 @@ pub struct SystemResource {
 
 pub fn get_unix_epoch_ms() -> i64 {
     //todo 添加一个获取普通utc时间的函数，考虑用结构体还是权举
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    // 当获取时间戳失败时会返回默认值-1
+    // SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(e) => {
+
+            error!(
+                event = "UnixEpochGenerateError",
+                message = e.to_string()
+            );
+            -1 as i64
+        }
+    }
 }
 
 //用于存储sysinfo 下必要的
@@ -610,3 +623,46 @@ pub async fn insert_system_status(
     }
 }
 
+///通过该函数获取到访问者的ip，如果失败则会返回一个字符串
+pub fn get_conn_ip(
+    req: &HttpRequest
+) -> String{
+    match req.connection_info().realip_remote_addr() {
+        Some(o) => o.to_string(),
+        None => {
+            warn!(
+                event = "GetHTTPClientIPError",
+                message = "无法获取到访问者IP"
+            );
+            "Unknown".to_string()
+        }
+    }
+}
+
+///通过该函数获取收到的http请求头，如果获取失败则会返回一个字符串
+pub fn get_user_agent(
+    req: &HttpRequest
+) -> String {
+    // req.headers().get("User-Agent").and_then(|v| v.to_str().ok()).unwrap_or("unknown").to_string()
+    match req.headers().get("User-Agent") {
+        Some(o) => {
+            match o.to_str() {
+                Ok(o) => o.to_string(),
+                Err(e) => {
+                    warn!(
+                        event = "GetHTTPHeadersError",
+                        message = e.to_string()
+                    );
+                    "Unknown".to_string()
+                }
+            }
+        },
+        None => {
+            error!(
+                event = "GetHTTPHeadersError",
+                message = "无法获取到请求头"
+            );
+            "Unknown".to_string()
+        }
+    }
+}
