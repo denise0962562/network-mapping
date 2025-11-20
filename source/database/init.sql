@@ -103,10 +103,10 @@ CREATE TABLE IF NOT EXISTS system_status (
 -- 表 login_logs 用于存储用户登录日志，包括登陆成功和失败 
 CREATE TABLE IF NOT EXISTS login_logs (
 	id SERIAL PRIMARY KEY,
-	event TEXT NOT NULL,
-	event_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
-	event_ip INET,
-	event_usage_id INT
+	event_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,       -- 触发登录事件的时间，该列通常由数据库自动生成，当然也可能由后端生产，需要在后面看
+	event_ip INET,                                                                 -- 触发登录事件的 IP 地址
+	event_usage_id INT,                                                            -- 登录日志中触发该事件的用户 ID ，该参数可有可无
+	is_successful boolean NOT NULL                                                 -- 登录日志中表示成功登录，True 表示登录成功，False 表示登录失败
 )
 
 --表 scanner_info 用于存储扫描器信息
