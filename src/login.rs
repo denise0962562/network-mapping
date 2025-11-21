@@ -148,8 +148,7 @@ impl LoginToken {
 
 /// 该函数用于处理用户登录，接受一个用户名和密码，如果密码校验成功则返回一个session，失败则传递错误
 pub async fn user_login(
-    req: HttpRequest,
-    conn_info: ConnectionInfo, 
+    req: &HttpRequest,
     username: &str, 
     password: &str, 
     pool: web::Data<deadpool_postgres::Pool>
@@ -171,7 +170,7 @@ pub async fn user_login(
             error!(
                     event = "INSERTDataToDatabaseError",
                     path = "",
-                    message = ""
+                    message = "向数据库中插入登录日志数据错误"
                 );
         }
 
@@ -180,7 +179,7 @@ pub async fn user_login(
         Ok(session.session)
     }
     else {
-        Err("错误".into())
+        Err("登录失败".into())
     }
 
     // let client = pool.get.await?;
