@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	uptime INT,                                                                     -- 扫描器总共运行的时间
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,     -- 扫描器创建的时间
 	ip_address INET,                                                                -- 扫描器的IP地址
-	id_enable boolean,                                                              -- 扫描器是否启用
+	is_enable boolean,                                                              -- 扫描器是否启用
 	remark TEXT,                                                                    -- 扫描器的备注
 	tag TEXT                                                                        -- 扫描器的标签
 );
@@ -131,8 +131,8 @@ CREATE TABLE IF NOT EXISTS ip_list (
 	ip INET NOT NULL,                                                               -- 该字段可以存储单个 IP 或 CIDR 地址段
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,     -- 白名单 IP/CIDR 创建时间
 	tag TEXT,                                                                       -- IP 列表的标签
-	remark TEXT                                                                     -- IP 列表的备注
-
+	remark TEXT,                                                                    -- IP 列表的备注
+	UNIQUE(ip, is_white)                                                            -- 限制了 ip 和 is_white 组合的唯一性
 );
 
 
