@@ -159,7 +159,7 @@ pub async fn user_login(
     
         let loginlogs = LoginLog {
             event_ip : get_conn_ip(&req),
-            event_useage_userid: 12121212,         //MARK 暂时这样，先提交再改
+            event_useage_userid: 1212,         //MARK 暂时这样，先提交再改
             is_successful: true
         };
         //MARK 暂时这样

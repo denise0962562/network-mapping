@@ -16,12 +16,12 @@ templates_name = "error.html"
 generated_mode = "sequence" # sequence 和random
 
 [database]
-host = "192.168.1.6"
-port = 54321
+host = "192.168.110.133"
+port = 54433
 database_type = "postgresql"
-username = "wsj"
-password = "123456789"
-db_name = "nmap"
+username = "nmapping"
+password = "123456"
+db_name = "nmapping"
 tls = false # true or false
 
 init_database_file = "source/database/init.sql"          #用于初始化数据库表的sql文件位置

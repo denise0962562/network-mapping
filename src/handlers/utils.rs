@@ -30,7 +30,7 @@ async fn get_scan_target(
     //         rate: 1000
     //     }
     // )
-    logs::write::info_logs(&req, &conn_info, "ReceivedRequests", "GenerateTarget", false);
+    logs::write::info_logs(&req, "ReceivedRequests", "GenerateTarget", false);
     random_generate_target()
 }
 
@@ -42,11 +42,11 @@ async fn file_read_test(req: HttpRequest, conn_info: ConnectionInfo, file: web::
     let _file_root = &file.file_root_directory;
     match fs::read_to_string(read_file_name) {
         Ok(file_content) => {
-            logs::write::info_logs(&req, &conn_info, "ReceivedRequests", "ReceivedRequests", false);
+            logs::write::info_logs(&req, "ReceivedRequests", "ReceivedRequests", false);
             HttpResponse::Ok().content_type(TEXT_HTML_UTF_8).body(file_content)
         },
         Err(_) => {
-            logs::write::warn_logs(&req, &conn_info, "ReceivedRequests", "FileNotFound");
+            logs::write::warn_logs(&req, "ReceivedRequests", "FileNotFound");
             HttpResponse::NotFound().body("File_NotFound!")
         },
     }
@@ -72,7 +72,7 @@ async fn static_file_system(req: HttpRequest, conn_info: ConnectionInfo, file_pa
 
     if !full_path.starts_with(base_path) {
 
-        logs::write::warn_logs(&req, &conn_info, "AttackRequests", "非法的路径访问");
+        logs::write::warn_logs(&req, "AttackRequests", "非法的路径访问");
 
         let error_info = FrontEndErrorInfo{ status_code: 403, error_title: "Forbidden", error_message: "因您的请求包含非法路径，所以服务器拒绝了您的请求！"};
         let body = front_end_error_page(&error_info, &page_template);
