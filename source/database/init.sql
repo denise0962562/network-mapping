@@ -5,9 +5,9 @@ CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(200) NOT NULL UNIQUE,
     password TEXT NOT NULL,
-    create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
-	limit_login INT DEFAULT 0,
-	enable_2fa boolean DEFAULT false
+    create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,    -- 用户的创建时间
+	limit_login INT DEFAULT 0,                                                            -- 表示用户是否是被限制登录
+	enable_2fa boolean DEFAULT false                                                      -- 表示用户是否启用了 2FA
 );
 
 -- 表 scan_task 用于存储扫描任务信息，配置了级联更新和删除
@@ -15,12 +15,12 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	user_id INT NOT NULL,
 	task_id SERIAL PRIMARY KEY, 
 	task_initiator VARCHAR(10) NOT NULL, 
-	task_target INET NOT NULL, 
-	task_create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
-	task_level INT NOT NULL CHECK ( task_level >= 0 AND task_level <=4 ), 
-	task_start_time BIGINT DEFAULT NULL, 
-	task_end_time BIGINT DEFAULT NULL, 
-	remarks TEXT DEFAULT NULL ,
+	task_target INET NOT NULL,                                                                -- 扫描的目标 IP/CIDR
+	task_create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,   -- 表示扫描任务的创建时间
+	task_level INT NOT NULL CHECK ( task_level >= 0 AND task_level <=4 ),                     -- 表示任务的优先级
+	task_start_time BIGINT DEFAULT NULL,                                                      -- 扫描开始时间
+	task_end_time BIGINT DEFAULT NULL,                                                        -- 扫描结束时间
+	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
 		REFERENCES users(id)
@@ -123,4 +123,16 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	remark TEXT,                                                                    -- 扫描器的备注
 	tag TEXT                                                                        -- 扫描器的标签
 );
+
+-- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
+CREATE TABLE IF NOT EXISTS ip_list (
+	id SERIAL PRIMARY KEY,
+	is_white boolean DEFAULT false,                                                 -- 该字段表示是否是白名单，默认为 false 
+	ip INET NOT NULL,                                                               -- 该字段可以存储单个 IP 或 CIDR 地址段
+	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,     -- 白名单 IP/CIDR 创建时间
+	tag TEXT,                                                                       -- IP 列表的标签
+	remark TEXT                                                                     -- IP 列表的备注
+
+);
+
 
