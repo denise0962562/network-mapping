@@ -10,7 +10,7 @@ pub mod handlers;
 use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::dev::ConnectionInfo;
 use actix_web::{HttpRequest, web};
-use tracing::{warn, error};
+use tracing::{error, info, warn};
 use std::path::{Path, PathBuf};
 use tera::{Tera, Context};
 use std::collections::HashMap;
@@ -448,6 +448,28 @@ pub fn generate_hash_password(password: &str) -> Result<String, password_hash::E
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     Ok(argon2.hash_password(password.as_bytes(), &salt)?.to_string())
+}
+
+/// 从数据库中获取密码，当成功时返回一个 String 类型的密码哈希值，当失败时就返回一个 PoolError 类型的错误。
+pub async fn get_password_from_database(
+    pool: deadpool_postgres::Pool,
+    username: &str
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = pool.get().await?;
+    let row = client.query_opt("SELECT password FROM users WHERE username = $1", &[&username]).await?;
+    match row {
+        Some(pwd_hash) => {
+            let pwd = pwd_hash.get(0);
+            Ok(pwd)
+        },
+        None => {
+            info!(
+                event = "UserPasswordHASHNotFound",
+                message = "用户密码哈希值未找到"
+            );
+            Err("未找到密码".into())
+        }
+    }
 }
 
 /// 校验密码
