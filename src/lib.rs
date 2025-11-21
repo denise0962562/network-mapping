@@ -255,7 +255,7 @@ impl DbResource {
 
                 //返回值的单位均为字节
 
-                let db_library_size_sql = "SELECT pg_database_size('nmap') AS db_size;";
+                let db_library_size_sql = "SELECT pg_database_size('nmapping') AS db_size;";
 
                 let db_table_size_sql = get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
                 let db_conn_sql = "SELECT COUNT(*) AS db_conn FROM pg_stat_activity;";
