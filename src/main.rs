@@ -59,6 +59,7 @@ async fn main() -> io::Result<()> {
     println!("日志系统已启动");
     let db_config = config.database;
     let database_c = db_config.clone();
+    let database_c2 = db_config.clone();
 
     // let database = format!("postgresql://{}:{}@{}/{}", db_config.username, db_config.password, db_config.host, db_config.db_name);
     let db_pool = db::create_postgresql_pool(
@@ -77,6 +78,7 @@ async fn main() -> io::Result<()> {
 
 
     let sys = Systems::new();  
+    let sys_2 = sys.clone();
 
     println!("服务已启动");
     println!("监听 {}:{}", server_host, server_port);
@@ -125,8 +127,8 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(db_pool.clone()))
             .app_data(web::Data::new(template_info.clone()))
             .app_data(web::Data::new(ReadFile{file_name: String::from("index.html"), file_root_directory: String::from("")}))
-            // .app_data(web::Data::new(sys.clone()))
-            // .app_data(web::Data::new(database_c.clone()))
+            .app_data(web::Data::new(sys_2.clone()))
+            .app_data(web::Data::new(database_c2.clone()))
             .configure(config::init_routes)
     })
     .bind((server_host, server_port))?
