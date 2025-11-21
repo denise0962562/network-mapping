@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
     password TEXT NOT NULL,
     create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
 	limit_login INT DEFAULT 0,
-	2fa boolean DEFAULT false
+	enable_2fa boolean DEFAULT false
 );
 
 -- 表 scan_task 用于存储扫描任务信息，配置了级联更新和删除
@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS login_logs (
 	event_ip INET,                                                                 -- 触发登录事件的 IP 地址
 	event_usage_id INT,                                                            -- 登录日志中触发该事件的用户 ID ，该参数可有可无
 	is_successful boolean NOT NULL                                                 -- 登录日志中表示成功登录，True 表示登录成功，False 表示登录失败
-)
+);
 
 --表 scanner_info 用于存储扫描器信息
 CREATE TABLE IF NOT EXISTS scanner_info (
@@ -122,5 +122,5 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	id_enable boolean,                                                              -- 扫描器是否启用
 	remark TEXT,                                                                    -- 扫描器的备注
 	tag TEXT                                                                        -- 扫描器的标签
-)
+);
 
