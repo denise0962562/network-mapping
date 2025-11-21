@@ -87,7 +87,7 @@ pub async fn login_logs_to_db(
     // MARK 过一段时间把数据库规划好之后再来处理这
     // BUG暂时不管这里的报错，这是故意留的以提示，还要处理错误 path
     let row = match transaction.execute(
-        "INSERT INTO login_logs( event_ip, event_usage_id, is_successful ) VALUES ( &1, &2, &3 );",
+        "INSERT INTO login_logs( event_ip, event_usage_id, is_successful ) VALUES ( $1, $2, $3 );",
         &[&log.event_ip, &log.event_useage_userid, &log.is_successful]
     ).await {
         Ok(r) => r,
