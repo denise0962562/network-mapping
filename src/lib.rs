@@ -630,7 +630,6 @@ pub async fn insert_system_status(
     let network = serde_json::to_value(s.network).unwrap();
     let raw = transaction.execute(&statement, &[&server_run_time, &cpu, &ram, &disk, &db_postgresql, &network]).await?;
     if raw == 1 {
-        println!("插入成功");
         transaction.commit().await?;
         Ok(())
     }else {

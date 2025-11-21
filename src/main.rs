@@ -104,13 +104,12 @@ async fn main() -> io::Result<()> {
 
         loop {
             ticker.tick().await;
-            println!("任务触发: {:?}", Utc::now());
             match insert_system_status(pool.clone(), database_c.db_name.clone(), sys.clone()).await {
                 Ok(_) => (),
                 Err(e) => {
                     let message = format!("插入系统状态错误: {}", e);
                     error!(
-                        event = "DATABASE-ERROR",
+                        event = "INSERTSystemStatusError",
                         path = "fn insert_system_status",
                         message
                     )
