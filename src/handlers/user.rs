@@ -44,12 +44,11 @@ async fn first_add_user(pool: web::Data<deadpool_postgres::Pool>) -> impl Respon
 #[post("/api/login")]
 async fn user_login_h(
     req: HttpRequest,
-    conn_info: ConnectionInfo,
     pool: web::Data<deadpool_postgres::Pool>,
     receiveinfo: web::Json<ReceiveLoginInfo>
 ) -> impl Responder {
 
-    match user_login(&req, conn_info, &receiveinfo.username, &receiveinfo.password, pool).await {
+    match user_login(&req, &receiveinfo.username, &receiveinfo.password, pool).await {
         Ok(session) => {
 
             let body = json!({
