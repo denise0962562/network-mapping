@@ -5,6 +5,7 @@ pub mod init;
 use tracing_appender::{rolling as import_log_rolling, rolling::RollingFileAppender};
 use std::path::Path;
 use tracing_subscriber::fmt::time::FormatTime;
+use std::net::IpAddr;
 
 
 pub enum LogRollingMode {
@@ -52,8 +53,8 @@ impl FormatTime for LogTime {
 pub struct LoginLog {
     // pub event: String,             // 该字段存储了事件名称
     // pub event_at: u32,             // 该字段存储了产生事件的事件
-    pub event_ip: String,          // 该字段存储了产生事件的ip地址
-    pub event_useage_userid: i16,  // 该字段存储了事件所使用的用户id，-1为用户id不存在,可以表示最大的用户ID为32767
+    pub event_ip: IpAddr,          // 该字段存储了产生事件的ip地址
+    pub event_useage_userid: i32,  // 该字段存储了事件所使用的用户id，-1为用户id不存在,可以表示最大的用户ID为32767
     pub is_successful: bool        // 该字段存储了一个 bool 值，表示（登录）是否成功
 }
 

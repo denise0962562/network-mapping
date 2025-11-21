@@ -102,6 +102,17 @@ pub async fn login_logs_to_db(
     };
 
     if row > 0 {
+        match transaction.commit().await {
+            Ok(()) => (),
+            Err(e) => {
+                error!(
+                    event = "TransactionCommitError",
+                    path = "",
+                    message = %e
+                );
+                return false
+            }
+        };
         true
     }
     else {

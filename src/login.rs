@@ -4,6 +4,8 @@ use actix_web::web;
 use tracing::{warn, info, error};
 // use actix_session::storage::{SessionStore, SessionKey};
 use uuid::Uuid;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::Instant;
 
 use crate::{get_conn_ip, login};
 use crate::{
@@ -22,14 +24,14 @@ pub struct LoginToken {
 pub struct SessionInfo<'a> {
     session: String,
     create_time: i64,
-    ttl: u32,
+    ttl: i32,
     username: &'a str,
 }
 
 impl LoginToken {
 //TODO 明天完善此处
     ///生成一个session并保存
-    pub async fn create_session<'a>(&self, ttl: u32, u_name: &'a str) -> SessionInfo<'a> {
+    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> SessionInfo<'a> {
         let session = SessionInfo { 
             session: Uuid::new_v4().to_string(), 
             create_time: get_unix_epoch_ms(), 
@@ -47,7 +49,7 @@ impl LoginToken {
             Err(e) => {
                 error!(
                     event = "SaveSessionFailed",
-                    message = "Save Session Failed"
+                    message = %e
                 );
                 SessionInfo {
                     session: "".to_string(),
@@ -78,7 +80,7 @@ impl LoginToken {
 
         //查找用户的id
         let row = transaction.query_opt(
-            "SELECT id FROM session WHERE username = $1;",
+            "SELECT id FROM users WHERE username = $1;",
             &[&sessioninfo.username]
         ).await?;
 
@@ -97,7 +99,7 @@ impl LoginToken {
         let userid: i32 = row.get("id");
         //插入一条session,其中包括了用户id token 有效时间，创建时间
         let r_rows = transaction.execute(
-            "INSERT INTO session (userid, token, ttl, create_time) VALUES ( $1, $2, $3, $4 );",
+            "INSERT INTO session (user_id, token, ttl, create_time) VALUES ( $1, $2, $3, $4 );",
             &[
                 &userid,
                 &sessioninfo.session,
@@ -110,7 +112,6 @@ impl LoginToken {
             Ok(())
         }
         else {
-            transaction.rollback();
             error!(
                 event = "INSERTDataError",
                 message = "插入session错误，返回值不为一"
@@ -154,11 +155,29 @@ pub async fn user_login(
     pool: web::Data<deadpool_postgres::Pool>
 ) -> Result<String, Box<dyn std::error::Error>> {
 
+    let start = Instant::now();
+
     let pwd_hash = get_password_from_database(pool.get_ref().clone(), username).await?;
+    let get_pwd_h = start.elapsed();
+    println!("get_p   : {:>6} ms", get_pwd_h.as_millis());
+
     if verify_password(password, pwd_hash.as_str()) {
+        let e_ip: IpAddr = match get_conn_ip(&req).parse() {
+            Ok(o) => o,
+            Err(e) => {
+                error!(
+                    event = "StringToIpAddrError",
+                    path = "",
+                    message = %e
+                );
+                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))                               //其中 IPV4 地址 0.0.0.0 表示从 String 转换为 IP 地址失败
+            }
+        };
+
+        let start = Instant::now();
     
         let loginlogs = LoginLog {
-            event_ip : get_conn_ip(&req),
+            event_ip :  e_ip,
             event_useage_userid: 1212,         //MARK 暂时这样，先提交再改
             is_successful: true
         };
@@ -173,37 +192,17 @@ pub async fn user_login(
                     message = "向数据库中插入登录日志数据错误"
                 );
         }
+        println!("to_db   : {:>6} ms", start.elapsed().as_millis());
+        let start = Instant::now();
 
         let login_token = LoginToken {pool: pool.get_ref().clone()};
         let session = login_token.create_session(2700, username).await;
+        println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
         Ok(session.session)
     }
     else {
         Err("登录失败".into())
     }
 
-    // let client = pool.get.await?;
-
-    // let stmt = client
-    //     .prepare("SELECT password FROM users WHERE username = $1")
-    //     .await?;
-    // if let Some(row) = client.query_opt(&stmt, &[&username]).await? {
-    //     let stored_hash: String = row.get(0);
-
-    //     if verify_password(password, &stored_hash) {
-    //         logs::write::info_logs(&req, "登录成功", "用户登录成功", false);
-    //         let login_token = LoginToken {
-    //             pool: pool.get_ref().clone()                                                     // 克隆一份
-    //         };
-    //         let c_session = login_token.create_session(2700, username);
-    //         Ok(())
-    //     } else {
-    //         logs::write::warn_logs(&req, "登录失败", "用户密码错误");
-    //         Err("登录失败".into())
-    //     }
-    // } else {
-    //     logs::write::error_logs(&req, "登录失败", "系统错误或未找到用户名");
-    //     Err("LoginError".into())
-    // }
 }
 

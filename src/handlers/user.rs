@@ -6,7 +6,7 @@ use crate::login::user_login;
 use crate::{TEXT_HTML_UTF_8};
 use crate::logs::write::{error_logs, info_logs, warn_logs};
 use serde_json::json;
-use std::time;
+use std::time::Instant;
 
 #[get("/add")]
 async fn first_add_user(pool: web::Data<deadpool_postgres::Pool>) -> impl Responder {
@@ -47,7 +47,9 @@ async fn user_login_h(
     pool: web::Data<deadpool_postgres::Pool>,
     receiveinfo: web::Json<ReceiveLoginInfo>
 ) -> impl Responder {
-
+    println!("================= Benchmark =================");
+    let total_start = Instant::now();                                                  // 总的开始时间
+    let start = Instant::now();                                                        // 登录函数开始时间
     match user_login(&req, &receiveinfo.username, &receiveinfo.password, pool).await {
         Ok(session) => {
 
@@ -61,6 +63,11 @@ async fn user_login_h(
                 .secure(true)
                 .max_age(cookie::time::Duration::seconds(2700))
                 .finish();
+            let total_es = total_start.elapsed();
+            let login_function = start.elapsed();
+            println!("Total   : {:>6} ms", total_es.as_millis());
+            println!("Login_f : {:>6} ms", login_function.as_millis());
+            println!("=============================================");
             HttpResponse::Ok()
                 .cookie(cookies)
                 .json(body)
@@ -73,9 +80,19 @@ async fn user_login_h(
                 "success": false,
                 "message": "登录失败"
             });
+            let total_es = total_start.elapsed();
+            let login_function = start.elapsed();
+            println!("Total   : {:>6} ms", total_es.as_millis());
+            println!("Login_f : {:>6} ms", login_function.as_millis());
+            println!("=============================================");
             HttpResponse::Ok()
                 .json(body)
         }
     }
+
+
+    
+
+    
 }
 
