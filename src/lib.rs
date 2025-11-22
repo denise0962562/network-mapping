@@ -24,6 +24,10 @@ use crate::db::{get_sql_from_file, SqlFile};
 
 use std::time::Instant;
 
+use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
+use password_hash::{PasswordHash, SaltString};
+use password_hash::rand_core::OsRng;
+
 //常量
 pub const TEXT_HTML_UTF_8: &str = "text/html; charset=utf-8";
 pub const TEXT_CSS_UTF_8: &str = "text/css; charset=utf-8";
@@ -435,16 +439,14 @@ fn get_server_uptime() -> u64 {
 }
 
 
-use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
-use password_hash::{PasswordHash, SaltString};
-use password_hash::rand_core::OsRng;
+
 
 /// 生成 Argon2id 哈希
 /// 
 /// 用于添加用户
 pub fn generate_hash_password(password: &str) -> Result<String, password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
-    let params = Params::new(64 * 1024, 2, 2, None)?; // 64 MiB, 3 次迭代, 4 并行
+    let params = Params::new(64 * 1024, 2, 2, None)?; // 64 MiB, 2 次迭代, 2 并行
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     Ok(argon2.hash_password(password.as_bytes(), &salt)?.to_string())
@@ -474,12 +476,24 @@ pub async fn get_password_from_database(
 
 /// 校验密码
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    if let Ok(parsed_hash) = PasswordHash::new(hash) {
-        let params = Params::new(64 * 1024, 2, 2, None).unwrap();
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        argon2.verify_password(password.as_bytes(), &parsed_hash).is_ok()
-    } else {
-        false
+    let start = Instant::now();
+
+    match PasswordHash::new(hash) {
+        Ok(parsed_hash) => {
+            let argon2 = Argon2::default();
+            let result = argon2.verify_password(password.as_bytes(), &parsed_hash).is_ok();
+            println!("verify_pwd {:>6} ms", start.elapsed().as_millis());
+            result
+        },
+        Err(e) => {
+            error!(
+                event = "ParsedHashError",
+                path = "",
+                message = %e
+            );
+            println!("verify_pwd_e {:>6}", start.elapsed().as_millis());
+            false
+        }
     }
 }
 
