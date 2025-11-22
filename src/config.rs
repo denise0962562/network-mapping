@@ -14,7 +14,8 @@ pub struct Config {
     pub log: LogConfig,
     pub templates: TemplatesConfig,
     pub scan_target_generated: ScanTargetConfig,
-    pub database: DatabaseConfig
+    pub database: DatabaseConfig,
+    pub pwd_hash: PasswordHashConfig
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +54,13 @@ pub struct DatabaseConfig {
     pub tls: bool,                                //是否使用tls
     pub init_database_file: String,               //初始化数据库表的sql文件
     pub sql_file_path: String,                    //sql文件存放路径（相对）
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PasswordHashConfig {
+    pub m: u32,                                    // 内存，单位 MiB
+    pub t: u32,                                    // 迭代，最大可设置为 4294967295
+    pub p: u32                                     // 并行，最大可设置为 4294967295
 }
 
 impl Config {

@@ -7,9 +7,13 @@ use crate::{TEXT_HTML_UTF_8};
 use crate::logs::write::{error_logs, info_logs, warn_logs};
 use serde_json::json;
 use std::time::Instant;
+use crate::config::PasswordHashConfig;
 
 #[get("/add")]
-async fn first_add_user(pool: web::Data<deadpool_postgres::Pool>) -> impl Responder {
+async fn first_add_user(
+    pool: web::Data<deadpool_postgres::Pool>,
+    pwd_hash_config: web::Data<PasswordHashConfig>
+) -> impl Responder {
     match admin::is_user_exist("admin", pool.clone()).await {
         Ok(o) => {
             if o {
@@ -19,7 +23,7 @@ async fn first_add_user(pool: web::Data<deadpool_postgres::Pool>) -> impl Respon
                     .body("用户已存在".to_string())
             }
             else {
-                let p_hash = generate_hash_password("admin");
+                let p_hash = generate_hash_password("admin", pwd_hash_config.get_ref().clone());
                 match p_hash {
                     Ok(o) => {
                         let userinfo = AddUserInfo{

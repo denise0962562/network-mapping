@@ -27,6 +27,7 @@ use std::time::Instant;
 use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
+use crate::config::PasswordHashConfig;
 
 //常量
 pub const TEXT_HTML_UTF_8: &str = "text/html; charset=utf-8";
@@ -444,9 +445,9 @@ fn get_server_uptime() -> u64 {
 /// 生成 Argon2id 哈希
 /// 
 /// 用于添加用户
-pub fn generate_hash_password(password: &str) -> Result<String, password_hash::Error> {
+pub fn generate_hash_password(password: &str, config: PasswordHashConfig) -> Result<String, password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
-    let params = Params::new(64 * 1024, 2, 2, None)?; // 64 MiB, 2 次迭代, 2 并行
+    let params = Params::new(config.m * 1024, config.t, config.p, None)?; // 配置文件中默认 64 MiB, 2 次迭代, 2 并行
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     Ok(argon2.hash_password(password.as_bytes(), &salt)?.to_string())

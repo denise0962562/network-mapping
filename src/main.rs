@@ -76,6 +76,9 @@ async fn main() -> io::Result<()> {
         Err(e) => panic!("初始化数据库错误{}", e),
     };
 
+    // 定义密码加密相关配置文件
+    let pwd_h = config.pwd_hash;
+
 
     let sys = Systems::new();  
     let sys_2 = sys.clone();
@@ -128,6 +131,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(ReadFile{file_name: String::from("index.html"), file_root_directory: String::from("")}))
             .app_data(web::Data::new(sys_2.clone()))
             .app_data(web::Data::new(database_c2.clone()))
+            .app_data(web::Data::new(pwd_h.clone()))
             .configure(config::init_routes)
     })
     .bind((server_host, server_port))?
