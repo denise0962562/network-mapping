@@ -5,7 +5,7 @@ port = 9999
 [log]
 directory = "logs"
 file_name = "server.json"
-file_rolling = 0                                        # daliy: 0, hourly: 1, minutely: 2, never: 3
+file_rolling = 0                                         # daliy: 0, hourly: 1, minutely: 2, never: 3
 debug_mode = false #false or true
 
 [templates]
@@ -16,7 +16,7 @@ templates_name = "error.html"
 generated_mode = "sequence" # sequence 和random
 
 [database]
-host = "192.168.110.133"
+host = "127.0.0.1"
 port = 54433
 database_type = "postgresql"
 username = "nmapping"
@@ -26,3 +26,11 @@ tls = false # true or false
 
 init_database_file = "source/database/init.sql"          #用于初始化数据库表的sql文件位置
 sql_file_path = "source/database/"                       #用于指定sql文件目录，通常为相对路径
+
+# 下面表示的是数据库中密码加密所需要的参数
+# 使用下面的默认值可以做到 1 秒校验和加密，保持原样就好
+[pwd_hash]
+m = 64                                                   # 内存，最大可设置为 65535 ，单位 MiB ，越大越好，但同时对设备要求越高。
+t = 2                                                    # 迭代，最大可设置为 4294967295 ，越大越好，但同时对设备要求越高。
+p = 2                                                    # 并行，最大可设置为 4294967295 ，越大越好，但同时对设备要求越高
+                                                         # 该参数可以理解为使用多少个核心运算。
