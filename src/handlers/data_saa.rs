@@ -8,6 +8,8 @@ use sysinfo;
 use crate::{Systems, login::{LoginToken}};
 use crate::config::DatabaseConfig;
 
+use std::fs;
+use tracing::{error, warn, info};
 // #[get("/api/data/saa/")]
 // async fn get_saa_data(req: HttpRequest, conn: ConnectionInfo) -> impl Responder {
 
@@ -59,4 +61,27 @@ async fn get_system_data(
     let db_name = db_config.db_name.clone();
     let s = SystemResource::new(sys, pool, db_name).await;
     HttpResponse::Ok().json(s)
+}
+
+#[get("/dashboard")]
+async fn render_dashboard_page(
+    req: HttpRequest
+) -> impl Responder {
+    match fs::read_to_string("./frontend/dashboard/index.html") {
+        Ok(f) => {
+            HttpResponse::Ok()
+                .content_type(TEXT_HTML_UTF_8)
+                .body(f)
+        },
+        Err(e) => {
+            error!(
+                event = "ReadFileError",
+                path = "",
+                message = %e
+            );
+            HttpResponse::NotFound()
+                .content_type(TEXT_HTML_UTF_8)
+                .body("")
+        }
+    }
 }
