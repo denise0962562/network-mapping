@@ -101,6 +101,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e) {
     // 这里可以添加实际的登录逻辑
     console.log('登录信息:', { email, password, remember });
 
+    document.getElementById('loadingOverlay').classList.remove('hidden');
     fetch('/api/login', {
         method: 'POST',
         headers: {
@@ -124,7 +125,8 @@ document.getElementById('loginForm').addEventListener('submit', function(e) {
             // 后端设置了 Set-Cookie，浏览器会自动保存
         } else {
             alert('登录失败');
-            window.location.reload;
+            document.getElementById('loadingOverlay').classList.add('hidden');
+            // window.location.reload;
         }
     });
     
