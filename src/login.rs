@@ -208,3 +208,14 @@ pub async fn user_login(
 
 }
 
+/// 该函数用于从 req 中获取 session
+/// 
+/// **需要注意生命周期，返回一个 Option<&str> ，其生命周期于传入的 cookie_n 一致**
+/// 
+/// 我认为该函数不需要做日志，日志就交给调用者了
+async fn get_session_from_req(req: HttpRequest, cookie_n: &str) -> Option<String> {
+    match req.cookie(cookie_n) {
+        Some(cookie) => Some(cookie.value().to_string()),
+        None => None
+    }
+}
