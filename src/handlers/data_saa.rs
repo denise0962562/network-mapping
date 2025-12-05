@@ -26,33 +26,33 @@ async fn get_system_data(
 ) -> impl Responder {
 
     // 定义 403 错误页面的闭包，接受一个 &str 类型的参数，该参数用于写入日志
-    let render_403 = | message | {
-        logs::write::warn_logs(&req, "SessionAuthFailed", message);
-        let error_info = FrontEndErrorInfo { status_code: 403, error_title: "Forbidden", error_message: "您已被屏蔽" };
-        HttpResponse::Forbidden()
-            .content_type(TEXT_HTML_UTF_8)
-            .body(front_end_error_page(&error_info, &page_template))
-    };
+    // let render_403 = | message | {
+    //     logs::write::warn_logs(&req, "SessionAuthFailed", message);
+    //     let error_info = FrontEndErrorInfo { status_code: 403, error_title: "Forbidden", error_message: "您已被屏蔽" };
+    //     HttpResponse::Forbidden()
+    //         .content_type(TEXT_HTML_UTF_8)
+    //         .body(front_end_error_page(&error_info, &page_template))
+    // };
 
-    let tmp_c = &req.cookie("session");
-    let session = match tmp_c {
-        Some(s) => s,
-        None => return render_403("没有获取到 Session")
-    };
+    // let tmp_c = &req.cookie("session");
+    // let session = match tmp_c {
+    //     Some(s) => s,
+    //     None => return render_403("没有获取到 Session")
+    // };
 
-    // 检查获取到的 session 是否有效
-    let session_value = session.value();
-    let token = LoginToken {pool: pool.get_ref().clone()};
-    match token.check_token(session_value).await {
-        Ok(true) => (),
-        Ok(false) => {
-            return render_403("数据库中未找到符合条件的 Session")
-        },
-        Err(e) => {
-            let error_m = e.to_string();
-            return render_403(&error_m)
-        }
-    };
+    // // 检查获取到的 session 是否有效
+    // let session_value = session.value();
+    // let token = LoginToken {pool: pool.get_ref().clone()};
+    // match token.check_token(session_value).await {
+    //     Ok(true) => (),
+    //     Ok(false) => {
+    //         return render_403("数据库中未找到符合条件的 Session")
+    //     },
+    //     Err(e) => {
+    //         let error_m = e.to_string();
+    //         return render_403(&error_m)
+    //     }
+    // };
 
     let sys = sys.get_ref().clone();
     let pool = pool.get_ref().clone();
