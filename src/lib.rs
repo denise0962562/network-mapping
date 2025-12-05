@@ -6,6 +6,7 @@ pub mod target_generated;
 pub mod login;
 pub mod admin;
 pub mod handlers;
+pub mod smiddleware;                                          // 自己的中间件 
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::dev::ConnectionInfo;

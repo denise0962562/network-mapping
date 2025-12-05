@@ -79,5 +79,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(Files::new("/static", "./static").show_files_listing().prefer_utf8(true))
         .service(handlers::utils::get_scan_target)
         .service(handlers::data_saa::get_system_data)
-        .service(handlers::utils::benchmark_route);
+        .service(handlers::utils::benchmark_route)
+        .service(handlers::data_saa::render_dashboard_page)
+        .default_service(web::to(handlers::utils::not_found));
 }

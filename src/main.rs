@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpServer};
+use rust_web_test::smiddleware::{AuthMiddlewareService, AuthMiddleware};
 use core::panic;
 use std::{io};
 use rust_web_test::logs::{self, LogRollingMode};
@@ -132,6 +133,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(sys_2.clone()))
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
+            .wrap(AuthMiddleware)
             .configure(config::init_routes)
     })
     .bind((server_host, server_port))?

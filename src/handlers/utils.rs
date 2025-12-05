@@ -99,3 +99,16 @@ async fn benchmark_route(sys: web::Data<Systems>, pool: web::Data<deadpool_postg
     benchmark(sys, pool, db_config.db_name.clone()).await;
     "Benchmark finished, check server logs."
 }
+
+pub async fn not_found(
+    page_template: web::Data<TemplatesInit>
+) -> impl Responder {
+    let error_info = FrontEndErrorInfo {
+        status_code: 404,
+        error_title: "NotFound",
+        error_message: "没有找到对应的资源"
+    };
+    HttpResponse::NotFound()
+        .content_type(TEXT_HTML_UTF_8)
+        .body(front_end_error_page(&error_info, &page_template))
+}

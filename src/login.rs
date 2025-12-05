@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub struct LoginToken {
-    pool: deadpool_postgres::Pool,
+    pub pool: deadpool_postgres::Pool,
 }
 
 
@@ -121,20 +121,22 @@ impl LoginToken {
     }
 
     ///检查token是否有效和存在
-    pub async fn check_token(&self, session: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// 
+    /// 找到token且token还未过期时返回 true ，未找到或已过期时返回当返回值多于一行时返回错误
+    pub async fn check_token(&self, session: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let client = self.pool.get().await?;
-        let stmt = client.prepare("SELECT token FROM session WHERE token = $1 AND is_enable = true;").await?;
+        let stmt = client.prepare("SELECT token FROM session WHERE token = $1 AND is_enable = true LIMIT 1;").await?;
         if client.query_opt(&stmt, &[&session]).await?.is_some() {
-            Ok(())
+            Ok(true)
         }
+        // 当返回值为 None 时执行下面的分支
         else {
             warn!(
                 event = "TokenUnvaild",
                 message = "token已过期或不存在"
             );
-            Err("未找到或已过期".into())
+            Ok(false)
         }
-
     }
 
     // pub async fn update_session_ttl(&self, session: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -206,3 +208,14 @@ pub async fn user_login(
 
 }
 
+/// 该函数用于从 req 中获取 session
+/// 
+/// **需要注意生命周期，返回一个 Option<&str> ，其生命周期于传入的 cookie_n 一致**
+/// 
+/// 我认为该函数不需要做日志，日志就交给调用者了
+pub fn get_session_from_req(req: &HttpRequest, cookie_n: &str) -> Option<String> {
+    match req.cookie(cookie_n) {
+        Some(cookie) => Some(cookie.value().to_string()),
+        None => None
+    }
+}
