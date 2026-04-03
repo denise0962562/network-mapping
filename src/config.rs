@@ -81,5 +81,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::data_saa::get_system_data)
         .service(handlers::utils::benchmark_route)
         .service(handlers::data_saa::render_dashboard_page)
+        .service(handlers::task::get_task)
+        .service(handlers::task::create_task)
         .default_service(web::to(handlers::utils::not_found));
 }

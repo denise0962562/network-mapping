@@ -47,7 +47,7 @@ pub async fn create_postgresql_pool(
     match pool.get().await {
         Ok(_conn) => {
             // _conn 是一个 deadpool::managed::Object，它会在离开作用域时自动返回池中
-            println!("✅ 数据库连接成功，连接池有效！");
+            println!("数据库连接成功，连接池有效！");
         }
         Err(e) => {
             // 如果连接失败，这里会返回错误

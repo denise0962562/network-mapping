@@ -17,14 +17,15 @@ use tera::{Tera, Context};
 use std::collections::HashMap;
 use sysinfo;
 use std::sync::{Arc, Mutex};
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use serde_json;
 use tokio_postgres::types::ToSql;
-
+use uuid::Uuid;
 use crate::db::{get_sql_from_file, SqlFile};
-
+use crate::logs::write::error_logs;
+use regex::Regex;
 use std::time::Instant;
-
+use ipnet::{AddrParseError, IpNet};
 use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
@@ -332,6 +333,151 @@ impl SystemResource {
         }
     }
 }
+
+/// 用于存储目标 IP ，适配 IpAddr 和 str
+pub enum TargetIP<'a> {
+    S(&'a str),
+    I(IpNet)
+}
+
+pub enum TargetPort<'a> {
+    S(&'a str),
+    I(u16)
+}
+
+/// 该函数用于解析ip地址，
+/// 可以接收传入字符串IP，会自动解析，然后返回一个向量
+fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
+    let mut n_v:Vec<IpNet> = Vec::new();
+    match ip {
+        TargetIP::S(i_str) => {
+            
+            for tmp in i_str.split(",") {
+                let t = tmp.parse::<IpNet>();
+                match t {
+                    Ok(o) => n_v.push(o),
+                    Err(e) => {
+                        error!(
+                            event = "PARSING-ERROR",
+                            message = e.to_string()
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+            return Ok(n_v)
+        },
+        TargetIP::I(ipadd) => {
+            n_v.push(ipadd);
+            return Ok(n_v)
+        }
+    }
+}
+
+/// 该函数用于检查传入的 端口 是否合法
+/// 返回 布尔 值，如果含有不合法字符就会返回 false
+fn check_port(port: &str) -> bool {
+
+    let re = Regex::new(r"^[0-9,\-]+$");
+    match re {
+        Ok(o) => {
+            if o.is_match(port) {
+                return true
+            }
+            else {
+                return false
+            }
+        },
+        Err(e) => {
+            error!(
+                event = "REGEX-ERROR",
+                message = e.to_string()
+            );
+            return false
+        }
+    }
+}
+
+/// 该结构体用于接收用户创建任务时的数据
+/// 仅有三个参数
+#[derive(Deserialize)]
+pub struct CreateTask {
+    pub ip: String,
+    pub port: String,
+    pub remark: Option<String>
+}
+
+/// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
+pub struct STask<'a> {
+    pub task_id: Option<uuid::Uuid>,
+    pub task_initiator: &'a str,
+    pub ip: Vec<IpNet>,
+    // u16 刚好 0~65535，如果不提供则默认为全端口，当然可以在配置文件中配置默认端口
+    pub port: Option<&'a str>,
+    pub start_at: Option<u64>,
+    pub end_at: Option<u64>,
+    pub remark: Option<&'a str>
+}
+
+impl<'a> STask<'a> {
+    pub fn new(
+        ip: TargetIP,
+        initiator: &'a str,
+        port: Option<&'a str>,
+        remark: Option<&'a str>
+    ) -> Result<Self, AddrParseError> {
+        let t_ip = parsing_target(ip)?;
+        
+        let t_port = match port {
+            Some(p) => {
+                if check_port(p) {
+                    p
+                }
+                else {
+                    "1-65535"
+                }
+            },
+            None => "1-65535"
+        };
+        Ok(Self { 
+            task_id: Some(Uuid::now_v7()), 
+            task_initiator: initiator, 
+            ip: t_ip, 
+            port: Some(t_port), 
+            start_at: None, 
+            end_at: None, 
+            remark: remark 
+        })
+    }
+
+    /// 用于向数据库中添加一条扫描任务条目
+    /// 返回一个 Result，当执行成功时返回 OK
+    pub async fn add(
+        &self,
+        pool: web::Data<deadpool_postgres::Pool>,
+        user_id: i32
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = pool.get().await?;
+        let client = p.transaction().await?;
+        let t_id:String;
+        match self.task_id {
+            Some(o) => t_id = o.to_string(),
+            None => return Err("task_id 为 None".into())
+        };
+
+        // 将 ipnet转换为 String
+        let tmp_ip:Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
+
+        client.execute(
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, $4::inet[], $5, $6, $7)", 
+            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &4, &self.remark]
+        ).await?;
+
+        client.commit().await?;
+        return Ok(())
+    }
+}
+
 
 ///获取数据库表的大小，单位为字节
 async fn get_db_table_size_byte(

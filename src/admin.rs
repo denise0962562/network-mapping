@@ -37,3 +37,15 @@ pub async fn is_user_exist(username: &str, pool: web::Data<deadpool_postgres::Po
         Ok(false)
     }
 }
+
+/// 该函数用于获取用户的 ID
+/// 
+pub async fn get_user_id<'a>(
+    seeion: &'a str,
+    pool: &web::Data<deadpool_postgres::Pool>
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let client = pool.get().await?;
+    let row = client.query_one("SELECT user_id FROM session WHERE token = $1 AND is_enable = TRUE;", &[&seeion]).await?;
+    let r:i32 = row.get("user_id");
+    Ok(r)
+}
