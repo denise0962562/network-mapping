@@ -353,7 +353,18 @@ fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
         TargetIP::S(i_str) => {
             
             for tmp in i_str.split(",") {
-                let t = tmp.parse::<IpNet>();
+                
+                let mut t = tmp.to_string();
+                if t.contains("/") {
+                    ()
+                } 
+                else if t.contains(":") {
+                    t.push_str("/128");
+                }
+                else {
+                    t.push_str("/32");    
+                }
+                let t = (&t).parse::<IpNet>();
                 match t {
                     Ok(o) => n_v.push(o),
                     Err(e) => {
@@ -469,7 +480,7 @@ impl<'a> STask<'a> {
         let tmp_ip:Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
 
         client.execute(
-            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, $4::inet[], $5, $6, $7)", 
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7)", 
             &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &4, &self.remark]
         ).await?;
 

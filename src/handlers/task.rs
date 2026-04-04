@@ -73,7 +73,7 @@ async fn create_task(
     };
 
 
-    let task_info = STask::new(TargetIP::S(&create_data.ip), "admin", Some(&create_data.port), Some(""));
+    let task_info = STask::new(TargetIP::S(&create_data.ip), "admin", Some(&create_data.port), create_data.remark.as_deref());
 
     user_id = match get_user_id(&session_str, &pool).await {
         Ok(o) => o,
