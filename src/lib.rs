@@ -9,7 +9,6 @@ pub mod handlers;
 pub mod smiddleware;                                          // 自己的中间件 
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use actix_web::dev::ConnectionInfo;
 use actix_web::{HttpRequest, web};
 use tracing::{error, info, warn};
 use std::path::{Path, PathBuf};
@@ -17,14 +16,16 @@ use tera::{Tera, Context};
 use std::collections::HashMap;
 use sysinfo;
 use std::sync::{Arc, Mutex};
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use serde_json;
 use tokio_postgres::types::ToSql;
-
+use uuid::{Uuid, uuid};
 use crate::db::{get_sql_from_file, SqlFile};
-
+use crate::logs::write::{error_logs, info_logs};
+use regex::Regex;
 use std::time::Instant;
-
+use ipnet::{AddrParseError, IpNet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
@@ -332,6 +333,162 @@ impl SystemResource {
         }
     }
 }
+
+/// 用于存储目标 IP ，适配 IpAddr 和 str
+pub enum TargetIP<'a> {
+    S(&'a str),
+    I(IpNet)
+}
+
+pub enum TargetPort<'a> {
+    S(&'a str),
+    I(u16)
+}
+
+/// 该函数用于解析ip地址，
+/// 可以接收传入字符串IP，会自动解析，然后返回一个向量
+fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
+    let mut n_v:Vec<IpNet> = Vec::new();
+    match ip {
+        TargetIP::S(i_str) => {
+            
+            for tmp in i_str.split(",") {
+                
+                let mut t = tmp.to_string();
+                if t.contains("/") {
+                    ()
+                } 
+                else if t.contains(":") {
+                    t.push_str("/128");
+                }
+                else {
+                    t.push_str("/32");    
+                }
+                let t = (&t).parse::<IpNet>();
+                match t {
+                    Ok(o) => n_v.push(o),
+                    Err(e) => {
+                        error!(
+                            event = "PARSING-ERROR",
+                            message = e.to_string()
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+            return Ok(n_v)
+        },
+        TargetIP::I(ipadd) => {
+            n_v.push(ipadd);
+            return Ok(n_v)
+        }
+    }
+}
+
+/// 该函数用于检查传入的 端口 是否合法
+/// 返回 布尔 值，如果含有不合法字符就会返回 false
+fn check_port(port: &str) -> bool {
+
+    let re = Regex::new(r"^[0-9,\-]+$");
+    match re {
+        Ok(o) => {
+            if o.is_match(port) {
+                return true
+            }
+            else {
+                return false
+            }
+        },
+        Err(e) => {
+            error!(
+                event = "REGEX-ERROR",
+                message = e.to_string()
+            );
+            return false
+        }
+    }
+}
+
+/// 该结构体用于接收用户创建任务时的数据
+/// 仅有三个参数
+#[derive(Deserialize)]
+pub struct CreateTask {
+    pub ip: String,
+    pub port: String,
+    pub remark: Option<String>
+}
+
+/// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
+pub struct STask<'a> {
+    pub task_id: Option<uuid::Uuid>,
+    pub task_initiator: &'a str,
+    pub ip: Vec<IpNet>,
+    // u16 刚好 0~65535，如果不提供则默认为全端口，当然可以在配置文件中配置默认端口
+    pub port: Option<&'a str>,
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+    pub remark: Option<&'a str>
+}
+
+impl<'a> STask<'a> {
+    pub fn new(
+        ip: TargetIP,
+        initiator: &'a str,
+        port: Option<&'a str>,
+        remark: Option<&'a str>
+    ) -> Result<Self, AddrParseError> {
+        let t_ip = parsing_target(ip)?;
+        
+        let t_port = match port {
+            Some(p) => {
+                if check_port(p) {
+                    p
+                }
+                else {
+                    "1-65535"
+                }
+            },
+            None => "1-65535"
+        };
+        Ok(Self { 
+            task_id: Some(Uuid::now_v7()), 
+            task_initiator: initiator, 
+            ip: t_ip, 
+            port: Some(t_port), 
+            start_at: None, 
+            end_at: None, 
+            remark: remark 
+        })
+    }
+
+    /// 用于向数据库中添加一条扫描任务条目
+    /// 返回一个 Result，当执行成功时返回 OK
+    pub async fn add(
+        &self,
+        pool: web::Data<deadpool_postgres::Pool>,
+        user_id: i32
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = pool.get().await?;
+        let client = p.transaction().await?;
+        let t_id:String;
+        match self.task_id {
+            Some(o) => t_id = o.to_string(),
+            None => return Err("task_id 为 None".into())
+        };
+
+        // 将 ipnet转换为 String
+        let tmp_ip:Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
+
+        client.execute(
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7)", 
+            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &4, &self.remark]
+        ).await?;
+
+        client.commit().await?;
+        return Ok(())
+    }
+}
+
 
 ///获取数据库表的大小，单位为字节
 async fn get_db_table_size_byte(
@@ -702,4 +859,76 @@ pub fn get_user_agent(
             "Unknown".to_string()
         }
     }
+}
+
+#[derive(Serialize, Debug)]
+pub struct ApplyTask {
+    pub user_id: i32,
+    pub task_id: Uuid,
+    pub task_target: Vec<String>,
+    pub task_port: String
+}
+
+/// 通过该函数实现扫描器申请任务
+/// 首先搜索合适的任务，如果没有任务则会创建一个系统任务，该任务也会写入 scan_task 中
+pub async fn apply_task(
+    pool: web::Data<deadpool_postgres::Pool>,
+    scanner_id: web::Query<ApplyTaskQuery>
+) -> Result<ApplyTask, Box<dyn std::error::Error>> {
+    let p = pool.get().await?;
+    let row = p.query_opt(
+        "SELECT user_id, task_id, task_target::text[], task_port FROM scan_task WHERE task_start_time IS NULL
+                    AND task_end_time IS NULL 
+                    ORDER BY task_level DESC, task_create_time LIMIT 1;", 
+        &[]
+    ).await?;
+
+    if let Some(r_applytask) = row.map(|r| {
+        let uid = Uuid::parse_str(r.get("task_id")).unwrap_or_default();
+
+        ApplyTask {
+            user_id: r.get("user_id"),
+            task_id: uid,
+            task_target: r.get("task_target"),
+            task_port: r.get("task_port")
+        }
+    }) {
+        info!(event = "SEARCH-TASK", path = "fn apply_task", message = r_applytask.task_id.to_string());
+        return Ok(r_applytask)
+    }
+
+
+    info!(event = "NOTFOUND-TASK-1", path = "fn apply_task", message = "数据库表 scan_task 中没有合适的任务");
+
+    // TODO: 到时需要实现 IP 生成，根据上次扫描的 IP 生成此次的 IP 
+    let c_task = STask {
+        task_id: Some(Uuid::now_v7()),
+        task_initiator: "System",
+        ip: vec!["47.122.119.248/24".parse::<IpNet>()?],
+        port: Some("1-65535"),
+        start_at: Some(get_unix_epoch_ms()),
+        end_at: None,
+        remark: None
+    };
+
+    if c_task.task_id.is_none() || c_task.ip.is_empty() || c_task.port.is_none() || c_task.start_at.is_none() {
+        Err("c_task 值出现错误".into())
+    } 
+    else {
+        c_task.add(pool, 1).await?;
+        info!(event = "CREATE-TASK", path = "fn apply_task", message = "创建系统默认扫描任务");
+        let i = ApplyTask {
+            user_id: 1,
+            task_id: c_task.task_id.unwrap(),
+            task_target: c_task.ip.iter().map(|ip| ip.to_string() ).collect(),
+            task_port: c_task.port.unwrap().to_string()
+        };
+        info!(event = "CREATE-TASK", path = "fn apply_task", message = i.task_id.to_string());
+        Ok(i)
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ApplyTaskQuery {
+    pub scannerid: Uuid
 }

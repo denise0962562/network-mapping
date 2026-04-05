@@ -121,7 +121,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e) {
                                     // Max-Age：单位是秒（3600 = 1小时）Expires：具体时间点（GMT 格式）HttpOnly：JS 不能读取（更安全）Secure：只在 HTTPS 下传输
 
             alert('登录成功');
-            window.location.href = '/home';
+            window.location.href = '/dashboard';
             // 后端设置了 Set-Cookie，浏览器会自动保存
         } else {
             alert('登录失败');

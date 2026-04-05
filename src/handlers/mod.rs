@@ -2,6 +2,7 @@ pub mod user;
 pub mod utils;
 pub mod datapage;
 pub mod data_saa; //数据统计与分析
+pub mod task;
 
 use serde::{Deserialize, Serialize};
 

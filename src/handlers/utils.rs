@@ -10,7 +10,7 @@ use crate::{logs, ReadFile, get_file_suffix, mime_system, FrontEndErrorInfo, fro
 use crate::{Systems, benchmark};
 
 
-#[get("/scanner/get_target")]
+#[get("/scanner/target")]
 async fn get_scan_target(
     req: HttpRequest, 
     conn_info: ConnectionInfo, 

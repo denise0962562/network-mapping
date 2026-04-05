@@ -12,10 +12,12 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- 表 scan_task 用于存储扫描任务信息，配置了级联更新和删除
 CREATE TABLE IF NOT EXISTS scan_task( 
+	id SERIAL PRIMARY KEY,
 	user_id INT NOT NULL,
-	task_id SERIAL PRIMARY KEY, 
+	task_id VARCHAR(36) NOT NULL,                                                             -- 任务的 ID ，应该为 UUIDV7
 	task_initiator VARCHAR(10) NOT NULL, 
-	task_target INET NOT NULL,                                                                -- 扫描的目标 IP/CIDR
+	task_target INET[] NOT NULL,                                                              -- 扫描的目标 IP/CIDR 数组
+	task_port TEXT DEFAULT '1-65535',                                                         -- 扫描目标的 PORT
 	task_create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,   -- 表示扫描任务的创建时间
 	task_level INT NOT NULL CHECK ( task_level >= 0 AND task_level <=4 ),                     -- 表示任务的优先级
 	task_start_time BIGINT DEFAULT NULL,                                                      -- 扫描开始时间
@@ -25,7 +27,8 @@ CREATE TABLE IF NOT EXISTS scan_task(
 		FOREIGN KEY (user_id)
 		REFERENCES users(id)
 		ON DELETE CASCADE
-		ON UPDATE CASCADE
+		ON UPDATE CASCADE,
+	CONSTRAINT uk_task_id UNIQUE (task_id)
 );
 
 -- 表 ips 用于存储ip数据，并配置了级联更新
@@ -39,7 +42,7 @@ CREATE TABLE IF NOT EXISTS ips (
 	update_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
     CONSTRAINT fk_task
         FOREIGN KEY (task_id)
-        REFERENCES scan_task(task_id)
+        REFERENCES scan_task(id)
         ON UPDATE CASCADE
 );
 
@@ -133,6 +136,20 @@ CREATE TABLE IF NOT EXISTS ip_list (
 	tag TEXT,                                                                       -- IP 列表的标签
 	remark TEXT,                                                                    -- IP 列表的备注
 	UNIQUE(ip, is_white)                                                            -- 限制了 ip 和 is_white 组合的唯一性
+);
+
+
+-- 表 scanner_info 用于存储扫描器的各种信息，可以存放扫描器的 ID (UUIDV4) ，扫描器的版本，所支持的网络环境 IPV4/IPV6/ALL ，当前状态（RUN/STOP）
+CREATE TABLE IF NOT EXISTS scanner_info (
+	id SERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         --该字段为扫描器的 ID ，UUIDV4
+	location TEXT,
+	ip INET NOT NULL,
+	version TEXT,
+	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
+	is_run boolean,
+	is_enable boolean,
+	remark TEXT 
 );
 
 

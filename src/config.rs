@@ -81,5 +81,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::data_saa::get_system_data)
         .service(handlers::utils::benchmark_route)
         .service(handlers::data_saa::render_dashboard_page)
+        .service(handlers::task::create_task)
+        .service(handlers::task::apply_task_handler)     //更换了 apply_task_handler 和 get_task的注册顺序
+        .service(handlers::task::get_task)
         .default_service(web::to(handlers::utils::not_found));
 }
