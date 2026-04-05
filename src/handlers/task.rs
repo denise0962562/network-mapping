@@ -3,8 +3,8 @@ use actix_web::{HttpRequest, HttpResponse, Responder, body, get, post, web, http
 use uuid::Uuid;
 use deadpool_postgres::{Manager, Pool, Object};
 use crate::logs::write::{info_logs, warn_logs, error_logs};
-use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8};
-use crate::{CreateTask, STask, TargetIP, TargetPort};
+use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8, APPLICATION_JSON};
+use crate::{CreateTask, STask, TargetIP, TargetPort, apply_task, ApplyTask, ApplyTaskQuery};
 use crate::smiddleware::{render_403, render_500};
 use crate::admin::get_user_id;
 
@@ -46,7 +46,7 @@ async fn get_task(
     }
 }
 
-#[post("/api/create/task")]
+#[post("/api/task/create")]
 async fn create_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
@@ -95,5 +95,28 @@ async fn create_task(
     }
 
     
+    
+}
+
+/// 用于扫描器申请一个扫描目标
+#[get("/api/task/apply")]
+async fn apply_task_handler(
+    req: HttpRequest,
+    scanner_id: web::Query<ApplyTaskQuery>,
+    pool: web::Data<Pool>
+) -> impl Responder {
+    println!("{}", scanner_id.scannerid);
+    let task_data = apply_task(pool, scanner_id).await;
+
+    if task_data.is_ok() {
+        task_data.map(|a_t| {
+            HttpResponse::Ok()
+                .json(a_t)
+        }).unwrap()
+    }
+    else {
+        HttpResponse::NotFound()
+            .body("没有找到或内部错误")
+    }
     
 }

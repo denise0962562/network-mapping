@@ -139,3 +139,17 @@ CREATE TABLE IF NOT EXISTS ip_list (
 );
 
 
+-- 表 scanner_info 用于存储扫描器的各种信息，可以存放扫描器的 ID (UUIDV4) ，扫描器的版本，所支持的网络环境 IPV4/IPV6/ALL ，当前状态（RUN/STOP）
+CREATE TABLE IF NOT EXISTS scanner_info (
+	id SERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         --该字段为扫描器的 ID ，UUIDV4
+	location TEXT,
+	ip INET NOT NULL,
+	version TEXT,
+	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
+	is_run boolean,
+	is_enable boolean,
+	remark TEXT 
+);
+
+
