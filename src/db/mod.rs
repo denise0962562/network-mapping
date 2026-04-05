@@ -122,6 +122,4 @@ pub async fn get_sql_from_file(file_path: &str, file_name: &str) -> Result<Strin
             Err(message.into())
         }
     }
-
-    
 }

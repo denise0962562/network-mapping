@@ -877,7 +877,7 @@ pub async fn apply_task(
 ) -> Result<ApplyTask, Box<dyn std::error::Error>> {
     let p = pool.get().await?;
     let row = p.query_opt(
-        "SELECT user_id, task_id, task_target, task_port FROM scan_task WHERE task_start_time IS NULL
+        "SELECT user_id, task_id, task_target::text[], task_port FROM scan_task WHERE task_start_time IS NULL
                     AND task_end_time IS NULL 
                     ORDER BY task_level DESC, task_create_time LIMIT 1;", 
         &[]
@@ -889,11 +889,11 @@ pub async fn apply_task(
         ApplyTask {
             user_id: r.get("user_id"),
             task_id: uid,
-            task_target: (r.get("task_target")),
+            task_target: r.get("task_target"),
             task_port: r.get("task_port")
         }
     }) {
-        println!("{:?}", r_applytask);
+        info!(event = "SEARCH-TASK", path = "fn apply_task", message = r_applytask.task_id.to_string());
         return Ok(r_applytask)
     }
 
@@ -911,23 +911,24 @@ pub async fn apply_task(
         remark: None
     };
 
-    if c_task.task_id.is_none() || !c_task.ip.is_empty() || c_task.port.is_none() || c_task.start_at.is_none() {
+    if c_task.task_id.is_none() || c_task.ip.is_empty() || c_task.port.is_none() || c_task.start_at.is_none() {
         Err("c_task 值出现错误".into())
     } 
     else {
         c_task.add(pool, 1).await?;
         info!(event = "CREATE-TASK", path = "fn apply_task", message = "创建系统默认扫描任务");
-        Ok(ApplyTask {
+        let i = ApplyTask {
             user_id: 1,
             task_id: c_task.task_id.unwrap(),
             task_target: c_task.ip.iter().map(|ip| ip.to_string() ).collect(),
             task_port: c_task.port.unwrap().to_string()
-        })
+        };
+        info!(event = "CREATE-TASK", path = "fn apply_task", message = i.task_id.to_string());
+        Ok(i)
     }
 }
 
 #[derive(Deserialize)]
 pub struct ApplyTaskQuery {
-    #[serde(rename = "scannerid")]
-    pub scannerid: String
+    pub scannerid: Uuid
 }

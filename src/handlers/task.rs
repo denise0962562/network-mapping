@@ -105,7 +105,6 @@ async fn apply_task_handler(
     scanner_id: web::Query<ApplyTaskQuery>,
     pool: web::Data<Pool>
 ) -> impl Responder {
-    println!("{}", scanner_id.scannerid);
     let task_data = apply_task(pool, scanner_id).await;
 
     if task_data.is_ok() {
@@ -116,6 +115,7 @@ async fn apply_task_handler(
     }
     else {
         HttpResponse::NotFound()
+            .content_type(TEXT_HTML_UTF_8)
             .body("没有找到或内部错误")
     }
     
