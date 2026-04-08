@@ -112,9 +112,11 @@ CREATE TABLE IF NOT EXISTS login_logs (
 	is_successful boolean NOT NULL                                                 -- 登录日志中表示成功登录，True 表示登录成功，False 表示登录失败
 );
 
---表 scanner_info 用于存储扫描器信息
+-- 表 scanner_info 用于存储扫描器的各种信息，可以存放扫描器的 ID (UUIDV4) ，扫描器的版本，所支持的网络环境 IPV4/IPV6/ALL ，当前状态（RUN/STOP）
 CREATE TABLE IF NOT EXISTS scanner_info (
 	id SERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         --该字段为扫描器的 ID ，UUIDV4
+	location TEXT,                                                                  -- 扫描器的位置描述
 	system_version TEXT,                                                            -- 扫描器所在的系统名称及版本
 	scanner_version TEXT,                                                           -- 扫描器的版本
 	cpus INT,                                                                       -- 扫描器 CPU 数量
@@ -122,6 +124,7 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	uptime INT,                                                                     -- 扫描器总共运行的时间
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,     -- 扫描器创建的时间
 	ip_address INET,                                                                -- 扫描器的IP地址
+	is_run boolean,                                                                 -- 扫描器是否在运行
 	is_enable boolean,                                                              -- 扫描器是否启用
 	remark TEXT,                                                                    -- 扫描器的备注
 	tag TEXT                                                                        -- 扫描器的标签
@@ -137,19 +140,3 @@ CREATE TABLE IF NOT EXISTS ip_list (
 	remark TEXT,                                                                    -- IP 列表的备注
 	UNIQUE(ip, is_white)                                                            -- 限制了 ip 和 is_white 组合的唯一性
 );
-
-
--- 表 scanner_info 用于存储扫描器的各种信息，可以存放扫描器的 ID (UUIDV4) ，扫描器的版本，所支持的网络环境 IPV4/IPV6/ALL ，当前状态（RUN/STOP）
-CREATE TABLE IF NOT EXISTS scanner_info (
-	id SERIAL PRIMARY KEY,
-	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         --该字段为扫描器的 ID ，UUIDV4
-	location TEXT,
-	ip INET NOT NULL,
-	version TEXT,
-	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
-	is_run boolean,
-	is_enable boolean,
-	remark TEXT 
-);
-
-

@@ -125,16 +125,25 @@ impl LoginToken {
     /// 找到token且token还未过期时返回 true ，未找到或已过期时返回当返回值多于一行时返回错误
     pub async fn check_token(&self, session: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let client = self.pool.get().await?;
-        let stmt = client.prepare("SELECT token FROM session WHERE token = $1 AND is_enable = true LIMIT 1;").await?;
-        if client.query_opt(&stmt, &[&session]).await?.is_some() {
-            Ok(true)
+        let stmt = client.prepare("SELECT token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true LIMIT 1;").await?;
+
+        if let Some(r_s) = client.query_opt(&stmt, &[&session]).await? {
+            let n_t = get_unix_epoch_ms();
+            let r_ttl:i32 = r_s.get("ttl");
+            let r_create_time:i64 = r_s.get("create_time");
+            let end_at = r_create_time + (r_ttl as i64) * 1000;
+
+            if n_t >= end_at {
+                warn!(event = "TokenUnvaild", message = "Token 已过期");
+                self.delete(session).await?;
+                Ok(false)
+            }
+            else {
+                Ok(true)
+            }
         }
-        // 当返回值为 None 时执行下面的分支
         else {
-            warn!(
-                event = "TokenUnvaild",
-                message = "token已过期或不存在"
-            );
+            warn!(event = "TokenUnvaild", message = "token已过期或不存在");
             Ok(false)
         }
     }
