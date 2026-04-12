@@ -20,30 +20,6 @@ fn get_st<'a>(
     record.get(key).map(String::as_str)
 }
 
-#[derive(Serialize, Deserialize)]
-struct RecordData {
-    org_name: Option<String>,                                                          // 组织名称
-    organisation: Option<String>,                                                      // 组织唯一标识符
-    org_type: Option<String>,                                                          // 组织类型
-    org_descr: Option<String>,                                                         // 组织描述信息
-    as_name: Option<String>,                                                           // 
-    as_number: Option<i32>,
-    ip: Option<IpAddr>,
-    country: Option<String>,                                                           // 国家
-    address: Option<String>,
-    last_modified: Option<String>,                                                     // 最后修改时间
-    admin_c: Option<HashSet<String>>,                                                  // 管理联系人
-    tech_c: Option<HashSet<String>>,                                                   // 技术联系人
-    mnt_by: Option<String>,                                                            // 主要维护者
-    status: Option<String>,
-    notify: Option<String>,
-    created: Option<String>,
-    changed: Option<String>,
-    remarks: Option<String>,
-    source: Option<String>
-}
-
-
 
 /// 对应数据开头键为 organisation
 struct OrgData<'a> {
@@ -133,8 +109,6 @@ impl<'a> RouteData<'a> {
 
 
 /// 对应开头键为 inetnum/inet6num
-/// 
-/// 需要应对
 struct InetNum<'a> {
     ip: Option<String>,
     netname: Option<&'a str>,
@@ -315,12 +289,6 @@ pub async fn w_records(
 
                 match RouteData::new(&tmp) {
                     Ok(route_data) => {
-                        // if let Some(ip) = &route_data.ip {
-                        //     for i in ip.bytes() {
-                        //         print!("{i}")
-                        //     }
-                        //     println!("route {}", ip);
-                        // }
                         
                         transaction.execute(
                             &stat_route,
@@ -349,12 +317,6 @@ pub async fn w_records(
 
                 match InetNum::new(&tmp) {
                     Ok(inet_data) => {
-                        // if let Some(ip) = &inet_data.ip {
-                        //     for i in ip.bytes() {
-                        //         print!("{i}")
-                        //     }
-                        //     println!("inet: {}", ip);
-                        // }
                         
                         transaction.execute(
                             &stat_inetnum,
@@ -420,26 +382,6 @@ pub async fn read_all(
 }
 
 
-// pub async fn read_all(
-//     pool: &Pool,
-//     p_set: HashSet<String>
-// ) {
-//     println!("开始读取文件路径");
-    
-//     let futures: Vec<_> = p_set.into_iter().map(|i| {
-//         let pool = pool.clone();
-//         async move {
-//             println!("开始处理 {}", &i);
-//             match w_records(&pool, i).await {
-//                 Ok(_) => println!("文件:处理完毕"),
-//                 Err(e) => println!("{}", e.to_string())
-//             }
-//         }
-//     }).collect();
-    
-//     futures::future::join_all(futures).await;
-// }
-
 /// 该函数用于根据一个输入路径获取该路径下所有文件路径
 pub fn get_all_filename(path: impl AsRef<Path>) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
 
@@ -452,81 +394,6 @@ pub fn get_all_filename(path: impl AsRef<Path>) -> Result<HashSet<String>, Box<d
     Ok(file_set)
 }
 
-
-// async fn read_line()
-
-/// 该函数用于通过一个 ip 范围生成相应的cidr，只支持 ipv4
-// pub fn parse_to_ipv4net(input: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
-//     let s = input.trim();
-
-//     // 含 '-' → 区间格式；否则视为 CIDR
-//     if s.contains('-') {
-//         Ok(parse_range(s)?)
-//     } else {
-//         Ok(Ipv4Net::from_str(s)?)
-//     }
-// }
-
-// /// 解析 `"start - end"` 或 `"start-end"` 格式并转换为 CIDR。
-// fn parse_range(s: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
-//     // 优先按 " - "（带空格）分割，再按第一个 '-' 分割
-//     println!("{}", s);
-//     let (start_str, end_str) = if let Some(pos) = s.find(" - ") {
-//         (&s[..pos], &s[pos + 3..])
-//     } else {
-
-//         if let Some(p) = s.find('-') {
-//             (&s[..p], &s[p + 1..])
-//         }
-//         else {
-//             return Err("没有在字段中找到 '-' 字符".into())
-//         }
-
-//         // let pos = s.find('-');                                        // 不管了直接 unwarp
-//         // (&s[..pos], &s[pos + 1..])
-//     };
-
-//     let start_str = start_str.trim();
-//     let end_str   = end_str.trim();
-
-//     let start = Ipv4Addr::from_str(start_str)?;
-//     let end   = Ipv4Addr::from_str(end_str)?;
-
-//     Ok(range_to_cidr(start, end)?)
-// }
-
-// /// 将 `[start, end]` 转换为单个 CIDR 块。
-// ///
-// /// 算法：对两端地址做 XOR，前导零数即为公共前缀长度，
-// /// 再验证构造出的网络地址和广播地址与输入完全一致。
-// fn range_to_cidr(start: Ipv4Addr, end: Ipv4Addr) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
-//     let start_u32 = u32::from(start);
-//     let end_u32   = u32::from(end);
-
-//     if start_u32 > end_u32 {
-//         return Err("起始地址 {start} 大于终止地址 {end}".into());
-//     }
-
-//     // 单地址 → /32
-//     if start_u32 == end_u32 {
-//         return Ok(Ipv4Net::new(start, 32)?);
-//     }
-
-//     // XOR → 公共前缀位数
-//     let prefix_len = (start_u32 ^ end_u32).leading_zeros() as u8;
-//     let network    = Ipv4Net::new(start, prefix_len)?;
-
-//     if network.network() != start {
-//         let e_m = format!("起始地址 {start} 不是 /{prefix_len} 的网络地址（应为 {}）",network.network());
-//         return Err(e_m.into())
-//     }
-//     if network.broadcast() != end {
-//         let e_m = format!("终止地址 {end} 不是 /{prefix_len} 的广播地址（应为 {}）",network.broadcast());
-//         return Err(e_m.into())
-//     }
-
-//     Ok(network)
-// }
 
 
 pub fn parse_to_ipv4net(input: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
@@ -657,7 +524,7 @@ fn parse_range(s: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
     }
     
     let range_size = end_u32 - start_u32;
-    if range_size > 1 << 24 {  // 限制在最多2^24个地址（约1600万个）以内
+    if range_size > 1 << 26 {  // 限制在最多2^26个地址（约6700万个）以内
         return Err("IP地址范围过大，超出安全限制".into());
     }
 
