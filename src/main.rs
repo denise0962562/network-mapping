@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer};
 use rust_web_test::smiddleware::{AuthMiddlewareService, AuthMiddleware};
 use core::panic;
+use std::collections::HashSet;
 use std::{io};
 use std::io::BufReader;
 use std::fs::File;
@@ -9,6 +10,7 @@ use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
 use chrono::{Utc, Timelike};
+use rust_web_test::rir::{get_all_filename, read_all, w_records};
 
 //todo 添加获取用户真实ip即请求数据，然后写进日志中
 
@@ -31,6 +33,21 @@ use chrono::{Utc, Timelike};
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
+
+    // let v = vec![
+    //     "/home/wsj/project/apnic/apnic.db.organisation", 
+    //     "/home/wsj/project/apnic/apnic.db.aut-num", 
+    //     "/home/wsj/project/apnic/apnic.db.inetnum", 
+    //     "/home/wsj/project/apnic/apnic.db.inet6num",
+    //     "/home/wsj/project/arin.db/arin.db",
+    //     "/home/wsj/project/afrinic/afrinic.db"
+    //     ];
+    // let rir_data_set: HashSet<&str> = v.iter().cloned().collect();
+
+    // read_all(rir_data_set).await;
+
+    
+    
 
     
     let config = config::Config::from_file("config.toml");
@@ -151,6 +168,16 @@ async fn main() -> io::Result<()> {
     });
 
     //tag
+
+    match get_all_filename("/home/wsj/project/RIR-DATA") {
+        Ok(o) => {
+            println!("开始处理 RIR 数据");
+            read_all(&db_pool, o).await
+        },
+        Err(e) => {
+            println!("ERROR: {}", e.to_string());
+        }
+    }
     
     HttpServer::new(move || {
         App::new()

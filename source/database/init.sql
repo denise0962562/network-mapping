@@ -6,8 +6,14 @@ CREATE TABLE IF NOT EXISTS users (
     username VARCHAR(200) NOT NULL UNIQUE,
     password TEXT NOT NULL,
     create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,    -- 用户的创建时间
-	limit_login INT DEFAULT 0,                                                            -- 表示用户是否是被限制登录
-	enable_2fa boolean DEFAULT false                                                      -- 表示用户是否启用了 2FA
+	limit_login boolean DEFAULT false,                                                    -- 表示用户是否是被限制登录，既可以表示系统用户永远无法登录以及该账号是否因为密码错误而临时禁止登录
+	limit_at BIGINT,                                                                      -- 限制登录操作产生的时间
+	limit_time INT,                                                                       -- 限制登录时间，单位为 秒 
+	enable_2fa boolean DEFAULT false,                                                     -- 表示用户是否启用了 2FA
+	last_login_at BIGINT,                                                                 -- 表示该用户最后一次登录的时间
+	last_login_ip INET,                                                                   -- 最后一次登录的 IP 地址
+	login_error_count INT,                                                                -- 登录错误的次数
+	last_error_at BIGINT                                                                  -- 最后一次登录出错的时间，以该时间为起点，判断是否将登录错误次数清零
 );
 
 -- 表 scan_task 用于存储扫描任务信息，配置了级联更新和删除
@@ -140,3 +146,73 @@ CREATE TABLE IF NOT EXISTS ip_list (
 	remark TEXT,                                                                    -- IP 列表的备注
 	UNIQUE(ip, is_white)                                                            -- 限制了 ip 和 is_white 组合的唯一性
 );
+
+
+-- 国家简写表
+CREATE TABLE IF NOT EXISTS country (
+	id SERIAL PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE,
+	create_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
+	remarks TEXT
+);
+
+
+-- 以下为 ASN 表所需要的组织信息表
+CREATE TABLE IF NOT EXISTS org (
+	id SERIAL PRIMARY KEY,
+	org_name TEXT DEFAULT NULL,                                                     -- 组织名
+	org_key TEXT,                                                                   -- 组织的唯一标识符
+	org_type TEXT,                                                                  -- 组织类型
+	descr TEXT DEFAULT NULL,                                                        -- 组织描述信息
+	country TEXT,                                                                    -- 组织所属国家
+	address TEXT,                                                                   -- 组织的物理地址
+	phone TEXT,                                                                     -- 组织的电话
+	email TEXT,                                                                     -- 组织的联系邮箱
+	admin_c TEXT,                                                                 -- 管理联系人
+	tech_c TEXT,                                                                  -- 组织技术联系人
+	last_modified timestamptz,                                                        -- 该组织信息最后变动时间，该信息来自 RIR 数据
+	create_at TEXT,                                                            -- 该条目创建的时间
+	source TEXT                                                                     -- 该条目数据来自哪一个 RIR
+);
+
+-- 以下为 ASN 表，其中描述了 IP/CIDR 当前宣告的 asn号，对应 RIR 数据中的 route/route6 路由宣告表
+CREATE TABLE IF NOT EXISTS asn (
+	id SERIAL PRIMARY KEY,
+	ip INET,
+	asnumber TEXT DEFAULT NULL,
+	descr TEXT,
+	status TEXT,                                                                    -- 当前段的状态 常见值包括：
+	                                                                                --   • ASSIGNED NON-PORTABLE：已分配给特定组织，不可转移
+																					--   • ALLOCATED PORTABLE：可携带的分配（常用于 ISP）
+																					--   • SUB-ALLOCATED：子分配
+	mnt_by TEXT,                                                                    -- 当前段的主维护者
+	mnt_irt TEXT,
+	mnt_lower TEXT,
+	created TEXT,                                                              -- 创建时间，该时间来自 RIR
+	last_modified timestamptz,                                                        -- 最后修改时间
+	create_at TEXT,                                                            -- 在本地数据库中创建的时间
+	remarks TEXT,
+	source TEXT
+);
+
+
+
+-- 该表描述了当前 IP/CIDR 对应的 ISP  ，对应 RIR 数据中的 inetnum/inet6num 所属表
+CREATE TABLE IF NOT EXISTS isp (
+	id SERIAL PRIMARY KEY,
+	ip INET,
+	netname TEXT,
+	descr TEXT,
+	country TEXT,
+	admin_c TEXT,
+	tech_c TEXT,
+	notify TEXT,
+	status TEXT,
+	mnt_by TEXT,
+	mnt_irt TEXT,
+	remarks TEXT,
+	last_modified timestamptz,
+	source TEXT,
+
+	create_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT              -- 该条目在本地数据库创建的时间
+)
