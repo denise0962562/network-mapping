@@ -1,7 +1,6 @@
 use actix_web::{web, App, HttpServer};
 use rust_web_test::smiddleware::{AuthMiddlewareService, AuthMiddleware};
 use core::panic;
-use std::collections::HashSet;
 use std::{io};
 use std::io::BufReader;
 use std::fs::File;
@@ -10,45 +9,11 @@ use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
 use chrono::{Utc, Timelike};
-use rust_web_test::rir::{get_all_filename, read_all, w_records};
-
-//todo 添加获取用户真实ip即请求数据，然后写进日志中
-
-// #[get("/test")]
-// async fn index(data: web::Data<AppState>, req: HttpRequest, conn_info: ConnectionInfo) -> impl Responder {
-//     let app_name = &data.app_name;
-//     // format!("<html><script>alert(\"Server Name: {app_name}\")</script></html>")
-//     // let user_ip = req.headers().get("X-Forwarded-For").and_then(|h| h.to_str().ok())
-//     //     .unwrap_or("未知 IP");
-
-//     let ip = &conn_info.realip_remote_addr().unwrap_or("无法获取 IP");
-//     logs::write::info_logs(&req, &conn_info, "ReceivedRequests", "ReceivedRequests", false);
-//     HttpResponse::Ok()
-//         .content_type(TEXT_HTML_UTF_8)
-//         .body(format!("<script>alert(\"Server Name: {} Your ip: {}\")</script>", app_name, ip))
-// }
-
-//用于存储初始化后的系统信息
+use rust_web_test::rir::get_rir_data;
 
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
-
-    // let v = vec![
-    //     "/home/wsj/project/apnic/apnic.db.organisation", 
-    //     "/home/wsj/project/apnic/apnic.db.aut-num", 
-    //     "/home/wsj/project/apnic/apnic.db.inetnum", 
-    //     "/home/wsj/project/apnic/apnic.db.inet6num",
-    //     "/home/wsj/project/arin.db/arin.db",
-    //     "/home/wsj/project/afrinic/afrinic.db"
-    //     ];
-    // let rir_data_set: HashSet<&str> = v.iter().cloned().collect();
-
-    // read_all(rir_data_set).await;
-
-    
-    
-
     
     let config = config::Config::from_file("config.toml");
     let server = config.server;
@@ -169,15 +134,17 @@ async fn main() -> io::Result<()> {
 
     //tag
 
-    match get_all_filename("/home/wsj/project/RIR-DATA") {
-        Ok(o) => {
-            println!("开始处理 RIR 数据");
-            read_all(&db_pool, o).await
-        },
-        Err(e) => {
-            println!("ERROR: {}", e.to_string());
-        }
-    }
+    // match get_all_filename("/home/wsj/project/RIR-DATA") {
+    //     Ok(o) => {
+    //         println!("开始处理 RIR 数据");
+    //         read_all(&db_pool, o).await
+    //     },
+    //     Err(e) => {
+    //         println!("ERROR: {}", e.to_string());
+    //     }
+    // }
+
+    // get_rir_data(&db_pool, "/home/wsj/project/RIR-DATA").await;
     
     HttpServer::new(move || {
         App::new()

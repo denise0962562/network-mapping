@@ -234,7 +234,7 @@ fn parse_rir_records(reader: &mut BufReader<File>) -> Result<Option<HashMap<Stri
 
 
 
-pub async fn w_records(
+async fn w_records(
     pool: &Pool,
     path: impl AsRef<Path>
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -360,7 +360,7 @@ pub async fn w_records(
     Ok(())
 }
 
-pub async fn read_all(
+async fn read_all(
     pool: &Pool,
     p_set: HashSet<String>
 ) {
@@ -383,7 +383,7 @@ pub async fn read_all(
 
 
 /// 该函数用于根据一个输入路径获取该路径下所有文件路径
-pub fn get_all_filename(path: impl AsRef<Path>) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+fn get_all_filename(path: impl AsRef<Path>) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
 
     let entry = fs::read_dir(path)?;
     
@@ -396,7 +396,7 @@ pub fn get_all_filename(path: impl AsRef<Path>) -> Result<HashSet<String>, Box<d
 
 
 
-pub fn parse_to_ipv4net(input: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
+fn parse_to_ipv4net(input: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
     let s = input.trim();
 
     // 检查输入长度限制，防止过长的输入造成潜在问题
@@ -586,3 +586,20 @@ fn range_to_cidr(start: Ipv4Addr, end: Ipv4Addr) -> Result<Ipv4Net, Box<dyn std:
     }
 }
 
+
+/// 该函数用于从指定目录读取 rir 数据并写入数据库
+pub async fn get_rir_data(
+    pool: &Pool,
+    path: &str
+) {
+    match get_all_filename(path) {
+        Ok(o) => {
+            println!("开始处理 RIR 数据");
+            read_all(pool, o).await;
+            println!("RIR 数据处理完毕");
+        },
+        Err(e) => {
+            println!("获取 RIR 数据文件路径错误：{}", e.to_string());
+        }
+    }
+}
