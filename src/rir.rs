@@ -245,7 +245,7 @@ async fn w_records(
     ).await?;
 
     let stat_route = c.prepare_cached(
-        "INSERT INTO asn (ip, asnumber, descr, mnt_by, created, last_modified, remarks, source) VALUES ($1::text::inet, $2, $3, $4, $5, $6::text::timestamptz, $7, $8);"
+        "INSERT INTO asn (ip, asnumber, descr, mnt_by, created, last_modified, remarks, source) VALUES ($1::text::inet, $2, $3, $4, $5::text::timestamptz, $6::text::timestamptz, $7, $8);"
     ).await?;
 
     // 13 个参数

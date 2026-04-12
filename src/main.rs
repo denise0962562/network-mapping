@@ -1,5 +1,5 @@
 use actix_web::{web, App, HttpServer};
-use rust_web_test::smiddleware::{AuthMiddlewareService, AuthMiddleware};
+use rust_web_test::smiddleware::AuthMiddleware;
 use core::panic;
 use std::{io};
 use std::io::BufReader;
@@ -9,7 +9,6 @@ use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
 use chrono::{Utc, Timelike};
-use rust_web_test::rir::get_rir_data;
 
 
 #[actix_web::main]
@@ -132,19 +131,6 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    //tag
-
-    // match get_all_filename("/home/wsj/project/RIR-DATA") {
-    //     Ok(o) => {
-    //         println!("开始处理 RIR 数据");
-    //         read_all(&db_pool, o).await
-    //     },
-    //     Err(e) => {
-    //         println!("ERROR: {}", e.to_string());
-    //     }
-    // }
-
-    // get_rir_data(&db_pool, "/home/wsj/project/RIR-DATA").await;
     
     HttpServer::new(move || {
         App::new()

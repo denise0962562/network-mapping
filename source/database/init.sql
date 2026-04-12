@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS ip_list (
 CREATE TABLE IF NOT EXISTS country (
 	id SERIAL PRIMARY KEY,
 	name TEXT NOT NULL UNIQUE,
-	create_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
+	create_at TIMESTAMPTZ DEFAULT NOW(),
 	remarks TEXT
 );
 
@@ -160,20 +160,32 @@ CREATE TABLE IF NOT EXISTS country (
 -- 以下为 ASN 表所需要的组织信息表
 CREATE TABLE IF NOT EXISTS org (
 	id SERIAL PRIMARY KEY,
-	org_name TEXT DEFAULT NULL,                                                     -- 组织名
-	org_key TEXT,                                                                   -- 组织的唯一标识符
-	org_type TEXT,                                                                  -- 组织类型
-	descr TEXT DEFAULT NULL,                                                        -- 组织描述信息
-	country TEXT,                                                                    -- 组织所属国家
-	address TEXT,                                                                   -- 组织的物理地址
-	phone TEXT,                                                                     -- 组织的电话
-	email TEXT,                                                                     -- 组织的联系邮箱
-	admin_c TEXT,                                                                 -- 管理联系人
-	tech_c TEXT,                                                                  -- 组织技术联系人
-	last_modified timestamptz,                                                        -- 该组织信息最后变动时间，该信息来自 RIR 数据
-	create_at TEXT,                                                            -- 该条目创建的时间
-	source TEXT                                                                     -- 该条目数据来自哪一个 RIR
+	org_name TEXT DEFAULT NULL,                                                    -- 组织名
+	org_key TEXT,                                                                  -- 组织的唯一标识符
+	org_type TEXT,                                                                 -- 组织类型
+	descr TEXT DEFAULT NULL,                                                       -- 组织描述信息
+	country TEXT,                                                                  -- 组织所属国家
+	address TEXT,                                                                  -- 组织的物理地址
+	phone TEXT,                                                                    -- 组织的电话
+	email TEXT,                                                                    -- 组织的联系邮箱
+	admin_c TEXT,                                                                  -- 管理联系人
+	tech_c TEXT,                                                                   -- 组织技术联系人
+	last_modified timestamptz,                                                     -- 该组织信息最后变动时间，该信息来自 RIR 数据
+	create_at TEXT,                                                                -- 该条目创建的时间
+	source TEXT,                                                                   -- 该条目数据来自哪一个 RIR
+	unique_hash TEXT GENERATED ALWAYS AS (
+		MD5(
+			COALESCE(org_name, '') ||
+			COALESCE(org_key, '') ||
+			COALESCE(country, '') ||
+			COALESCE(admin_c, '') ||
+			COALESCE(source, '') 
+		)
+	) STORED
 );
+
+ALTER TABLE org
+ADD CONSTRAINT org_unique_hash UNIQUE (unique_hash);
 
 -- 以下为 ASN 表，其中描述了 IP/CIDR 当前宣告的 asn号，对应 RIR 数据中的 route/route6 路由宣告表
 CREATE TABLE IF NOT EXISTS asn (
@@ -188,12 +200,25 @@ CREATE TABLE IF NOT EXISTS asn (
 	mnt_by TEXT,                                                                    -- 当前段的主维护者
 	mnt_irt TEXT,
 	mnt_lower TEXT,
-	created TEXT,                                                              -- 创建时间，该时间来自 RIR
-	last_modified timestamptz,                                                        -- 最后修改时间
-	create_at TEXT,                                                            -- 在本地数据库中创建的时间
+	created timestamptz,                                                            -- 创建时间，该时间来自 RIR
+	last_modified timestamptz,                                                      -- 最后修改时间
+	create_at TEXT,                                                                 -- 在本地数据库中创建的时间
 	remarks TEXT,
-	source TEXT
+	source TEXT,
+	unique_hash TEXT GENERATED ALWAYS AS (
+		MD5(
+			COALESCE(ip::TEXT, '') ||
+			COALESCE(asnumber, '') ||
+			COALESCE(status, '') ||
+			COALESCE(mnt_by, '') ||
+			COALESCE(remarks, '') ||
+			COALESCE(source, '')
+		)
+	) STORED
 );
+
+ALTER TABLE asn
+ADD CONSTRAINT asn_unique_hash UNIQUE (unique_hash);
 
 
 
@@ -214,5 +239,24 @@ CREATE TABLE IF NOT EXISTS isp (
 	last_modified timestamptz,
 	source TEXT,
 
-	create_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT              -- 该条目在本地数据库创建的时间
-)
+	create_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,              -- 该条目在本地数据库创建的时间
+	unique_hash TEXT GENERATED ALWAYS AS (
+        MD5(
+            COALESCE(ip::TEXT, '') ||
+            COALESCE(netname, '') ||
+            COALESCE(descr, '') ||
+            COALESCE(country, '') ||
+            COALESCE(admin_c, '') ||
+            COALESCE(tech_c, '') ||
+            COALESCE(notify, '') ||
+            COALESCE(status, '') ||
+            COALESCE(mnt_by, '') ||
+            COALESCE(mnt_irt, '') ||
+            COALESCE(remarks, '') ||
+            COALESCE(source, '')
+        )
+    ) STORED
+);
+
+ALTER TABLE isp 
+ADD CONSTRAINT isp_unique_hash UNIQUE (unique_hash);
