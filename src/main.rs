@@ -1,5 +1,5 @@
 use actix_web::{web, App, HttpServer};
-use rust_web_test::smiddleware::{AuthMiddlewareService, AuthMiddleware};
+use rust_web_test::smiddleware::AuthMiddleware;
 use core::panic;
 use std::{io};
 use std::io::BufReader;
@@ -10,28 +10,9 @@ use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
 use chrono::{Utc, Timelike};
 
-//todo 添加获取用户真实ip即请求数据，然后写进日志中
-
-// #[get("/test")]
-// async fn index(data: web::Data<AppState>, req: HttpRequest, conn_info: ConnectionInfo) -> impl Responder {
-//     let app_name = &data.app_name;
-//     // format!("<html><script>alert(\"Server Name: {app_name}\")</script></html>")
-//     // let user_ip = req.headers().get("X-Forwarded-For").and_then(|h| h.to_str().ok())
-//     //     .unwrap_or("未知 IP");
-
-//     let ip = &conn_info.realip_remote_addr().unwrap_or("无法获取 IP");
-//     logs::write::info_logs(&req, &conn_info, "ReceivedRequests", "ReceivedRequests", false);
-//     HttpResponse::Ok()
-//         .content_type(TEXT_HTML_UTF_8)
-//         .body(format!("<script>alert(\"Server Name: {} Your ip: {}\")</script>", app_name, ip))
-// }
-
-//用于存储初始化后的系统信息
-
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
-
     
     let config = config::Config::from_file("config.toml");
     let server = config.server;
@@ -150,7 +131,6 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    //tag
     
     HttpServer::new(move || {
         App::new()

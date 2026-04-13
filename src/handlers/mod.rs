@@ -6,7 +6,7 @@ pub mod task;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct ReceiveLoginInfo {
     pub username: String,
     pub password: String,

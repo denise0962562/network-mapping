@@ -6,7 +6,11 @@ pub mod target_generated;
 pub mod login;
 pub mod admin;
 pub mod handlers;
-pub mod smiddleware;                                          // 自己的中间件 
+pub mod smiddleware;                                          // 自己的中间件
+pub mod rir;                                                  // 该模块用于从五大 RIR 获取 ASN 和组织等信息
+
+#[cfg(test)]
+pub mod test;                                                 // 测试模块
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::{HttpRequest, web};

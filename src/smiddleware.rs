@@ -17,6 +17,7 @@ use actix_web::{
 use futures::future::LocalBoxFuture;
 
 use crate::login::get_session_from_req;
+use crate::logs::write::info_logs;
 use crate::{TEXT_HTML_UTF_8};
 use crate::login::{LoginToken};
 use tracing::{error, warn, info};
@@ -86,6 +87,15 @@ where
         }
         // let need_check = path_list.iter().any(|p| path.starts_with(p));
         let page = req.app_data::<web::Data<TemplatesInit>>().cloned();
+
+        info!(
+            event = "received_requests",
+            client_ip = &req.connection_info().realip_remote_addr().unwrap_or("Unknown IP"),
+            method = &req.method().to_string(),
+            user_agent = &req.headers().get("User-Agent").map(|u| u.to_str().unwrap_or("Invalid UTF-8")).unwrap_or("Unknown or None"),
+            path = &req.path(),
+            query = &req.query_string(),
+        );
 
 
         Box::pin(async move {

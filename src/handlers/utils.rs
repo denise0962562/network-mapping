@@ -5,6 +5,7 @@ use crate::target_generated::{ScanTargetGetResponse, targetgenerated::{random_ge
 use crate::{TEXT_HTML_UTF_8};
 use std::{path::PathBuf, fs};
 use crate::{logs, ReadFile, get_file_suffix, mime_system, FrontEndErrorInfo, front_end_error_page, TemplatesInit};
+use crate::rir::get_rir_data;
 
 //基准测试
 use crate::{Systems, benchmark};
@@ -111,4 +112,16 @@ pub async fn not_found(
     HttpResponse::NotFound()
         .content_type(TEXT_HTML_UTF_8)
         .body(front_end_error_page(&error_info, &page_template))
+}
+
+
+/// 用于启动加载 RIR 数据
+#[get("/api/updaterir")]
+async fn update_rir(
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl  Responder {
+    let c = pool.get_ref();
+    get_rir_data(c, "/home/wsj/project/RIR-DATA").await;
+    HttpResponse::Ok()
+        .body("成功")
 }
