@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS asn (
 	mnt_lower TEXT,
 	created timestamptz,                                                            -- 创建时间，该时间来自 RIR
 	last_modified timestamptz,                                                      -- 最后修改时间
-	create_at TEXT,                                                                 -- 在本地数据库中创建的时间
+	create_at TIMESTAMPTZ DEFAULT NOW(),                                            -- 在本地数据库中创建的时间
 	remarks TEXT,
 	source TEXT,
 	unique_hash TEXT GENERATED ALWAYS AS (
@@ -239,7 +239,7 @@ CREATE TABLE IF NOT EXISTS isp (
 	last_modified timestamptz,
 	source TEXT,
 
-	create_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,              -- 该条目在本地数据库创建的时间
+	create_at TIMESTAMPTZ DEFAULT NOW(),              -- 该条目在本地数据库创建的时间
 	unique_hash TEXT GENERATED ALWAYS AS (
         MD5(
             COALESCE(ip::TEXT, '') ||
