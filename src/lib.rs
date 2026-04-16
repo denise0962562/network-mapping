@@ -6,8 +6,11 @@ pub mod target_generated;
 pub mod login;
 pub mod admin;
 pub mod handlers;
-pub mod smiddleware;                                          // 自己的中间件
 pub mod rir;                                                  // 该模块用于从五大 RIR 获取 ASN 和组织等信息
+
+// 自己的中间件
+pub mod middlewares;
+
 
 #[cfg(test)]
 pub mod test;                                                 // 测试模块
@@ -29,7 +32,6 @@ use crate::logs::write::{error_logs, info_logs};
 use regex::Regex;
 use std::time::Instant;
 use ipnet::{AddrParseError, IpNet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;

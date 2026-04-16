@@ -1,5 +1,6 @@
 use actix_web::{web, App, HttpServer};
-use rust_web_test::smiddleware::AuthMiddleware;
+use rust_web_test::middlewares::smiddleware::AuthMiddleware;
+use rust_web_test::middlewares::hmiddleware::SHeaderM;
 use core::panic;
 use std::{io};
 use std::io::BufReader;
@@ -141,6 +142,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
             .wrap(AuthMiddleware)
+            .wrap(SHeaderM)
             .configure(config::init_routes)
     })
     .bind_rustls_0_23((server_host, server_port), tls_config)?
