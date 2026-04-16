@@ -184,8 +184,7 @@ CREATE TABLE IF NOT EXISTS org (
 	) STORED
 );
 
-ALTER TABLE org
-ADD CONSTRAINT org_unique_hash UNIQUE (unique_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_unique_hash ON org (unique_hash);
 
 -- 以下为 ASN 表，其中描述了 IP/CIDR 当前宣告的 asn号，对应 RIR 数据中的 route/route6 路由宣告表
 CREATE TABLE IF NOT EXISTS asn (
@@ -217,8 +216,7 @@ CREATE TABLE IF NOT EXISTS asn (
 	) STORED
 );
 
-ALTER TABLE asn
-ADD CONSTRAINT asn_unique_hash UNIQUE (unique_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asn_unique_hash ON asn (unique_hash);
 
 
 
@@ -258,5 +256,4 @@ CREATE TABLE IF NOT EXISTS isp (
     ) STORED
 );
 
-ALTER TABLE isp 
-ADD CONSTRAINT isp_unique_hash UNIQUE (unique_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_isp_unique_hash ON isp (unique_hash);
