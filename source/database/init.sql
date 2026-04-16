@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS scaninfo (
 CREATE TABLE IF NOT EXISTS session (
 	user_id INT NOT NULL,
 	id SERIAL PRIMARY KEY,
-	token VARCHAR(36) NOT NULL UNIQUE,
+	token VARCHAR(36) NOT NULL,
 	ttl INT DEFAULT 1200, 
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
 	is_enable boolean DEFAULT true,
@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS session (
 		REFERENCES users(id)
 		ON UPDATE CASCADE
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 
 -- 表 system_status 用于存储系统状态数据
 CREATE TABLE IF NOT EXISTS system_status (
@@ -184,8 +186,7 @@ CREATE TABLE IF NOT EXISTS org (
 	) STORED
 );
 
-ALTER TABLE org
-ADD CONSTRAINT org_unique_hash UNIQUE (unique_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_unique_hash ON org (unique_hash);
 
 -- 以下为 ASN 表，其中描述了 IP/CIDR 当前宣告的 asn号，对应 RIR 数据中的 route/route6 路由宣告表
 CREATE TABLE IF NOT EXISTS asn (
@@ -202,7 +203,7 @@ CREATE TABLE IF NOT EXISTS asn (
 	mnt_lower TEXT,
 	created timestamptz,                                                            -- 创建时间，该时间来自 RIR
 	last_modified timestamptz,                                                      -- 最后修改时间
-	create_at TEXT,                                                                 -- 在本地数据库中创建的时间
+	create_at TIMESTAMPTZ DEFAULT NOW(),                                            -- 在本地数据库中创建的时间
 	remarks TEXT,
 	source TEXT,
 	unique_hash TEXT GENERATED ALWAYS AS (
@@ -217,8 +218,7 @@ CREATE TABLE IF NOT EXISTS asn (
 	) STORED
 );
 
-ALTER TABLE asn
-ADD CONSTRAINT asn_unique_hash UNIQUE (unique_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asn_unique_hash ON asn (unique_hash);
 
 
 
@@ -239,7 +239,7 @@ CREATE TABLE IF NOT EXISTS isp (
 	last_modified timestamptz,
 	source TEXT,
 
-	create_at BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,              -- 该条目在本地数据库创建的时间
+	create_at TIMESTAMPTZ DEFAULT NOW(),              -- 该条目在本地数据库创建的时间
 	unique_hash TEXT GENERATED ALWAYS AS (
         MD5(
             COALESCE(ip::TEXT, '') ||
@@ -258,5 +258,4 @@ CREATE TABLE IF NOT EXISTS isp (
     ) STORED
 );
 
-ALTER TABLE isp 
-ADD CONSTRAINT isp_unique_hash UNIQUE (unique_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_isp_unique_hash ON isp (unique_hash);
