@@ -936,3 +936,33 @@ pub async fn apply_task(
 pub struct ApplyTaskQuery {
     pub scannerid: Uuid
 }
+
+
+/// 该函数用于退出登录
+/// 
+/// 返回一个 Result<bool> ，返回 true 代表该 token 已被正常销毁，返回 false 代表 token 本身就是无效的。
+pub async fn log_out(
+    session: &str,
+    pool: &deadpool_postgres::Pool
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut c = pool.get().await?;
+    if let Some(_) = c.query_opt("SELECT token FROM session WHERE is_enable = True AND token = $1;", &[&session]).await? {
+        let transaction = c.transaction().await?;
+        transaction.execute("UPDATE session SET is_enable = False WHERE token = $1;", &[&session]).await?;
+        transaction.commit().await?;
+        info!(
+            event = "UserLogout",
+            path = "fn log_out",
+            message = "用户已退出登录"
+        );
+        Ok(true)
+    }
+    else {
+        info!(
+            event = "TokenUnvaild",
+            path = "fn log_out",
+            message = "用户传入的 token 已过期或不存在"
+        );
+        Ok(false)
+    }
+}

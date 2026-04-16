@@ -1,5 +1,8 @@
 
-use crate::{admin, generate_hash_password, AddUserInfo};
+use crate::smiddleware::render_500;
+use crate::{admin, generate_hash_password, AddUserInfo, log_out};
+use actix_web::cookie::time::OffsetDateTime;
+use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, dev::ConnectionInfo, get, post, cookie, cookie::Cookie};
 use crate::handlers::{ReceiveLoginInfo, ResponseLoginStatus};
 use crate::login::user_login;
@@ -8,6 +11,7 @@ use crate::logs::write::{error_logs, info_logs, warn_logs};
 use serde_json::json;
 use std::time::Instant;
 use crate::config::PasswordHashConfig;
+use crate::TemplatesInit;
 
 #[get("/add")]
 async fn first_add_user(
@@ -93,10 +97,54 @@ async fn user_login_h(
                 .json(body)
         }
     }
-
-
-    
-
     
 }
 
+
+#[get("/logout")]
+async fn user_logout(
+    req: HttpRequest,
+    pool: web::Data<deadpool_postgres::Pool>,
+    page_template: web::Data<TemplatesInit>
+) -> impl Responder {
+    if let Some(token) = &req.cookie("session") {
+        let p = pool.get_ref();
+        let tmp_token = token.to_string();
+        match log_out(&tmp_token, p).await {
+            Ok(true) => {
+                let cookies = Cookie::build("session", &tmp_token)
+                    .path("/")
+                    .http_only(true)
+                    .secure(true)
+                    .expires(OffsetDateTime::UNIX_EPOCH)
+                    .finish();
+                HttpResponse::MovedPermanently()
+                    .insert_header((header::LOCATION, "/login"))
+                    .cookie(cookies)
+                    .finish()
+            },
+            Ok(false) => {
+                let cookies = Cookie::build("session", &tmp_token)
+                    .path("/")
+                    .http_only(true)
+                    .secure(true)
+                    .expires(OffsetDateTime::UNIX_EPOCH)
+                    .finish();
+                HttpResponse::MovedPermanently()
+                    .insert_header((header::LOCATION, "/login"))
+                    .cookie(cookies)
+                    .finish()
+            },
+            Err(e) => {
+                error_logs(&req, "注销账号错误", e.to_string().as_str());
+                let page = page_template.get_ref();
+                render_500(&req, page, "注销账号错误")
+            }
+        }
+    }
+    else {
+        HttpResponse::MovedPermanently()
+            .insert_header((header::LOCATION, "/login"))
+            .finish()
+    }
+}

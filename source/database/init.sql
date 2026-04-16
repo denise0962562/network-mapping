@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS scaninfo (
 CREATE TABLE IF NOT EXISTS session (
 	user_id INT NOT NULL,
 	id SERIAL PRIMARY KEY,
-	token VARCHAR(36) NOT NULL UNIQUE,
+	token VARCHAR(36) NOT NULL,
 	ttl INT DEFAULT 1200, 
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
 	is_enable boolean DEFAULT true,
@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS session (
 		REFERENCES users(id)
 		ON UPDATE CASCADE
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 
 -- 表 system_status 用于存储系统状态数据
 CREATE TABLE IF NOT EXISTS system_status (
