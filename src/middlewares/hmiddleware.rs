@@ -63,6 +63,10 @@ where
                 header::CONTENT_SECURITY_POLICY,
                 header::HeaderValue::from_static("default-src \'self\'")
             );
+            res.headers_mut().insert(
+                header::X_FRAME_OPTIONS,
+                header::HeaderValue::from_static("DENY")
+            );
             Ok(res)
         })
     }
