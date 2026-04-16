@@ -945,16 +945,21 @@ pub async fn log_out(
     session: &str,
     pool: &deadpool_postgres::Pool
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut c = pool.get().await?;
-    if let Some(_) = c.query_opt("SELECT token FROM session WHERE is_enable = True AND token = $1;", &[&session]).await? {
-        let transaction = c.transaction().await?;
-        transaction.execute("UPDATE session SET is_enable = False WHERE token = $1;", &[&session]).await?;
-        transaction.commit().await?;
+    let c = pool.get().await?;
+    if let Some(_) = c.query_opt("SELECT token FROM session WHERE is_enable = true AND token = $1;", &[&session]).await? {
+        let tmp_r = c.execute("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await?;
         info!(
             event = "UserLogout",
             path = "fn log_out",
             message = "用户已退出登录"
         );
+        if tmp_r != 1 {
+            error!(
+                event = "Error",
+                path = "fn log_out",
+                message = format!("更新session返回值为{}", tmp_r)
+            );
+        }
         Ok(true)
     }
     else {

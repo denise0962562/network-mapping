@@ -70,6 +70,7 @@ async fn user_login_h(
                 .http_only(true)
                 .secure(true)
                 .max_age(cookie::time::Duration::seconds(2700))
+                .same_site(cookie::SameSite::Strict)
                 .finish();
             let total_es = total_start.elapsed();
             let login_function = start.elapsed();
@@ -109,10 +110,10 @@ async fn user_logout(
 ) -> impl Responder {
     if let Some(token) = &req.cookie("session") {
         let p = pool.get_ref();
-        let tmp_token = token.to_string();
+        let tmp_token = token.value();
         match log_out(&tmp_token, p).await {
             Ok(true) => {
-                let cookies = Cookie::build("session", &tmp_token)
+                let cookies = Cookie::build("session", tmp_token)
                     .path("/")
                     .http_only(true)
                     .secure(true)
@@ -124,7 +125,7 @@ async fn user_logout(
                     .finish()
             },
             Ok(false) => {
-                let cookies = Cookie::build("session", &tmp_token)
+                let cookies = Cookie::build("session", tmp_token)
                     .path("/")
                     .http_only(true)
                     .secure(true)
