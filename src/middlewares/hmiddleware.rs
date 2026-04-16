@@ -52,7 +52,12 @@ where
         let fut = self.service.call(req);
 
         Box::pin(async move {
+
+            // 可以在此之前拦截请求
+
             let mut res = fut.await?;
+            
+            // 在此拦截响应
 
             res.headers_mut().insert(
                 header::CONTENT_SECURITY_POLICY,
