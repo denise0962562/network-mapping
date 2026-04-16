@@ -1,13 +1,13 @@
 
-use crate::smiddleware::render_500;
+use crate::middlewares::smiddleware::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::http::header;
-use actix_web::{web, HttpResponse, Responder, HttpRequest, dev::ConnectionInfo, get, post, cookie, cookie::Cookie};
-use crate::handlers::{ReceiveLoginInfo, ResponseLoginStatus};
+use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
+use crate::handlers::{ReceiveLoginInfo};
 use crate::login::user_login;
 use crate::{TEXT_HTML_UTF_8};
-use crate::logs::write::{error_logs, info_logs, warn_logs};
+use crate::logs::write::{error_logs};
 use serde_json::json;
 use std::time::Instant;
 use crate::config::PasswordHashConfig;

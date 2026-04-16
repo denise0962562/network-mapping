@@ -1,8 +1,6 @@
-use actix_web::web::Json;
 use actix_web::{http::header::ContentType, test, App, web};
 use crate::config;
-use crate::handlers::user::user_login_h;
-use crate::smiddleware::AuthMiddleware;
+use crate::middlewares::smiddleware::AuthMiddleware;
 use crate::{handlers, login::user_login, logs};
 use crate::logs::{LogRollingMode};
 use crate::db;
