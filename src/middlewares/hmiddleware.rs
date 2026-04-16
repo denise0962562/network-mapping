@@ -67,6 +67,14 @@ where
                 header::X_FRAME_OPTIONS,
                 header::HeaderValue::from_static("DENY")
             );
+            res.headers_mut().insert(
+                header::STRICT_TRANSPORT_SECURITY,
+                header::HeaderValue::from_static("max-age=315360000;")
+            );
+            res.headers_mut().insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                header::HeaderValue::from_static("nosniff")
+            );
             Ok(res)
         })
     }
