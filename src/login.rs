@@ -13,7 +13,7 @@ use crate::{
     verify_password, 
     logs::LoginLog,
     logs::{write::login_logs_to_db}, 
-    get_password_from_database
+    get_password_and_id_from_database
 };
 
 pub struct LoginToken {
@@ -167,18 +167,19 @@ pub async fn user_login(
 ) -> Result<String, Box<dyn std::error::Error>> {
 
     let start = Instant::now();
+    let poo = pool.get_ref();
 
-    let pwd_hash = get_password_from_database(pool.get_ref().clone(), username).await?;
+    let (tmp_id, pwd_hash) = get_password_and_id_from_database(poo, username).await?;
     let get_pwd_h = start.elapsed();
     println!("get_p   : {:>6} ms", get_pwd_h.as_millis());
 
-    if verify_password(password, pwd_hash.as_str()) {
+    if verify_password(password, &pwd_hash) {
         let e_ip: IpAddr = match get_conn_ip(&req).parse() {
             Ok(o) => o,
             Err(e) => {
                 error!(
                     event = "StringToIpAddrError",
-                    path = "",
+                    path = "fn user_login",
                     message = %e
                 );
                 IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))                               //其中 IPV4 地址 0.0.0.0 表示从 String 转换为 IP 地址失败
@@ -189,11 +190,11 @@ pub async fn user_login(
     
         let loginlogs = LoginLog {
             event_ip :  e_ip,
-            event_useage_userid: 1212,         //MARK 暂时这样，先提交再改
+            event_useage_userid: tmp_id,         //MARK 暂时这样，先提交再改
             is_successful: true
         };
         //MARK 暂时这样
-        if login_logs_to_db(pool.get_ref().clone(), loginlogs).await {
+        if login_logs_to_db(poo, loginlogs).await {
             ();
         }
         else {
