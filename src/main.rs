@@ -2,6 +2,7 @@ use actix_web::{web, App, HttpServer};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use rust_web_test::middlewares::smiddleware::AuthMiddleware;
 use rust_web_test::middlewares::hmiddleware::SHeaderM;
+use rust_web_test::middlewares::csrfmiddleware::CsrfMiddleware;
 use core::panic;
 use std::{io};
 use rust_web_test::logs::{self, LogRollingMode};
@@ -119,6 +120,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(sys_2.clone()))
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
+            .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
             .configure(config::init_routes)

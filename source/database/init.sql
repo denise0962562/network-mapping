@@ -104,7 +104,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enabl
 CREATE TABLE IF NOT EXISTS csrftoken (
 	id SERIAL PRIMARY KEY,
 	user_id INT,
-	session_id,
+	session_id INT,
 	token TEXT NOT NULL,
 	create_time TIMESTAMPTZ DEFAULT NOW(),
 	is_enable boolean DEFAULT true

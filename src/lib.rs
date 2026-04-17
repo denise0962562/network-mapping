@@ -947,7 +947,8 @@ pub async fn log_out(
     pool: &deadpool_postgres::Pool
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
-    if let Some(_) = c.query_opt("SELECT token FROM session WHERE is_enable = true AND token = $1;", &[&session]).await? {
+    if let Some(r) = c.query_opt("SELECT id, token FROM session WHERE is_enable = true AND token = $1;", &[&session]).await? {
+        c.execute("UPDATE csrftoken SET is_enable = false WHERE session_id = $1", &[&r.get::<_, i32>("id")]).await?;
         let tmp_r = c.execute("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await?;
         info!(
             event = "UserLogout",

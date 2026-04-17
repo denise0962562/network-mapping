@@ -31,7 +31,7 @@ pub struct SessionInfo<'a> {
 impl LoginToken {
 //TODO 明天完善此处
     ///生成一个session并保存
-    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> SessionInfo<'a> {
+    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> (SessionInfo<'a>, i32) {
         let session = SessionInfo { 
             session: Uuid::new_v4().to_string(), 
             create_time: get_unix_epoch_ms(), 
@@ -44,19 +44,19 @@ impl LoginToken {
                     event = "SuccessfulSaveSession",
                     message = "Successful Save Session "
                 );
-                session
+                (session, o)
             },
             Err(e) => {
                 error!(
                     event = "SaveSessionFailed",
                     message = %e
                 );
-                SessionInfo {
+                (SessionInfo {
                     session: "".to_string(),
                     create_time: 0,
                     ttl: 0,
                     username: u_name
-                }
+                }, 0)
             }
         }
         
@@ -74,7 +74,7 @@ impl LoginToken {
 
     ///保存一个token,
     /// 返回result，当成功时为OK
-    pub async fn save(&self, sessioninfo: &SessionInfo<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn save(&self, sessioninfo: &SessionInfo<'_>) -> Result<i32, Box<dyn std::error::Error>> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
@@ -98,18 +98,17 @@ impl LoginToken {
 
         let userid: i32 = row.get("id");
         //插入一条session,其中包括了用户id token 有效时间，创建时间
-        let r_rows = transaction.execute(
-            "INSERT INTO session (user_id, token, ttl, create_time) VALUES ( $1, $2, $3, $4 );",
+        if let Some(r_rows) = transaction.query_opt(
+            "INSERT INTO session (user_id, token, ttl, create_time) VALUES ( $1, $2, $3, $4 ) RETURNING id;",
             &[
                 &userid,
                 &sessioninfo.session,
                 &sessioninfo.ttl,
                 &sessioninfo.create_time
             ]
-        ).await?;
-        if r_rows == 1 {
+        ).await? {
             transaction.commit().await?;
-            Ok(())
+            return Ok(r_rows.get::<_, i32>("id"))
         }
         else {
             error!(
@@ -163,13 +162,12 @@ pub async fn user_login(
     req: &HttpRequest,
     username: &str, 
     password: &str, 
-    pool: web::Data<deadpool_postgres::Pool>
-) -> Result<String, Box<dyn std::error::Error>> {
+    pool: &deadpool_postgres::Pool
+) -> Result<(String, i32), Box<dyn std::error::Error>> {
 
     let start = Instant::now();
-    let poo = pool.get_ref();
 
-    let (tmp_id, pwd_hash) = get_password_and_id_from_database(poo, username).await?;
+    let (tmp_id, pwd_hash) = get_password_and_id_from_database(pool, username).await?;
     let get_pwd_h = start.elapsed();
     println!("get_p   : {:>6} ms", get_pwd_h.as_millis());
 
@@ -194,7 +192,7 @@ pub async fn user_login(
             is_successful: true
         };
         //MARK 暂时这样
-        if login_logs_to_db(poo, loginlogs).await {
+        if login_logs_to_db(pool, loginlogs).await {
             ();
         }
         else {
@@ -207,10 +205,10 @@ pub async fn user_login(
         println!("to_db   : {:>6} ms", start.elapsed().as_millis());
         let start = Instant::now();
 
-        let login_token = LoginToken {pool: pool.get_ref().clone()};
-        let session = login_token.create_session(2700, username).await;
+        let login_token = LoginToken {pool: pool.clone()};
+        let (session, session_id) = login_token.create_session(2700, username).await;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
-        Ok(session.session)
+        Ok((session.session, session_id))
     }
     else {
         Err("登录失败".into())

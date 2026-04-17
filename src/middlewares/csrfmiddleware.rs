@@ -56,13 +56,16 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
 
 
-        let service = Arc::clone(&self.service);
+        let svc = self.service.clone();
         
 
         Box::pin(async move {
 
             if req.method().as_str() == "GET" {
-                return Ok(service.call(req).await?.map_into_left_body())
+                return Ok(svc.call(req).await?.map_into_left_body())
+            }
+            if req.method().as_str() == "POST" && &req.path().to_string() == "/api/login" {
+                return Ok(svc.call(req).await?.map_into_left_body())
             }
 
             let page = match req.app_data::<web::Data<TemplatesInit>>() {
@@ -105,76 +108,8 @@ where
                 }
             };
 
-
-            if req.method().as_str() == "POST" && req.path() == "/api/login" {
-                let t_req = Arc::clone(&self.service);
-                let mut res = service.call(req).await?;
-                
-                // 拦截响应，根据响应注入 CSRF Token
-                let tmp_status = res.response().status().as_u16();
-                if tmp_status == 401 {
-                    return Ok(
-                        res.map_into_left_body()
-                    )
-                }
-
-                else if tmp_status == 200 {
-
-                    let mut csrf_buffer: [u8; 256] = [0; 256];
-                    match openssl::rand::rand_bytes(&mut csrf_buffer) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error_logs(res.request(), "GenerateCSRFTokenError", &e.to_string());
-                            let resp = HttpResponse::InternalServerError().body("500");
-                            // res.response_mut().head_mut().status = StatusCode::INTERNAL_SERVER_ERROR;
-                            return Ok(
-                                res.map_into_left_body()
-                            )
-                        }
-                    };
-                    let csrf_base64 = base64::encode_block(&csrf_buffer);
-
-                    match client.execute(
-                        "INSERT INTO csrftoken (token) VALUES ($1);",
-                        &[&csrf_base64]
-                    ).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error_logs(req.request(), "InsertCSRFTokenError", &e.to_string());
-                            let resp = render_500(req.request(), &page, "InsertCSRFTokenError");
-                            return Ok(
-                                req.into_response(resp).map_into_right_body()
-                            )
-                        }
-                    };
-
-                    match header::HeaderValue::from_str(&csrf_base64) {
-                        Ok(v) => {
-                            res.headers_mut().insert(
-                                header::HeaderName::from_static("X-CSRF-Token"),
-                                v
-                            );
-                        },
-                        Err(e) => {
-                            error_logs(req.request(), "InsertCSRFTokenError", &e.to_string());
-                            let resp = HttpResponse::InternalServerError().body("500");
-                            return Ok(
-                                req.into_response(resp).map_into_right_body()
-                            )
-                        }
-                    }
-
-                    return Ok(
-                        res.map_into_left_body()
-                    )
-                }
-                else {
-                    return Ok(res.map_into_left_body())
-                }
-            }
-
             let tmp_csrf_token_base64 = match req.headers().get("X-CSRF-Token") {
-                Some(t_bytes) => base64::encode_block(t_bytes.as_bytes()),
+                Some(t_base64) => t_base64.to_str().unwrap_or(""),
                 None => {
                     warn_logs(req.request(), "CSRFTokenError", "未获取到 CSRF Token");
                     let resp = HttpResponse::Forbidden().body("403");
@@ -183,26 +118,6 @@ where
                     )
                 }
             };
-            
-
-            
-
-            // BUG 需要校验该 csrftoken是否于其session对应
-            // let (t_csrftoken_id, t_user_id, t_session_id) = match client.query_opt(
-            //         "SELECT id, user_id, session_id FROM csrftoken WHERE token = $1 AND is_enable = true;",
-            //         &[&tmp_csrf_token_base64]
-            //     ).await? {
-            //         Some(r) => {
-            //             (r.get::<_, i32>("id"), r.get::<_, i32>("user_id"), r.get::<_, i32>("session_id"))
-            //         },
-            //         None => {
-            //             info_logs(req.request(), "CSRFTokenInvalid", "CSRFToken 无效", false);
-            //             let resp = HttpResponse::Forbidden().body("403");
-            //             return Ok(
-            //                 req.into_response(resp).map_into_right_body()
-            //             )
-            //         }
-            // };
 
             // BUG 需要校验该 csrftoken是否于其session对应
             // match client.query_opt(
@@ -242,7 +157,7 @@ where
             };
 
             match t {
-                Some(_) => Ok(self.service.call(req).await?.map_into_left_body()),
+                Some(_) => Ok(svc.call(req).await?.map_into_left_body()),
                 None => {
                     let resp = HttpResponse::Forbidden().body("403");
                     return Ok(
@@ -250,38 +165,6 @@ where
                     )
                 }
             }
-
-            // if let Some(tmp_row) = match client.query_opt(
-            //     "SELECT id, user_id, session_id FROM csrftoken WHERE token = $1 AND is_enable = true;",
-            //     &[&tmp_csrf_token_base64]
-            // ).await {
-            //     Ok(o) => o,
-            //     Err(e) => {
-            //         error!(
-            //             event = "DatabaseSELETEError",
-            //             path = "csrfmiddleware -> fn call",
-            //             message = %e
-            //         );
-            //         let resp = HttpResponse::InternalServerError().body("500 Internal Server Error");
-            //         return Ok(
-            //             req.into_response(resp).map_into_right_body()
-            //         )
-            //     }
-            // } {
-            //     return Ok(
-            //         self.service.call(req).await?.map_into_left_body()
-            //     )
-            // }
-            // else {
-            //     info_logs(req.request(), "CSRFTokenInvalid", "CSRFToken 无效", false);
-            //     let resp = HttpResponse::Forbidden().body("403");
-            //     return Ok(
-            //         req.into_response(resp).map_into_right_body()
-            //     )
-            // }
-            
-
-            // 处理下发
             
         })
     }

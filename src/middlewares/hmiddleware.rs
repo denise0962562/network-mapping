@@ -61,7 +61,7 @@ where
 
             res.headers_mut().insert(
                 header::CONTENT_SECURITY_POLICY,
-                header::HeaderValue::from_static("default-src \'self\'")
+                header::HeaderValue::from_static("default-src \'self\';style-src 'self' 'unsafe-inline';")  // 暂时允许内联css
             );
             res.headers_mut().insert(
                 header::X_FRAME_OPTIONS,

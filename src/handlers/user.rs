@@ -1,9 +1,10 @@
-
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
+use openssl::base64;
+use tracing::error;
 use crate::handlers::{ReceiveLoginInfo};
 use crate::login::user_login;
 use crate::{TEXT_HTML_UTF_8};
@@ -58,33 +59,18 @@ async fn user_login_h(
     println!("================= Benchmark =================");
     let total_start = Instant::now();                                                  // 总的开始时间
     let start = Instant::now();                                                        // 登录函数开始时间
-    match user_login(&req, &receiveinfo.username, &receiveinfo.password, pool).await {
-        Ok(session) => {
-
-            let body = json!({
-                "success": true,
-                "message": "登录成功"
-            });
-            let cookies = Cookie::build("session", &session)
-                .path("/")
-                .http_only(true)
-                .secure(true)
-                .max_age(cookie::time::Duration::seconds(2700))
-                .same_site(cookie::SameSite::Strict)
-                .finish();
-            let total_es = total_start.elapsed();
-            let login_function = start.elapsed();
-            println!("Total   : {:>6} ms", total_es.as_millis());
-            println!("Login_f : {:>6} ms", login_function.as_millis());
-            println!("=============================================");
-            HttpResponse::Ok()
-                .cookie(cookies)
-                .json(body)
-        },
+    let p = pool.get_ref();
+    let (t_session, session_id) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, p).await {
+        Ok(o) => o,
         Err(e) => {
             let log_event = "LoginFaild";
             let log_message = &receiveinfo.username;
             error_logs(&req, log_event, log_message.as_str());
+            error!(
+                event = "UserLoginError",
+                path = "fn user_login_h",
+                message = %e
+            );
             let body = json!({
                 "success": false,
                 "message": "登录失败"
@@ -94,10 +80,72 @@ async fn user_login_h(
             println!("Total   : {:>6} ms", total_es.as_millis());
             println!("Login_f : {:>6} ms", login_function.as_millis());
             println!("=============================================");
-            HttpResponse::Unauthorized()
+            return HttpResponse::Unauthorized()
                 .json(body)
         }
-    }
+    };
+
+    let body = json!({
+        "success": true,
+        "message": "登录成功"
+    });
+    let cookies = Cookie::build("session", &t_session)
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .max_age(cookie::time::Duration::seconds(2700))
+        .same_site(cookie::SameSite::Strict)
+        .finish();
+    let total_es = total_start.elapsed();
+    let login_function = start.elapsed();
+
+
+    let mut csrf_buffer:[u8; 32] = [0; 32];
+    match openssl::rand::rand_bytes(&mut csrf_buffer) {
+        Ok(_) => (),
+        Err(e) => {
+            error_logs(&req, "GenerateCSRFTokenError", &e.to_string());
+            return HttpResponse::InternalServerError()
+                .body("500 Interna lServer Error")
+        }
+    };
+
+    let csrf_base64 = base64::encode_block(&csrf_buffer);
+
+    let client = match p.get().await {
+        Ok(o) => o,
+        Err(e) => {
+            error!(
+                event = "GetclientError",
+                path = "fn user_login_h",
+                message = %e
+            );
+            return HttpResponse::InternalServerError()
+                .body("500 Interna lServer Error")
+        }
+    };
+
+    match client.execute(
+        "INSERT INTO csrftoken (session_id, token) VALUES ($1, $2);",
+        &[&session_id, &csrf_base64]
+    ).await {
+        Ok(_) => (),
+        Err(e) => {
+            error_logs(&req, "InsertCSRFTokenError", &e.to_string());
+            return HttpResponse::InternalServerError()
+                .body("500 Interna lServer Error")
+        }
+    };
+
+
+    println!("Total   : {:>6} ms", total_es.as_millis());
+    println!("Login_f : {:>6} ms", login_function.as_millis());
+    println!("=============================================");
+    HttpResponse::Ok()
+        .cookie(cookies)
+        .insert_header(("X-CSRF-Token", csrf_base64))
+        .json(body)
+
     
 }
 
@@ -112,19 +160,7 @@ async fn user_logout(
         let p = pool.get_ref();
         let tmp_token = token.value();
         match log_out(&tmp_token, p).await {
-            Ok(true) => {
-                let cookies = Cookie::build("session", tmp_token)
-                    .path("/")
-                    .http_only(true)
-                    .secure(true)
-                    .expires(OffsetDateTime::UNIX_EPOCH)
-                    .finish();
-                HttpResponse::MovedPermanently()
-                    .insert_header((header::LOCATION, "/login"))
-                    .cookie(cookies)
-                    .finish()
-            },
-            Ok(false) => {
+            Ok(_) => {
                 let cookies = Cookie::build("session", tmp_token)
                     .path("/")
                     .http_only(true)
