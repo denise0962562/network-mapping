@@ -134,7 +134,7 @@ impl LoginToken {
             let end_at = r_create_time + (r_ttl as i64) * 1000;
 
             if n_t >= end_at {
-                warn!(event = "TokenUnvaild", message = "Token 已过期");
+                warn!(event = "TokenInvaild", message = "Token 无效");
                 self.delete(session).await?;
                 Ok(false)
             }
@@ -143,7 +143,7 @@ impl LoginToken {
             }
         }
         else {
-            warn!(event = "TokenUnvaild", message = "token已过期或不存在");
+            warn!(event = "TokenInvaild", message = "Token 无效");
             Ok(false)
         }
     }

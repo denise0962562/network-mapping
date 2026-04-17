@@ -100,6 +100,18 @@ CREATE TABLE IF NOT EXISTS session (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 
+-- 表 csrftoken 用于存储 csrftoken ，
+CREATE TABLE IF NOT EXISTS csrftoken (
+	id SERIAL PRIMARY KEY,
+	user_id INT,
+	session_id,
+	token TEXT NOT NULL,
+	create_time TIMESTAMPTZ DEFAULT NOW(),
+	is_enable boolean DEFAULT true
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_csrftoken_unique ON csrftoken (token, is_enable);
+
 -- 表 system_status 用于存储系统状态数据
 CREATE TABLE IF NOT EXISTS system_status (
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,

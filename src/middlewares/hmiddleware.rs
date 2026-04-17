@@ -75,6 +75,13 @@ where
                 header::X_CONTENT_TYPE_OPTIONS,
                 header::HeaderValue::from_static("nosniff")
             );
+            
+            // 通过 HTTP 响应标头下发 CSRF Token
+            // 允许前端读取 X-CSRF-Token 头
+            res.headers_mut().insert(
+                header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                header::HeaderValue::from_static("X-CSRF-Token")
+            );
             Ok(res)
         })
     }

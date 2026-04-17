@@ -965,9 +965,9 @@ pub async fn log_out(
     }
     else {
         info!(
-            event = "TokenUnvaild",
+            event = "TokenInvaild",
             path = "fn log_out",
-            message = "用户传入的 token 已过期或不存在"
+            message = "Token 无效"
         );
         Ok(false)
     }
