@@ -1,10 +1,9 @@
 use actix_web::{web, App, HttpServer};
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use rust_web_test::middlewares::smiddleware::AuthMiddleware;
 use rust_web_test::middlewares::hmiddleware::SHeaderM;
 use core::panic;
 use std::{io};
-use std::io::BufReader;
-use std::fs::File;
 use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_status};
 use tracing::{error};
@@ -64,32 +63,11 @@ async fn main() -> io::Result<()> {
     // 定义密码加密相关配置文件
     let pwd_h = config.pwd_hash;
 
-    // 定义 tls 相关配置
-    rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .unwrap();
-
-    let mut certs_file = BufReader::new(File::open("./ssl/cert.pem").unwrap());
-    let mut key_file = BufReader::new(File::open("./ssl/key.pem").unwrap());
-
-    // load TLS certs and key
-    // to create a self-signed temporary cert for testing:
-    // `openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 365 -subj '/CN=localhost'`
-    let tls_certs = rustls_pemfile::certs(&mut certs_file)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let tls_key = rustls_pemfile::pkcs8_private_keys(&mut key_file)
-        .next()
-        .unwrap()
-        .unwrap();
-
-    // set up TLS config options
-    let tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(tls_key))
-        .unwrap();
-
-
+    let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).expect("SslAcceptor::mozilla_intermediate(SslMethod::tls_server()) ERROR");
+    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM).unwrap();
+    tls.set_certificate_chain_file("./ssl/cert.pem").unwrap();
+    tls.check_private_key().unwrap();
+    
     let sys = Systems::new();  
     let sys_2 = sys.clone();
 
@@ -145,7 +123,7 @@ async fn main() -> io::Result<()> {
             .wrap(AuthMiddleware)
             .configure(config::init_routes)
     })
-    .bind_rustls_0_23((server_host, server_port), tls_config)?
+    .bind_openssl((server_host, server_port), tls)?
     .run()
     .await
 
