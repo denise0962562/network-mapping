@@ -58,7 +58,7 @@ pub fn error_logs(req: &HttpRequest, event: &str, message: &str) {
 /// 
 /// 在该函数中无需其调用者处理错误，该函数 **会自动处理错误，然后返回 bool 值**
 pub async fn login_logs_to_db(
-    pool: deadpool_postgres::Pool,
+    pool: &deadpool_postgres::Pool,
     log: LoginLog
 ) -> bool {
     let mut client = match pool.get().await {
@@ -66,7 +66,7 @@ pub async fn login_logs_to_db(
         Err(e) => {
             error!(
                 event = "GetConnErrorFromPool",
-                path = "",
+                path = "fn login_logs_to_db",
                 message = %e
             );
             return false
@@ -77,7 +77,7 @@ pub async fn login_logs_to_db(
         Err(e) => {
             error!(
                 event = "OpenTransactionError",
-                path = "",
+                path = "fn login_logs_to_db",
                 message = %e
             );
             return false
@@ -85,7 +85,6 @@ pub async fn login_logs_to_db(
     };
 
     // MARK 过一段时间把数据库规划好之后再来处理这
-    // BUG暂时不管这里的报错，这是故意留的以提示，还要处理错误 path
     let row = match transaction.execute(
         "INSERT INTO login_logs( event_ip, event_usage_id, is_successful ) VALUES ( $1, $2, $3 );",
         &[&log.event_ip, &log.event_useage_userid, &log.is_successful]
@@ -94,7 +93,7 @@ pub async fn login_logs_to_db(
         Err(e) => {
             error!(
                 event = "ExecuteSQLError",
-                path = "",
+                path = "fn login_logs_to_db",
                 message = %e
             );
             return false
@@ -107,7 +106,7 @@ pub async fn login_logs_to_db(
             Err(e) => {
                 error!(
                     event = "TransactionCommitError",
-                    path = "",
+                    path = "fn login_logs_to_db",
                     message = %e
                 );
                 return false
@@ -118,7 +117,7 @@ pub async fn login_logs_to_db(
     else {
         error!(
             event = "INSERTDataToDatabaseError",
-            path = "",
+            path = "fn login_logs_to_db",
             message = "向数据库中插入日志数据失败"
         );
         false

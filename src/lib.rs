@@ -617,25 +617,24 @@ pub fn generate_hash_password(password: &str, config: PasswordHashConfig) -> Res
     Ok(argon2.hash_password(password.as_bytes(), &salt)?.to_string())
 }
 
-/// 从数据库中获取密码，当成功时返回一个 String 类型的密码哈希值，当失败时就返回一个 PoolError 类型的错误。
-pub async fn get_password_from_database(
-    pool: deadpool_postgres::Pool,
+/// 用于从数据库中获得用户的密码哈希值和在表中的 ID ，返回一个 Result<(i32, String), Error>
+pub async fn get_password_and_id_from_database(
+    pool: &deadpool_postgres::Pool,
     username: &str
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(i32, String), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
-    let row = client.query_opt("SELECT password FROM users WHERE username = $1", &[&username]).await?;
-    match row {
-        Some(pwd_hash) => {
-            let pwd = pwd_hash.get(0);
-            Ok(pwd)
-        },
-        None => {
-            info!(
+    if let Some(row) = client.query_opt("SELECT id, password FROM users WHERE username = $1", &[&username]).await? {
+        // let id: i32 = row.get("id");
+        // let pwd_hash: String = row.get("password");
+        Ok((row.get::<_, i32>("id"), row.get::<_, String>("password")))
+    }
+    else {
+        info!(
                 event = "UserPasswordHASHNotFound",
+                path = "fn get_password_from_database",
                 message = "用户密码哈希值未找到"
             );
-            Err("未找到密码".into())
-        }
+        Err("未找到密码".into())
     }
 }
 
@@ -948,7 +947,8 @@ pub async fn log_out(
     pool: &deadpool_postgres::Pool
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
-    if let Some(_) = c.query_opt("SELECT token FROM session WHERE is_enable = true AND token = $1;", &[&session]).await? {
+    if let Some(r) = c.query_opt("SELECT id, token FROM session WHERE is_enable = true AND token = $1;", &[&session]).await? {
+        c.execute("UPDATE csrftoken SET is_enable = false WHERE session_id = $1", &[&r.get::<_, i32>("id")]).await?;
         let tmp_r = c.execute("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await?;
         info!(
             event = "UserLogout",
@@ -966,9 +966,9 @@ pub async fn log_out(
     }
     else {
         info!(
-            event = "TokenUnvaild",
+            event = "TokenInvaild",
             path = "fn log_out",
-            message = "用户传入的 token 已过期或不存在"
+            message = "Token 无效"
         );
         Ok(false)
     }

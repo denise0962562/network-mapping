@@ -1,10 +1,10 @@
-use actix_web::{HttpRequest, HttpResponse, Responder, body, get, post, web, http::header};
+use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web, http::header};
 use uuid::Uuid;
-use deadpool_postgres::{Manager, Pool, Object};
-use crate::logs::write::{info_logs, warn_logs, error_logs};
-use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8, APPLICATION_JSON};
-use crate::{CreateTask, STask, TargetIP, TargetPort, apply_task, ApplyTask, ApplyTaskQuery};
-use crate::middlewares::smiddleware::{render_403, render_500};
+use deadpool_postgres::{Pool};
+use crate::logs::write::{error_logs};
+use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8};
+use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery};
+use crate::middlewares::{render_403, render_500};
 use crate::admin::get_user_id;
 
 #[get("/api/task/{task_id}")]
