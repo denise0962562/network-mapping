@@ -60,7 +60,7 @@ async fn user_login_h(
     let total_start = Instant::now();                                                  // 总的开始时间
     let start = Instant::now();                                                        // 登录函数开始时间
     let p = pool.get_ref();
-    let (t_session, session_id) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, p).await {
+    let (t_session, session_id, user_id) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, p).await {
         Ok(o) => o,
         Err(e) => {
             let log_event = "LoginFaild";
@@ -126,8 +126,8 @@ async fn user_login_h(
     };
 
     match client.execute(
-        "INSERT INTO csrftoken (session_id, token) VALUES ($1, $2);",
-        &[&session_id, &csrf_base64]
+        "INSERT INTO csrftoken (user_id, session_id, token) VALUES ($1, $2, $3);",
+        &[&user_id, &session_id, &csrf_base64]
     ).await {
         Ok(_) => (),
         Err(e) => {
@@ -144,6 +144,7 @@ async fn user_login_h(
     HttpResponse::Ok()
         .cookie(cookies)
         .insert_header(("X-CSRF-Token", csrf_base64))
+        .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "X-CSRF-Token"))
         .json(body)
 
     
