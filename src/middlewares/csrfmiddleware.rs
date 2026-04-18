@@ -138,9 +138,12 @@ where
             //         }
             // };
 
+
+            let tmp_session = req.request().cookie("session").map(|t| t.value().to_string()).unwrap_or(format!(""));
+
             let t = match client.query_opt(
-                "SELECT id, user_id, session_id FROM csrftoken WHERE token = $1 AND is_enable = true;",
-                &[&tmp_csrf_token_base64]
+                "SELECT c.id,c.user_id,c.session_id FROM csrftoken c JOIN session s ON c.session_id = s.id AND c.user_id = s.user_id AND s.token = $1 WHERE c.token = $2 AND c.is_enable = true AND s.is_enable = true",
+                &[&tmp_session, &tmp_csrf_token_base64]
             ).await {
                 Ok(o) => o,
                 Err(e) => {
