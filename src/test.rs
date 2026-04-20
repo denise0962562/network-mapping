@@ -56,7 +56,6 @@ async fn login_test() {
         .set_json(ReceiveLoginInfo{
             username: "admin".to_string(),
             password: "1".to_string(),
-            rememberme: true
         })
         .to_request();
 
