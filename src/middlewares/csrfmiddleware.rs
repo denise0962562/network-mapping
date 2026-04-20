@@ -1,12 +1,11 @@
 use std::{future::{Ready, ready}, sync::Arc};
 use tracing::error;
-use openssl::base64;
 
 use crate::{TemplatesInit, logs::write::{error_logs, info_logs}, middlewares::{get_pool_from_app_data, render_500, render_500_simple}};
 use crate::logs::write::warn_logs;
 
 use actix_web::{
-    Error, HttpResponse, body::EitherBody, dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready}, http::{StatusCode, header}, web
+    Error, HttpResponse, body::EitherBody, dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready}, web
 };
 use futures_util::future::LocalBoxFuture;
 
@@ -119,28 +118,11 @@ where
                 }
             };
 
-            // BUG 需要校验该 csrftoken是否于其session对应
-            // match client.query_opt(
-            //         "SELECT id, user_id, session_id FROM csrftoken WHERE token = $1 AND is_enable = true;",
-            //         &[&tmp_csrf_token_base64]
-            //     ).await? {
-            //         Some(r) => {
-            //             return Ok(
-            //                 self.service.call(req).await?.map_into_left_body()
-            //             )
-            //         },
-            //         None => {
-            //             info_logs(req.request(), "CSRFTokenInvalid", "CSRFToken 无效", false);
-            //             let resp = HttpResponse::Forbidden().body("403");
-            //             return Ok(
-            //                 req.into_response(resp).map_into_right_body()
-            //             )
-            //         }
-            // };
+            let tmp_session = req.request().cookie("session").map(|t| t.value().to_string()).unwrap_or(format!(""));
 
             let t = match client.query_opt(
-                "SELECT id, user_id, session_id FROM csrftoken WHERE token = $1 AND is_enable = true;",
-                &[&tmp_csrf_token_base64]
+                "SELECT user_id, id FROM session WHERE is_enable = true AND token = $1 AND csrf_token = $2;",
+                &[&tmp_session, &tmp_csrf_token_base64]
             ).await {
                 Ok(o) => o,
                 Err(e) => {

@@ -3,7 +3,6 @@ use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
-use openssl::base64;
 use tracing::error;
 use crate::handlers::{ReceiveLoginInfo};
 use crate::login::user_login;
@@ -60,7 +59,7 @@ async fn user_login_h(
     let total_start = Instant::now();                                                  // 总的开始时间
     let start = Instant::now();                                                        // 登录函数开始时间
     let p = pool.get_ref();
-    let (t_session, session_id) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, p).await {
+    let (t_session, csrf_token) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, p).await {
         Ok(o) => o,
         Err(e) => {
             let log_event = "LoginFaild";
@@ -99,51 +98,13 @@ async fn user_login_h(
     let total_es = total_start.elapsed();
     let login_function = start.elapsed();
 
-
-    let mut csrf_buffer:[u8; 32] = [0; 32];
-    match openssl::rand::rand_bytes(&mut csrf_buffer) {
-        Ok(_) => (),
-        Err(e) => {
-            error_logs(&req, "GenerateCSRFTokenError", &e.to_string());
-            return HttpResponse::InternalServerError()
-                .body("500 Interna lServer Error")
-        }
-    };
-
-    let csrf_base64 = base64::encode_block(&csrf_buffer);
-
-    let client = match p.get().await {
-        Ok(o) => o,
-        Err(e) => {
-            error!(
-                event = "GetclientError",
-                path = "fn user_login_h",
-                message = %e
-            );
-            return HttpResponse::InternalServerError()
-                .body("500 Interna lServer Error")
-        }
-    };
-
-    match client.execute(
-        "INSERT INTO csrftoken (session_id, token) VALUES ($1, $2);",
-        &[&session_id, &csrf_base64]
-    ).await {
-        Ok(_) => (),
-        Err(e) => {
-            error_logs(&req, "InsertCSRFTokenError", &e.to_string());
-            return HttpResponse::InternalServerError()
-                .body("500 Interna lServer Error")
-        }
-    };
-
-
     println!("Total   : {:>6} ms", total_es.as_millis());
     println!("Login_f : {:>6} ms", login_function.as_millis());
     println!("=============================================");
     HttpResponse::Ok()
         .cookie(cookies)
-        .insert_header(("X-CSRF-Token", csrf_base64))
+        .insert_header(("X-CSRF-Token", csrf_token))
+        .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "X-CSRF-Token"))
         .json(body)
 
     

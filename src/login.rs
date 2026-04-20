@@ -6,6 +6,7 @@ use tracing::{warn, info, error};
 use uuid::Uuid;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
+use openssl::base64;
 
 use crate::{get_conn_ip, login};
 use crate::{
@@ -29,34 +30,42 @@ pub struct SessionInfo<'a> {
 }
 
 impl LoginToken {
-//TODO 明天完善此处
-    ///生成一个session并保存
-    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> (SessionInfo<'a>, i32) {
+    ///生成一个session 和 csrftoken 并保存
+    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> Result<(SessionInfo<'a>, String), Box<dyn std::error::Error>> {
         let session = SessionInfo { 
             session: Uuid::new_v4().to_string(), 
             create_time: get_unix_epoch_ms(), 
             ttl: ttl, 
             username: u_name 
         };
-        match self.save(&session).await {
+
+        let mut tmp_csrf_token_buffer: [u8; 32] = [0; 32];
+        let csrf_token_base64 = match openssl::rand::rand_bytes(&mut tmp_csrf_token_buffer) {
+            Ok(_) => base64::encode_block(&tmp_csrf_token_buffer),
+            Err(e) => {
+                error!(
+                    event = "GenerateCSRFTokenError",
+                    path = "LoginToken => fn create_session",
+                    message = %e
+                );
+                return Err(e.into())
+            }
+        };
+        match self.save(&session, &csrf_token_base64).await {
             Ok(o) => {
                 info!(
                     event = "SuccessfulSaveSession",
                     message = "Successful Save Session "
                 );
-                (session, o)
+                Ok((session, csrf_token_base64))
             },
             Err(e) => {
                 error!(
                     event = "SaveSessionFailed",
+                    path = "LoginToken => fn create_session => self.save",
                     message = %e
                 );
-                (SessionInfo {
-                    session: "".to_string(),
-                    create_time: 0,
-                    ttl: 0,
-                    username: u_name
-                }, 0)
+                return Err(e.into())
             }
         }
         
@@ -74,7 +83,7 @@ impl LoginToken {
 
     ///保存一个token,
     /// 返回result，当成功时为OK
-    pub async fn save(&self, sessioninfo: &SessionInfo<'_>) -> Result<i32, Box<dyn std::error::Error>> {
+    pub async fn save(&self, sessioninfo: &SessionInfo<'_>, csrftoken: &str) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
@@ -99,16 +108,17 @@ impl LoginToken {
         let userid: i32 = row.get("id");
         //插入一条session,其中包括了用户id token 有效时间，创建时间
         if let Some(r_rows) = transaction.query_opt(
-            "INSERT INTO session (user_id, token, ttl, create_time) VALUES ( $1, $2, $3, $4 ) RETURNING id;",
+            "INSERT INTO session (user_id, token, csrf_token, ttl, create_time) VALUES ( $1, $2, $3, $4, $5 ) RETURNING id, user_id;",
             &[
                 &userid,
                 &sessioninfo.session,
+                &csrftoken,
                 &sessioninfo.ttl,
                 &sessioninfo.create_time
             ]
         ).await? {
             transaction.commit().await?;
-            return Ok(r_rows.get::<_, i32>("id"))
+            return Ok((r_rows.get::<_, i32>("id"), r_rows.get::<_, i32>("user_id")))
         }
         else {
             error!(
@@ -163,54 +173,75 @@ pub async fn user_login(
     username: &str, 
     password: &str, 
     pool: &deadpool_postgres::Pool
-) -> Result<(String, i32), Box<dyn std::error::Error>> {
+) -> Result<(String, String), Box<dyn std::error::Error>> {
 
+    let l_successful:bool;
     let start = Instant::now();
 
-    let (tmp_id, pwd_hash) = get_password_and_id_from_database(pool, username).await?;
+    // 即使用户名不存在也校验密码，预防时序攻击
+    let (tmp_id, pwd_hash) = match get_password_and_id_from_database(pool, username).await {
+        Ok(o) => {
+            l_successful = true;
+            o
+        },
+        Err(e) => {
+            l_successful = false;
+            error!(
+                event = "GetUserPasswordHashError",
+                path = "fn user_login",
+                message = %e
+            );
+            (-1 as i32, format!("$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II"))
+        }
+    };
     let get_pwd_h = start.elapsed();
     println!("get_p   : {:>6} ms", get_pwd_h.as_millis());
 
-    if verify_password(password, &pwd_hash) {
-        let e_ip: IpAddr = match get_conn_ip(&req).parse() {
-            Ok(o) => o,
-            Err(e) => {
-                error!(
-                    event = "StringToIpAddrError",
-                    path = "fn user_login",
-                    message = %e
-                );
-                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))                               //其中 IPV4 地址 0.0.0.0 表示从 String 转换为 IP 地址失败
-            }
-        };
-
-        let start = Instant::now();
-    
-        let loginlogs = LoginLog {
-            event_ip :  e_ip,
-            event_useage_userid: tmp_id,         //MARK 暂时这样，先提交再改
-            is_successful: true
-        };
-        //MARK 暂时这样
-        if login_logs_to_db(pool, loginlogs).await {
-            ();
-        }
-        else {
+    let e_ip: IpAddr = match get_conn_ip(&req).parse() {
+        Ok(o) => o,
+        Err(e) => {
             error!(
-                    event = "INSERTDataToDatabaseError",
-                    path = "",
-                    message = "向数据库中插入登录日志数据错误"
-                );
+                event = "StringToIpAddrError",
+                path = "fn user_login",
+                message = %e
+            );
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))                               //其中 IPV4 地址 0.0.0.0 表示从 String 转换为 IP 地址失败
         }
+    };
+
+    let mut loginlogs = LoginLog {
+        event_ip :  e_ip,
+        event_useage_userid: tmp_id,
+        is_successful: false
+    };
+    if verify_password(password, &pwd_hash) && l_successful {
+        
+        let start = Instant::now();
+        
+        loginlogs.is_successful = true;
+        if !login_logs_to_db(pool, loginlogs).await {
+            error!(
+                event = "INSERTDataToDatabaseError",
+                path = "fn user_login",
+                message = "向数据库中插入登录日志数据错误"
+            );
+        };
         println!("to_db   : {:>6} ms", start.elapsed().as_millis());
         let start = Instant::now();
 
         let login_token = LoginToken {pool: pool.clone()};
-        let (session, session_id) = login_token.create_session(2700, username).await;
+        let (session, csrf_token) = login_token.create_session(2700, username).await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
-        Ok((session.session, session_id))
+        Ok((session.session, csrf_token))
     }
     else {
+        if !login_logs_to_db(pool, loginlogs).await {
+            error!(
+                event = "INSERTDataToDatabaseError",
+                path = "fn user_login",
+                message = "向数据库中插入登录日志数据错误"
+            );
+        };
         Err("登录失败".into())
     }
 
