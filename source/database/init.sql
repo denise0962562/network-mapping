@@ -88,29 +88,16 @@ CREATE TABLE IF NOT EXISTS scaninfo (
 CREATE TABLE IF NOT EXISTS session (
 	user_id INT NOT NULL,
 	id SERIAL PRIMARY KEY,
-	token VARCHAR(36) NOT NULL,
+	token TEXT NOT NULL,
+	csrf_token TEXT NOT NULL,
 	ttl INT DEFAULT 1200, 
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
-	is_enable boolean DEFAULT true,
-	CONSTRAINT fk_user
-		FOREIGN KEY (user_id)
-		REFERENCES users(id)
-		ON UPDATE CASCADE
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
-
--- 表 csrftoken 用于存储 csrftoken ，
-CREATE TABLE IF NOT EXISTS csrftoken (
-	id SERIAL PRIMARY KEY,
-	user_id INT,
-	session_id INT,
-	token TEXT NOT NULL,
-	create_time TIMESTAMPTZ DEFAULT NOW(),
 	is_enable boolean DEFAULT true
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_csrftoken_unique ON csrftoken (token, is_enable);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, is_enable);
+
 
 -- 表 system_status 用于存储系统状态数据
 CREATE TABLE IF NOT EXISTS system_status (

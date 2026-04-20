@@ -119,30 +119,10 @@ where
                 }
             };
 
-            // BUG 需要校验该 csrftoken是否于其session对应
-            // match client.query_opt(
-            //         "SELECT id, user_id, session_id FROM csrftoken WHERE token = $1 AND is_enable = true;",
-            //         &[&tmp_csrf_token_base64]
-            //     ).await? {
-            //         Some(r) => {
-            //             return Ok(
-            //                 self.service.call(req).await?.map_into_left_body()
-            //             )
-            //         },
-            //         None => {
-            //             info_logs(req.request(), "CSRFTokenInvalid", "CSRFToken 无效", false);
-            //             let resp = HttpResponse::Forbidden().body("403");
-            //             return Ok(
-            //                 req.into_response(resp).map_into_right_body()
-            //             )
-            //         }
-            // };
-
-
             let tmp_session = req.request().cookie("session").map(|t| t.value().to_string()).unwrap_or(format!(""));
 
             let t = match client.query_opt(
-                "SELECT c.id,c.user_id,c.session_id FROM csrftoken c JOIN session s ON c.session_id = s.id AND c.user_id = s.user_id AND s.token = $1 WHERE c.token = $2 AND c.is_enable = true AND s.is_enable = true",
+                "SELECT user_id, id FROM session WHERE is_enable = true AND token = $1 AND csrf_token = $2;",
                 &[&tmp_session, &tmp_csrf_token_base64]
             ).await {
                 Ok(o) => o,

@@ -6,6 +6,7 @@ use tracing::{warn, info, error};
 use uuid::Uuid;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
+use openssl::base64;
 
 use crate::{get_conn_ip, login};
 use crate::{
@@ -29,34 +30,42 @@ pub struct SessionInfo<'a> {
 }
 
 impl LoginToken {
-//TODO 明天完善此处
-    ///生成一个session并保存
-    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> (SessionInfo<'a>, i32, i32) {
+    ///生成一个session 和 csrftoken 并保存
+    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> Result<(SessionInfo<'a>, String), Box<dyn std::error::Error>> {
         let session = SessionInfo { 
             session: Uuid::new_v4().to_string(), 
             create_time: get_unix_epoch_ms(), 
             ttl: ttl, 
             username: u_name 
         };
-        match self.save(&session).await {
+
+        let mut tmp_csrf_token_buffer: [u8; 32] = [0; 32];
+        let csrf_token_base64 = match openssl::rand::rand_bytes(&mut tmp_csrf_token_buffer) {
+            Ok(_) => base64::encode_block(&tmp_csrf_token_buffer),
+            Err(e) => {
+                error!(
+                    event = "GenerateCSRFTokenError",
+                    path = "LoginToken => fn create_session",
+                    message = %e
+                );
+                return Err(e.into())
+            }
+        };
+        match self.save(&session, &csrf_token_base64).await {
             Ok(o) => {
                 info!(
                     event = "SuccessfulSaveSession",
                     message = "Successful Save Session "
                 );
-                (session, o.0, o.1)
+                Ok((session, csrf_token_base64))
             },
             Err(e) => {
                 error!(
                     event = "SaveSessionFailed",
+                    path = "LoginToken => fn create_session => self.save",
                     message = %e
                 );
-                (SessionInfo {
-                    session: "".to_string(),
-                    create_time: 0,
-                    ttl: 0,
-                    username: u_name
-                }, 0, 0)
+                return Err(e.into())
             }
         }
         
@@ -74,7 +83,7 @@ impl LoginToken {
 
     ///保存一个token,
     /// 返回result，当成功时为OK
-    pub async fn save(&self, sessioninfo: &SessionInfo<'_>) -> Result<(i32, i32), Box<dyn std::error::Error>> {
+    pub async fn save(&self, sessioninfo: &SessionInfo<'_>, csrftoken: &str) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
@@ -99,10 +108,11 @@ impl LoginToken {
         let userid: i32 = row.get("id");
         //插入一条session,其中包括了用户id token 有效时间，创建时间
         if let Some(r_rows) = transaction.query_opt(
-            "INSERT INTO session (user_id, token, ttl, create_time) VALUES ( $1, $2, $3, $4 ) RETURNING id, user_id;",
+            "INSERT INTO session (user_id, token, csrf_token, ttl, create_time) VALUES ( $1, $2, $3, $4, $5 ) RETURNING id, user_id;",
             &[
                 &userid,
                 &sessioninfo.session,
+                &csrftoken,
                 &sessioninfo.ttl,
                 &sessioninfo.create_time
             ]
@@ -163,7 +173,7 @@ pub async fn user_login(
     username: &str, 
     password: &str, 
     pool: &deadpool_postgres::Pool
-) -> Result<(String, i32, i32), Box<dyn std::error::Error>> {
+) -> Result<(String, String), Box<dyn std::error::Error>> {
 
     let start = Instant::now();
 
@@ -206,9 +216,9 @@ pub async fn user_login(
         let start = Instant::now();
 
         let login_token = LoginToken {pool: pool.clone()};
-        let (session, session_id, user_id) = login_token.create_session(2700, username).await;
+        let (session, csrf_token) = login_token.create_session(2700, username).await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
-        Ok((session.session, session_id, user_id))
+        Ok((session.session, csrf_token))
     }
     else {
         Err("登录失败".into())
