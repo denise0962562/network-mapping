@@ -728,7 +728,7 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
 
 
 ///系统信息api基准测试
-pub async fn benchmark(sys: web::Data<Systems>, pool: web::Data<deadpool_postgres::Pool>, db_name: String) {
+pub async fn benchmark(sys: web::Data<Systems>, pool: web::Data<deadpool_postgres::Pool>, _db_name: String) {
     let total_start = Instant::now();
     let pool = pool.get_ref().clone();
 
@@ -878,7 +878,7 @@ pub struct ApplyTask {
 /// 首先搜索合适的任务，如果没有任务则会创建一个系统任务，该任务也会写入 scan_task 中
 pub async fn apply_task(
     pool: web::Data<deadpool_postgres::Pool>,
-    scanner_id: web::Query<ApplyTaskQuery>
+    _scanner_id: web::Query<ApplyTaskQuery>
 ) -> Result<ApplyTask, Box<dyn std::error::Error>> {
     let p = pool.get().await?;
     let row = p.query_opt(

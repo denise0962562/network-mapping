@@ -3,7 +3,6 @@ use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
-use openssl::base64;
 use tracing::error;
 use crate::handlers::{ReceiveLoginInfo};
 use crate::login::user_login;

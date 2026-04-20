@@ -1,12 +1,11 @@
 use std::{future::{Ready, ready}, sync::Arc};
 use tracing::error;
-use openssl::base64;
 
 use crate::{TemplatesInit, logs::write::{error_logs, info_logs}, middlewares::{get_pool_from_app_data, render_500, render_500_simple}};
 use crate::logs::write::warn_logs;
 
 use actix_web::{
-    Error, HttpResponse, body::EitherBody, dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready}, http::{StatusCode, header}, web
+    Error, HttpResponse, body::EitherBody, dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready}, web
 };
 use futures_util::future::LocalBoxFuture;
 

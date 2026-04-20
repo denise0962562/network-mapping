@@ -175,43 +175,57 @@ pub async fn user_login(
     pool: &deadpool_postgres::Pool
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
 
+    let l_successful:bool;
     let start = Instant::now();
 
-    let (tmp_id, pwd_hash) = get_password_and_id_from_database(pool, username).await?;
+    // 即使用户名不存在也校验密码，预防时序攻击
+    let (tmp_id, pwd_hash) = match get_password_and_id_from_database(pool, username).await {
+        Ok(o) => {
+            l_successful = true;
+            o
+        },
+        Err(e) => {
+            l_successful = false;
+            error!(
+                event = "GetUserPasswordHashError",
+                path = "fn user_login",
+                message = %e
+            );
+            (-1 as i32, format!("$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II"))
+        }
+    };
     let get_pwd_h = start.elapsed();
     println!("get_p   : {:>6} ms", get_pwd_h.as_millis());
 
-    if verify_password(password, &pwd_hash) {
-        let e_ip: IpAddr = match get_conn_ip(&req).parse() {
-            Ok(o) => o,
-            Err(e) => {
-                error!(
-                    event = "StringToIpAddrError",
-                    path = "fn user_login",
-                    message = %e
-                );
-                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))                               //其中 IPV4 地址 0.0.0.0 表示从 String 转换为 IP 地址失败
-            }
-        };
-
-        let start = Instant::now();
-    
-        let loginlogs = LoginLog {
-            event_ip :  e_ip,
-            event_useage_userid: tmp_id,         //MARK 暂时这样，先提交再改
-            is_successful: true
-        };
-        //MARK 暂时这样
-        if login_logs_to_db(pool, loginlogs).await {
-            ();
-        }
-        else {
+    let e_ip: IpAddr = match get_conn_ip(&req).parse() {
+        Ok(o) => o,
+        Err(e) => {
             error!(
-                    event = "INSERTDataToDatabaseError",
-                    path = "",
-                    message = "向数据库中插入登录日志数据错误"
-                );
+                event = "StringToIpAddrError",
+                path = "fn user_login",
+                message = %e
+            );
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))                               //其中 IPV4 地址 0.0.0.0 表示从 String 转换为 IP 地址失败
         }
+    };
+
+    let mut loginlogs = LoginLog {
+        event_ip :  e_ip,
+        event_useage_userid: tmp_id,
+        is_successful: false
+    };
+    if verify_password(password, &pwd_hash) && l_successful {
+        
+        let start = Instant::now();
+        
+        loginlogs.is_successful = true;
+        if !login_logs_to_db(pool, loginlogs).await {
+            error!(
+                event = "INSERTDataToDatabaseError",
+                path = "fn user_login",
+                message = "向数据库中插入登录日志数据错误"
+            );
+        };
         println!("to_db   : {:>6} ms", start.elapsed().as_millis());
         let start = Instant::now();
 
@@ -221,6 +235,13 @@ pub async fn user_login(
         Ok((session.session, csrf_token))
     }
     else {
+        if !login_logs_to_db(pool, loginlogs).await {
+            error!(
+                event = "INSERTDataToDatabaseError",
+                path = "fn user_login",
+                message = "向数据库中插入登录日志数据错误"
+            );
+        };
         Err("登录失败".into())
     }
 
