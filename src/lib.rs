@@ -421,6 +421,7 @@ fn check_port(port: &str) -> bool {
 pub struct CreateTask {
     pub ip: String,
     pub port: String,
+    pub level: i8,
     pub remark: Option<String>
 }
 
@@ -472,6 +473,7 @@ impl<'a> STask<'a> {
     pub async fn add(
         &self,
         pool: web::Data<deadpool_postgres::Pool>,
+        level: i32,
         user_id: i32
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut p = pool.get().await?;
@@ -487,7 +489,7 @@ impl<'a> STask<'a> {
 
         client.execute(
             "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7)", 
-            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &4, &self.remark]
+            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark]
         ).await?;
 
         client.commit().await?;
@@ -920,7 +922,7 @@ pub async fn apply_task(
         Err("c_task 值出现错误".into())
     } 
     else {
-        c_task.add(pool, 1).await?;
+        c_task.add(pool, 0, 1).await?;
         info!(event = "CREATE-TASK", path = "fn apply_task", message = "创建系统默认扫描任务");
         let i = ApplyTask {
             user_id: 1,

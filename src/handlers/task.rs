@@ -1,11 +1,11 @@
 use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web, http::header};
 use uuid::Uuid;
 use deadpool_postgres::{Pool};
-use crate::logs::write::{error_logs};
+use crate::logs::write::{error_logs, info_logs};
 use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8};
 use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery};
 use crate::middlewares::{render_403, render_500};
-use crate::admin::get_user_id;
+use crate::admin::get_user_id_and_name;
 
 #[get("/api/task/{task_id}")]
 async fn get_task(
@@ -52,40 +52,47 @@ async fn create_task(
     create_data: web::Json<CreateTask>,
     page_template: web::Data<TemplatesInit>
 ) -> impl Responder {
-    let p = pool.get().await;
-    let user_id:i32;
-    let session_str:String;
-    let t_cookie = req.cookie("session");
-    
-    //t_cookie.map(|c| session_str = c.value());
 
-
-    match t_cookie {
-        Some(t_session) => {
-            session_str = t_session.value().to_string();
-        },
-        None => {
-            return HttpResponse::MovedPermanently()
-                .insert_header((header::LOCATION, "/login"))
-                .finish()
+    match create_data.level {
+        0..5 => (),
+        _ => {
+            info_logs(&req, "InvalidParams", format!("任务优先级level不符合要求{}",create_data.level).as_str(), false);
+            return HttpResponse::BadRequest()
+                .body("400 Bad Request")
         }
+    }
+
+    let session_option = &req.cookie("session");
+    let session_str = match session_option {
+        Some(s) => s.value(),
+        None => ""
     };
 
 
-    let task_info = STask::new(TargetIP::S(&create_data.ip), "admin", Some(&create_data.port), create_data.remark.as_deref());
+    // TODO 需要处理优先级参数
+    
 
-    user_id = match get_user_id(&session_str, &pool).await {
+    let (user_id, user_name) = match get_user_id_and_name(session_str, &pool).await {
         Ok(o) => o,
         Err(e) => {
             error_logs(&req, "SEARCH-USER-ERROR", &e.to_string());
             return render_403(&req, &page_template, "未找到相关的用户 id")
         }
     };
+
+    let task_info = STask::new(TargetIP::S(&create_data.ip), &user_name,Some(&create_data.port), create_data.remark.as_deref());
     
     match task_info {
         Ok(o) => {
-            o.add(pool, user_id).await.map_err(|e| render_500(&req, &page_template, &e.to_string()));
-            return HttpResponse::Ok().finish()
+            if let Err(e) = o.add(pool, create_data.level as i32, user_id).await {
+                error_logs(&req, "AddTaskError", e.to_string().as_str());
+                return HttpResponse::InternalServerError()
+                    .body("500")
+            }
+            return HttpResponse::Ok()
+                .content_type(TEXT_HTML_UTF_8)
+                .body("创建成功")
+                
         },
         Err(e) => {
             error_logs(&req, "STASK-ERROR", &e.to_string());

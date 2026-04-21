@@ -40,12 +40,12 @@ pub async fn is_user_exist(username: &str, pool: web::Data<deadpool_postgres::Po
 
 /// 该函数用于获取用户的 ID
 /// 
-pub async fn get_user_id<'a>(
+pub async fn get_user_id_and_name<'a>(
     seeion: &'a str,
     pool: &web::Data<deadpool_postgres::Pool>
-) -> Result<i32, Box<dyn std::error::Error>> {
+) -> Result<(i32, String), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
-    let row = client.query_one("SELECT user_id FROM session WHERE token = $1 AND is_enable = TRUE;", &[&seeion]).await?;
-    let r:i32 = row.get("user_id");
-    Ok(r)
+    let row = client.query_one("SELECT s.user_id, u.username FROM session s CROSS JOIN users u WHERE s.token = $1 AND s.is_enable = True AND u.limit_login = False AND s.user_id = u.id;", &[&seeion]).await?;
+    // let r:i32 = row.get("user_id");
+    Ok((row.get::<_, i32>("user_id"), row.get::<_, String>("username")))
 }
