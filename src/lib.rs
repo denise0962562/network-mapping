@@ -35,6 +35,7 @@ use ipnet::{AddrParseError, IpNet};
 use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
+use cidr::IpInet;
 use crate::config::PasswordHashConfig;
 
 //常量
@@ -974,4 +975,70 @@ pub async fn log_out(
         );
         Ok(false)
     }
+}
+
+
+/// 该枚举定义了权限，其中系统权限最高，该级别的用户由初始化数据库时创建，且该权限的用户无法查看其他用户的数据，该权限主要用于系统自动创建的扫描任务
+/// Administrator 为管理员权限，该权限可以查看所有的任务
+/// 使用枚举时需要传入一个用户id
+pub enum Permission {
+    Administrator(i32),
+    Users(i32)
+}
+
+#[derive(Serialize)]
+pub struct TaskItem {
+    pub task_id: String,
+    pub task_target: Vec<IpInet>,
+    pub task_initiator: String,
+    pub task_port: String,
+    pub task_create_time: i64,
+    pub task_level: i32,
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+    pub remarks: Option<String>
+}
+
+/// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
+/// 
+/// 接收多个参数，分别为 
+pub async fn get_task_item(
+    pool: &deadpool_postgres::Pool,
+    s_count: i64,
+    permissions: Permission
+) -> Result<Vec<TaskItem>, Box<dyn std::error::Error>> {
+    let c = pool.get().await?;
+
+    let row = match permissions {
+        Permission::Administrator(_id) => {
+            c.query(
+                "SELECT * FROM scan_task ORDER BY id DESC LIMIT $1;",
+                &[&s_count]
+            ).await?
+        },
+        Permission::Users(u_id) => {
+            c.query(
+                "SELECT * FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;", 
+                &[&u_id, &s_count]
+            ).await?
+        }
+    };
+
+    let mut task_item_r: Vec<TaskItem> = Vec::new();
+    
+    for r in row {
+        let titem = TaskItem {
+            task_id: r.get::<_, String>("task_id"),
+            task_target: r.get::<_, Vec<IpInet>>("task_target"),
+            task_initiator: r.get::<_, String>("task_initiator"),
+            task_level: r.get::<_, i32>("task_level"),
+            task_port: r.get::<_, String>("task_port"),
+            task_create_time: r.get::<_, i64>("task_create_time"),
+            start_at: r.get::<_, Option<i64>>("task_start_time"),
+            end_at: r.get::<_, Option<i64>>("task_end_time"),
+            remarks: r.get::<_, Option<String>>("remarks")  
+        };
+        task_item_r.push(titem);
+    }
+    Ok(task_item_r)
 }
