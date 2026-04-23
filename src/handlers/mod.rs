@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 pub struct ReceiveLoginInfo {
     pub username: String,
     pub password: String,
-    pub rememberme: bool,
 }
 
 #[derive(Serialize)]

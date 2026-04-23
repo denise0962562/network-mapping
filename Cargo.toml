@@ -15,7 +15,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "json"] }
 tracing-appender = "0.2"
 rand = "0.9"
-tokio-postgres = "0.7"
+tokio-postgres = { version = "0.7", features = ["array-impls", "with-cidr-0_3"]}
+cidr = { version = "0.3", features = ["serde"]}
 deadpool-postgres = "0.14"
 deadpool = "0.12"
 argon2 = "0.5"

@@ -95,6 +95,13 @@ async fn user_login_h(
         .max_age(cookie::time::Duration::seconds(2700))
         .same_site(cookie::SameSite::Strict)
         .finish();
+    let cookie_csrf_token = Cookie::build("csrf_token", &csrf_token)
+        .path("/")
+        .secure(true)
+        .max_age(cookie::time::Duration::seconds(2700))
+        .same_site(cookie::SameSite::Strict)
+        .finish();
+
     let total_es = total_start.elapsed();
     let login_function = start.elapsed();
 
@@ -103,8 +110,9 @@ async fn user_login_h(
     println!("=============================================");
     HttpResponse::Ok()
         .cookie(cookies)
-        .insert_header(("X-CSRF-Token", csrf_token))
-        .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "X-CSRF-Token"))
+        .cookie(cookie_csrf_token)
+        // .insert_header(("X-CSRF-Token", csrf_token))
+        // .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "X-CSRF-Token"))
         .json(body)
 
     
@@ -117,6 +125,10 @@ async fn user_logout(
     pool: web::Data<deadpool_postgres::Pool>,
     page_template: web::Data<TemplatesInit>
 ) -> impl Responder {
+    let tmp_csrf_t = match &req.headers().get("X-CSRF-Token") {
+        Some(s) => s.to_str().unwrap_or(""),
+        None => ""
+    };
     if let Some(token) = &req.cookie("session") {
         let p = pool.get_ref();
         let tmp_token = token.value();
@@ -128,9 +140,14 @@ async fn user_logout(
                     .secure(true)
                     .expires(OffsetDateTime::UNIX_EPOCH)
                     .finish();
-                HttpResponse::MovedPermanently()
-                    .insert_header((header::LOCATION, "/login"))
+                let cookie_csrf_token = Cookie::build("csrf_token", tmp_csrf_t)
+                    .path("/")
+                    .secure(true)
+                    .expires(OffsetDateTime::UNIX_EPOCH)
+                    .finish();
+                HttpResponse::Ok()
                     .cookie(cookies)
+                    .cookie(cookie_csrf_token)
                     .finish()
             },
             Err(e) => {

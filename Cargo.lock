@@ -354,6 +354,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "array-init"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
+
+[[package]]
 name = "async-trait"
 version = "0.1.88"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +563,15 @@ dependencies = [
  "parse-zoneinfo",
  "phf 0.11.3",
  "phf_codegen",
+]
+
+[[package]]
+name = "cidr"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "579504560394e388085d0c080ea587dfa5c15f7e251b4d5247d1e1a61d1d6928"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1909,7 +1924,9 @@ version = "0.2.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8dc729a129e682e8d24170cd30ae1aa01b336b096cbb56df6d534ffec133d186"
 dependencies = [
+ "array-init",
  "bytes",
+ "cidr",
  "fallible-iterator",
  "postgres-derive",
  "postgres-protocol",
@@ -2110,6 +2127,7 @@ dependencies = [
  "actix-web",
  "argon2",
  "chrono",
+ "cidr",
  "deadpool",
  "deadpool-postgres",
  "futures",

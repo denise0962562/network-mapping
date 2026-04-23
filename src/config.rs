@@ -83,6 +83,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::data_saa::render_dashboard_page)
         .service(handlers::task::create_task)
         .service(handlers::task::apply_task_handler)     //更换了 apply_task_handler 和 get_task的注册顺序
+        .service(handlers::task::get_all_task_handler)
         .service(handlers::task::get_task)
         .service(handlers::utils::update_rir)
         .service(user::user_logout)

@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(200) NOT NULL UNIQUE,
     password TEXT NOT NULL,
+	permissions INT,                                                                      -- 用户的权限级别
     create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,    -- 用户的创建时间
 	limit_login boolean DEFAULT false,                                                    -- 表示用户是否是被限制登录，既可以表示系统用户永远无法登录以及该账号是否因为密码错误而临时禁止登录
 	limit_at BIGINT,                                                                      -- 限制登录操作产生的时间
@@ -25,7 +26,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	task_target INET[] NOT NULL,                                                              -- 扫描的目标 IP/CIDR 数组
 	task_port TEXT DEFAULT '1-65535',                                                         -- 扫描目标的 PORT
 	task_create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,   -- 表示扫描任务的创建时间
-	task_level INT NOT NULL CHECK ( task_level >= 0 AND task_level <=4 ),                     -- 表示任务的优先级
+	task_level INT NOT NULL CHECK ( task_level >= 0 AND task_level <=4 ) DEFAULT 1,           -- 表示任务的优先级
 	task_start_time BIGINT DEFAULT NULL,                                                      -- 扫描开始时间
 	task_end_time BIGINT DEFAULT NULL,                                                        -- 扫描结束时间
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
