@@ -4,7 +4,7 @@ use deadpool_postgres::{Pool};
 use tracing::error;
 use crate::logs::write::{error_logs, info_logs};
 use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8};
-use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery, get_task_item};
+use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery, get_task_item, TaskItemJson, ReceiveTaskItemQueryInfo};
 use crate::middlewares::{render_403, render_500};
 use crate::admin::get_user_id_and_name;
 
@@ -102,7 +102,7 @@ async fn create_task(
 /// 用于扫描器申请一个扫描目标
 #[get("/api/task/apply")]
 async fn apply_task_handler(
-    req: HttpRequest,
+    _req: HttpRequest,
     scanner_id: web::Query<ApplyTaskQuery>,
     pool: web::Data<Pool>
 ) -> impl Responder {
@@ -125,6 +125,7 @@ async fn apply_task_handler(
 #[get("/api/task/all")]
 async fn get_all_task_handler(
     req: HttpRequest,
+    query_info: web::Query<ReceiveTaskItemQueryInfo>,
     pool: web::Data<Pool>
 ) -> impl Responder {
     let p = pool.get_ref();
@@ -165,7 +166,12 @@ async fn get_all_task_handler(
     };
 
 
-    let tmp_result = match get_task_item(p, 5, crate::Permission::Administrator(user_id)).await {
+    let (tmp_result, total_count, item_count, start_index) = match get_task_item(
+        p, 
+        query_info.count.unwrap_or(5), 
+        query_info.start,
+        crate::Permission::Administrator(user_id)
+    ).await {
         Ok(o) => o,
         Err(e) => {
             error!(
@@ -178,6 +184,13 @@ async fn get_all_task_handler(
         }
     };
 
+    let tmp_json = TaskItemJson {
+        total_c: total_count,
+        item_c: item_count,
+        start_id: start_index,
+        task_item: tmp_result
+    };
+
     HttpResponse::Ok()
-        .json(tmp_result)
+        .json(tmp_json)
 }

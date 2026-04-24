@@ -986,6 +986,7 @@ pub enum Permission {
     Users(i32)
 }
 
+/// 表示单个任务条目
 #[derive(Serialize)]
 pub struct TaskItem {
     pub task_id: String,
@@ -994,9 +995,26 @@ pub struct TaskItem {
     pub task_port: String,
     pub task_create_time: i64,
     pub task_level: i32,
+    pub scanner_id: Option<Uuid>,
     pub start_at: Option<i64>,
     pub end_at: Option<i64>,
     pub remarks: Option<String>
+}
+
+/// 表示 Json 格式的任务列表
+#[derive(Serialize)]
+pub struct TaskItemJson {
+    pub total_c: i64,
+    pub item_c: i64,
+    pub start_id: i32,
+    pub task_item: Vec<TaskItem>
+}
+
+/// 该结构体表示接收查询任务列表信息
+#[derive(Deserialize)]
+pub struct ReceiveTaskItemQueryInfo {
+    pub start: Option<i32>,
+    pub count: Option<i64>,
 }
 
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
@@ -1005,28 +1023,45 @@ pub struct TaskItem {
 pub async fn get_task_item(
     pool: &deadpool_postgres::Pool,
     s_count: i64,
+    start_id: Option<i32>,
     permissions: Permission
-) -> Result<Vec<TaskItem>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<TaskItem>, i64, i64, i32), Box<dyn std::error::Error>> {
     let c = pool.get().await?;
 
     let row = match permissions {
         Permission::Administrator(_id) => {
-            c.query(
-                "SELECT * FROM scan_task ORDER BY id DESC LIMIT $1;",
-                &[&s_count]
-            ).await?
+            if let Some(st) = start_id {
+                c.query(
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE id <= $1 ORDER BY id DESC LIMIT $2;",
+                    &[&st, &s_count]
+                ).await?
+            }
+            else {
+                c.query(
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task ORDER BY id DESC LIMIT $1;",
+                    &[&s_count]
+                ).await?
+            }
+            
         },
         Permission::Users(u_id) => {
             c.query(
-                "SELECT * FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;", 
+                "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;", 
                 &[&u_id, &s_count]
             ).await?
         }
     };
 
     let mut task_item_r: Vec<TaskItem> = Vec::new();
+    let mut total_count_item: i64 = 0;
+    let mut count: i64 = 0;
+    let mut start_id: i32 = 0;
     
-    for r in row {
+    for (index, r) in row.iter().enumerate() {
+        if index == 0 {
+            start_id = r.get::<_, i32>("id");
+        }
+        total_count_item = r.get::<_, i64>("total_count");
         let titem = TaskItem {
             task_id: r.get::<_, String>("task_id"),
             task_target: r.get::<_, Vec<IpInet>>("task_target"),
@@ -1034,11 +1069,13 @@ pub async fn get_task_item(
             task_level: r.get::<_, i32>("task_level"),
             task_port: r.get::<_, String>("task_port"),
             task_create_time: r.get::<_, i64>("task_create_time"),
+            scanner_id: None,
             start_at: r.get::<_, Option<i64>>("task_start_time"),
             end_at: r.get::<_, Option<i64>>("task_end_time"),
             remarks: r.get::<_, Option<String>>("remarks")  
         };
         task_item_r.push(titem);
+        count += 1;
     }
-    Ok(task_item_r)
+    Ok((task_item_r, total_count_item, count, start_id))
 }
