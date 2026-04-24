@@ -8,6 +8,8 @@ file_name = "server.json"
 file_rolling = 0                                         # daliy: 0, hourly: 1, minutely: 2, never: 3
 debug_mode = false #false or true
 
+status_duration = 5                                      # 系统信息采集频率，单位 秒 且为 u64，表示每隔 * 秒采集一次基本信息
+
 [templates]
 templates_directory = "templates/**/*.html"
 templates_name = "error.html"

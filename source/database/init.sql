@@ -102,7 +102,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, 
 
 -- 表 system_status 用于存储系统状态数据
 CREATE TABLE IF NOT EXISTS system_status (
-	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
+	id SERIAL PRIMARY KEY,
+	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,   -- 为了便于筛选，使用秒级 UNIX 时间戳
 	server_run_time BIGINT DEFAULT 0,
 	cpu JSONB DEFAULT NULL,
 	ram JSONB DEFAULT NULL,

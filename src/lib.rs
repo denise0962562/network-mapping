@@ -26,9 +26,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use tokio_postgres::types::ToSql;
-use uuid::{Uuid, uuid};
-use crate::db::{get_sql_from_file, SqlFile};
-use crate::logs::write::{error_logs, info_logs};
+use uuid::{Uuid};
+use crate::db::{get_sql_from_file};
 use regex::Regex;
 use std::time::Instant;
 use ipnet::{AddrParseError, IpNet};
@@ -36,6 +35,8 @@ use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifie
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
 use cidr::IpInet;
+use chrono::Utc;
+use serde_json::Value;
 use crate::config::PasswordHashConfig;
 
 //常量
@@ -75,28 +76,28 @@ pub struct TemplatesInit {
 }
 
 //以下存储的数据都为约值，会自动舍弃精度
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DbResource {
     pub db_library_size: String,
     pub db_table_size: HashMap<String, DbTableSizeInfo>,
     pub db_conn: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DbTableSizeInfo {
     pub total: i64,
     pub data: i64,
     pub index: i64
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemCPU {
     pub cpu_usage: f32,                 //cpu总体使用率
     pub cpu: HashMap<String, f32>       //单个cpu使用率
 }
 
 //系统缓存大小，包括swap
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemRAM {
     pub total_ram: u64,
     pub used_ram: u64,
@@ -106,32 +107,33 @@ pub struct SystemRAM {
     pub swap_usage: f32
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemDisk {
     pub disk_total_space: u64,
     pub disk_total_usage: u64,
     pub disk: HashMap<String, Vec<u64>>
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemNetInfo {
     pub send: String,
     pub receive: String
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemNetwork {
     pub net: HashMap<String, SystemNetInfo>
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemResource {
-    pub server_run_time: u64,
+    pub server_run_time: i64,
     pub cpu: SystemCPU,
     pub ram: SystemRAM,
     pub disk: SystemDisk,
     pub db_postgresql: DbResource,
-    pub network: SystemNetwork
+    pub network: SystemNetwork,
+    pub create_at: Option<i64>
 }
 
 pub fn get_unix_epoch_ms() -> i64 {
@@ -329,14 +331,15 @@ impl Default for DbTableSizeInfo  {
 }
 
 impl SystemResource {
-    pub async fn new(sys: Systems, pool: deadpool_postgres::Pool, db_name: String) -> Self {
+    pub async fn new(sys: Systems, pool: deadpool_postgres::Pool, _db_name: String) -> Self {
         Self {
-            server_run_time: get_server_uptime(),
+            server_run_time: get_server_uptime() as i64,
             cpu: SystemCPU::new(sys.sys.clone()),
             ram: SystemRAM::new(sys.sys.clone()),
             disk: SystemDisk::new(sys.disk.clone()),
             db_postgresql: DbResource::new(pool, "source/database/").await,
-            network: SystemNetwork::new(sys.network.clone())
+            network: SystemNetwork::new(sys.network.clone()),
+            create_at: None
         }
     }
 }
@@ -1078,4 +1081,68 @@ pub async fn get_task_item(
         count += 1;
     }
     Ok((task_item_r, total_count_item, count, start_id))
+}
+
+
+/// 用于接收系统信息查询
+#[derive(Deserialize)]
+pub struct ReceiveSystemStatusInfo {
+    pub count: Option<i64>,
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SystemStatusJson {
+    pub total_c: i32,
+    pub status_item: Vec<SystemResource>
+}
+
+/// 获取系统状态信息
+pub async fn get_system_status_info(
+    start_at: Option<i64>,
+    end_at: Option<i64>,
+    count: i64,
+    pool: &deadpool_postgres::Pool
+) -> Result<(Vec<SystemResource>, i32), Box<dyn std::error::Error>> {
+    let connect = pool.get().await?;
+
+    let row = if start_at.is_some() || end_at.is_some() {
+        connect.query(
+            "SELECT * 
+                        FROM system_status 
+                        WHERE create_time BETWEEN 
+                            COALESCE($1, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                            AND 
+                            COALESCE($2, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                        ORDER BY id DESC 
+                        LIMIT $3;",
+            &[&start_at, &end_at, &count]
+        ).await?
+    }
+    else {
+        connect.query(
+            "SELECT * FROM system_status ORDER BY id DESC LIMIT $1;",
+            &[&count]
+        ).await?
+    };
+
+    let mut vec_status: Vec<SystemResource> = Vec::new();
+    let mut tmp_count: i32 = 0;
+
+    for r in row {
+        let tmp = SystemResource {
+            server_run_time: r.get::<_, i64>("server_run_time"),
+            cpu: serde_json::from_value(r.get::<_, Value>("cpu"))?,
+            ram: serde_json::from_value(r.get::<_, Value>("ram"))?,
+            disk: serde_json::from_value(r.get::<_, Value>("disk"))?,
+            db_postgresql: serde_json::from_value(r.get::<_, Value>("db_postgresql"))?,
+            network: serde_json::from_value(r.get::<_, Value>("network"))?,
+            create_at: Some(r.get::<_, i64>("create_time"))
+        };
+        tmp_count += 1;
+        vec_status.push(tmp);
+    }
+    Ok((vec_status, tmp_count))
+
 }

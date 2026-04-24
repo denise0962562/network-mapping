@@ -30,6 +30,7 @@ pub struct LogConfig {
     pub file_name: String,
     pub file_rolling: u8,
     pub debug_mode: bool,
+    pub status_duration: u64
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,7 +79,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::utils::static_file_system)
         .service(Files::new("/static", "./static").show_files_listing().prefer_utf8(true))
         .service(handlers::utils::get_scan_target)
-        .service(handlers::data_saa::get_system_data)
+        .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
         .service(handlers::data_saa::render_dashboard_page)
         .service(handlers::task::create_task)

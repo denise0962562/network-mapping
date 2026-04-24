@@ -9,7 +9,7 @@ use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_status};
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
-use chrono::{Utc, Timelike};
+// use chrono::{Utc, Timelike};
 
 
 #[actix_web::main]
@@ -76,22 +76,24 @@ async fn main() -> io::Result<()> {
     println!("监听 {}:{}", server_host, server_port);
     println!("监听地址：{}\n端口：{}\n日志使用的目录：{}\n日志文件名：{}\n日志文件滚动周期模式：{}\n日志系统调试模式：{}", &server_host, &server_port, &log_file_directory, &log_file_name, &log.file_rolling, &log_debug_mode);
     println!("模板目录：{}\n模板文件名：{}", template_info.templates_directory, template_info.templates_name);
+    println!("系统信息采集频率：{}", log.status_duration);
 
+    // 暂时取消等待
     // 计算下一个 2 分钟整点
-    let now = Utc::now();
-    let next_minute = ((now.minute() / 2) + 1) * 2; // 下一个偶数分钟
-    let start_time = Utc::now()
-        .with_minute(next_minute % 60).unwrap()
-        .with_second(0).unwrap()
-        .with_nanosecond(0).unwrap();
+    // let now = Utc::now();
+    // let next_minute = ((now.minute() / 2) + 1) * 2; // 下一个偶数分钟
+    // let start_time = Utc::now()
+    //     .with_minute(next_minute % 60).unwrap()
+    //     .with_second(0).unwrap()
+    //     .with_nanosecond(0).unwrap();
 
-    let delay = (start_time.timestamp_millis() - now.timestamp_millis()) as u64;
+    // let delay = (start_time.timestamp_millis() - now.timestamp_millis()) as u64;
 
     // 从整点开始，每 2 分钟 tick 一次
     tokio::spawn(async move {
         let mut ticker = interval_at(
-            Instant::now() + Duration::from_millis(delay),
-            Duration::from_secs(120),
+            Instant::now() + Duration::from_millis(0),
+            Duration::from_secs(log.status_duration),
         );
 
         loop {
