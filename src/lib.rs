@@ -35,7 +35,6 @@ use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifie
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
 use cidr::IpInet;
-use chrono::Utc;
 use serde_json::Value;
 use crate::config::PasswordHashConfig;
 
@@ -59,9 +58,9 @@ pub struct _ProxySetting {
     _headers: String,
 }
 
-pub struct AddUserInfo {
-    pub username: String,
-    pub password_hash: String,
+pub struct AddUserInfo<'a> {
+    pub username: &'a str,
+    pub password_hash: &'a str,
 }
 
 pub struct ReadFile {

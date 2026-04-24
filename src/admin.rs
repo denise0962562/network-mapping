@@ -1,8 +1,17 @@
 use actix_web::{web};
+use serde::Deserialize;
 use crate::AddUserInfo;
 
+// BUG 暂时使用 bug 标签用于提示
+/// 该结构体用于接收测试使用的创建用户信息
+#[derive(Deserialize)]
+pub struct ReceiveAddUserInfo {
+    pub username: String,
+    pub password: String
+}
+
 ///该函数用于添加用户，且需要调用者处理日志。
-pub async fn add_user(user: AddUserInfo, pool: web::Data<deadpool_postgres::Pool>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn add_user<'a>(user: AddUserInfo<'a>, pool: &deadpool_postgres::Pool) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = pool.get().await?;
     let transaction = client.transaction().await?;
     let stmt = transaction.prepare("INSERT INTO users (username, password) VALUES ($1, $2); ").await?;
@@ -21,7 +30,7 @@ pub async fn add_user(user: AddUserInfo, pool: web::Data<deadpool_postgres::Pool
 ///该函数用于检查用户是否存在
 /// 
 /// 如果用户存在则返回true
-pub async fn is_user_exist(username: &str, pool: web::Data<deadpool_postgres::Pool>) -> Result<bool, Box<dyn std::error::Error>> {
+pub async fn is_user_exist(username: &str, pool: &deadpool_postgres::Pool) -> Result<bool, Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     let stmt = client.prepare("SELECT username FROM users WHERE username = $1;").await?;
     // if let Some(_) = client.query_opt(&stmt, &[&username]).await? {

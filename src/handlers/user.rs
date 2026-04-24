@@ -12,38 +12,57 @@ use serde_json::json;
 use std::time::Instant;
 use crate::config::PasswordHashConfig;
 use crate::TemplatesInit;
+use crate::admin::ReceiveAddUserInfo;
 
-#[get("/add")]
+// BUG 暂时使用 bug 标签用于提示
+/// 该接口为测试阶段接口，用于快速创建账号，在生产环境下必须删除
+#[get("/test/adduser")]
 async fn first_add_user(
     pool: web::Data<deadpool_postgres::Pool>,
+    query_info: web::Query<ReceiveAddUserInfo>,
     pwd_hash_config: web::Data<PasswordHashConfig>
 ) -> impl Responder {
-    match admin::is_user_exist("admin", pool.clone()).await {
-        Ok(o) => {
-            if o {
-                println!("用户已存在");
-                HttpResponse::Ok()
-                    .content_type(TEXT_HTML_UTF_8)    
-                    .body("用户已存在".to_string())
-            }
-            else {
-                let p_hash = generate_hash_password("admin", pwd_hash_config.get_ref().clone());
-                match p_hash {
-                    Ok(o) => {
-                        let userinfo = AddUserInfo{
-                            username: "admin".to_string(),
-                            password_hash: o
-                        };
-                        let _ = admin::add_user(userinfo, pool).await;
-                        HttpResponse::Ok()
-                            .content_type(TEXT_HTML_UTF_8)
-                            .body("用户添加成功")
-                    },
-                    Err(e) => HttpResponse::BadRequest().body(format!("系统错误，生成密码hash错误\n{}", e))
+    let p = pool.get_ref();
+
+    match admin::is_user_exist(&query_info.username, p).await {
+        Ok(true) => {
+            HttpResponse::FailedDependency()
+                .content_type(TEXT_HTML_UTF_8)
+                .body("用户已存在")
+        },
+        Ok(false) => {
+            match generate_hash_password(&query_info.password, pwd_hash_config.get_ref().clone()) {
+                Ok(o) => {
+                    let userinfo = AddUserInfo{
+                        username: &query_info.username,
+                        password_hash: o.as_str()
+                    };
+                    let _ = admin::add_user(userinfo, p).await;
+                    println!("添加用户：{}:{}", &query_info.username, &query_info.password);
+                    HttpResponse::Ok()
+                        .content_type(TEXT_HTML_UTF_8)
+                        .body("用户添加成功")
+                },
+                Err(e) => {
+                    error!(
+                        event = "GeneratePasswordHashError",
+                        path = "fn first_add_user",
+                        message = %e
+                    );
+                    HttpResponse::InternalServerError()
+                        .body("500")
                 }
             }
         },
-        Err(e) => HttpResponse::BadRequest().body(format!("系统错误\n{}", e))
+        Err(e) => {
+            error!(
+                event = "CheckUserError",
+                path = "fn first_add_user",
+                message = %e
+            );
+            HttpResponse::InternalServerError()
+                .body("500")
+        }
     }
 }
 
