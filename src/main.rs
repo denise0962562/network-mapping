@@ -9,7 +9,8 @@ use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_status};
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
-// use chrono::{Utc, Timelike};
+
+use rust_web_test::admin::check_system_user;
 
 
 #[actix_web::main]
@@ -61,13 +62,17 @@ async fn main() -> io::Result<()> {
         Err(e) => panic!("初始化数据库错误{}", e),
     };
 
+    println!("开始检查系统配置");
+
+    check_system_user(&db_pool).await;
+
     // 定义密码加密相关配置文件
     let pwd_h = config.pwd_hash;
 
     let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).expect("SslAcceptor::mozilla_intermediate(SslMethod::tls_server()) ERROR");
-    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM).unwrap();
-    tls.set_certificate_chain_file("./ssl/cert.pem").unwrap();
-    tls.check_private_key().unwrap();
+    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM).expect("指定私钥文件错误");
+    tls.set_certificate_chain_file("./ssl/cert.pem").expect("指定证书文件错误");
+    tls.check_private_key().expect("私钥检查错误");
     
     let sys = Systems::new();  
     let sys_2 = sys.clone();
@@ -89,7 +94,7 @@ async fn main() -> io::Result<()> {
 
     // let delay = (start_time.timestamp_millis() - now.timestamp_millis()) as u64;
 
-    // 从整点开始，每 2 分钟 tick 一次
+    // 从整点开始，每隔一段时间 tick 一次，该时间由配置文件指定
     tokio::spawn(async move {
         let mut ticker = interval_at(
             Instant::now() + Duration::from_millis(0),

@@ -61,7 +61,19 @@ pub struct _ProxySetting {
 pub struct AddUserInfo<'a> {
     pub username: &'a str,
     pub password_hash: &'a str,
+    pub role: i32
 }
+
+
+impl<'a> AddUserInfo<'a> {
+    fn check(&self) -> Result<(),Box<dyn std::error::Error>> {
+        match self.role {
+            0..=2 => Ok(()),
+            _ => Err("角色值不符合规则".into())
+        }
+    }
+}
+
 
 pub struct ReadFile {
     pub file_name: String,

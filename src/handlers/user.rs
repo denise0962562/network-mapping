@@ -35,13 +35,24 @@ async fn first_add_user(
                 Ok(o) => {
                     let userinfo = AddUserInfo{
                         username: &query_info.username,
-                        password_hash: o.as_str()
+                        password_hash: o.as_str(),
+                        role: query_info.role
+
                     };
-                    let _ = admin::add_user(userinfo, p).await;
-                    println!("添加用户：{}:{}", &query_info.username, &query_info.password);
-                    HttpResponse::Ok()
-                        .content_type(TEXT_HTML_UTF_8)
-                        .body("用户添加成功")
+                    match admin::add_user(userinfo, p).await {
+                        Ok(_) => {
+                            println!("添加用户：{}:{}", &query_info.username, &query_info.password);
+                            HttpResponse::Ok()
+                                .content_type(TEXT_HTML_UTF_8)
+                                .body("用户添加成功")
+                        },
+                        Err(e) => {
+                            println!("添加用户失败：{}:{}\n错误：{}", &query_info.username, &query_info.password, e.to_string());
+                            HttpResponse::InternalServerError()
+                                .content_type(TEXT_HTML_UTF_8)
+                                .body("添加用户失败")
+                        }
+                    }
                 },
                 Err(e) => {
                     error!(
