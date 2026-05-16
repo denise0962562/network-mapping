@@ -268,7 +268,7 @@ impl SystemNetwork {
 }
 
 impl DbResource {
-    pub async fn new(pool: deadpool_postgres::Pool, sql_file_path: &str ) -> Self {
+    pub async fn new(pool: &deadpool_postgres::Pool, sql_file_path: &str ) -> Self {
         let client = pool.get().await;
         // let mut db_h: HashMap<String, String> = HashMap::new();
 
@@ -342,7 +342,7 @@ impl Default for DbTableSizeInfo  {
 }
 
 impl SystemResource {
-    pub async fn new(sys: Systems, pool: deadpool_postgres::Pool, _db_name: String) -> Self {
+    pub async fn new(sys: Systems, pool: &deadpool_postgres::Pool, _db_name: String) -> Self {
         Self {
             server_run_time: get_server_uptime() as i64,
             cpu: SystemCPU::new(sys.sys.clone()),
@@ -745,9 +745,9 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
 
 
 ///系统信息api基准测试
-pub async fn benchmark(sys: web::Data<Systems>, pool: web::Data<deadpool_postgres::Pool>, _db_name: String) {
+pub async fn benchmark(sys: web::Data<Systems>, pool: web::Data<&deadpool_postgres::Pool>, _db_name: String) {
     let total_start = Instant::now();
-    let pool = pool.get_ref().clone();
+    let pool = pool.get_ref();
 
     // CPU
     let start = Instant::now();
@@ -808,7 +808,7 @@ pub fn path_secure_join(root: &str, input: &str) -> Option<PathBuf> {
 
 ///向数据库插入系统数据
 pub async fn insert_system_status(
-    pool: deadpool_postgres::Pool, 
+    pool: &deadpool_postgres::Pool, 
     db_name: String,
     sys: Systems
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

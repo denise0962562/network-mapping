@@ -10,11 +10,24 @@ use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
 
-use rust_web_test::admin::check_system_user;
-
+use rust_web_test::admin::{check_system_user, send_email, SendEmail};
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
+    send_email(
+        SendEmail { 
+            host: "mail.abdc.world".to_string(), 
+            from_address: "test@mail.abdc.world".to_string(), 
+            from_name: "name".to_string(), 
+            to_address: "wsj@mail.abdc.world".to_string(), 
+            to_name: "wsj".to_string(), 
+            account_name: "test@mail.abdc.world".to_string(), 
+            account_password: "oVaiD2r9ek".to_string(), 
+            subject: "Test".to_string(), 
+            text: "这是一封测试邮件".to_string() 
+        }
+    ).await;
+
     
     let config = config::Config::from_file("config.toml");
     let server = config.server;
@@ -103,7 +116,7 @@ async fn main() -> io::Result<()> {
 
         loop {
             ticker.tick().await;
-            match insert_system_status(pool.clone(), database_c.db_name.clone(), sys.clone()).await {
+            match insert_system_status(&db_pool, database_c.db_name.clone(), sys.clone()).await {
                 Ok(_) => (),
                 Err(e) => {
                     let message = format!("插入系统状态错误: {}", e);
@@ -121,7 +134,7 @@ async fn main() -> io::Result<()> {
     
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(db_pool.clone()))
+            .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(template_info.clone()))
             .app_data(web::Data::new(ReadFile{file_name: String::from("index.html"), file_root_directory: String::from("")}))
             .app_data(web::Data::new(sys_2.clone()))

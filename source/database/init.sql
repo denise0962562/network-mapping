@@ -260,3 +260,12 @@ CREATE TABLE IF NOT EXISTS isp (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_isp_unique_hash ON isp (unique_hash);
+
+-- 存放配置
+CREATE TABLE IF NOT EXISTS setting (
+	type TEXT,
+	key TEXT,
+	value TEXT,
+	create_at TIMESTAMPTZ DEFAULT NOW(),
+	update_at TIMESTAMPTZ
+)
