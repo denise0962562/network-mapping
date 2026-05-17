@@ -10,7 +10,7 @@ use crate::{TEXT_HTML_UTF_8};
 use crate::logs::write::{error_logs};
 use serde_json::json;
 use std::time::Instant;
-use crate::config::PasswordHashConfig;
+use crate::config::{EmailConfig, PasswordHashConfig};
 use crate::TemplatesInit;
 use crate::admin::ReceiveAddUserInfo;
 
@@ -83,13 +83,15 @@ async fn first_add_user(
 async fn user_login_h(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
+    mail_config: web::Data<Option<EmailConfig>>,
     receiveinfo: web::Json<ReceiveLoginInfo>
 ) -> impl Responder {
     println!("================= Benchmark =================");
     let total_start = Instant::now();                                                  // 总的开始时间
     let start = Instant::now();                                                        // 登录函数开始时间
     let p = pool.get_ref();
-    let (t_session, csrf_token) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, p).await {
+    let m_c = mail_config.get_ref().as_ref();
+    let (t_session, csrf_token) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, m_c, p).await {
         Ok(o) => o,
         Err(e) => {
             let log_event = "LoginFaild";

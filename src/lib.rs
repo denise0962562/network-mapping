@@ -638,12 +638,11 @@ pub fn generate_hash_password(password: &str, config: PasswordHashConfig) -> Res
 pub async fn get_password_and_id_from_database(
     pool: &deadpool_postgres::Pool,
     username: &str
-) -> Result<(i32, String), Box<dyn std::error::Error>> {
+) -> Result<(i32, String, Option<String>), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
-    if let Some(row) = client.query_opt("SELECT id, password FROM users WHERE username = $1", &[&username]).await? {
-        // let id: i32 = row.get("id");
-        // let pwd_hash: String = row.get("password");
-        Ok((row.get::<_, i32>("id"), row.get::<_, String>("password")))
+    if let Some(row) = client.query_opt("SELECT id, password, email FROM users WHERE username = $1", &[&username]).await? {
+
+        Ok((row.get::<_, i32>("id"), row.get::<_, String>("password"), row.get::<_, Option<String>>("email")))
     }
     else {
         info!(

@@ -9,26 +9,12 @@ use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_status};
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
-
-use rust_web_test::admin::{check_system_user, send_email, SendEmail};
+// use lettre::message::{Mailbox, header::ContentType};
+use rust_web_test::admin::{check_system_user};
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
-    send_email(
-        SendEmail { 
-            host: "mail.abdc.world".to_string(), 
-            from_address: "test@mail.abdc.world".to_string(), 
-            from_name: "name".to_string(), 
-            to_address: "wsj@mail.abdc.world".to_string(), 
-            to_name: "wsj".to_string(), 
-            account_name: "test@mail.abdc.world".to_string(), 
-            account_password: "oVaiD2r9ek".to_string(), 
-            subject: "Test".to_string(), 
-            text: "这是一封测试邮件".to_string() 
-        }
-    ).await;
 
-    
     let config = config::Config::from_file("config.toml");
     let server = config.server;
     let server_host = server.host;
@@ -81,6 +67,8 @@ async fn main() -> io::Result<()> {
 
     // 定义密码加密相关配置文件
     let pwd_h = config.pwd_hash;
+
+    let mail_c = config.email_config;
 
     let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).expect("SslAcceptor::mozilla_intermediate(SslMethod::tls_server()) ERROR");
     tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM).expect("指定私钥文件错误");
@@ -140,6 +128,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(sys_2.clone()))
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
+            .app_data(web::Data::new(mail_c.clone()))
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)

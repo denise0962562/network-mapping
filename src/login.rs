@@ -1,20 +1,22 @@
 
-use actix_web::{HttpRequest, dev::ConnectionInfo};
-use actix_web::web;
+use actix_web::{HttpRequest};
 use tracing::{warn, info, error};
-// use actix_session::storage::{SessionStore, SessionKey};
 use uuid::Uuid;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 use openssl::base64;
+use lettre::Message;
+use lettre::message::{Mailbox, header::ContentType};
 
-use crate::{get_conn_ip, login};
+use crate::config::EmailConfig;
+use crate::{get_conn_ip};
 use crate::{
     get_unix_epoch_ms, 
     verify_password, 
     logs::LoginLog,
     logs::{write::login_logs_to_db}, 
-    get_password_and_id_from_database
+    get_password_and_id_from_database,
+    admin::send_email
 };
 
 pub struct LoginToken {
@@ -52,7 +54,7 @@ impl LoginToken {
             }
         };
         match self.save(&session, &csrf_token_base64).await {
-            Ok(o) => {
+            Ok(_o) => {
                 info!(
                     event = "SuccessfulSaveSession",
                     message = "Successful Save Session "
@@ -172,6 +174,7 @@ pub async fn user_login(
     req: &HttpRequest,
     username: &str, 
     password: &str, 
+    mail_config: Option<&EmailConfig>,
     pool: &deadpool_postgres::Pool
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
 
@@ -179,7 +182,7 @@ pub async fn user_login(
     let start = Instant::now();
 
     // 即使用户名不存在也校验密码，预防时序攻击
-    let (tmp_id, pwd_hash) = match get_password_and_id_from_database(pool, username).await {
+    let (tmp_id, pwd_hash, user_email) = match get_password_and_id_from_database(pool, username).await {
         Ok(o) => {
             l_successful = true;
             o
@@ -191,7 +194,7 @@ pub async fn user_login(
                 path = "fn user_login",
                 message = %e
             );
-            (-1 as i32, format!("$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II"))
+            (-1 as i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), None)
         }
     };
     let get_pwd_h = start.elapsed();
@@ -232,6 +235,37 @@ pub async fn user_login(
         let login_token = LoginToken {pool: pool.clone()};
         let (session, csrf_token) = login_token.create_session(2700, username).await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
+        // match user_email {
+        //     Some(mail_address) => {
+        //         let mail_message = Message::builder()
+        //             .from(Mailbox::new(Some("Network Mapping".to_string()), "test@mail.abdc.world".to_string().parse().unwrap()))
+        //             .to(Mailbox::new(None, mail_address.parse().unwrap()))
+        //             .subject("Test".to_string())
+        //             .header(ContentType::TEXT_PLAIN)
+        //             .body("登录成功".to_string())
+        //             .unwrap();
+
+        //         send_email(mail_config, mail_message).await;
+        //     },
+        //     None => ()
+        // };
+
+        if let Some(m_config) = mail_config {
+            match user_email {
+                Some(mail_address) => {
+                    let mail_message = Message::builder()
+                        .from(Mailbox::new(Some("Network Mapping".to_string()), "test@mail.abdc.world".to_string().parse().unwrap()))
+                        .to(Mailbox::new(None, mail_address.parse().unwrap()))
+                        .subject("Test".to_string())
+                        .header(ContentType::TEXT_PLAIN)
+                        .body("登录成功".to_string())
+                        .unwrap();
+
+                    send_email(m_config, mail_message).await;
+                },
+                None => ()
+            };
+        }
         Ok((session.session, csrf_token))
     }
     else {

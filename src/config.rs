@@ -15,7 +15,8 @@ pub struct Config {
     pub templates: TemplatesConfig,
     pub scan_target_generated: ScanTargetConfig,
     pub database: DatabaseConfig,
-    pub pwd_hash: PasswordHashConfig
+    pub pwd_hash: PasswordHashConfig,
+    pub email_config: Option<EmailConfig>
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +63,13 @@ pub struct PasswordHashConfig {
     pub m: u32,                                    // 内存，单位 MiB
     pub t: u32,                                    // 迭代，最大可设置为 4294967295
     pub p: u32                                     // 并行，最大可设置为 4294967295
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EmailConfig {
+    pub host: String,
+    pub account_username: String,
+    pub account_password: String
 }
 
 impl Config {

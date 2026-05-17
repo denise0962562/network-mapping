@@ -6,7 +6,7 @@ port = 9999
 directory = "logs"
 file_name = "server.json"
 file_rolling = 0                                         # daliy: 0, hourly: 1, minutely: 2, never: 3
-debug_mode = false #false or true
+debug_mode = true #false or true
 
 status_duration = 5                                      # 系统信息采集频率，单位 秒 且为 u64，表示每隔 * 秒采集一次基本信息
 
@@ -36,3 +36,8 @@ m = 64                                                   # 内存，最大可设
 t = 2                                                    # 迭代，最大可设置为 4294967295 ，越大越好，但同时对设备要求越高。
 p = 2                                                    # 并行，最大可设置为 4294967295 ，越大越好，但同时对设备要求越高
                                                          # 该参数可以理解为使用多少个核心运算。
+
+#[email_config]
+#host = "example.com"
+#account_username = "example@example.com"
+#account_password = ""

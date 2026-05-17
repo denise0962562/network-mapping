@@ -2,9 +2,9 @@ use actix_web::{web};
 use serde::Deserialize;
 use tracing::{info, warn};
 use lettre::{Message, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-use lettre::message::{Mailbox, header::ContentType};
+// use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
-use crate::AddUserInfo;
+use crate::{AddUserInfo, config::EmailConfig};
 
 /// 该结构体用于接收测试使用的创建用户信息
 #[derive(Deserialize)]
@@ -20,17 +20,6 @@ pub enum UserRole {
     User
 }
 
-pub struct SendEmail {
-    pub host: String,
-    pub from_address: String,
-    pub from_name: String,
-    pub to_address: String,
-    pub to_name: String,
-    pub account_name: String,
-    pub account_password: String,
-    pub subject: String,
-    pub text: String
-}
 
 ///该函数用于添加用户，且需要调用者处理日志。
 pub async fn add_user<'a>(user: AddUserInfo<'a>, pool: &deadpool_postgres::Pool) -> Result<(), Box<dyn std::error::Error>> {
@@ -127,23 +116,29 @@ pub async fn create_system_user(
 /// 发送邮件
 /// 
 pub async fn send_email(
-    send_info: SendEmail
+    emailconf: &EmailConfig,
+    mail: Message
 ) {
-    let email = Message::builder()
-        .from(Mailbox::new(Some(send_info.from_name), send_info.from_address.parse().unwrap()))
-        .to(Mailbox::new(Some(send_info.to_name), send_info.to_address.parse().unwrap()))
-        .subject(send_info.subject)
-        .header(ContentType::TEXT_PLAIN)
-        .body(send_info.text)
-        .unwrap();
-
-    let creds = Credentials::new(send_info.account_name, send_info.account_password);
-
+    let creds = Credentials::new(emailconf.account_username.to_string(), emailconf.account_password.to_string());
 
     // 使用465端口，且强制加密
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&send_info.host).unwrap().credentials(creds).build();
-    match mailer.send(email).await {
-        Ok(_) => println!("Email sent successfully!"),
-        Err(e) => panic!("Could not send email: {e:?}"),
+    let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&emailconf.host).unwrap().credentials(creds).build();
+    match mailer.send(mail).await {
+        Ok(_) => {
+            info!(
+                event = "SendEmailSuccessfully",
+                path = "fn send_email",
+                message = "Email sent successfully!"
+            );
+            println!("Email sent successfully!")
+        },
+        Err(e) => {
+            warn!(
+                event = "SendEmailError",
+                path = "fn send_email",
+                message = format!("Could not send email: {e:?}")
+            );
+            println!("Could not send email: {e:?}")
+        },
     }
 }
