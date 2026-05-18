@@ -9,7 +9,7 @@ use lettre::Message;
 use lettre::message::{Mailbox, header::ContentType};
 
 use crate::config::EmailConfig;
-use crate::{get_conn_ip};
+use crate::{UserLoginInfo, get_conn_ip};
 use crate::{
     get_unix_epoch_ms, 
     verify_password, 
@@ -136,7 +136,9 @@ impl LoginToken {
     /// 找到token且token还未过期时返回 true ，未找到或已过期时返回当返回值多于一行时返回错误
     pub async fn check_token(&self, session: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let client = self.pool.get().await?;
-        let stmt = client.prepare("SELECT token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true LIMIT 1;").await?;
+        let stmt = client.prepare(
+            "SELECT token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true AND totp_verify_successful = true LIMIT 1;"
+        ).await?;
 
         if let Some(r_s) = client.query_opt(&stmt, &[&session]).await? {
             let n_t = get_unix_epoch_ms();
@@ -182,7 +184,7 @@ pub async fn user_login(
     let start = Instant::now();
 
     // 即使用户名不存在也校验密码，预防时序攻击
-    let (tmp_id, pwd_hash, user_email) = match get_password_and_id_from_database(pool, username).await {
+    let (tmp_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(pool, username).await {
         Ok(o) => {
             l_successful = true;
             o
@@ -194,7 +196,14 @@ pub async fn user_login(
                 path = "fn user_login",
                 message = %e
             );
-            (-1 as i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), None)
+            let t = UserLoginInfo {
+                username: String::new(),
+                role: -1,
+                email_address: None,
+                twofa: None
+            };
+            // FIXME 当用户不存在时会提供一个默认的校验，但是，如果用户自己调整了密码加密参数，则会导致默认提供的参数实际计算时间与用户其他的密码校验时间不一致
+            (-1 as i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), t)
         }
     };
     let get_pwd_h = start.elapsed();
@@ -217,6 +226,8 @@ pub async fn user_login(
         event_useage_userid: tmp_id,
         is_successful: false
     };
+
+    // 当用户不存在或者是查找用户错误时使用提供的默认密文校验密码
     if verify_password(password, &pwd_hash) && l_successful {
         
         let start = Instant::now();
@@ -235,23 +246,9 @@ pub async fn user_login(
         let login_token = LoginToken {pool: pool.clone()};
         let (session, csrf_token) = login_token.create_session(2700, username).await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
-        // match user_email {
-        //     Some(mail_address) => {
-        //         let mail_message = Message::builder()
-        //             .from(Mailbox::new(Some("Network Mapping".to_string()), "test@mail.abdc.world".to_string().parse().unwrap()))
-        //             .to(Mailbox::new(None, mail_address.parse().unwrap()))
-        //             .subject("Test".to_string())
-        //             .header(ContentType::TEXT_PLAIN)
-        //             .body("登录成功".to_string())
-        //             .unwrap();
-
-        //         send_email(mail_config, mail_message).await;
-        //     },
-        //     None => ()
-        // };
 
         if let Some(m_config) = mail_config {
-            match user_email {
+            match user_login_info.email_address {
                 Some(mail_address) => {
                     let mail_message = Message::builder()
                         .from(Mailbox::new(Some("Network Mapping".to_string()), "test@mail.abdc.world".to_string().parse().unwrap()))

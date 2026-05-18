@@ -5,14 +5,14 @@ use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
 use tracing::error;
 use crate::handlers::{ReceiveLoginInfo};
-use crate::login::user_login;
+use crate::login::{get_session_from_req, user_login};
 use crate::{TEXT_HTML_UTF_8};
-use crate::logs::write::{error_logs};
+use crate::logs::write::{error_logs, info_logs};
 use serde_json::json;
 use std::time::Instant;
 use crate::config::{EmailConfig, PasswordHashConfig};
 use crate::TemplatesInit;
-use crate::admin::ReceiveAddUserInfo;
+use crate::admin::{ReceiveAddUserInfo, VerifyTotp, bind_twofa, get_user_id_and_name, totp_struct, totp_token_verify};
 
 // BUG 暂时使用 bug 标签用于提示
 /// 该接口为测试阶段接口，用于快速创建账号，在生产环境下必须删除
@@ -151,6 +151,7 @@ async fn user_login_h(
 }
 
 
+/// 注销会话接口
 #[get("/logout")]
 async fn user_logout(
     req: HttpRequest,
@@ -183,9 +184,9 @@ async fn user_logout(
                     .finish()
             },
             Err(e) => {
-                error_logs(&req, "注销账号错误", e.to_string().as_str());
+                error_logs(&req, "注销会话错误", e.to_string().as_str());
                 let page = page_template.get_ref();
-                render_500(&req, page, "注销账号错误")
+                render_500(&req, page, "注销会话错误")
             }
         }
     }
@@ -194,4 +195,82 @@ async fn user_logout(
             .insert_header((header::LOCATION, "/login"))
             .finish()
     }
+}
+
+
+/// 绑定 2FA 验证器
+/// 
+/// 直接返回 optauth url
+#[get("/api/totp/bind")]
+async fn bind_twofa_h(
+    req: HttpRequest,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+
+    let pool_r = pool.get_ref();
+    let session = get_session_from_req(&req, "session").unwrap_or(String::new());
+    let (_, username) = match get_user_id_and_name(&session, pool_r).await {
+        Ok(tmp) => tmp,
+        Err(e) => {
+            error_logs(&req, "GetUserIdandNameError", &e.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    
+    match bind_twofa(username, pool_r).await {
+        Ok(tmp) => {
+            return HttpResponse::ImUsed()
+                .json(json!({"success": true, "data": tmp}))
+        },
+        Err(e) => {
+            error_logs(&req, "CreateOptauthUrlError", &e.to_string());
+            return HttpResponse::InternalServerError().finish()
+        }
+    }
+
+}
+
+
+
+/// 验证 TOTP Token 接口
+#[post("/api/totp/verify")]
+async fn verify_totp_h(
+    info: web::Json<VerifyTotp>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    req: HttpRequest
+) -> impl Responder {
+
+    if let Some(request_cookie) = get_session_from_req(&req, "session") {
+        let database_conn = pool.get_ref();
+        let (_, username) = match get_user_id_and_name(&request_cookie, database_conn).await {
+            Ok(id_and_name) => id_and_name,
+            Err(e) => {
+                error_logs(&req, "GetUserIdandNameError", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        };
+        let totp = match totp_struct(username, database_conn).await {
+            Ok(tmp) => tmp,
+            Err(e) => {
+                error_logs(&req, "生成 TOTP 结构体错误", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        };
+
+        match totp_token_verify(totp, &info.token).await {
+            Ok(true) => HttpResponse::Ok(),
+            Ok(false) => {
+                info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
+                HttpResponse::Unauthorized()
+            },
+            Err(e) => {
+                error_logs(&req, "TOTPTokenVerifyError", &e.to_string());
+                HttpResponse::InternalServerError()
+            }
+        }
+    } else {
+        HttpResponse::Unauthorized()
+    }
+
 }

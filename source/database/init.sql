@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS users (
 	limit_at BIGINT,                                                                      -- 限制登录操作产生的时间
 	limit_time INT,                                                                       -- 限制登录时间，单位为 秒 
 	enable_2fa boolean DEFAULT false,                                                     -- 表示用户是否启用了 2FA
+	totp_secret TEXT,                                                                     -- TOTP 密钥
 	last_login_at BIGINT,                                                                 -- 表示该用户最后一次登录的时间
 	last_login_ip INET,                                                                   -- 最后一次登录的 IP 地址
 	login_error_count INT,                                                                -- 登录错误的次数
@@ -93,6 +94,7 @@ CREATE TABLE IF NOT EXISTS session (
 	token TEXT NOT NULL,
 	csrf_token TEXT NOT NULL,
 	ttl INT DEFAULT 1200, 
+	totp_verify_successful boolean DEFAULT false,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
 	is_enable boolean DEFAULT true
 );

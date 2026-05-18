@@ -17,6 +17,7 @@ pub mod test;                                                 // 测试模块
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::{HttpRequest, web};
+use tokio_postgres::Row;
 use tracing::{error, info, warn};
 use std::path::{Path, PathBuf};
 use tera::{Tera, Context};
@@ -27,7 +28,6 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 use tokio_postgres::types::ToSql;
 use uuid::{Uuid};
-use crate::db::{get_sql_from_file};
 use regex::Regex;
 use std::time::Instant;
 use ipnet::{AddrParseError, IpNet};
@@ -36,7 +36,10 @@ use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
 use cidr::IpInet;
 use serde_json::Value;
-use crate::config::PasswordHashConfig;
+
+use db::{get_sql_from_file};
+use config::PasswordHashConfig;
+use admin::TotpInfo;
 
 //常量
 pub const TEXT_HTML_UTF_8: &str = "text/html; charset=utf-8";
@@ -74,6 +77,13 @@ impl<'a> AddUserInfo<'a> {
     }
 }
 
+
+pub struct UserLoginInfo {
+    pub username: String,
+    pub role: i32,
+    pub email_address: Option<String>,
+    pub twofa: Option<TotpInfo>
+}
 
 pub struct ReadFile {
     pub file_name: String,
@@ -487,7 +497,7 @@ impl<'a> STask<'a> {
     /// 返回一个 Result，当执行成功时返回 OK
     pub async fn add(
         &self,
-        pool: web::Data<deadpool_postgres::Pool>,
+        pool: &deadpool_postgres::Pool,
         level: i32,
         user_id: i32
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -620,9 +630,6 @@ fn get_server_uptime() -> u64 {
     sysinfo::System::uptime()
 }
 
-
-
-
 /// 生成 Argon2id 哈希
 /// 
 /// 用于添加用户
@@ -638,11 +645,36 @@ pub fn generate_hash_password(password: &str, config: PasswordHashConfig) -> Res
 pub async fn get_password_and_id_from_database(
     pool: &deadpool_postgres::Pool,
     username: &str
-) -> Result<(i32, String, Option<String>), Box<dyn std::error::Error>> {
+) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
-    if let Some(row) = client.query_opt("SELECT id, password, email FROM users WHERE username = $1", &[&username]).await? {
+    if let Some(row) = client.query_opt(
+        "SELECT id, password, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1", 
+        &[&username]
+    ).await? {
+        // TODO 需要改进，避免闭包获得所有权
+        let get_twofa_info = |row: Row| -> Option<TotpInfo> {
+            if row.get::<_, bool>("enable_2fa") {
+                Some(TotpInfo {
+                    username: row.get::<_, String>("username"),
+                    // email_address: row.get::<_, String>("email"),
+                    totp_secret: row.get::<_, String>("totp_secret")
+                })
+            } else {
+                None
+            }
+        };
 
-        Ok((row.get::<_, i32>("id"), row.get::<_, String>("password"), row.get::<_, Option<String>>("email")))
+        let u_id = row.get::<_, i32>("id");
+        let u_pwd = row.get::<_, String>("password");
+
+        let userinfo = UserLoginInfo {
+            username: username.to_string(),
+            role: row.get::<_, i32>("role"),
+            email_address: row.get::<_, Option<String>>("email"),
+            twofa: get_twofa_info(row)
+        };
+
+        Ok((u_id, u_pwd, userinfo))
     }
     else {
         info!(
@@ -893,7 +925,7 @@ pub struct ApplyTask {
 /// 通过该函数实现扫描器申请任务
 /// 首先搜索合适的任务，如果没有任务则会创建一个系统任务，该任务也会写入 scan_task 中
 pub async fn apply_task(
-    pool: web::Data<deadpool_postgres::Pool>,
+    pool: &deadpool_postgres::Pool,
     _scanner_id: web::Query<ApplyTaskQuery>
 ) -> Result<ApplyTask, Box<dyn std::error::Error>> {
     let p = pool.get().await?;
@@ -964,7 +996,7 @@ pub async fn log_out(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
     if let Some(tmp_r) = c.query_opt("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await? {
-        // let tmp_r = c.execute("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await?;
+
         info!(
             event = "UserLogout",
             path = "fn log_out",

@@ -69,8 +69,9 @@ async fn create_task(
         None => ""
     };
 
+    let database_conn = pool.get_ref();
 
-    let (user_id, user_name) = match get_user_id_and_name(session_str, &pool).await {
+    let (user_id, user_name) = match get_user_id_and_name(session_str, database_conn).await {
         Ok(o) => o,
         Err(e) => {
             error_logs(&req, "SEARCH-USER-ERROR", &e.to_string());
@@ -82,7 +83,7 @@ async fn create_task(
     
     match task_info {
         Ok(o) => {
-            if let Err(e) = o.add(pool, create_data.level as i32, user_id).await {
+            if let Err(e) = o.add(database_conn, create_data.level as i32, user_id).await {
                 error_logs(&req, "AddTaskError", e.to_string().as_str());
                 return HttpResponse::InternalServerError()
                     .body("500")
@@ -106,7 +107,8 @@ async fn apply_task_handler(
     scanner_id: web::Query<ApplyTaskQuery>,
     pool: web::Data<Pool>
 ) -> impl Responder {
-    let task_data = apply_task(pool, scanner_id).await;
+    let database_conn = pool.get_ref();
+    let task_data = apply_task(database_conn, scanner_id).await;
 
     if task_data.is_ok() {
         task_data.map(|a_t| {
