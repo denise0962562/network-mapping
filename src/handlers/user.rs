@@ -91,7 +91,7 @@ async fn user_login_h(
     let start = Instant::now();                                                        // 登录函数开始时间
     let p = pool.get_ref();
     let m_c = mail_config.get_ref().as_ref();
-    let (t_session, csrf_token) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, m_c, p).await {
+    let (t_session, csrf_token, enable_twofa) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, m_c, p).await {
         Ok(o) => o,
         Err(e) => {
             let log_event = "LoginFaild";
@@ -116,10 +116,6 @@ async fn user_login_h(
         }
     };
 
-    let body = json!({
-        "success": true,
-        "message": "登录成功"
-    });
     let cookies = Cookie::build("session", &t_session)
         .path("/")
         .http_only(true)
@@ -140,14 +136,31 @@ async fn user_login_h(
     println!("Total   : {:>6} ms", total_es.as_millis());
     println!("Login_f : {:>6} ms", login_function.as_millis());
     println!("=============================================");
-    HttpResponse::Ok()
-        .cookie(cookies)
-        .cookie(cookie_csrf_token)
-        // .insert_header(("X-CSRF-Token", csrf_token))
-        // .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "X-CSRF-Token"))
-        .json(body)
-
-    
+    match enable_twofa {
+        true => {
+            // 使用 401 Unauthorized 表示还需要继续验证 TOTP Token
+            HttpResponse::Unauthorized()
+                .cookie(cookies)
+                .cookie(cookie_csrf_token)
+                .json(
+                    json!({
+                        "success": true,
+                        "message": "请验证 2FA 验证码"
+                    })
+                )
+        },
+        false => {
+            HttpResponse::Ok()
+                .cookie(cookies)
+                .cookie(cookie_csrf_token)
+                .json(
+                    json!({
+                        "success": true,
+                        "message": "登录成功"
+                    })
+                )
+        }
+    }
 }
 
 
@@ -251,7 +264,11 @@ async fn verify_totp_h(
             }
         };
         let totp = match totp_struct(username, database_conn).await {
-            Ok(tmp) => tmp,
+            Ok(Some(tmp)) => tmp,
+            Ok(None) => {
+                info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);
+                return HttpResponse::NotFound();
+            },
             Err(e) => {
                 error_logs(&req, "生成 TOTP 结构体错误", &e.to_string());
                 return HttpResponse::InternalServerError();

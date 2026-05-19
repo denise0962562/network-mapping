@@ -648,7 +648,7 @@ pub async fn get_password_and_id_from_database(
 ) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
-        "SELECT id, password, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1", 
+        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1", 
         &[&username]
     ).await? {
         // TODO 需要改进，避免闭包获得所有权

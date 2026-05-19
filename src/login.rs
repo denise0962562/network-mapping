@@ -33,7 +33,7 @@ pub struct SessionInfo<'a> {
 
 impl LoginToken {
     ///生成一个session 和 csrftoken 并保存
-    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> Result<(SessionInfo<'a>, String), Box<dyn std::error::Error>> {
+    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str, enable_2fa: bool) -> Result<(SessionInfo<'a>, String), Box<dyn std::error::Error>> {
         let session = SessionInfo { 
             session: Uuid::new_v4().to_string(), 
             create_time: get_unix_epoch_ms(), 
@@ -53,7 +53,7 @@ impl LoginToken {
                 return Err(e.into())
             }
         };
-        match self.save(&session, &csrf_token_base64).await {
+        match self.save(&session, &csrf_token_base64, enable_2fa).await {
             Ok(_o) => {
                 info!(
                     event = "SuccessfulSaveSession",
@@ -85,7 +85,7 @@ impl LoginToken {
 
     ///保存一个token,
     /// 返回result，当成功时为OK
-    pub async fn save(&self, sessioninfo: &SessionInfo<'_>, csrftoken: &str) -> Result<(i32, i32), Box<dyn std::error::Error>> {
+    pub async fn save(&self, sessioninfo: &SessionInfo<'_>, csrftoken: &str, enable_2fa: bool) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
@@ -110,12 +110,13 @@ impl LoginToken {
         let userid: i32 = row.get("id");
         //插入一条session,其中包括了用户id token 有效时间，创建时间
         if let Some(r_rows) = transaction.query_opt(
-            "INSERT INTO session (user_id, token, csrf_token, ttl, create_time) VALUES ( $1, $2, $3, $4, $5 ) RETURNING id, user_id;",
+            "INSERT INTO session (user_id, token, csrf_token, ttl, totp_verify_successful, create_time) VALUES ( $1, $2, $3, $4, $5, $6 ) RETURNING id, user_id;",
             &[
                 &userid,
                 &sessioninfo.session,
                 &csrftoken,
                 &sessioninfo.ttl,
+                &!enable_2fa,
                 &sessioninfo.create_time
             ]
         ).await? {
@@ -178,7 +179,7 @@ pub async fn user_login(
     password: &str, 
     mail_config: Option<&EmailConfig>,
     pool: &deadpool_postgres::Pool
-) -> Result<(String, String), Box<dyn std::error::Error>> {
+) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
 
     let l_successful:bool;
     let start = Instant::now();
@@ -242,9 +243,10 @@ pub async fn user_login(
         };
         println!("to_db   : {:>6} ms", start.elapsed().as_millis());
         let start = Instant::now();
+        let enable_2fa = user_login_info.twofa.map(|_| true).unwrap_or(false);
 
         let login_token = LoginToken {pool: pool.clone()};
-        let (session, csrf_token) = login_token.create_session(2700, username).await?;
+        let (session, csrf_token) = login_token.create_session(2700, username, enable_2fa).await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
 
         if let Some(m_config) = mail_config {
@@ -263,7 +265,7 @@ pub async fn user_login(
                 None => ()
             };
         }
-        Ok((session.session, csrf_token))
+        Ok((session.session, csrf_token, enable_2fa))
     }
     else {
         if !login_logs_to_db(pool, loginlogs).await {

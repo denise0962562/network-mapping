@@ -96,5 +96,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::task::get_task)
         .service(handlers::utils::update_rir)
         .service(user::user_logout)
+        .service(handlers::user::verify_totp_h)
+        .service(handlers::user::bind_twofa_h)
         .default_service(web::to(handlers::utils::not_found));
 }

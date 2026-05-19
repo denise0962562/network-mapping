@@ -3,7 +3,7 @@ use tracing::{info, warn};
 use lettre::{Message, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 // use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 use totp_rs::{Algorithm, Secret, TOTP};
 
 use crate::{AddUserInfo, config::EmailConfig};
@@ -167,24 +167,44 @@ pub async fn send_email(
 pub async fn totp_struct(
     username: String,
     pool: &deadpool_postgres::Pool
-) -> Result<TOTP, Box<dyn std::error::Error>> {
+) -> Result<Option<TOTP>, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
-    if let Some(r) = c.query_opt(
+    // match c.query_opt(
+    //     "SELECT id, totp_secret FROM users WHERE limit_login = false AND enable_2fa = true AND username = $1;",
+    //     &[&username]
+    // ).await? {
+    //     Ok(Some(
+    //         TOTP::new(
+    //         Algorithm::SHA1, 
+    //         6, 
+    //         1, 
+    //         30, 
+    //         Secret::Encoded(r.get::<_, String>("totp_secret")).to_bytes()?, 
+    //         Some("Network Mapping".to_string()), 
+    //         username
+    //     )?)),
+    //     Err(e)
+    // } 
+
+    match c.query_opt(
         "SELECT id, totp_secret FROM users WHERE limit_login = false AND enable_2fa = true AND username = $1;",
         &[&username]
     ).await? {
-        Ok(
-            TOTP::new(
-            Algorithm::SHA1, 
-            6, 
-            1, 
-            30, 
-            Secret::Encoded(r.get::<_, String>("totp_secret")).to_bytes()?, 
-            Some("Network Mapping".to_string()), 
-            username
-        )?)
-    } else {
-        Err("查找用户的 totp secret 错误".into())
+        Some(r) => {
+            Ok(Some(
+                TOTP::new(
+                Algorithm::SHA1, 
+                6, 
+                1, 
+                30, 
+                Secret::Encoded(r.get::<_, String>("totp_secret")).to_bytes()?, 
+                Some("Network Mapping".to_string()), 
+                username
+            )?))
+        },
+        None => {
+            Ok(None)
+        }
     }
 
 }
@@ -196,7 +216,7 @@ pub async fn check_twofa_bind(
     pool: &deadpool_postgres::Pool
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let database_conn = pool.get().await?;
-    if let Some(r) = database_conn.query_opt(
+    if let Some(_r) = database_conn.query_opt(
         "SELECT username FROM users WHERE username = $1 AND enable_2fa = true AND totp_secret <> NULL;",
         &[&username]
     ).await? {
@@ -228,11 +248,12 @@ pub async fn bind_twofa(
     let mut c = pool.get().await?;
     let transaction = c.transaction().await?;
     let _r = transaction.execute(
-        "INSERT INTO users (totp_secret) VALUES ($1) WHERE username = $2;",
+        "UPDATE users SET totp_secret = $1 AND enable_2fa = true WHERE username = $2;",
 
         // 此处的 secret32 是经过 base32 编码后的数据
         &[&secret32.to_encoded().to_string(), &username]
     ).await?;
+    transaction.commit().await?;
     println!("otpauth url:{}", url);
 
     Ok(url)
