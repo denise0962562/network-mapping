@@ -71,7 +71,7 @@ async fn create_task(
 
     let database_conn = pool.get_ref();
 
-    let (user_id, user_name) = match get_user_id_and_name(session_str, database_conn).await {
+    let (user_id, _u_role, user_name) = match get_user_id_and_name(session_str, database_conn).await {
         Ok(o) => o,
         Err(e) => {
             error_logs(&req, "SEARCH-USER-ERROR", &e.to_string());

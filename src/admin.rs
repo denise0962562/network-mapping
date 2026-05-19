@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 use lettre::{Message, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 // use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
@@ -33,6 +33,12 @@ pub struct TotpInfo {
 pub struct VerifyTotp {
     pub username: String,
     pub token: String
+}
+
+/// 接受解绑 2FA 信息
+#[derive(Deserialize)]
+pub struct Unbind2FAH {
+    pub username: String
 }
 
 
@@ -72,16 +78,16 @@ pub async fn is_user_exist(username: &str, pool: &deadpool_postgres::Pool) -> Re
 /// 
 /// FIXME 需要解决 pool 类型错误问题
 pub async fn get_user_id_and_name<'a>(
-    seeion: &'a str,
+    session: &'a str,
     pool: &deadpool_postgres::Pool
-) -> Result<(i32, String), Box<dyn std::error::Error>> {
+) -> Result<(i32, i32, String), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     let row = client.query_one(
-        "SELECT s.user_id, u.username FROM session s CROSS JOIN users u WHERE s.token = $1 AND s.is_enable = True AND u.limit_login = False AND s.user_id = u.id;", 
-        &[&seeion]
+        "SELECT s.user_id, u.username, u.role FROM session s CROSS JOIN users u WHERE s.token = $1 AND s.is_enable = True AND u.limit_login = False AND s.user_id = u.id;", 
+        &[&session]
     ).await?;
 
-    Ok((row.get::<_, i32>("user_id"), row.get::<_, String>("username")))
+    Ok((row.get::<_, i32>("user_id"), row.get::<_, i32>("role"), row.get::<_, String>("username")))
 }
 
 /// 检查系统用户数量，该操作在系统启动前执行。
@@ -169,22 +175,6 @@ pub async fn totp_struct(
     pool: &deadpool_postgres::Pool
 ) -> Result<Option<TOTP>, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
-    // match c.query_opt(
-    //     "SELECT id, totp_secret FROM users WHERE limit_login = false AND enable_2fa = true AND username = $1;",
-    //     &[&username]
-    // ).await? {
-    //     Ok(Some(
-    //         TOTP::new(
-    //         Algorithm::SHA1, 
-    //         6, 
-    //         1, 
-    //         30, 
-    //         Secret::Encoded(r.get::<_, String>("totp_secret")).to_bytes()?, 
-    //         Some("Network Mapping".to_string()), 
-    //         username
-    //     )?)),
-    //     Err(e)
-    // } 
 
     match c.query_opt(
         "SELECT id, totp_secret FROM users WHERE limit_login = false AND enable_2fa = true AND username = $1;",
@@ -206,7 +196,6 @@ pub async fn totp_struct(
             Ok(None)
         }
     }
-
 }
 
 /// 检查 2FA 是否已绑定
@@ -278,5 +267,43 @@ pub async fn totp_token_verify(
     else {
         println!("验证失败");
         Ok(false)
+    }
+}
+
+/// 解除 2FA 绑定
+/// 
+/// **该操作只能由管理员操作**,
+/// 且需要调用者做权限判断
+pub async fn unbind_2fa(
+    username: &str,
+    pool: &deadpool_postgres::Pool
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut c = pool.get().await?;
+    let db_transaction = c.transaction().await?;
+    let r =  db_transaction.execute(
+        "UPDATE users SET enable_2fa = false AND totp_secret = NULL WHERE username = $1;",
+        &[&username]
+    ).await?;
+    if r == 1 {
+        info!(
+            event = "Unbind2FASuccessful",
+            path = "fn unbind_2fa",
+            message = format!("用户 {} 解绑 2FA 成功", username)
+        );
+        Ok(true)
+    } else if r == 0 {
+        warn!(
+            event = "Unbind2FAWarning",
+            path = "fn unbind_2fa",
+            message = format!("用户 {} 没有绑定 2FA", username)
+        );
+        Ok(false)
+    } else {
+        error!(
+            event = "Unbind2FAfaild",
+            path = "fn unbind_2fa",
+            message = "数据库更新条目数不等于 0 和 1"
+        );
+        Err("数据库更新条目数不等于 0 和 1".into())
     }
 }
