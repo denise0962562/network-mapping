@@ -96,7 +96,7 @@ use crate::config::DatabaseConfig;
 
 ///获取系统信息基准测试
 #[get("/benchmark")]
-async fn benchmark_route(sys: web::Data<Systems>, pool: web::Data<deadpool_postgres::Pool>, db_config: web::Data<DatabaseConfig>) -> impl Responder {
+async fn benchmark_route(sys: web::Data<Systems>, pool: web::Data<&deadpool_postgres::Pool>, db_config: web::Data<DatabaseConfig>) -> impl Responder {
     benchmark(sys, pool, db_config.db_name.clone()).await;
     "Benchmark finished, check server logs."
 }

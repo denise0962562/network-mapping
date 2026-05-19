@@ -1,20 +1,22 @@
 
-use actix_web::{HttpRequest, dev::ConnectionInfo};
-use actix_web::web;
+use actix_web::{HttpRequest};
 use tracing::{warn, info, error};
-// use actix_session::storage::{SessionStore, SessionKey};
 use uuid::Uuid;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 use openssl::base64;
+use lettre::Message;
+use lettre::message::{Mailbox, header::ContentType};
 
-use crate::{get_conn_ip, login};
+use crate::config::EmailConfig;
+use crate::{UserLoginInfo, get_conn_ip};
 use crate::{
     get_unix_epoch_ms, 
     verify_password, 
     logs::LoginLog,
     logs::{write::login_logs_to_db}, 
-    get_password_and_id_from_database
+    get_password_and_id_from_database,
+    admin::send_email
 };
 
 pub struct LoginToken {
@@ -31,7 +33,7 @@ pub struct SessionInfo<'a> {
 
 impl LoginToken {
     ///生成一个session 和 csrftoken 并保存
-    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str) -> Result<(SessionInfo<'a>, String), Box<dyn std::error::Error>> {
+    pub async fn create_session<'a>(&self, ttl: i32, u_name: &'a str, enable_2fa: bool) -> Result<(SessionInfo<'a>, String), Box<dyn std::error::Error>> {
         let session = SessionInfo { 
             session: Uuid::new_v4().to_string(), 
             create_time: get_unix_epoch_ms(), 
@@ -51,8 +53,8 @@ impl LoginToken {
                 return Err(e.into())
             }
         };
-        match self.save(&session, &csrf_token_base64).await {
-            Ok(o) => {
+        match self.save(&session, &csrf_token_base64, enable_2fa).await {
+            Ok(_o) => {
                 info!(
                     event = "SuccessfulSaveSession",
                     message = "Successful Save Session "
@@ -83,7 +85,7 @@ impl LoginToken {
 
     ///保存一个token,
     /// 返回result，当成功时为OK
-    pub async fn save(&self, sessioninfo: &SessionInfo<'_>, csrftoken: &str) -> Result<(i32, i32), Box<dyn std::error::Error>> {
+    pub async fn save(&self, sessioninfo: &SessionInfo<'_>, csrftoken: &str, enable_2fa: bool) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
@@ -108,12 +110,13 @@ impl LoginToken {
         let userid: i32 = row.get("id");
         //插入一条session,其中包括了用户id token 有效时间，创建时间
         if let Some(r_rows) = transaction.query_opt(
-            "INSERT INTO session (user_id, token, csrf_token, ttl, create_time) VALUES ( $1, $2, $3, $4, $5 ) RETURNING id, user_id;",
+            "INSERT INTO session (user_id, token, csrf_token, ttl, totp_verify_successful, create_time) VALUES ( $1, $2, $3, $4, $5, $6 ) RETURNING id, user_id;",
             &[
                 &userid,
                 &sessioninfo.session,
                 &csrftoken,
                 &sessioninfo.ttl,
+                &!enable_2fa,
                 &sessioninfo.create_time
             ]
         ).await? {
@@ -134,7 +137,9 @@ impl LoginToken {
     /// 找到token且token还未过期时返回 true ，未找到或已过期时返回当返回值多于一行时返回错误
     pub async fn check_token(&self, session: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let client = self.pool.get().await?;
-        let stmt = client.prepare("SELECT token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true LIMIT 1;").await?;
+        let stmt = client.prepare(
+            "SELECT token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true AND totp_verify_successful = true LIMIT 1;"
+        ).await?;
 
         if let Some(r_s) = client.query_opt(&stmt, &[&session]).await? {
             let n_t = get_unix_epoch_ms();
@@ -172,14 +177,15 @@ pub async fn user_login(
     req: &HttpRequest,
     username: &str, 
     password: &str, 
+    mail_config: Option<&EmailConfig>,
     pool: &deadpool_postgres::Pool
-) -> Result<(String, String), Box<dyn std::error::Error>> {
+) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
 
     let l_successful:bool;
     let start = Instant::now();
 
     // 即使用户名不存在也校验密码，预防时序攻击
-    let (tmp_id, pwd_hash) = match get_password_and_id_from_database(pool, username).await {
+    let (tmp_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(pool, username).await {
         Ok(o) => {
             l_successful = true;
             o
@@ -191,7 +197,14 @@ pub async fn user_login(
                 path = "fn user_login",
                 message = %e
             );
-            (-1 as i32, format!("$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II"))
+            let t = UserLoginInfo {
+                username: String::new(),
+                role: -1,
+                email_address: None,
+                twofa: None
+            };
+            // FIXME 当用户不存在时会提供一个默认的校验，但是，如果用户自己调整了密码加密参数，则会导致默认提供的参数实际计算时间与用户其他的密码校验时间不一致
+            (-1 as i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), t)
         }
     };
     let get_pwd_h = start.elapsed();
@@ -214,6 +227,8 @@ pub async fn user_login(
         event_useage_userid: tmp_id,
         is_successful: false
     };
+
+    // 当用户不存在或者是查找用户错误时使用提供的默认密文校验密码
     if verify_password(password, &pwd_hash) && l_successful {
         
         let start = Instant::now();
@@ -228,11 +243,29 @@ pub async fn user_login(
         };
         println!("to_db   : {:>6} ms", start.elapsed().as_millis());
         let start = Instant::now();
+        let enable_2fa = user_login_info.twofa.map(|_| true).unwrap_or(false);
 
         let login_token = LoginToken {pool: pool.clone()};
-        let (session, csrf_token) = login_token.create_session(2700, username).await?;
+        let (session, csrf_token) = login_token.create_session(2700, username, enable_2fa).await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
-        Ok((session.session, csrf_token))
+
+        if let Some(m_config) = mail_config {
+            match user_login_info.email_address {
+                Some(mail_address) => {
+                    let mail_message = Message::builder()
+                        .from(Mailbox::new(Some("Network Mapping".to_string()), "test@mail.abdc.world".to_string().parse().unwrap()))
+                        .to(Mailbox::new(None, mail_address.parse().unwrap()))
+                        .subject("Test".to_string())
+                        .header(ContentType::TEXT_PLAIN)
+                        .body("登录成功".to_string())
+                        .unwrap();
+
+                    send_email(m_config, mail_message).await;
+                },
+                None => ()
+            };
+        }
+        Ok((session.session, csrf_token, enable_2fa))
     }
     else {
         if !login_logs_to_db(pool, loginlogs).await {

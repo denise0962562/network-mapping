@@ -5,45 +5,75 @@ use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
 use tracing::error;
 use crate::handlers::{ReceiveLoginInfo};
-use crate::login::user_login;
+use crate::login::{get_session_from_req, user_login};
 use crate::{TEXT_HTML_UTF_8};
-use crate::logs::write::{error_logs};
+use crate::logs::write::{error_logs, info_logs};
 use serde_json::json;
 use std::time::Instant;
-use crate::config::PasswordHashConfig;
+use crate::config::{EmailConfig, PasswordHashConfig};
 use crate::TemplatesInit;
+use crate::admin::{ReceiveAddUserInfo, VerifyTotp, bind_twofa, get_user_id_and_name, totp_struct, totp_token_verify};
 
-#[get("/add")]
+// BUG 暂时使用 bug 标签用于提示
+/// 该接口为测试阶段接口，用于快速创建账号，在生产环境下必须删除
+#[get("/test/adduser")]
 async fn first_add_user(
     pool: web::Data<deadpool_postgres::Pool>,
+    query_info: web::Query<ReceiveAddUserInfo>,
     pwd_hash_config: web::Data<PasswordHashConfig>
 ) -> impl Responder {
-    match admin::is_user_exist("admin", pool.clone()).await {
-        Ok(o) => {
-            if o {
-                println!("用户已存在");
-                HttpResponse::Ok()
-                    .content_type(TEXT_HTML_UTF_8)    
-                    .body("用户已存在".to_string())
-            }
-            else {
-                let p_hash = generate_hash_password("admin", pwd_hash_config.get_ref().clone());
-                match p_hash {
-                    Ok(o) => {
-                        let userinfo = AddUserInfo{
-                            username: "admin".to_string(),
-                            password_hash: o
-                        };
-                        let _ = admin::add_user(userinfo, pool).await;
-                        HttpResponse::Ok()
-                            .content_type(TEXT_HTML_UTF_8)
-                            .body("用户添加成功")
-                    },
-                    Err(e) => HttpResponse::BadRequest().body(format!("系统错误，生成密码hash错误\n{}", e))
+    let p = pool.get_ref();
+
+    match admin::is_user_exist(&query_info.username, p).await {
+        Ok(true) => {
+            HttpResponse::FailedDependency()
+                .content_type(TEXT_HTML_UTF_8)
+                .body("用户已存在")
+        },
+        Ok(false) => {
+            match generate_hash_password(&query_info.password, pwd_hash_config.get_ref().clone()) {
+                Ok(o) => {
+                    let userinfo = AddUserInfo{
+                        username: &query_info.username,
+                        password_hash: o.as_str(),
+                        role: query_info.role
+
+                    };
+                    match admin::add_user(userinfo, p).await {
+                        Ok(_) => {
+                            println!("添加用户：{}:{}", &query_info.username, &query_info.password);
+                            HttpResponse::Ok()
+                                .content_type(TEXT_HTML_UTF_8)
+                                .body("用户添加成功")
+                        },
+                        Err(e) => {
+                            println!("添加用户失败：{}:{}\n错误：{}", &query_info.username, &query_info.password, e.to_string());
+                            HttpResponse::InternalServerError()
+                                .content_type(TEXT_HTML_UTF_8)
+                                .body("添加用户失败")
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!(
+                        event = "GeneratePasswordHashError",
+                        path = "fn first_add_user",
+                        message = %e
+                    );
+                    HttpResponse::InternalServerError()
+                        .body("500")
                 }
             }
         },
-        Err(e) => HttpResponse::BadRequest().body(format!("系统错误\n{}", e))
+        Err(e) => {
+            error!(
+                event = "CheckUserError",
+                path = "fn first_add_user",
+                message = %e
+            );
+            HttpResponse::InternalServerError()
+                .body("500")
+        }
     }
 }
 
@@ -53,13 +83,15 @@ async fn first_add_user(
 async fn user_login_h(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
+    mail_config: web::Data<Option<EmailConfig>>,
     receiveinfo: web::Json<ReceiveLoginInfo>
 ) -> impl Responder {
     println!("================= Benchmark =================");
     let total_start = Instant::now();                                                  // 总的开始时间
     let start = Instant::now();                                                        // 登录函数开始时间
     let p = pool.get_ref();
-    let (t_session, csrf_token) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, p).await {
+    let m_c = mail_config.get_ref().as_ref();
+    let (t_session, csrf_token, enable_twofa) = match user_login(&req, &receiveinfo.username, &receiveinfo.password, m_c, p).await {
         Ok(o) => o,
         Err(e) => {
             let log_event = "LoginFaild";
@@ -84,10 +116,6 @@ async fn user_login_h(
         }
     };
 
-    let body = json!({
-        "success": true,
-        "message": "登录成功"
-    });
     let cookies = Cookie::build("session", &t_session)
         .path("/")
         .http_only(true)
@@ -108,17 +136,35 @@ async fn user_login_h(
     println!("Total   : {:>6} ms", total_es.as_millis());
     println!("Login_f : {:>6} ms", login_function.as_millis());
     println!("=============================================");
-    HttpResponse::Ok()
-        .cookie(cookies)
-        .cookie(cookie_csrf_token)
-        // .insert_header(("X-CSRF-Token", csrf_token))
-        // .insert_header((header::ACCESS_CONTROL_EXPOSE_HEADERS, "X-CSRF-Token"))
-        .json(body)
-
-    
+    match enable_twofa {
+        true => {
+            // 使用 401 Unauthorized 表示还需要继续验证 TOTP Token
+            HttpResponse::Unauthorized()
+                .cookie(cookies)
+                .cookie(cookie_csrf_token)
+                .json(
+                    json!({
+                        "success": true,
+                        "message": "请验证 2FA 验证码"
+                    })
+                )
+        },
+        false => {
+            HttpResponse::Ok()
+                .cookie(cookies)
+                .cookie(cookie_csrf_token)
+                .json(
+                    json!({
+                        "success": true,
+                        "message": "登录成功"
+                    })
+                )
+        }
+    }
 }
 
 
+/// 注销会话接口
 #[get("/logout")]
 async fn user_logout(
     req: HttpRequest,
@@ -151,9 +197,9 @@ async fn user_logout(
                     .finish()
             },
             Err(e) => {
-                error_logs(&req, "注销账号错误", e.to_string().as_str());
+                error_logs(&req, "注销会话错误", e.to_string().as_str());
                 let page = page_template.get_ref();
-                render_500(&req, page, "注销账号错误")
+                render_500(&req, page, "注销会话错误")
             }
         }
     }
@@ -162,4 +208,86 @@ async fn user_logout(
             .insert_header((header::LOCATION, "/login"))
             .finish()
     }
+}
+
+
+/// 绑定 2FA 验证器
+/// 
+/// 直接返回 optauth url
+#[get("/api/totp/bind")]
+async fn bind_twofa_h(
+    req: HttpRequest,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+
+    let pool_r = pool.get_ref();
+    let session = get_session_from_req(&req, "session").unwrap_or(String::new());
+    let (_, username) = match get_user_id_and_name(&session, pool_r).await {
+        Ok(tmp) => tmp,
+        Err(e) => {
+            error_logs(&req, "GetUserIdandNameError", &e.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    
+    match bind_twofa(username, pool_r).await {
+        Ok(tmp) => {
+            return HttpResponse::ImUsed()
+                .json(json!({"success": true, "data": tmp}))
+        },
+        Err(e) => {
+            error_logs(&req, "CreateOptauthUrlError", &e.to_string());
+            return HttpResponse::InternalServerError().finish()
+        }
+    }
+
+}
+
+
+
+/// 验证 TOTP Token 接口
+#[post("/api/totp/verify")]
+async fn verify_totp_h(
+    info: web::Json<VerifyTotp>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    req: HttpRequest
+) -> impl Responder {
+
+    if let Some(request_cookie) = get_session_from_req(&req, "session") {
+        let database_conn = pool.get_ref();
+        let (_, username) = match get_user_id_and_name(&request_cookie, database_conn).await {
+            Ok(id_and_name) => id_and_name,
+            Err(e) => {
+                error_logs(&req, "GetUserIdandNameError", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        };
+        let totp = match totp_struct(username, database_conn).await {
+            Ok(Some(tmp)) => tmp,
+            Ok(None) => {
+                info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);
+                return HttpResponse::NotFound();
+            },
+            Err(e) => {
+                error_logs(&req, "生成 TOTP 结构体错误", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        };
+
+        match totp_token_verify(totp, &info.token).await {
+            Ok(true) => HttpResponse::Ok(),
+            Ok(false) => {
+                info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
+                HttpResponse::Unauthorized()
+            },
+            Err(e) => {
+                error_logs(&req, "TOTPTokenVerifyError", &e.to_string());
+                HttpResponse::InternalServerError()
+            }
+        }
+    } else {
+        HttpResponse::Unauthorized()
+    }
+
 }

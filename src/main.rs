@@ -9,12 +9,12 @@ use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_status};
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
-use chrono::{Utc, Timelike};
-
+// use lettre::message::{Mailbox, header::ContentType};
+use rust_web_test::admin::{check_system_user};
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
-    
+
     let config = config::Config::from_file("config.toml");
     let server = config.server;
     let server_host = server.host;
@@ -61,13 +61,19 @@ async fn main() -> io::Result<()> {
         Err(e) => panic!("初始化数据库错误{}", e),
     };
 
+    println!("开始检查系统配置");
+
+    check_system_user(&db_pool).await;
+
     // 定义密码加密相关配置文件
     let pwd_h = config.pwd_hash;
 
+    let mail_c = config.email_config;
+
     let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).expect("SslAcceptor::mozilla_intermediate(SslMethod::tls_server()) ERROR");
-    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM).unwrap();
-    tls.set_certificate_chain_file("./ssl/cert.pem").unwrap();
-    tls.check_private_key().unwrap();
+    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM).expect("指定私钥文件错误");
+    tls.set_certificate_chain_file("./ssl/cert.pem").expect("指定证书文件错误");
+    tls.check_private_key().expect("私钥检查错误");
     
     let sys = Systems::new();  
     let sys_2 = sys.clone();
@@ -76,27 +82,29 @@ async fn main() -> io::Result<()> {
     println!("监听 {}:{}", server_host, server_port);
     println!("监听地址：{}\n端口：{}\n日志使用的目录：{}\n日志文件名：{}\n日志文件滚动周期模式：{}\n日志系统调试模式：{}", &server_host, &server_port, &log_file_directory, &log_file_name, &log.file_rolling, &log_debug_mode);
     println!("模板目录：{}\n模板文件名：{}", template_info.templates_directory, template_info.templates_name);
+    println!("系统信息采集频率：{}", log.status_duration);
 
+    // 暂时取消等待
     // 计算下一个 2 分钟整点
-    let now = Utc::now();
-    let next_minute = ((now.minute() / 2) + 1) * 2; // 下一个偶数分钟
-    let start_time = Utc::now()
-        .with_minute(next_minute % 60).unwrap()
-        .with_second(0).unwrap()
-        .with_nanosecond(0).unwrap();
+    // let now = Utc::now();
+    // let next_minute = ((now.minute() / 2) + 1) * 2; // 下一个偶数分钟
+    // let start_time = Utc::now()
+    //     .with_minute(next_minute % 60).unwrap()
+    //     .with_second(0).unwrap()
+    //     .with_nanosecond(0).unwrap();
 
-    let delay = (start_time.timestamp_millis() - now.timestamp_millis()) as u64;
+    // let delay = (start_time.timestamp_millis() - now.timestamp_millis()) as u64;
 
-    // 从整点开始，每 2 分钟 tick 一次
+    // 从整点开始，每隔一段时间 tick 一次，该时间由配置文件指定
     tokio::spawn(async move {
         let mut ticker = interval_at(
-            Instant::now() + Duration::from_millis(delay),
-            Duration::from_secs(120),
+            Instant::now() + Duration::from_millis(0),
+            Duration::from_secs(log.status_duration),
         );
 
         loop {
             ticker.tick().await;
-            match insert_system_status(pool.clone(), database_c.db_name.clone(), sys.clone()).await {
+            match insert_system_status(&db_pool, database_c.db_name.clone(), sys.clone()).await {
                 Ok(_) => (),
                 Err(e) => {
                     let message = format!("插入系统状态错误: {}", e);
@@ -114,12 +122,13 @@ async fn main() -> io::Result<()> {
     
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(db_pool.clone()))
+            .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(template_info.clone()))
             .app_data(web::Data::new(ReadFile{file_name: String::from("index.html"), file_root_directory: String::from("")}))
             .app_data(web::Data::new(sys_2.clone()))
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
+            .app_data(web::Data::new(mail_c.clone()))
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)

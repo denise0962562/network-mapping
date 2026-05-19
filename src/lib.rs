@@ -17,6 +17,7 @@ pub mod test;                                                 // 测试模块
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::{HttpRequest, web};
+use tokio_postgres::Row;
 use tracing::{error, info, warn};
 use std::path::{Path, PathBuf};
 use tera::{Tera, Context};
@@ -26,9 +27,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use tokio_postgres::types::ToSql;
-use uuid::{Uuid, uuid};
-use crate::db::{get_sql_from_file, SqlFile};
-use crate::logs::write::{error_logs, info_logs};
+use uuid::{Uuid};
 use regex::Regex;
 use std::time::Instant;
 use ipnet::{AddrParseError, IpNet};
@@ -36,7 +35,11 @@ use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifie
 use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
 use cidr::IpInet;
-use crate::config::PasswordHashConfig;
+use serde_json::Value;
+
+use db::{get_sql_from_file};
+use config::PasswordHashConfig;
+use admin::TotpInfo;
 
 //常量
 pub const TEXT_HTML_UTF_8: &str = "text/html; charset=utf-8";
@@ -58,9 +61,28 @@ pub struct _ProxySetting {
     _headers: String,
 }
 
-pub struct AddUserInfo {
+pub struct AddUserInfo<'a> {
+    pub username: &'a str,
+    pub password_hash: &'a str,
+    pub role: i32
+}
+
+
+impl<'a> AddUserInfo<'a> {
+    fn check(&self) -> Result<(),Box<dyn std::error::Error>> {
+        match self.role {
+            0..=2 => Ok(()),
+            _ => Err("角色值不符合规则".into())
+        }
+    }
+}
+
+
+pub struct UserLoginInfo {
     pub username: String,
-    pub password_hash: String,
+    pub role: i32,
+    pub email_address: Option<String>,
+    pub twofa: Option<TotpInfo>
 }
 
 pub struct ReadFile {
@@ -75,28 +97,28 @@ pub struct TemplatesInit {
 }
 
 //以下存储的数据都为约值，会自动舍弃精度
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DbResource {
     pub db_library_size: String,
     pub db_table_size: HashMap<String, DbTableSizeInfo>,
     pub db_conn: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DbTableSizeInfo {
     pub total: i64,
     pub data: i64,
     pub index: i64
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemCPU {
     pub cpu_usage: f32,                 //cpu总体使用率
     pub cpu: HashMap<String, f32>       //单个cpu使用率
 }
 
 //系统缓存大小，包括swap
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemRAM {
     pub total_ram: u64,
     pub used_ram: u64,
@@ -106,32 +128,33 @@ pub struct SystemRAM {
     pub swap_usage: f32
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemDisk {
     pub disk_total_space: u64,
     pub disk_total_usage: u64,
     pub disk: HashMap<String, Vec<u64>>
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemNetInfo {
     pub send: String,
     pub receive: String
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemNetwork {
     pub net: HashMap<String, SystemNetInfo>
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SystemResource {
-    pub server_run_time: u64,
+    pub server_run_time: i64,
     pub cpu: SystemCPU,
     pub ram: SystemRAM,
     pub disk: SystemDisk,
     pub db_postgresql: DbResource,
-    pub network: SystemNetwork
+    pub network: SystemNetwork,
+    pub create_at: Option<i64>
 }
 
 pub fn get_unix_epoch_ms() -> i64 {
@@ -255,7 +278,7 @@ impl SystemNetwork {
 }
 
 impl DbResource {
-    pub async fn new(pool: deadpool_postgres::Pool, sql_file_path: &str ) -> Self {
+    pub async fn new(pool: &deadpool_postgres::Pool, sql_file_path: &str ) -> Self {
         let client = pool.get().await;
         // let mut db_h: HashMap<String, String> = HashMap::new();
 
@@ -329,14 +352,15 @@ impl Default for DbTableSizeInfo  {
 }
 
 impl SystemResource {
-    pub async fn new(sys: Systems, pool: deadpool_postgres::Pool, db_name: String) -> Self {
+    pub async fn new(sys: Systems, pool: &deadpool_postgres::Pool, _db_name: String) -> Self {
         Self {
-            server_run_time: get_server_uptime(),
+            server_run_time: get_server_uptime() as i64,
             cpu: SystemCPU::new(sys.sys.clone()),
             ram: SystemRAM::new(sys.sys.clone()),
             disk: SystemDisk::new(sys.disk.clone()),
             db_postgresql: DbResource::new(pool, "source/database/").await,
-            network: SystemNetwork::new(sys.network.clone())
+            network: SystemNetwork::new(sys.network.clone()),
+            create_at: None
         }
     }
 }
@@ -473,7 +497,7 @@ impl<'a> STask<'a> {
     /// 返回一个 Result，当执行成功时返回 OK
     pub async fn add(
         &self,
-        pool: web::Data<deadpool_postgres::Pool>,
+        pool: &deadpool_postgres::Pool,
         level: i32,
         user_id: i32
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -606,9 +630,6 @@ fn get_server_uptime() -> u64 {
     sysinfo::System::uptime()
 }
 
-
-
-
 /// 生成 Argon2id 哈希
 /// 
 /// 用于添加用户
@@ -624,12 +645,36 @@ pub fn generate_hash_password(password: &str, config: PasswordHashConfig) -> Res
 pub async fn get_password_and_id_from_database(
     pool: &deadpool_postgres::Pool,
     username: &str
-) -> Result<(i32, String), Box<dyn std::error::Error>> {
+) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
-    if let Some(row) = client.query_opt("SELECT id, password FROM users WHERE username = $1", &[&username]).await? {
-        // let id: i32 = row.get("id");
-        // let pwd_hash: String = row.get("password");
-        Ok((row.get::<_, i32>("id"), row.get::<_, String>("password")))
+    if let Some(row) = client.query_opt(
+        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1", 
+        &[&username]
+    ).await? {
+        // TODO 需要改进，避免闭包获得所有权
+        let get_twofa_info = |row: Row| -> Option<TotpInfo> {
+            if row.get::<_, bool>("enable_2fa") {
+                Some(TotpInfo {
+                    username: row.get::<_, String>("username"),
+                    // email_address: row.get::<_, String>("email"),
+                    totp_secret: row.get::<_, String>("totp_secret")
+                })
+            } else {
+                None
+            }
+        };
+
+        let u_id = row.get::<_, i32>("id");
+        let u_pwd = row.get::<_, String>("password");
+
+        let userinfo = UserLoginInfo {
+            username: username.to_string(),
+            role: row.get::<_, i32>("role"),
+            email_address: row.get::<_, Option<String>>("email"),
+            twofa: get_twofa_info(row)
+        };
+
+        Ok((u_id, u_pwd, userinfo))
     }
     else {
         info!(
@@ -731,9 +776,9 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
 
 
 ///系统信息api基准测试
-pub async fn benchmark(sys: web::Data<Systems>, pool: web::Data<deadpool_postgres::Pool>, _db_name: String) {
+pub async fn benchmark(sys: web::Data<Systems>, pool: web::Data<&deadpool_postgres::Pool>, _db_name: String) {
     let total_start = Instant::now();
-    let pool = pool.get_ref().clone();
+    let pool = pool.get_ref();
 
     // CPU
     let start = Instant::now();
@@ -794,7 +839,7 @@ pub fn path_secure_join(root: &str, input: &str) -> Option<PathBuf> {
 
 ///向数据库插入系统数据
 pub async fn insert_system_status(
-    pool: deadpool_postgres::Pool, 
+    pool: &deadpool_postgres::Pool, 
     db_name: String,
     sys: Systems
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -880,7 +925,7 @@ pub struct ApplyTask {
 /// 通过该函数实现扫描器申请任务
 /// 首先搜索合适的任务，如果没有任务则会创建一个系统任务，该任务也会写入 scan_task 中
 pub async fn apply_task(
-    pool: web::Data<deadpool_postgres::Pool>,
+    pool: &deadpool_postgres::Pool,
     _scanner_id: web::Query<ApplyTaskQuery>
 ) -> Result<ApplyTask, Box<dyn std::error::Error>> {
     let p = pool.get().await?;
@@ -951,7 +996,7 @@ pub async fn log_out(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
     if let Some(tmp_r) = c.query_opt("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await? {
-        // let tmp_r = c.execute("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await?;
+
         info!(
             event = "UserLogout",
             path = "fn log_out",
@@ -986,6 +1031,7 @@ pub enum Permission {
     Users(i32)
 }
 
+/// 表示单个任务条目
 #[derive(Serialize)]
 pub struct TaskItem {
     pub task_id: String,
@@ -994,9 +1040,26 @@ pub struct TaskItem {
     pub task_port: String,
     pub task_create_time: i64,
     pub task_level: i32,
+    pub scanner_id: Option<Uuid>,
     pub start_at: Option<i64>,
     pub end_at: Option<i64>,
     pub remarks: Option<String>
+}
+
+/// 表示 Json 格式的任务列表
+#[derive(Serialize)]
+pub struct TaskItemJson {
+    pub total_c: i64,
+    pub item_c: i64,
+    pub start_id: i32,
+    pub task_item: Vec<TaskItem>
+}
+
+/// 该结构体表示接收查询任务列表信息
+#[derive(Deserialize)]
+pub struct ReceiveTaskItemQueryInfo {
+    pub start: Option<i32>,
+    pub count: Option<i64>,
 }
 
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
@@ -1005,28 +1068,45 @@ pub struct TaskItem {
 pub async fn get_task_item(
     pool: &deadpool_postgres::Pool,
     s_count: i64,
+    start_id: Option<i32>,
     permissions: Permission
-) -> Result<Vec<TaskItem>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<TaskItem>, i64, i64, i32), Box<dyn std::error::Error>> {
     let c = pool.get().await?;
 
     let row = match permissions {
         Permission::Administrator(_id) => {
-            c.query(
-                "SELECT * FROM scan_task ORDER BY id DESC LIMIT $1;",
-                &[&s_count]
-            ).await?
+            if let Some(st) = start_id {
+                c.query(
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE id <= $1 ORDER BY id DESC LIMIT $2;",
+                    &[&st, &s_count]
+                ).await?
+            }
+            else {
+                c.query(
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task ORDER BY id DESC LIMIT $1;",
+                    &[&s_count]
+                ).await?
+            }
+            
         },
         Permission::Users(u_id) => {
             c.query(
-                "SELECT * FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;", 
+                "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;", 
                 &[&u_id, &s_count]
             ).await?
         }
     };
 
     let mut task_item_r: Vec<TaskItem> = Vec::new();
+    let mut total_count_item: i64 = 0;
+    let mut count: i64 = 0;
+    let mut start_id: i32 = 0;
     
-    for r in row {
+    for (index, r) in row.iter().enumerate() {
+        if index == 0 {
+            start_id = r.get::<_, i32>("id");
+        }
+        total_count_item = r.get::<_, i64>("total_count");
         let titem = TaskItem {
             task_id: r.get::<_, String>("task_id"),
             task_target: r.get::<_, Vec<IpInet>>("task_target"),
@@ -1034,11 +1114,77 @@ pub async fn get_task_item(
             task_level: r.get::<_, i32>("task_level"),
             task_port: r.get::<_, String>("task_port"),
             task_create_time: r.get::<_, i64>("task_create_time"),
+            scanner_id: None,
             start_at: r.get::<_, Option<i64>>("task_start_time"),
             end_at: r.get::<_, Option<i64>>("task_end_time"),
             remarks: r.get::<_, Option<String>>("remarks")  
         };
         task_item_r.push(titem);
+        count += 1;
     }
-    Ok(task_item_r)
+    Ok((task_item_r, total_count_item, count, start_id))
+}
+
+
+/// 用于接收系统信息查询
+#[derive(Deserialize)]
+pub struct ReceiveSystemStatusInfo {
+    pub count: Option<i64>,
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SystemStatusJson {
+    pub total_c: i32,
+    pub status_item: Vec<SystemResource>
+}
+
+/// 获取系统状态信息
+pub async fn get_system_status_info(
+    start_at: Option<i64>,
+    end_at: Option<i64>,
+    count: i64,
+    pool: &deadpool_postgres::Pool
+) -> Result<(Vec<SystemResource>, i32), Box<dyn std::error::Error>> {
+    let connect = pool.get().await?;
+
+    let row = if start_at.is_some() || end_at.is_some() {
+        connect.query(
+            "SELECT * 
+                        FROM system_status 
+                        WHERE create_time BETWEEN 
+                            COALESCE($1, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                            AND 
+                            COALESCE($2, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                        ORDER BY id DESC 
+                        LIMIT $3;",
+            &[&start_at, &end_at, &count]
+        ).await?
+    }
+    else {
+        connect.query(
+            "SELECT * FROM system_status ORDER BY id DESC LIMIT $1;",
+            &[&count]
+        ).await?
+    };
+
+    let mut vec_status: Vec<SystemResource> = Vec::new();
+    let mut tmp_count: i32 = 0;
+
+    for r in row {
+        let tmp = SystemResource {
+            server_run_time: r.get::<_, i64>("server_run_time"),
+            cpu: serde_json::from_value(r.get::<_, Value>("cpu"))?,
+            ram: serde_json::from_value(r.get::<_, Value>("ram"))?,
+            disk: serde_json::from_value(r.get::<_, Value>("disk"))?,
+            db_postgresql: serde_json::from_value(r.get::<_, Value>("db_postgresql"))?,
+            network: serde_json::from_value(r.get::<_, Value>("network"))?,
+            create_at: Some(r.get::<_, i64>("create_time"))
+        };
+        tmp_count += 1;
+        vec_status.push(tmp);
+    }
+    Ok((vec_status, tmp_count))
+
 }

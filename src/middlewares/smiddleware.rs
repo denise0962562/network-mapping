@@ -1,5 +1,6 @@
 use std::future::{Ready, ready};
 use std::sync::Arc;
+use actix_web::HttpResponse;
 use actix_web::{
     body::EitherBody,                // 可以参见 https://docs.rs/actix-web/latest/actix_web/body/enum.EitherBody.html
     dev::{
@@ -13,10 +14,11 @@ use futures::future::LocalBoxFuture;
 
 use crate::login::get_session_from_req;
 use crate::login::{LoginToken};
+use crate::logs::write::info_logs;
 use tracing::{error, info};
 use crate::{TemplatesInit};
 
-use crate::middlewares::{get_pool_from_app_data, render_403, render_500, render_500_simple};
+use crate::middlewares::{get_pool_from_app_data, render_500, render_500_simple};
 
 /// 用于 session 检查的中间件的 Transform
 pub struct AuthMiddleware;
@@ -136,7 +138,9 @@ where
                                     svc.call(req).await?.map_into_left_body()
                             )},
                             Ok(false) => {
-                                let resp = render_403(req.request(), page_template, "数据库中未找到符合条件的 Session");
+                                info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session", false);
+                                let resp = HttpResponse::Unauthorized()
+                                    .body("401");
                                 Ok(
                                     req.into_response(resp).map_into_right_body()
                             )},
@@ -154,7 +158,9 @@ where
                         }
                     },
                     None => {
-                        let resp = render_403(req.request(), page_template, "没获取到 session");
+                        info_logs(req.request(), "InvalidSession", "未能从请求中获取到 Session", false);
+                        let resp = HttpResponse::Unauthorized()
+                            .body("401");
                         Ok(
                             req.into_response(resp).map_into_right_body()
                         )

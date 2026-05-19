@@ -15,7 +15,8 @@ pub struct Config {
     pub templates: TemplatesConfig,
     pub scan_target_generated: ScanTargetConfig,
     pub database: DatabaseConfig,
-    pub pwd_hash: PasswordHashConfig
+    pub pwd_hash: PasswordHashConfig,
+    pub email_config: Option<EmailConfig>
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +31,7 @@ pub struct LogConfig {
     pub file_name: String,
     pub file_rolling: u8,
     pub debug_mode: bool,
+    pub status_duration: u64
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +65,13 @@ pub struct PasswordHashConfig {
     pub p: u32                                     // 并行，最大可设置为 4294967295
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct EmailConfig {
+    pub host: String,
+    pub account_username: String,
+    pub account_password: String
+}
+
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
         let content = fs::read_to_string(path).expect("无法读取配置文件");
@@ -78,7 +87,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::utils::static_file_system)
         .service(Files::new("/static", "./static").show_files_listing().prefer_utf8(true))
         .service(handlers::utils::get_scan_target)
-        .service(handlers::data_saa::get_system_data)
+        .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
         .service(handlers::data_saa::render_dashboard_page)
         .service(handlers::task::create_task)
@@ -87,5 +96,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::task::get_task)
         .service(handlers::utils::update_rir)
         .service(user::user_logout)
+        .service(handlers::user::verify_totp_h)
+        .service(handlers::user::bind_twofa_h)
         .default_service(web::to(handlers::utils::not_found));
 }

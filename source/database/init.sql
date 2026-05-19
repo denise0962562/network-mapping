@@ -5,12 +5,14 @@ CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(200) NOT NULL UNIQUE,
     password TEXT NOT NULL,
-	permissions INT,                                                                      -- 用户的权限级别
+	role INT,                                                                             -- 用户的权限级别，INT4 值，从 0-2 分别为系统、管理员、普通用户
+	email TEXT,
     create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,    -- 用户的创建时间
 	limit_login boolean DEFAULT false,                                                    -- 表示用户是否是被限制登录，既可以表示系统用户永远无法登录以及该账号是否因为密码错误而临时禁止登录
 	limit_at BIGINT,                                                                      -- 限制登录操作产生的时间
 	limit_time INT,                                                                       -- 限制登录时间，单位为 秒 
 	enable_2fa boolean DEFAULT false,                                                     -- 表示用户是否启用了 2FA
+	totp_secret TEXT,                                                                     -- TOTP 密钥
 	last_login_at BIGINT,                                                                 -- 表示该用户最后一次登录的时间
 	last_login_ip INET,                                                                   -- 最后一次登录的 IP 地址
 	login_error_count INT,                                                                -- 登录错误的次数
@@ -92,6 +94,7 @@ CREATE TABLE IF NOT EXISTS session (
 	token TEXT NOT NULL,
 	csrf_token TEXT NOT NULL,
 	ttl INT DEFAULT 1200, 
+	totp_verify_successful boolean DEFAULT false,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
 	is_enable boolean DEFAULT true
 );
@@ -102,7 +105,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, 
 
 -- 表 system_status 用于存储系统状态数据
 CREATE TABLE IF NOT EXISTS system_status (
-	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,
+	id SERIAL PRIMARY KEY,
+	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,   -- 为了便于筛选，使用秒级 UNIX 时间戳
 	server_run_time BIGINT DEFAULT 0,
 	cpu JSONB DEFAULT NULL,
 	ram JSONB DEFAULT NULL,
@@ -259,3 +263,12 @@ CREATE TABLE IF NOT EXISTS isp (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_isp_unique_hash ON isp (unique_hash);
+
+-- 存放配置
+CREATE TABLE IF NOT EXISTS setting (
+	type TEXT,
+	key TEXT,
+	value TEXT,
+	create_at TIMESTAMPTZ DEFAULT NOW(),
+	update_at TIMESTAMPTZ
+)
