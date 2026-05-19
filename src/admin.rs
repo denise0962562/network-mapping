@@ -270,6 +270,32 @@ pub async fn totp_token_verify(
     }
 }
 
+/// totp 验证状态更改
+pub async fn totp_verify_status_change(
+    session: &str,
+    pool: &deadpool_postgres::Pool
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = pool.get().await?;
+    let db_transaction = conn.transaction().await?;
+    let r = db_transaction.execute(
+        "UPDATE session SET totp_verify_successful = true WHERE token = $1;",
+        &[&session]
+    ).await?;
+    if r == 0 {
+        warn!(
+            event = "ChangeTotpStatus",
+            path = "fn totp_verify_status_change",
+            message = "没有更改 totp verify 状态"
+        );
+        Ok(())
+    } else if r == 1 {
+        db_transaction.commit().await?;
+        Ok(())
+    } else {
+        Err(format!("更改 totp verify status 影响 {} 行", r).into())
+    }
+}
+
 /// 解除 2FA 绑定
 /// 
 /// **该操作只能由管理员操作**,

@@ -5,6 +5,7 @@ use tracing::error;
 use serde_json::json;
 use std::time::Instant;
 
+use crate::admin::totp_verify_status_change;
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
@@ -285,7 +286,10 @@ async fn verify_totp_h(
         };
 
         match totp_token_verify(totp, &info.token).await {
-            Ok(true) => HttpResponse::Ok(),
+            Ok(true) => {
+                totp_verify_status_change(&request_cookie, database_conn).await.map(|_| HttpResponse::Ok()).unwrap_or(HttpResponse::InternalServerError())
+                // HttpResponse::Ok()
+            },
             Ok(false) => {
                 info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
                 HttpResponse::Unauthorized()

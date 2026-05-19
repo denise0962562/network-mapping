@@ -68,7 +68,7 @@ where
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = vec!["/api", "/dashboard"];
         // 白名单
-        let white_path = vec!["/api/login"];
+        let white_path = vec!["/api/login", "/api/totp/verify"];
         let path = req.path().to_owned();
         let svc = self.service.clone();
 
