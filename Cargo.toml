@@ -17,11 +17,12 @@ tracing-appender = "0.2"
 rand = "0.9"
 tokio-postgres = { version = "0.7", features = ["array-impls", "with-cidr-0_3"]}
 cidr = { version = "0.3", features = ["serde"]}
-deadpool-postgres = "0.14"
+deadpool-postgres = { version = "0.14"}
 deadpool = "0.12"
 argon2 = "0.5"
 password-hash = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tokio = { version = "1", features = ["full"] }
+#tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
 uuid = { version = "1.18", features = ["v4", "v7", "serde"]}
 sysinfo = "0.38"
 chrono = {version = "0.4", features = ["serde"]}
@@ -33,6 +34,7 @@ regex = "1.12"
 openssl = "0.10"
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "pool"]}
 totp-rs = { version = "5.7", features = ["gen_secret", "qr"]}
+postgres-from-row = "0.5"
 
 [profile.dev]
 opt-level = 0

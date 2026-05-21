@@ -5,7 +5,7 @@ use tracing::error;
 use serde_json::json;
 use std::time::Instant;
 
-use crate::admin::totp_verify_status_change;
+use crate::admin::{GetUserInfoH, get_user_info, totp_verify_status_change};
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
@@ -342,4 +342,54 @@ async fn unbind_2fa_h(
         HttpResponse::Unauthorized()
     }
     
+}
+
+/// 获取用户信息
+/// 
+#[get("/api/userinfo/get")]
+async fn get_user_info_h(
+    req: HttpRequest,
+    info: web::Query<GetUserInfoH>,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_ref = pool.get_ref();
+
+    if let Some(session) = get_session_from_req(&req, "session") {
+        let (_id, u_role, username) = match get_user_id_and_name(&session, pool_ref).await {
+            Ok(o) => o,
+            Err(e) => {
+                error_logs(&req, "GetUserIdandNameError", &e.to_string());
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+
+        let t_username = if info.list.unwrap_or(false) {
+            // 当 list 存在且为 true 时不会指定用户名
+            None
+        } else if u_role == 1 {
+
+            // 管理员可以查询所有用户，如果没有指定则查询自己的信息
+            Some(info.username.as_deref().unwrap_or(username.as_str()))
+        } else if u_role == 2 {
+
+            // 普通用户只能查询自己的信息
+            Some(username.as_str())
+        } else {
+            error_logs(&req, "GetUserInfoError", format!("role: {}, 错误的权限", u_role).as_str());
+            return HttpResponse::InternalServerError().finish()
+        };
+
+        match get_user_info(u_role, t_username, info.count.map(|c| c as i64), pool_ref).await {
+            Ok(data) => {
+                HttpResponse::Ok()
+                    .json(data)
+            },
+            Err(e) => {
+                error_logs(&req, "GetUserInfoError", &e.to_string());
+                HttpResponse::InternalServerError().finish()
+            }
+        }
+    } else {
+        HttpResponse::Unauthorized().finish()
+    }
 }

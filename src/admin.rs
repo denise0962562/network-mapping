@@ -1,10 +1,12 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error};
 use lettre::{Message, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 // use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use std::time::{SystemTime, UNIX_EPOCH};
 use totp_rs::{Algorithm, Secret, TOTP};
+use postgres_from_row::FromRow;
+use cidr::IpInet;
 
 use crate::{AddUserInfo, config::EmailConfig};
 
@@ -332,4 +334,64 @@ pub async fn unbind_2fa(
         );
         Err("数据库更新条目数不等于 0 和 1".into())
     }
+}
+
+#[derive(Deserialize)]
+pub struct GetUserInfoH {
+    pub username: Option<String>,
+    pub list: Option<bool>,
+    pub count: Option<u32>                          // 通过限制数据类型避免负数
+}
+
+#[derive(Deserialize, FromRow, Serialize)]
+pub struct UserInfo {
+    pub id: i32,
+    pub username: String,
+    pub role: i32,
+    pub email: Option<String>,
+    pub create_time: i64,
+    pub limit_login: bool,
+    pub limit_at: Option<i64>,
+    pub limit_time: Option<i32>,
+    pub enable_2fa: bool,
+    pub last_login_at: Option<i64>,
+    pub last_login_ip: Option<IpInet>,
+    pub login_error_count: Option<i32>,
+    pub last_error_at: Option<i64>
+}
+
+/// 获取用户信息
+/// 
+/// 当权限足够时可以通过将 username 设置为 None 来获取所有用户信息，
+/// 条目限制默认 5 条
+pub async fn get_user_info(
+    role: i32,
+    username: Option<&str>,
+    limit_iteams: Option<i64>,
+    pool: &deadpool_postgres::Pool
+) -> Result<Vec<UserInfo>, Box<dyn std::error::Error>> {
+    let database_conn = pool.get().await?;
+    let limit_i = limit_iteams.unwrap_or(5);
+
+    let r = match (role, username) {
+        (1, None) => {
+            database_conn.query(
+                "SELECT id, username, role, email, create_time, limit_login, limit_at, limit_time, enable_2fa, last_login_at, last_login_ip, login_error_count, last_error_at FROM users LIMIT $1;",
+                &[&limit_i]
+            ).await?
+        },
+        (1 | 2, Some(username_t)) => {
+            database_conn.query(
+                "SELECT id, username, role, email, create_time, limit_login, limit_at, limit_time, enable_2fa, last_login_at, last_login_ip, login_error_count, last_error_at FROM users WHERE username = $1 LIMIT 1;",
+                &[&username_t]
+            ).await?
+        },
+        _ => return Err("没有对应的权限".into())
+    };
+
+    Ok( 
+        r.iter().map(|row| -> UserInfo {
+            FromRow::from_row(row)
+        }).collect()
+    )
 }
