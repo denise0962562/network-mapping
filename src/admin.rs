@@ -239,7 +239,7 @@ pub async fn bind_twofa(
     let mut c = pool.get().await?;
     let transaction = c.transaction().await?;
     let _r = transaction.execute(
-        "UPDATE users SET totp_secret = $1 AND enable_2fa = true WHERE username = $2;",
+        "UPDATE users SET totp_secret = $1, enable_2fa = true WHERE username = $2;",
 
         // 此处的 secret32 是经过 base32 编码后的数据
         &[&secret32.to_encoded().to_string(), &username]
@@ -309,7 +309,7 @@ pub async fn unbind_2fa(
     let mut c = pool.get().await?;
     let db_transaction = c.transaction().await?;
     let r =  db_transaction.execute(
-        "UPDATE users SET enable_2fa = false AND totp_secret = NULL WHERE username = $1;",
+        "UPDATE users SET enable_2fa = false, totp_secret = NULL WHERE username = $1;",
         &[&username]
     ).await?;
     if r == 1 {
@@ -394,4 +394,57 @@ pub async fn get_user_info(
             FromRow::from_row(row)
         }).collect()
     )
+}
+
+/// 用户基础信息
+#[derive(Deserialize)]
+pub struct UserBaseInfo {
+    pub username: String,
+    pub email: String
+}
+
+/// 更新用户信息
+/// 
+pub async fn update_user_info(
+    username: &str,
+    role: i32,
+    new_user_info: &UserBaseInfo,
+    pool: &deadpool_postgres::Pool
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut database_conn = pool.get().await?;
+    let conn_transaction = database_conn.transaction().await?;
+
+    let result = conn_transaction.execute(
+        "UPDATE users SET username = $1, email = $2 WHERE username = $3 AND role = $4;",
+        &[&new_user_info.username, &new_user_info.email, &username, &role]
+    ).await?;
+
+    match result {
+
+        // 更改成功
+        1 => {
+            conn_transaction.commit().await?;
+            Ok(())
+        },
+        
+        // 没有更改任何条目
+        0 => {
+            warn!(
+                event = "UpdateUserInfo",
+                path = "fn update_user_info",
+                message = "没有更改任何条目，可能是该用户不存在或数据异常"
+            );
+            Ok(())
+        },
+
+        // 更改了多行，这是不允许的，所以不会提交事务
+        _ => {
+            error!(
+                event = "UpdateUserInfo",
+                path = "fn update_user_info",
+                message = "更改了多行"
+            );
+            Err("更改了多行".into())
+        }
+    }
 }

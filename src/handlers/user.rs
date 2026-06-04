@@ -5,7 +5,7 @@ use tracing::error;
 use serde_json::json;
 use std::time::Instant;
 
-use crate::admin::{GetUserInfoH, get_user_info, totp_verify_status_change};
+use crate::admin::{GetUserInfoH, UserBaseInfo, get_user_info, totp_verify_status_change, update_user_info};
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
@@ -304,6 +304,7 @@ async fn verify_totp_h(
     }
 }
 
+
 /// 解绑 2FA ，该操作只能由管理员设置
 /// 
 #[post("/api/totp/unbind")]
@@ -343,6 +344,7 @@ async fn unbind_2fa_h(
     }
     
 }
+
 
 /// 获取用户信息
 /// 
@@ -391,5 +393,39 @@ async fn get_user_info_h(
         }
     } else {
         HttpResponse::Unauthorized().finish()
+    }
+}
+
+
+/// 更新用户信息
+///
+#[post("/api/userinfo/update")]
+async fn update_user_info_h(
+    req: HttpRequest,
+    new_user_i: web::Json<UserBaseInfo>,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_ref = pool.get_ref();
+
+    if let Some(session) = get_session_from_req(&req, "session") {
+        let (_id, u_role, username) = match get_user_id_and_name(&session, pool_ref).await {
+            Ok(o) => o,
+            Err(e) => {
+                error_logs(&req, "GetUserIdandNameError", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        };
+        match update_user_info(&username, u_role, &new_user_i, pool_ref).await {
+            Ok(()) => {
+                HttpResponse::Ok()
+            },
+            Err(e) => {
+                error_logs(&req, "UpdateUserInfoError", &e.to_string());
+                HttpResponse::InternalServerError()
+            }
+        }
+
+    } else {
+        HttpResponse::Unauthorized()
     }
 }

@@ -3,3 +3,4 @@ scanner/
 /logs/
 .vscode/
 ssl/
+.codegraph/
