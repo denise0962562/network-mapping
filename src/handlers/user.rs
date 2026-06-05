@@ -1,18 +1,29 @@
-use crate::middlewares::render_500;
-use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
 use tracing::error;
+use serde_json::json;
+use std::time::Instant;
+
+use crate::admin::{GetUserInfoH, UserBaseInfo, get_user_info, totp_verify_status_change, update_user_info};
+use crate::middlewares::render_500;
+use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
 use crate::login::{get_session_from_req, user_login};
 use crate::{TEXT_HTML_UTF_8};
 use crate::logs::write::{error_logs, info_logs};
-use serde_json::json;
-use std::time::Instant;
 use crate::config::{EmailConfig, PasswordHashConfig};
 use crate::TemplatesInit;
-use crate::admin::{ReceiveAddUserInfo, VerifyTotp, bind_twofa, get_user_id_and_name, totp_struct, totp_token_verify};
+use admin::{
+    ReceiveAddUserInfo, 
+    Unbind2FAH, 
+    VerifyTotp, 
+    bind_twofa, 
+    get_user_id_and_name, 
+    totp_struct, 
+    totp_token_verify, 
+    unbind_2fa
+};
 
 // BUG 暂时使用 bug 标签用于提示
 /// 该接口为测试阶段接口，用于快速创建账号，在生产环境下必须删除
@@ -222,7 +233,7 @@ async fn bind_twofa_h(
 
     let pool_r = pool.get_ref();
     let session = get_session_from_req(&req, "session").unwrap_or(String::new());
-    let (_, username) = match get_user_id_and_name(&session, pool_r).await {
+    let (_u_id, _u_role, username) = match get_user_id_and_name(&session, pool_r).await {
         Ok(tmp) => tmp,
         Err(e) => {
             error_logs(&req, "GetUserIdandNameError", &e.to_string());
@@ -245,7 +256,6 @@ async fn bind_twofa_h(
 }
 
 
-
 /// 验证 TOTP Token 接口
 #[post("/api/totp/verify")]
 async fn verify_totp_h(
@@ -256,7 +266,7 @@ async fn verify_totp_h(
 
     if let Some(request_cookie) = get_session_from_req(&req, "session") {
         let database_conn = pool.get_ref();
-        let (_, username) = match get_user_id_and_name(&request_cookie, database_conn).await {
+        let (_, _, username) = match get_user_id_and_name(&request_cookie, database_conn).await {
             Ok(id_and_name) => id_and_name,
             Err(e) => {
                 error_logs(&req, "GetUserIdandNameError", &e.to_string());
@@ -276,7 +286,10 @@ async fn verify_totp_h(
         };
 
         match totp_token_verify(totp, &info.token).await {
-            Ok(true) => HttpResponse::Ok(),
+            Ok(true) => {
+                totp_verify_status_change(&request_cookie, database_conn).await.map(|_| HttpResponse::Ok()).unwrap_or(HttpResponse::InternalServerError())
+                // HttpResponse::Ok()
+            },
             Ok(false) => {
                 info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
                 HttpResponse::Unauthorized()
@@ -289,5 +302,130 @@ async fn verify_totp_h(
     } else {
         HttpResponse::Unauthorized()
     }
+}
 
+
+/// 解绑 2FA ，该操作只能由管理员设置
+/// 
+#[post("/api/totp/unbind")]
+async fn unbind_2fa_h(
+    req: HttpRequest,
+    unbind_info: web::Json<Unbind2FAH>,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_c = pool.get_ref();
+
+    if let Some(session) = get_session_from_req(&req, "session") {
+        let (_id, u_role, _username) = match get_user_id_and_name(&session, pool_c).await {
+            Ok(o) => o,
+            Err(e) => {
+                error_logs(&req, "GetUserIdandNameError", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        };
+        if u_role != 1 {
+            return HttpResponse::Forbidden();
+        };
+        match unbind_2fa(&unbind_info.username, pool_c).await {
+            Ok(true) => {
+                info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功", false);
+                HttpResponse::Ok()
+            },
+            Ok(false) => {
+                HttpResponse::NotFound()
+            },
+            Err(e) => {
+                error_logs(&req, "Unbind2FAfaild", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        }
+    } else {
+        HttpResponse::Unauthorized()
+    }
+    
+}
+
+
+/// 获取用户信息
+/// 
+#[get("/api/userinfo/get")]
+async fn get_user_info_h(
+    req: HttpRequest,
+    info: web::Query<GetUserInfoH>,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_ref = pool.get_ref();
+
+    if let Some(session) = get_session_from_req(&req, "session") {
+        let (_id, u_role, username) = match get_user_id_and_name(&session, pool_ref).await {
+            Ok(o) => o,
+            Err(e) => {
+                error_logs(&req, "GetUserIdandNameError", &e.to_string());
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+
+        let t_username = if info.list.unwrap_or(false) {
+            // 当 list 存在且为 true 时不会指定用户名
+            None
+        } else if u_role == 1 {
+
+            // 管理员可以查询所有用户，如果没有指定则查询自己的信息
+            Some(info.username.as_deref().unwrap_or(username.as_str()))
+        } else if u_role == 2 {
+
+            // 普通用户只能查询自己的信息
+            Some(username.as_str())
+        } else {
+            error_logs(&req, "GetUserInfoError", format!("role: {}, 错误的权限", u_role).as_str());
+            return HttpResponse::InternalServerError().finish()
+        };
+
+        match get_user_info(u_role, t_username, info.count.map(|c| c as i64), pool_ref).await {
+            Ok(data) => {
+                HttpResponse::Ok()
+                    .json(data)
+            },
+            Err(e) => {
+                error_logs(&req, "GetUserInfoError", &e.to_string());
+                HttpResponse::InternalServerError().finish()
+            }
+        }
+    } else {
+        HttpResponse::Unauthorized().finish()
+    }
+}
+
+
+/// 更新用户信息
+///
+#[post("/api/userinfo/update")]
+async fn update_user_info_h(
+    req: HttpRequest,
+    new_user_i: web::Json<UserBaseInfo>,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_ref = pool.get_ref();
+
+    if let Some(session) = get_session_from_req(&req, "session") {
+        let (_id, u_role, username) = match get_user_id_and_name(&session, pool_ref).await {
+            Ok(o) => o,
+            Err(e) => {
+                error_logs(&req, "GetUserIdandNameError", &e.to_string());
+                return HttpResponse::InternalServerError();
+            }
+        };
+        match update_user_info(&username, u_role, &new_user_i, pool_ref).await {
+            Ok(()) => {
+                HttpResponse::Ok()
+            },
+            Err(e) => {
+                error_logs(&req, "UpdateUserInfoError", &e.to_string());
+                HttpResponse::InternalServerError()
+            }
+        }
+
+    } else {
+        HttpResponse::Unauthorized()
+    }
 }

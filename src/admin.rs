@@ -1,11 +1,14 @@
-use serde::Deserialize;
-use tracing::{info, warn};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn, error};
 use lettre::{Message, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 // use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use std::time::{SystemTime, UNIX_EPOCH};
 use totp_rs::{Algorithm, Secret, TOTP};
+use postgres_from_row::FromRow;
+use cidr::IpInet;
 
+use crate::config::SystemConfig;
 use crate::{AddUserInfo, config::EmailConfig};
 
 /// 该结构体用于接收测试使用的创建用户信息
@@ -17,9 +20,9 @@ pub struct ReceiveAddUserInfo {
 }
 
 pub enum UserRole {
-    System,
-    Administrator,
-    User
+    System = 0,
+    Administrator = 1,
+    User = 2
 }
 
 /// TOTP 相关信息
@@ -33,6 +36,12 @@ pub struct TotpInfo {
 pub struct VerifyTotp {
     pub username: String,
     pub token: String
+}
+
+/// 接受解绑 2FA 信息
+#[derive(Deserialize)]
+pub struct Unbind2FAH {
+    pub username: String
 }
 
 
@@ -72,16 +81,16 @@ pub async fn is_user_exist(username: &str, pool: &deadpool_postgres::Pool) -> Re
 /// 
 /// FIXME 需要解决 pool 类型错误问题
 pub async fn get_user_id_and_name<'a>(
-    seeion: &'a str,
+    session: &'a str,
     pool: &deadpool_postgres::Pool
-) -> Result<(i32, String), Box<dyn std::error::Error>> {
+) -> Result<(i32, i32, String), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     let row = client.query_one(
-        "SELECT s.user_id, u.username FROM session s CROSS JOIN users u WHERE s.token = $1 AND s.is_enable = True AND u.limit_login = False AND s.user_id = u.id;", 
-        &[&seeion]
+        "SELECT s.user_id, u.username, u.role FROM session s CROSS JOIN users u WHERE s.token = $1 AND s.is_enable = True AND u.limit_login = False AND s.user_id = u.id;", 
+        &[&session]
     ).await?;
 
-    Ok((row.get::<_, i32>("user_id"), row.get::<_, String>("username")))
+    Ok((row.get::<_, i32>("user_id"), row.get::<_, i32>("role"), row.get::<_, String>("username")))
 }
 
 /// 检查系统用户数量，该操作在系统启动前执行。
@@ -169,22 +178,6 @@ pub async fn totp_struct(
     pool: &deadpool_postgres::Pool
 ) -> Result<Option<TOTP>, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
-    // match c.query_opt(
-    //     "SELECT id, totp_secret FROM users WHERE limit_login = false AND enable_2fa = true AND username = $1;",
-    //     &[&username]
-    // ).await? {
-    //     Ok(Some(
-    //         TOTP::new(
-    //         Algorithm::SHA1, 
-    //         6, 
-    //         1, 
-    //         30, 
-    //         Secret::Encoded(r.get::<_, String>("totp_secret")).to_bytes()?, 
-    //         Some("Network Mapping".to_string()), 
-    //         username
-    //     )?)),
-    //     Err(e)
-    // } 
 
     match c.query_opt(
         "SELECT id, totp_secret FROM users WHERE limit_login = false AND enable_2fa = true AND username = $1;",
@@ -206,7 +199,6 @@ pub async fn totp_struct(
             Ok(None)
         }
     }
-
 }
 
 /// 检查 2FA 是否已绑定
@@ -248,7 +240,7 @@ pub async fn bind_twofa(
     let mut c = pool.get().await?;
     let transaction = c.transaction().await?;
     let _r = transaction.execute(
-        "UPDATE users SET totp_secret = $1 AND enable_2fa = true WHERE username = $2;",
+        "UPDATE users SET totp_secret = $1, enable_2fa = true WHERE username = $2;",
 
         // 此处的 secret32 是经过 base32 编码后的数据
         &[&secret32.to_encoded().to_string(), &username]
@@ -278,5 +270,246 @@ pub async fn totp_token_verify(
     else {
         println!("验证失败");
         Ok(false)
+    }
+}
+
+/// totp 验证状态更改
+pub async fn totp_verify_status_change(
+    session: &str,
+    pool: &deadpool_postgres::Pool
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = pool.get().await?;
+    let db_transaction = conn.transaction().await?;
+    let r = db_transaction.execute(
+        "UPDATE session SET totp_verify_successful = true WHERE token = $1;",
+        &[&session]
+    ).await?;
+    if r == 0 {
+        warn!(
+            event = "ChangeTotpStatus",
+            path = "fn totp_verify_status_change",
+            message = "没有更改 totp verify 状态"
+        );
+        Ok(())
+    } else if r == 1 {
+        db_transaction.commit().await?;
+        Ok(())
+    } else {
+        Err(format!("更改 totp verify status 影响 {} 行", r).into())
+    }
+}
+
+/// 解除 2FA 绑定
+/// 
+/// **该操作只能由管理员操作**,
+/// 且需要调用者做权限判断
+pub async fn unbind_2fa(
+    username: &str,
+    pool: &deadpool_postgres::Pool
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut c = pool.get().await?;
+    let db_transaction = c.transaction().await?;
+    let r =  db_transaction.execute(
+        "UPDATE users SET enable_2fa = false, totp_secret = NULL WHERE username = $1;",
+        &[&username]
+    ).await?;
+    if r == 1 {
+        info!(
+            event = "Unbind2FASuccessful",
+            path = "fn unbind_2fa",
+            message = format!("用户 {} 解绑 2FA 成功", username)
+        );
+        Ok(true)
+    } else if r == 0 {
+        warn!(
+            event = "Unbind2FAWarning",
+            path = "fn unbind_2fa",
+            message = format!("用户 {} 没有绑定 2FA", username)
+        );
+        Ok(false)
+    } else {
+        error!(
+            event = "Unbind2FAfaild",
+            path = "fn unbind_2fa",
+            message = "数据库更新条目数不等于 0 和 1"
+        );
+        Err("数据库更新条目数不等于 0 和 1".into())
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GetUserInfoH {
+    pub username: Option<String>,
+    pub list: Option<bool>,
+    pub count: Option<u32>                          // 通过限制数据类型避免负数
+}
+
+#[derive(Deserialize, FromRow, Serialize)]
+pub struct UserInfo {
+    pub id: i32,
+    pub username: String,
+    pub role: i32,
+    pub email: Option<String>,
+    pub create_time: i64,
+    pub limit_login: bool,
+    pub limit_at: Option<i64>,
+    pub limit_time: Option<i32>,
+    pub enable_2fa: bool,
+    pub last_login_at: Option<i64>,
+    pub last_login_ip: Option<IpInet>,
+    pub login_error_count: Option<i32>,
+    pub last_error_at: Option<i64>
+}
+
+/// 获取用户信息
+/// 
+/// 当权限足够时可以通过将 username 设置为 None 来获取所有用户信息，
+/// 条目限制默认 5 条
+pub async fn get_user_info(
+    role: i32,
+    username: Option<&str>,
+    limit_items: Option<i64>,
+    pool: &deadpool_postgres::Pool
+) -> Result<Vec<UserInfo>, Box<dyn std::error::Error>> {
+
+    const USER_SELECT_S: &str = 
+        "SELECT \
+            id, username, role, email, create_time, limit_login, limit_at, limit_time, \
+            enable_2fa, last_login_at, last_login_ip, login_error_count, last_error_at \
+        FROM users";
+
+    let database_conn = pool.get().await?;
+    let limit_i = limit_items.unwrap_or(5);
+
+    let r = match (role, username) {
+        (1, None) => {
+            database_conn.query(
+                &format!("{USER_SELECT_S} LIMIT $1;"),
+                &[&limit_i]
+            ).await?
+        },
+        (1 | 2, Some(username_t)) => {
+            database_conn.query(
+                &format!("{USER_SELECT_S} WHERE username = $1 LIMIT 1;"),
+                &[&username_t]
+            ).await?
+        },
+        _ => return Err("没有对应的权限".into())
+    };
+
+    Ok( 
+        r.iter().map(|row| -> UserInfo {
+            FromRow::from_row(row)
+        }).collect()
+    )
+}
+
+/// 用户基础信息
+#[derive(Deserialize)]
+pub struct UserBaseInfo {
+    pub username: String,
+    pub email: String
+}
+
+/// 更新用户信息
+/// 
+pub async fn update_user_info(
+    username: &str,
+    role: i32,
+    new_user_info: &UserBaseInfo,
+    pool: &deadpool_postgres::Pool
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut database_conn = pool.get().await?;
+    let conn_transaction = database_conn.transaction().await?;
+
+    let result = conn_transaction.execute(
+        "UPDATE users SET username = $1, email = $2 WHERE username = $3 AND role = $4;",
+        &[&new_user_info.username, &new_user_info.email, &username, &role]
+    ).await?;
+
+    match result {
+
+        // 更改成功
+        1 => {
+            conn_transaction.commit().await?;
+            Ok(())
+        },
+        
+        // 没有更改任何条目
+        0 => {
+            warn!(
+                event = "UpdateUserInfo",
+                path = "fn update_user_info",
+                message = "没有更改任何条目，可能是该用户不存在或数据异常"
+            );
+            Ok(())
+        },
+
+        // 更改了多行，这是不允许的，所以不会提交事务
+        _ => {
+            error!(
+                event = "UpdateUserInfo",
+                path = "fn update_user_info",
+                message = "更改了多行"
+            );
+            Err("更改了多行".into())
+        }
+    }
+}
+
+/// 从数据库中获取系统配置
+pub async fn get_config_from_database(
+    pool: &deadpool_postgres::Pool,
+    item_type: &str,
+    key: Option<&str>
+) -> Result<Vec<SystemConfig>, Box<dyn std::error::Error>> {
+
+    const GET_CONFIG_SELECT_S: &str = "SELECT item_type, key, value, create_at, update_at FROM setting WHERE item_type = ";
+
+    let conn = pool.get().await?;
+    let result = match key {
+        Some(k) => {
+            conn.query(
+                &format!("{GET_CONFIG_SELECT_S} $1 AND key = $2 LIMIT 1;"),
+                &[&item_type, &k]
+            ).await?
+        },
+        None => {
+            conn.query(
+                &format!("{GET_CONFIG_SELECT_S} $1;"),
+                &[&item_type]
+            ).await?
+        }
+    };
+
+    if result.is_empty() {
+        Ok(vec![SystemConfig::new()])
+    } else {
+        Ok(result.iter().map(FromRow::from_row).collect())
+    }
+
+}
+
+/// 向数据库写入系统配置
+/// 
+pub async fn write_config_to_database(
+    pool: &deadpool_postgres::Pool,
+    sys_conf: &SystemConfig
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = pool.get().await?;
+    let transaction = conn.transaction().await?;
+
+    match transaction.execute(
+        "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3);",
+        &[&sys_conf.item_type, &sys_conf.key, &sys_conf.value]
+    ).await? {
+        1 => {
+            transaction.commit().await?;
+            Ok(())
+        },
+
+        _ => {
+            Err("插入数据异常".into())
+        }
     }
 }
