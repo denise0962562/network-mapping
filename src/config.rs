@@ -103,6 +103,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(user::get_user_info_h)
         .service(user::update_user_info_h)
         .service(utils::get_config_h)
+        .service(utils::test_mail_server_h)
         .default_service(web::to(handlers::utils::not_found));
 }
 
@@ -148,3 +149,11 @@ pub struct GetConfig {
     pub item_type: String,
     pub key: Option<String>
 }
+
+pub struct MailConfig {
+    pub server_type: String,
+    pub host: String,
+    pub account_username: String,
+    pub account_password: String,
+}
+
