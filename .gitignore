@@ -4,3 +4,4 @@ scanner/
 .vscode/
 ssl/
 .codegraph/
+test-resource/

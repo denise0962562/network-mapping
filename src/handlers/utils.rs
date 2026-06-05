@@ -1,11 +1,13 @@
 
 use actix_web::{web, get, HttpRequest, HttpResponse, Responder, dev::ConnectionInfo};
-// use crate::handlers::{ScanTargetDone, ScanTargetGet};
-use crate::target_generated::{ScanTargetGetResponse, targetgenerated::{random_generate_target, sequence_generate_target}};
-use crate::{TEXT_HTML_UTF_8};
 use std::{path::PathBuf, fs};
+use tracing::error;
+
+use crate::{admin::get_config_from_database, logs::write::error_logs, target_generated::{ScanTargetGetResponse, targetgenerated::{random_generate_target, sequence_generate_target}}};
+use crate::{TEXT_HTML_UTF_8};
 use crate::{logs, ReadFile, get_file_suffix, mime_system, FrontEndErrorInfo, front_end_error_page, TemplatesInit};
 use crate::rir::get_rir_data;
+use crate::config::GetConfig;
 
 //基准测试
 use crate::{Systems, benchmark};
@@ -125,3 +127,32 @@ async fn update_rir(
     HttpResponse::Ok()
         .body("成功")
 }
+
+
+/// 获取配置
+/// 
+#[get("/api/config/get")]
+async fn get_config_h(
+    req: HttpRequest,
+    conf_q: web::Query<GetConfig>,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_ref = pool.get_ref();
+
+    let con = match get_config_from_database(pool_ref, &conf_q.item_type, conf_q.key.as_deref()).await {
+        Ok(o) => o,
+        Err(e) => {
+            error!(
+                event = "GetConfigError",
+                path = "fn get_config_h",
+                message = e.to_string()
+            );
+            return HttpResponse::InternalServerError().finish()
+        }
+    };
+    HttpResponse::Ok().json(con)
+}
+
+
+// 测试 SMTP 邮件服务器
+//#[]

@@ -2,10 +2,12 @@
 
 use actix_web::web;
 use actix_files::Files;
+use postgres_from_row::FromRow;
 use std::{path::Path, fs};
-use serde::{Deserialize};
+use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 
-use crate::{handlers::{self, user}};
+use crate::handlers::{self, user, utils};
 
 
 #[derive(Debug, Deserialize)]
@@ -100,5 +102,49 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(user::bind_twofa_h)
         .service(user::get_user_info_h)
         .service(user::update_user_info_h)
+        .service(utils::get_config_h)
         .default_service(web::to(handlers::utils::not_found));
+}
+
+#[derive(Serialize)]
+pub enum ConfigType {
+    None,
+    SmtpConfig,
+}
+
+impl ConfigType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConfigType::None => "None",
+            ConfigType::SmtpConfig => "smtp",
+        }
+    }
+}
+
+/// 系统配置
+#[derive(FromRow, Serialize)]
+pub struct SystemConfig {
+    pub item_type: String,
+    pub key: String,
+    pub value: String,
+    pub create_at: DateTime<chrono::Utc>,
+    pub update_at: Option<DateTime<chrono::Utc>>
+}
+
+impl SystemConfig {
+    pub fn new() -> Self {
+        SystemConfig { 
+            item_type: String::new(), 
+            key: String::new(), 
+            value: String::new(), 
+            create_at: DateTime::<Utc>::UNIX_EPOCH, 
+            update_at: None 
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GetConfig {
+    pub item_type: String,
+    pub key: Option<String>
 }

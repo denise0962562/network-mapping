@@ -8,6 +8,7 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use postgres_from_row::FromRow;
 use cidr::IpInet;
 
+use crate::config::SystemConfig;
 use crate::{AddUserInfo, config::EmailConfig};
 
 /// 该结构体用于接收测试使用的创建用户信息
@@ -19,9 +20,9 @@ pub struct ReceiveAddUserInfo {
 }
 
 pub enum UserRole {
-    System,
-    Administrator,
-    User
+    System = 0,
+    Administrator = 1,
+    User = 2
 }
 
 /// TOTP 相关信息
@@ -367,22 +368,29 @@ pub struct UserInfo {
 pub async fn get_user_info(
     role: i32,
     username: Option<&str>,
-    limit_iteams: Option<i64>,
+    limit_items: Option<i64>,
     pool: &deadpool_postgres::Pool
 ) -> Result<Vec<UserInfo>, Box<dyn std::error::Error>> {
+
+    const USER_SELECT_S: &str = 
+        "SELECT \
+            id, username, role, email, create_time, limit_login, limit_at, limit_time, \
+            enable_2fa, last_login_at, last_login_ip, login_error_count, last_error_at \
+        FROM users";
+
     let database_conn = pool.get().await?;
-    let limit_i = limit_iteams.unwrap_or(5);
+    let limit_i = limit_items.unwrap_or(5);
 
     let r = match (role, username) {
         (1, None) => {
             database_conn.query(
-                "SELECT id, username, role, email, create_time, limit_login, limit_at, limit_time, enable_2fa, last_login_at, last_login_ip, login_error_count, last_error_at FROM users LIMIT $1;",
+                &format!("{USER_SELECT_S} LIMIT $1;"),
                 &[&limit_i]
             ).await?
         },
         (1 | 2, Some(username_t)) => {
             database_conn.query(
-                "SELECT id, username, role, email, create_time, limit_login, limit_at, limit_time, enable_2fa, last_login_at, last_login_ip, login_error_count, last_error_at FROM users WHERE username = $1 LIMIT 1;",
+                &format!("{USER_SELECT_S} WHERE username = $1 LIMIT 1;"),
                 &[&username_t]
             ).await?
         },
@@ -445,6 +453,63 @@ pub async fn update_user_info(
                 message = "更改了多行"
             );
             Err("更改了多行".into())
+        }
+    }
+}
+
+/// 从数据库中获取系统配置
+pub async fn get_config_from_database(
+    pool: &deadpool_postgres::Pool,
+    item_type: &str,
+    key: Option<&str>
+) -> Result<Vec<SystemConfig>, Box<dyn std::error::Error>> {
+
+    const GET_CONFIG_SELECT_S: &str = "SELECT item_type, key, value, create_at, update_at FROM setting WHERE item_type = ";
+
+    let conn = pool.get().await?;
+    let result = match key {
+        Some(k) => {
+            conn.query(
+                &format!("{GET_CONFIG_SELECT_S} $1 AND key = $2 LIMIT 1;"),
+                &[&item_type, &k]
+            ).await?
+        },
+        None => {
+            conn.query(
+                &format!("{GET_CONFIG_SELECT_S} $1;"),
+                &[&item_type]
+            ).await?
+        }
+    };
+
+    if result.is_empty() {
+        Ok(vec![SystemConfig::new()])
+    } else {
+        Ok(result.iter().map(FromRow::from_row).collect())
+    }
+
+}
+
+/// 向数据库写入系统配置
+/// 
+pub async fn write_config_to_database(
+    pool: &deadpool_postgres::Pool,
+    sys_conf: &SystemConfig
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = pool.get().await?;
+    let transaction = conn.transaction().await?;
+
+    match transaction.execute(
+        "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3);",
+        &[&sys_conf.item_type, &sys_conf.key, &sys_conf.value]
+    ).await? {
+        1 => {
+            transaction.commit().await?;
+            Ok(())
+        },
+
+        _ => {
+            Err("插入数据异常".into())
         }
     }
 }
