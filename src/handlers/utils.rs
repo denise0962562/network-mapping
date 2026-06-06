@@ -3,13 +3,11 @@ use actix_web::{web, get, post, HttpRequest, HttpResponse, Responder, dev::Conne
 use std::{path::PathBuf, fs};
 use tracing::error;
 use lettre::{Message, message::Mailbox, message::header::ContentType};
-use std::collections::{HashMap};
-use serde_json;
 
 use crate::admin::{get_config_from_database, get_user_id_and_name, get_user_info, send_email};
 use crate::{target_generated::{ScanTargetGetResponse, targetgenerated::random_generate_target}};
 use crate::{TEXT_HTML_UTF_8};
-use crate::{logs::write::{error_logs, info_logs, warn_logs}, ReadFile, get_file_suffix, mime_system, FrontEndErrorInfo, front_end_error_page, TemplatesInit};
+use crate::{logs::write::{error_logs, warn_logs, info_logs}, ReadFile, get_file_suffix, mime_system, FrontEndErrorInfo, front_end_error_page, TemplatesInit};
 use crate::rir::get_rir_data;
 use crate::config::{GetConfig, EmailConfig};
 use crate::login::{get_session_from_req};
@@ -20,7 +18,7 @@ use crate::{Systems, benchmark};
 
 #[get("/scanner/target")]
 async fn get_scan_target(
-    req: HttpRequest, 
+    _req: HttpRequest, 
     _conn_info: ConnectionInfo, 
     // get_target: web::Query<ScanTargetGet>, 
     // target_generated: web::Data<ScanTargetConfig>
@@ -38,7 +36,6 @@ async fn get_scan_target(
     //         rate: 1000
     //     }
     // )
-    info_logs(&req, "ReceivedRequests", "GenerateTarget", false);
     random_generate_target()
 }
 
@@ -50,7 +47,6 @@ async fn file_read_test(req: HttpRequest, _conn_info: ConnectionInfo, file: web:
     let _file_root = &file.file_root_directory;
     match fs::read_to_string(read_file_name) {
         Ok(file_content) => {
-            info_logs(&req, "ReceivedRequests", "ReceivedRequests", false);
             HttpResponse::Ok().content_type(TEXT_HTML_UTF_8).body(file_content)
         },
         Err(_) => {
@@ -165,8 +161,8 @@ async fn get_config_h(
 #[post("/api/mail/smtp/test")]
 async fn test_mail_server_h(
     req: HttpRequest,
-    test_data: web::Json<Option<EmailConfig>>,
-    mail_config: web::Data<EmailConfig>,
+    test_data: Option<web::Json<EmailConfig>>,
+    mail_config: web::Data<Option<EmailConfig>>,
     pool: web::Data<deadpool_postgres::Pool>
 ) -> impl Responder {
     let pool_ref = pool.get_ref();
@@ -177,91 +173,61 @@ async fn test_mail_server_h(
             Ok(o) => o,
             Err(e) => {
                 error_logs(&req, "GetUserIdandNameError", &e.to_string());
-                return HttpResponse::InternalServerError();
+                return HttpResponse::InternalServerError().finish();
             }
         };
 
-        // 暂时这样，过一段时间给改成链式调用
+        if u_role != 1 {
+            info_logs(&req, "UserPermissionDenied", "用户权限不足，操作请求已被拒绝。", false);
+            return HttpResponse::Forbidden().finish()
+        }
+
         let info = match get_user_info(u_role, Some(&username), Some(1), pool_ref).await {
-            Ok(mut t_info) => t_info.remove(0),
+
+            // 为 UserInfo 实现了 Default ，然后使用 unwrap_or_default() 函数使用默认值
+            Ok(o) => o.into_iter().next().unwrap_or_default(),
             Err(e) => {
                 error!(
-                    event = "",
-                    path = "",
+                    event = "GetUserInfoError",
+                    path = "fn test_mail_server_h",
                     message = e.to_string()
                 );
-                return HttpResponse::InternalServerError()
+                return HttpResponse::InternalServerError().finish()
             }
         };
-
-
-        // let info = match get_user_info(u_role, Some(&username), Some(1), pool_ref).await
-        //     .into_iter()
-        //     .next()?;
-
 
         let user_mail = info.email.unwrap_or(String::new());
 
+        let mail_context = String::from("这是一封测试邮件，用于测试您设置的邮件服务器是否正常工作。如果您没有发送测试邮件请忽略此封邮件。");
+        let mail_title = String::from("Test");
+        let mail_account_name = Some(String::from("Network Mapping"));
 
-        if let Some(test_d) = test_data.as_ref() {
-            let mail_message = Message::builder()
-                .from(Mailbox::new(Some("Network Mapping".to_string()), (&test_d.account_username).to_string().parse().unwrap()))
-                .to(Mailbox::new(None, user_mail.parse().unwrap()))
-                .subject("Test".to_string())
-                .header(ContentType::TEXT_PLAIN)
-                .body("这是一封测试邮件，用于测试您设置的邮件服务器是否正常工作。如果您没有发送测试邮件请忽略此封邮件。".to_string())
-                .unwrap();
-            send_email(test_d, mail_message).await;
-            HttpResponse::Ok()
-        } else {
-            // 似乎写的多余了
-            // let hash: HashMap<String, String> = match get_config_from_database(pool_ref, "smtp", None).await {
-            //     Ok(o) => o,
-            //     Err(e) => {
-            //         error!(
-            //             event = "GetConfigError",
-            //             path = "fn test_mail_server",
-            //             message = e.to_string()
-            //         );
-            //         return HttpResponse::InternalServerError()
-            //     }
-            // }
-            // .into_iter()
-            // .map(|tmp| (tmp.key, tmp.value) )
-            // .collect();
+        let mail_config = match test_data.as_deref() {
+            Some(td) => td,
+            None => {
+                match mail_config.as_ref() {
+                    Some(e) => e,
+                    None => {
+                        return HttpResponse::Ok()
+                            .content_type(TEXT_HTML_UTF_8)
+                            .body("未从数据库中找到相关配置")
+                    }
+                }
+            }
+        };
 
-            // let value = match serde_json::to_value(hash) {
-            //     Ok(o) => o,
-            //     Err(e) => {
-            //         error!(
-            //             event = "",
-            //             path = "",
-            //             message = ""
-            //         );
-            //         return HttpResponse::InternalServerError()
-            //     }
-            // };
+        let mail_message = Message::builder()
+            .from(Mailbox::new(mail_account_name, (mail_config.account_username).to_string().parse().unwrap()))
+            .to(Mailbox::new(None, user_mail.parse().unwrap()))
+            .subject(mail_title)
+            .header(ContentType::TEXT_PLAIN)
+            .body(mail_context)
+            .unwrap();
+        send_email(mail_config, mail_message).await;
+        HttpResponse::Ok().finish()
 
-            // let mail_conf: EmailConfig = match serde_json::from_value(value) {
-            //     Ok(o) => o,
-            //     Err(e) => {
-            //         return HttpResponse::InternalServerError()
-            //     }
-            // };
-
-            let mail_message = Message::builder()
-                .from(Mailbox::new(Some("Network Mapping".to_string()), (&mail_config.account_username).to_string().parse().unwrap()))
-                .to(Mailbox::new(None, user_mail.parse().unwrap()))
-                .subject("Test".to_string())
-                .header(ContentType::TEXT_PLAIN)
-                .body("这是一封测试邮件，用于测试您设置的邮件服务器是否正常工作。如果您没有发送测试邮件请忽略此封邮件。".to_string())
-                .unwrap();
-
-            send_email(&mail_config, mail_message).await;
-            HttpResponse::Ok()
-        }
     }
     else {
-        HttpResponse::Unauthorized()
+        HttpResponse::Unauthorized().finish()
     }
 }

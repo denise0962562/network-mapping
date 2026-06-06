@@ -361,6 +361,27 @@ pub struct UserInfo {
     pub last_error_at: Option<i64>
 }
 
+impl Default for UserInfo {
+    fn default() -> Self {
+        Self { 
+            id: -1, 
+            username: String::new(), 
+            role: -1, 
+            email: None, 
+            create_time: -1, 
+            limit_login: true, 
+            limit_at: None, 
+            limit_time: None, 
+            enable_2fa: true, 
+            last_login_at: None, 
+            last_login_ip: None, 
+            login_error_count: None, 
+            last_error_at: None 
+        }
+    }
+}
+
+
 /// 获取用户信息
 /// 
 /// 当权限足够时可以通过将 username 设置为 None 来获取所有用户信息，
