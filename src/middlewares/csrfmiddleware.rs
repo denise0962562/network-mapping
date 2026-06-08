@@ -60,9 +60,10 @@ where
 
         Box::pin(async move {
 
-            if req.method().as_str() == "GET" {
-                return Ok(svc.call(req).await?.map_into_left_body())
-            }
+            // MARK: 对 GET 请求也校验 csrf token
+            // if req.method().as_str() == "GET" {
+            //     return Ok(svc.call(req).await?.map_into_left_body())
+            // }
             if req.method().as_str() == "POST" && &req.path().to_string() == "/api/login" {
                 return Ok(svc.call(req).await?.map_into_left_body())
             }

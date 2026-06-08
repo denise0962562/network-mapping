@@ -135,10 +135,10 @@ impl LoginToken {
     ///检查token是否有效和存在
     /// 
     /// 找到token且token还未过期时返回 true ，未找到或已过期时返回当返回值多于一行时返回错误
-    pub async fn check_token(&self, session: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn check_token(&self, session: &str) -> Result<(bool, i32), Box<dyn std::error::Error>> {
         let client = self.pool.get().await?;
         let stmt = client.prepare(
-            "SELECT token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true AND totp_verify_successful = true LIMIT 1;"
+            "SELECT user_id, token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true AND totp_verify_successful = true LIMIT 1;"
         ).await?;
 
         if let Some(r_s) = client.query_opt(&stmt, &[&session]).await? {
@@ -150,15 +150,15 @@ impl LoginToken {
             if n_t >= end_at {
                 warn!(event = "TokenInvaild", message = "Token 无效");
                 self.delete(session).await?;
-                Ok(false)
+                Ok((false, -1))
             }
             else {
-                Ok(true)
+                Ok((true, r_s.get("user_id")))
             }
         }
         else {
-            warn!(event = "TokenInvaild", message = "Token 无效");
-            Ok(false)
+            warn!(event = "TokenInvaild", path = "fn check_token", message = "Token 无效");
+            Ok((false, -1))
         }
     }
 

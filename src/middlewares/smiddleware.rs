@@ -1,6 +1,6 @@
 use std::future::{Ready, ready};
 use std::sync::Arc;
-use actix_web::HttpResponse;
+use actix_web::{HttpMessage, HttpResponse};
 use actix_web::{
     body::EitherBody,                // 可以参见 https://docs.rs/actix-web/latest/actix_web/body/enum.EitherBody.html
     dev::{
@@ -12,6 +12,7 @@ use actix_web::{
 
 use futures::future::LocalBoxFuture;
 
+use crate::admin::{UserSession, get_user_base_info};
 use crate::login::get_session_from_req;
 use crate::login::{LoginToken};
 use crate::logs::write::info_logs;
@@ -64,7 +65,6 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
 
-
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = vec!["/api", "/dashboard"];
         // 白名单
@@ -79,8 +79,6 @@ where
         else {
             need_check = path_list.iter().any(|p| path.starts_with(p));
         }
-        // let need_check = path_list.iter().any(|p| path.starts_with(p));
-        let page = req.app_data::<web::Data<TemplatesInit>>().cloned();
 
         info!(
             event = "received_requests",
@@ -90,7 +88,6 @@ where
             path = &req.path(),
             query = &req.query_string(),
         );
-
 
         Box::pin(async move {
             if !need_check {
@@ -102,14 +99,6 @@ where
             
             else {
                 
-                let page_template = match page.as_ref() {
-                    Some(p) => p.get_ref(),
-                    None => {
-                        let resp = render_500_simple(req.request(), "未能正确获取到模板系统");
-                        return Ok(
-                            req.into_response(resp).map_into_right_body()
-                    )}
-                };
                 let session = {
                     get_session_from_req(req.request(), "session")
                 };
@@ -119,11 +108,11 @@ where
                             Ok(p) => p,
                             Err(e) => {
                                 error!(
-                                    event = "",
-                                    path = "",
+                                    event = "GetPoolError",
+                                    path = "fn call",
                                     message = %e
                                 );
-                                let resp = render_500(req.request(), page_template, "获取数据库连接池失败");
+                                let resp = HttpResponse::InternalServerError().finish();
                                 return Ok(
                                     req.into_response(resp).map_into_right_body()
                                 )
@@ -133,11 +122,31 @@ where
                             pool: g_pool.clone()
                         };
                         match login_t.check_token(&se).await {
-                            Ok(true) => {
+                            Ok((true, uid)) => {
+                                let tmp_info = match get_user_base_info(g_pool, uid).await {
+                                    Ok(o) => o,
+                                    Err(e) => {
+                                        error!(
+                                            event = "GetUserBaseInfoError",
+                                            path = "fn call",
+                                            message = e.to_string()
+                                        );
+                                        let res = HttpResponse::InternalServerError().finish();
+                                        return Ok(req.into_response(res).map_into_right_body())
+                                    }
+                                };
+
+                                // 向通过检查的请求注入用户基础数据
+                                req.extensions_mut().insert(tmp_info);
+
+                                // 向通过检查的请求注入 session ，这样就不需要在每个 handler 中都读取一个 session 了
+                                req.extensions_mut().insert(UserSession { session: se });
+
                                 Ok(
                                     svc.call(req).await?.map_into_left_body()
-                            )},
-                            Ok(false) => {
+                                )
+                            },
+                            Ok((false, _)) => {
                                 info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session", false);
                                 let resp = HttpResponse::Unauthorized()
                                     .body("401");
@@ -146,11 +155,11 @@ where
                             )},
                             Err(e) => {
                                     error!(
-                                        event = "",
-                                        path = "",
+                                        event = "TokenVerifyError",
+                                        path = "fn call",
                                         message = %e
                                     );
-                                    let resp = render_500(req.request(), page_template, "校验token出错了");
+                                    let resp = HttpResponse::InternalServerError().finish();
                                     return Ok(
                                         req.into_response(resp).map_into_right_body()
                                     )

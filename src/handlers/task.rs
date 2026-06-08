@@ -1,12 +1,12 @@
-use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
+use actix_web::{HttpMessage, HttpRequest, HttpResponse, Responder, get, post, web};
 use uuid::Uuid;
 use deadpool_postgres::{Pool};
 use tracing::error;
 use crate::logs::write::{error_logs, info_logs};
-use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8};
+use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8, Permission};
 use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery, get_task_item, TaskItemJson, ReceiveTaskItemQueryInfo};
 use crate::middlewares::{render_403, render_500};
-use crate::admin::get_user_id_and_name;
+use crate::admin::{UserBaseI, get_user_id_and_name};
 
 #[get("/api/task/{task_id}")]
 async fn get_task(
@@ -124,55 +124,50 @@ async fn apply_task_handler(
     
 }
 
+/// 获取所有任务接口
+/// 
+/// 分为管理员权限和普通用户权限
 #[get("/api/task/all")]
 async fn get_all_task_handler(
     req: HttpRequest,
     query_info: web::Query<ReceiveTaskItemQueryInfo>,
     pool: web::Data<Pool>
 ) -> impl Responder {
+    let ext = req.extensions();
     let p = pool.get_ref();
-    let t_session = match &req.cookie("session") {
-        Some(c) => c.value().to_string(),
-        None => String::new()
-    };
-    let client = match p.get().await {
-        Ok(o) => o,
-        Err(e) => {
+
+    let userbasei = match ext.get::<UserBaseI>() {
+        Some(s) => s,
+        None => {
             error!(
-                event = "GetPoolError",
+                event = "GetUserBaseInfo",
                 path = "fn get_all_task_handler",
-                message = %e
+                message = "获取用户基础信息错误"
             );
-            return HttpResponse::InternalServerError()
-                .body("500")
+            return HttpResponse::InternalServerError().finish()
         }
     };
 
-    let user_id = match client.query_opt(
-        "SELECT user_id FROM session WHERE token = $1 LIMIT 1;",
-        &[&t_session]
-    ).await {
-        Ok(Some(o)) => {
-            o.get::<_, i32>("user_id") 
-        },
-        Ok(None) => {
-            info_logs(&req, "NotFoundSession", "获取用户ID失败", false);
-            return HttpResponse::Unauthorized()
-                .body("401")
-        }
-        Err(e) => {
-            error_logs(&req, "SELECTError", e.to_string().as_str());
-            return HttpResponse::InternalServerError()
-                .body("500")
+    let user_id = userbasei.id;
+
+    let permi = match userbasei.role {
+        1 => Permission::Administrator(user_id),
+        2 => Permission::Users(user_id),
+        _ => {
+            error!(
+                event = "UserRoleValueInvalid",
+                path = "fn get_all_task_handler",
+                message = format!("用户角色值为：{}", userbasei.role)
+            );
+            return HttpResponse::InternalServerError().finish()
         }
     };
-
 
     let (tmp_result, total_count, item_count, start_index) = match get_task_item(
         p, 
         query_info.count.unwrap_or(5), 
         query_info.start,
-        crate::Permission::Administrator(user_id)
+        permi
     ).await {
         Ok(o) => o,
         Err(e) => {
