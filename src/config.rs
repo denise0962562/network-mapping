@@ -1,7 +1,6 @@
 ///web系统配置文件
 
 use actix_web::web;
-use actix_files::Files;
 use postgres_from_row::FromRow;
 use std::{path::Path, fs};
 use serde::{Deserialize, Serialize};
@@ -85,13 +84,9 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
     cfg
         .service(user::first_add_user)
         .service(user::user_login_h)
-        .service(handlers::utils::file_read_test)
-        .service(handlers::utils::static_file_system)
-        .service(Files::new("/static", "./static").show_files_listing().prefer_utf8(true))
         .service(handlers::utils::get_scan_target)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
-        .service(handlers::data_saa::render_dashboard_page)
         .service(handlers::task::create_task)
         .service(handlers::task::apply_task_handler)     //更换了 apply_task_handler 和 get_task的注册顺序
         .service(handlers::task::get_all_task_handler)
