@@ -1,7 +1,7 @@
 use std::{future::{Ready, ready}, sync::Arc};
 use tracing::error;
 
-use crate::{TemplatesInit, logs::write::{error_logs, info_logs}, middlewares::{get_pool_from_app_data, render_500, render_500_simple}};
+use crate::{TemplatesInit, middlewares::{get_pool_from_app_data, render_500, render_500_simple}};
 use crate::logs::write::warn_logs;
 
 use actix_web::{
@@ -60,9 +60,10 @@ where
 
         Box::pin(async move {
 
-            if req.method().as_str() == "GET" {
-                return Ok(svc.call(req).await?.map_into_left_body())
-            }
+            // MARK: 对 GET 请求也校验 csrf token
+            // if req.method().as_str() == "GET" {
+            //     return Ok(svc.call(req).await?.map_into_left_body())
+            // }
             if req.method().as_str() == "POST" && &req.path().to_string() == "/api/login" {
                 return Ok(svc.call(req).await?.map_into_left_body())
             }

@@ -6,7 +6,7 @@ use rust_web_test::middlewares::csrfmiddleware::CsrfMiddleware;
 use core::panic;
 use std::{io};
 use rust_web_test::logs::{self, LogRollingMode};
-use rust_web_test::{config, db, ReadFile, Systems, TemplatesInit, insert_system_status};
+use rust_web_test::{config, db, Systems, TemplatesInit, insert_system_status};
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
 // use lettre::message::{Mailbox, header::ContentType};
@@ -124,7 +124,6 @@ async fn main() -> io::Result<()> {
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(template_info.clone()))
-            .app_data(web::Data::new(ReadFile{file_name: String::from("index.html"), file_root_directory: String::from("")}))
             .app_data(web::Data::new(sys_2.clone()))
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))

@@ -1,15 +1,14 @@
 use actix_web::cookie::time::OffsetDateTime;
-use actix_web::http::header;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
 use tracing::error;
 use serde_json::json;
 use std::time::Instant;
 
-use crate::admin::{GetUserInfoH, UserBaseInfo, get_user_info, totp_verify_status_change, update_user_info};
+use crate::admin::{GetUserInfoH, UserBaseInfo, UserSession, get_user_info, totp_verify_status_change, update_user_info, UserBaseI};
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
-use crate::login::{get_session_from_req, user_login};
+use crate::login::{user_login};
 use crate::{TEXT_HTML_UTF_8};
 use crate::logs::write::{error_logs, info_logs};
 use crate::config::{EmailConfig, PasswordHashConfig};
@@ -19,7 +18,6 @@ use admin::{
     Unbind2FAH, 
     VerifyTotp, 
     bind_twofa, 
-    get_user_id_and_name, 
     totp_struct, 
     totp_token_verify, 
     unbind_2fa
@@ -180,45 +178,42 @@ async fn user_login_h(
 async fn user_logout(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
-    page_template: web::Data<TemplatesInit>
+    page_template: web::Data<TemplatesInit>,
+    session: UserSession
 ) -> impl Responder {
     let tmp_csrf_t = match &req.headers().get("X-CSRF-Token") {
         Some(s) => s.to_str().unwrap_or(""),
         None => ""
     };
-    if let Some(token) = &req.cookie("session") {
-        let p = pool.get_ref();
-        let tmp_token = token.value();
-        match log_out(&tmp_token, p).await {
-            Ok(_) => {
-                let cookies = Cookie::build("session", tmp_token)
-                    .path("/")
-                    .http_only(true)
-                    .secure(true)
-                    .expires(OffsetDateTime::UNIX_EPOCH)
-                    .finish();
-                let cookie_csrf_token = Cookie::build("csrf_token", tmp_csrf_t)
-                    .path("/")
-                    .secure(true)
-                    .expires(OffsetDateTime::UNIX_EPOCH)
-                    .finish();
-                HttpResponse::Ok()
-                    .cookie(cookies)
-                    .cookie(cookie_csrf_token)
-                    .finish()
-            },
-            Err(e) => {
-                error_logs(&req, "注销会话错误", e.to_string().as_str());
-                let page = page_template.get_ref();
-                render_500(&req, page, "注销会话错误")
-            }
+
+    let p = pool.get_ref();
+    let c_s = session.session;
+
+    match log_out(&c_s, p).await {
+        Ok(_) => {
+            let cookies = Cookie::build("session", &c_s)
+                .path("/")
+                .http_only(true)
+                .secure(true)
+                .expires(OffsetDateTime::UNIX_EPOCH)
+                .finish();
+            let cookie_csrf_token = Cookie::build("csrf_token", tmp_csrf_t)
+                .path("/")
+                .secure(true)
+                .expires(OffsetDateTime::UNIX_EPOCH)
+                .finish();
+            HttpResponse::Ok()
+                .cookie(cookies)
+                .cookie(cookie_csrf_token)
+                .finish()
+        },
+        Err(e) => {
+            error_logs(&req, "注销会话错误", e.to_string().as_str());
+            let page = page_template.get_ref();
+            render_500(&req, page, "注销会话错误")
         }
     }
-    else {
-        HttpResponse::MovedPermanently()
-            .insert_header((header::LOCATION, "/login"))
-            .finish()
-    }
+    
 }
 
 
@@ -228,21 +223,12 @@ async fn user_logout(
 #[get("/api/totp/bind")]
 async fn bind_twofa_h(
     req: HttpRequest,
-    pool: web::Data<deadpool_postgres::Pool>
+    pool: web::Data<deadpool_postgres::Pool>,
+    user_base_i: UserBaseI
 ) -> impl Responder {
-
     let pool_r = pool.get_ref();
-    let session = get_session_from_req(&req, "session").unwrap_or(String::new());
-    let (_u_id, _u_role, username) = match get_user_id_and_name(&session, pool_r).await {
-        Ok(tmp) => tmp,
-        Err(e) => {
-            error_logs(&req, "GetUserIdandNameError", &e.to_string());
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
     
-    match bind_twofa(username, pool_r).await {
+    match bind_twofa(user_base_i.username, pool_r).await {
         Ok(tmp) => {
             return HttpResponse::ImUsed()
                 .json(json!({"success": true, "data": tmp}))
@@ -252,7 +238,6 @@ async fn bind_twofa_h(
             return HttpResponse::InternalServerError().finish()
         }
     }
-
 }
 
 
@@ -261,46 +246,40 @@ async fn bind_twofa_h(
 async fn verify_totp_h(
     info: web::Json<VerifyTotp>,
     pool: web::Data<deadpool_postgres::Pool>,
-    req: HttpRequest
+    req: HttpRequest,
+    session: UserSession,
+    user_base_i: UserBaseI
 ) -> impl Responder {
 
-    if let Some(request_cookie) = get_session_from_req(&req, "session") {
-        let database_conn = pool.get_ref();
-        let (_, _, username) = match get_user_id_and_name(&request_cookie, database_conn).await {
-            Ok(id_and_name) => id_and_name,
-            Err(e) => {
-                error_logs(&req, "GetUserIdandNameError", &e.to_string());
-                return HttpResponse::InternalServerError();
-            }
-        };
-        let totp = match totp_struct(username, database_conn).await {
-            Ok(Some(tmp)) => tmp,
-            Ok(None) => {
-                info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);
-                return HttpResponse::NotFound();
-            },
-            Err(e) => {
-                error_logs(&req, "生成 TOTP 结构体错误", &e.to_string());
-                return HttpResponse::InternalServerError();
-            }
-        };
-
-        match totp_token_verify(totp, &info.token).await {
-            Ok(true) => {
-                totp_verify_status_change(&request_cookie, database_conn).await.map(|_| HttpResponse::Ok()).unwrap_or(HttpResponse::InternalServerError())
-                // HttpResponse::Ok()
-            },
-            Ok(false) => {
-                info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
-                HttpResponse::Unauthorized()
-            },
-            Err(e) => {
-                error_logs(&req, "TOTPTokenVerifyError", &e.to_string());
-                HttpResponse::InternalServerError()
-            }
+    let database_conn = pool.get_ref();
+    let username = user_base_i.username;
+    let totp = match totp_struct(username, database_conn).await {
+        Ok(Some(tmp)) => tmp,
+        Ok(None) => {
+            info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);
+            return HttpResponse::NotFound();
+        },
+        Err(e) => {
+            error_logs(&req, "生成 TOTP 结构体错误", &e.to_string());
+            return HttpResponse::InternalServerError();
         }
-    } else {
-        HttpResponse::Unauthorized()
+    };
+
+    match totp_token_verify(totp, &info.token).await {
+        Ok(true) => {
+            totp_verify_status_change(&session.session, database_conn).await
+                .map(|_| HttpResponse::Ok())
+                .unwrap_or(HttpResponse::InternalServerError())
+            // HttpResponse::Ok()
+        },
+        Ok(false) => {
+            info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
+            HttpResponse::Unauthorized()
+        },
+        Err(e) => {
+            error_logs(&req, "TOTPTokenVerifyError", &e.to_string());
+            HttpResponse::InternalServerError()
+        }
     }
 }
 
@@ -311,38 +290,27 @@ async fn verify_totp_h(
 async fn unbind_2fa_h(
     req: HttpRequest,
     unbind_info: web::Json<Unbind2FAH>,
-    pool: web::Data<deadpool_postgres::Pool>
+    pool: web::Data<deadpool_postgres::Pool>,
+    user_base_i: UserBaseI
 ) -> impl Responder {
     let pool_c = pool.get_ref();
-
-    if let Some(session) = get_session_from_req(&req, "session") {
-        let (_id, u_role, _username) = match get_user_id_and_name(&session, pool_c).await {
-            Ok(o) => o,
-            Err(e) => {
-                error_logs(&req, "GetUserIdandNameError", &e.to_string());
-                return HttpResponse::InternalServerError();
-            }
-        };
-        if u_role != 1 {
-            return HttpResponse::Forbidden();
-        };
-        match unbind_2fa(&unbind_info.username, pool_c).await {
-            Ok(true) => {
-                info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功", false);
-                HttpResponse::Ok()
-            },
-            Ok(false) => {
-                HttpResponse::NotFound()
-            },
-            Err(e) => {
-                error_logs(&req, "Unbind2FAfaild", &e.to_string());
-                return HttpResponse::InternalServerError();
-            }
-        }
-    } else {
-        HttpResponse::Unauthorized()
-    }
     
+    if user_base_i.role != 1 {
+        return HttpResponse::Forbidden();
+    };
+    match unbind_2fa(&unbind_info.username, pool_c).await {
+        Ok(true) => {
+            info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功", false);
+            HttpResponse::Ok()
+        },
+        Ok(false) => {
+            HttpResponse::NotFound()
+        },
+        Err(e) => {
+            error_logs(&req, "Unbind2FAfaild", &e.to_string());
+            return HttpResponse::InternalServerError();
+        }
+    }
 }
 
 
@@ -352,48 +320,40 @@ async fn unbind_2fa_h(
 async fn get_user_info_h(
     req: HttpRequest,
     info: web::Query<GetUserInfoH>,
-    pool: web::Data<deadpool_postgres::Pool>
+    pool: web::Data<deadpool_postgres::Pool>,
+    user_base_i: UserBaseI
 ) -> impl Responder {
     let pool_ref = pool.get_ref();
+    let u_role = user_base_i.role;
+    let username = user_base_i.username;
 
-    if let Some(session) = get_session_from_req(&req, "session") {
-        let (_id, u_role, username) = match get_user_id_and_name(&session, pool_ref).await {
-            Ok(o) => o,
-            Err(e) => {
-                error_logs(&req, "GetUserIdandNameError", &e.to_string());
-                return HttpResponse::InternalServerError().finish();
-            }
-        };
+    let t_username = if info.list.unwrap_or(false) {
+        // 当 list 存在且为 true 时不会指定用户名
+        None
+    } else if u_role == 1 {
 
-        let t_username = if info.list.unwrap_or(false) {
-            // 当 list 存在且为 true 时不会指定用户名
-            None
-        } else if u_role == 1 {
+        // 管理员可以查询所有用户，如果没有指定则查询自己的信息
+        Some(info.username.as_deref().unwrap_or(username.as_str()))
+    } else if u_role == 2 {
 
-            // 管理员可以查询所有用户，如果没有指定则查询自己的信息
-            Some(info.username.as_deref().unwrap_or(username.as_str()))
-        } else if u_role == 2 {
-
-            // 普通用户只能查询自己的信息
-            Some(username.as_str())
-        } else {
-            error_logs(&req, "GetUserInfoError", format!("role: {}, 错误的权限", u_role).as_str());
-            return HttpResponse::InternalServerError().finish()
-        };
-
-        match get_user_info(u_role, t_username, info.count.map(|c| c as i64), pool_ref).await {
-            Ok(data) => {
-                HttpResponse::Ok()
-                    .json(data)
-            },
-            Err(e) => {
-                error_logs(&req, "GetUserInfoError", &e.to_string());
-                HttpResponse::InternalServerError().finish()
-            }
-        }
+        // 普通用户只能查询自己的信息
+        Some(username.as_str())
     } else {
-        HttpResponse::Unauthorized().finish()
+        error_logs(&req, "GetUserInfoError", format!("role: {}, 错误的权限", u_role).as_str());
+        return HttpResponse::InternalServerError().finish()
+    };
+
+    match get_user_info(u_role, t_username, info.count.map(|c| c as i64), pool_ref).await {
+        Ok(data) => {
+            HttpResponse::Ok()
+                .json(data)
+        },
+        Err(e) => {
+            error_logs(&req, "GetUserInfoError", &e.to_string());
+            HttpResponse::InternalServerError().finish()
+        }
     }
+
 }
 
 
@@ -403,29 +363,18 @@ async fn get_user_info_h(
 async fn update_user_info_h(
     req: HttpRequest,
     new_user_i: web::Json<UserBaseInfo>,
-    pool: web::Data<deadpool_postgres::Pool>
+    pool: web::Data<deadpool_postgres::Pool>,
+    user_base_i: UserBaseI
 ) -> impl Responder {
     let pool_ref = pool.get_ref();
 
-    if let Some(session) = get_session_from_req(&req, "session") {
-        let (_id, u_role, username) = match get_user_id_and_name(&session, pool_ref).await {
-            Ok(o) => o,
-            Err(e) => {
-                error_logs(&req, "GetUserIdandNameError", &e.to_string());
-                return HttpResponse::InternalServerError();
-            }
-        };
-        match update_user_info(&username, u_role, &new_user_i, pool_ref).await {
-            Ok(()) => {
-                HttpResponse::Ok()
-            },
-            Err(e) => {
-                error_logs(&req, "UpdateUserInfoError", &e.to_string());
-                HttpResponse::InternalServerError()
-            }
+    match update_user_info(&user_base_i.username, user_base_i.role, &new_user_i, pool_ref).await {
+        Ok(()) => {
+            HttpResponse::Ok()
+        },
+        Err(e) => {
+            error_logs(&req, "UpdateUserInfoError", &e.to_string());
+            HttpResponse::InternalServerError()
         }
-
-    } else {
-        HttpResponse::Unauthorized()
     }
 }

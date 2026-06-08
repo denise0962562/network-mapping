@@ -1,7 +1,9 @@
+use std::future::{ready, Ready};
 use actix_web::dev::ServiceRequest;
-use actix_web::{web, HttpResponse, HttpRequest};
+use actix_web::{HttpMessage, HttpRequest, HttpResponse, web, FromRequest, dev::Payload, Error, error::ErrorInternalServerError};
 use tracing::error;
 
+use crate::admin::{UserBaseI, UserSession};
 use crate::{front_end_error_page, FrontEndErrorInfo, TemplatesInit, logs};
 use crate::{TEXT_HTML_UTF_8};
 
@@ -71,4 +73,43 @@ pub fn render_500_simple(
     logs::write::error_logs(req, "未能正确获取到模板系统", message);
     HttpResponse::InternalServerError()
         .body("500 Internal Server Error")
+}
+
+
+impl FromRequest for UserBaseI {
+    type Error = Error;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+
+        if let Some(result) = req
+            .extensions()
+            .get::<UserBaseI>().cloned() {
+                ready(Ok(result))
+        } else {
+            ready(
+                Err(
+                    ErrorInternalServerError("500")
+                )
+            )
+        }
+    }
+}
+
+
+impl FromRequest for UserSession {
+    type Error = Error;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        if let Some(result) = req.extensions().get::<UserSession>().cloned() {
+            ready(Ok(result))
+        } else {
+            ready(
+                Err(
+                    ErrorInternalServerError("500")
+                )
+            )
+        }
+    }
 }

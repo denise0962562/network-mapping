@@ -1,12 +1,8 @@
 use actix_web::{web, get, Responder, HttpRequest, HttpResponse};
-use crate::{ReceiveSystemStatusInfo, TEXT_HTML_UTF_8};
-use crate::{SystemStatusJson, get_system_status_info};
-use std::fs;
 use tracing::{error};
-// #[get("/api/data/saa/")]
-// async fn get_saa_data(req: HttpRequest, conn: ConnectionInfo) -> impl Responder {
 
-// }
+use crate::{ReceiveSystemStatusInfo};
+use crate::{SystemStatusJson, get_system_status_info};
 
 
 #[get("/api/data/system-data")]
@@ -36,27 +32,4 @@ async fn get_system_data_handler(
     };
 
     HttpResponse::Ok().json(t_json)
-}
-
-#[get("/dashboard")]
-async fn render_dashboard_page(
-    _req: HttpRequest
-) -> impl Responder {
-    match fs::read_to_string("./frontend/dashboard/index.html") {
-        Ok(f) => {
-            HttpResponse::Ok()
-                .content_type(TEXT_HTML_UTF_8)
-                .body(f)
-        },
-        Err(e) => {
-            error!(
-                event = "ReadFileError",
-                path = "",
-                message = %e
-            );
-            HttpResponse::NotFound()
-                .content_type(TEXT_HTML_UTF_8)
-                .body("")
-        }
-    }
 }

@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error};
 use lettre::{Message, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-// use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use std::time::{SystemTime, UNIX_EPOCH};
 use totp_rs::{Algorithm, Secret, TOTP};
 use postgres_from_row::FromRow;
 use cidr::IpInet;
+use deadpool_postgres::Pool;
 
 use crate::config::SystemConfig;
 use crate::{AddUserInfo, config::EmailConfig};
@@ -261,10 +261,7 @@ pub async fn totp_token_verify(
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs();
-    let current_token = totp.generate(seconds);
-    println!("当前token：{}", &current_token);
     if totp.check(token, seconds) {
-        println!("成功");
         Ok(true)
     }
     else {
@@ -360,6 +357,27 @@ pub struct UserInfo {
     pub login_error_count: Option<i32>,
     pub last_error_at: Option<i64>
 }
+
+impl Default for UserInfo {
+    fn default() -> Self {
+        Self { 
+            id: -1, 
+            username: String::new(), 
+            role: -1, 
+            email: None, 
+            create_time: -1, 
+            limit_login: true, 
+            limit_at: None, 
+            limit_time: None, 
+            enable_2fa: true, 
+            last_login_at: None, 
+            last_login_ip: None, 
+            login_error_count: None, 
+            last_error_at: None 
+        }
+    }
+}
+
 
 /// 获取用户信息
 /// 
@@ -485,7 +503,7 @@ pub async fn get_config_from_database(
     if result.is_empty() {
         Ok(vec![SystemConfig::new()])
     } else {
-        Ok(result.iter().map(FromRow::from_row).collect())
+        Ok(result.iter().map(SystemConfig::try_from_row).collect::<Result<Vec<_>, _>>()?)
     }
 
 }
@@ -512,4 +530,51 @@ pub async fn write_config_to_database(
             Err("插入数据异常".into())
         }
     }
+}
+
+/// 用户基础信息，主要用于中间件注入
+/// 
+/// 只允许存储常用的基础信息，不会存储机密信息
+#[derive(FromRow, Clone)]
+pub struct UserBaseI {
+    pub id: i32,
+    pub username: String,
+    pub role: i32,
+    pub email: String,
+    pub limit_login: bool,
+    pub enable_2fa: bool
+}
+
+#[derive(Clone)]
+pub struct UserSession {
+    pub session: String
+}
+
+/// 获取用户基础信息，返回的数据主要用于注入请求
+pub async fn get_user_base_info(
+    pool: &Pool,
+    user_id: i32
+) -> Result<UserBaseI, Box<dyn std::error::Error>> {
+    let conn = pool.get().await?;
+
+    let row = conn.query_opt(
+        "SELECT id, username, role, email, limit_login, enable_2fa From users WHERE id = $1 LIMIT 1;",
+        &[&user_id]
+    ).await?;
+
+    Ok(row.map(|t| FromRow::try_from_row(&t))
+        // 此处利用 transpose 将 Option<Result<T,E>> 转换为 Result<Option<T>,E>
+        .transpose()?
+        .unwrap_or(
+            UserBaseI { 
+                id: -1, 
+                username: String::new(), 
+                role: -1, 
+                email: String::new(), 
+                limit_login: true, 
+                enable_2fa: true 
+            }
+        )
+    )
+    
 }
