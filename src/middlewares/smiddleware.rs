@@ -6,8 +6,7 @@ use actix_web::{
     dev::{
         forward_ready, Service, ServiceRequest, ServiceResponse, Transform
     },
-    Error,
-    web
+    Error
 };
 
 use futures::future::LocalBoxFuture;
@@ -17,9 +16,8 @@ use crate::login::get_session_from_req;
 use crate::login::{LoginToken};
 use crate::logs::write::info_logs;
 use tracing::{error, info};
-use crate::{TemplatesInit};
 
-use crate::middlewares::{get_pool_from_app_data, render_500, render_500_simple};
+use crate::middlewares::{get_pool_from_app_data};
 
 /// 用于 session 检查的中间件的 Transform
 pub struct AuthMiddleware;
@@ -66,7 +64,7 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
 
         // 向量 path_list 定义了需要做权限校验的路径
-        let path_list = vec!["/api", "/dashboard"];
+        let path_list = vec!["/api", "/dashboard", "/logout"];
         // 白名单
         let white_path = vec!["/api/login", "/api/totp/verify"];
         let path = req.path().to_owned();

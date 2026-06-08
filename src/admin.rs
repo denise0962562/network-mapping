@@ -535,7 +535,7 @@ pub async fn write_config_to_database(
 /// 用户基础信息，主要用于中间件注入
 /// 
 /// 只允许存储常用的基础信息，不会存储机密信息
-#[derive(FromRow)]
+#[derive(FromRow, Clone)]
 pub struct UserBaseI {
     pub id: i32,
     pub username: String,
@@ -545,6 +545,7 @@ pub struct UserBaseI {
     pub enable_2fa: bool
 }
 
+#[derive(Clone)]
 pub struct UserSession {
     pub session: String
 }

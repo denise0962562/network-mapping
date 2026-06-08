@@ -1,7 +1,7 @@
 use std::{future::{Ready, ready}, sync::Arc};
 use tracing::error;
 
-use crate::{TemplatesInit, logs::write::{error_logs, info_logs}, middlewares::{get_pool_from_app_data, render_500, render_500_simple}};
+use crate::{TemplatesInit, middlewares::{get_pool_from_app_data, render_500, render_500_simple}};
 use crate::logs::write::warn_logs;
 
 use actix_web::{

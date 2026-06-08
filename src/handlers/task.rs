@@ -1,19 +1,19 @@
-use actix_web::{HttpMessage, HttpRequest, HttpResponse, Responder, get, post, web};
+use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
 use uuid::Uuid;
 use deadpool_postgres::{Pool};
 use tracing::error;
 use crate::logs::write::{error_logs, info_logs};
-use crate::{FrontEndErrorInfo, front_end_error_page, TemplatesInit, TEXT_HTML_UTF_8, Permission};
+use crate::{TemplatesInit, TEXT_HTML_UTF_8, Permission};
 use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery, get_task_item, TaskItemJson, ReceiveTaskItemQueryInfo};
-use crate::middlewares::{render_403, render_500};
-use crate::admin::{UserBaseI, get_user_id_and_name};
+use crate::middlewares::{render_500};
+use crate::admin::{UserBaseI, UserSession};
 
+/// TODO 让我想想这个接口是干啥的
 #[get("/api/task/{task_id}")]
 async fn get_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
     task_id: web::Path<Uuid>,
-    page_template: web::Data<TemplatesInit>
 ) -> impl Responder {
     let c = pool.get_ref().get().await;
 
@@ -27,21 +27,13 @@ async fn get_task(
                 },
                 Err(e) =>{
                     error_logs(&req, "DATABASE-QUERY-ERROR", e.to_string().as_str());
-                    return HttpResponse::InternalServerError().content_type(TEXT_HTML_UTF_8).body("ERROR")
+                    return HttpResponse::InternalServerError().finish()
                 }
             }
         },
         Err(e) =>{
             error_logs(&req, "DATABASE-ERROR", &(e.to_string()));
-            let info = FrontEndErrorInfo{
-                status_code: 500,
-                error_title: "Internal Server Error",
-                error_message: "内部服务器错误"
-            };
-            let body = front_end_error_page(&info, &page_template);
-            return HttpResponse::InternalServerError()
-                .content_type(TEXT_HTML_UTF_8)
-                .body(body)
+            HttpResponse::InternalServerError().finish()
         }
     }
 }
@@ -51,7 +43,8 @@ async fn create_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
     create_data: web::Json<CreateTask>,
-    page_template: web::Data<TemplatesInit>
+    page_template: web::Data<TemplatesInit>,
+    user_base_i: UserBaseI,
 ) -> impl Responder {
 
     match create_data.level {
@@ -63,21 +56,9 @@ async fn create_task(
         }
     }
 
-    let session_option = &req.cookie("session");
-    let session_str = match session_option {
-        Some(s) => s.value(),
-        None => ""
-    };
-
     let database_conn = pool.get_ref();
-
-    let (user_id, _u_role, user_name) = match get_user_id_and_name(session_str, database_conn).await {
-        Ok(o) => o,
-        Err(e) => {
-            error_logs(&req, "SEARCH-USER-ERROR", &e.to_string());
-            return render_403(&req, &page_template, "未找到相关的用户 id")
-        }
-    };
+    let user_id = user_base_i.id;
+    let user_name = user_base_i.username;
 
     let task_info = STask::new(TargetIP::S(&create_data.ip), &user_name,Some(&create_data.port), create_data.remark.as_deref());
     
@@ -129,35 +110,24 @@ async fn apply_task_handler(
 /// 分为管理员权限和普通用户权限
 #[get("/api/task/all")]
 async fn get_all_task_handler(
-    req: HttpRequest,
+    _req: HttpRequest,
     query_info: web::Query<ReceiveTaskItemQueryInfo>,
-    pool: web::Data<Pool>
+    pool: web::Data<Pool>,
+    user_base_i: UserBaseI,
 ) -> impl Responder {
-    let ext = req.extensions();
     let p = pool.get_ref();
 
-    let userbasei = match ext.get::<UserBaseI>() {
-        Some(s) => s,
-        None => {
-            error!(
-                event = "GetUserBaseInfo",
-                path = "fn get_all_task_handler",
-                message = "获取用户基础信息错误"
-            );
-            return HttpResponse::InternalServerError().finish()
-        }
-    };
+    let user_id = user_base_i.id;
+    let user_role = user_base_i.role;
 
-    let user_id = userbasei.id;
-
-    let permi = match userbasei.role {
+    let permi = match user_role {
         1 => Permission::Administrator(user_id),
         2 => Permission::Users(user_id),
         _ => {
             error!(
                 event = "UserRoleValueInvalid",
                 path = "fn get_all_task_handler",
-                message = format!("用户角色值为：{}", userbasei.role)
+                message = format!("用户角色值为：{}", user_role)
             );
             return HttpResponse::InternalServerError().finish()
         }
