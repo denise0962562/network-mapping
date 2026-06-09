@@ -66,7 +66,9 @@ where
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = vec!["/api", "/dashboard", "/logout"];
         // 白名单
-        let white_path = vec!["/api/login", "/api/totp/verify"];
+        let white_path = vec!["/api/login"];
+        // 不检查 csrf token
+        let no_ckeck_csrft = vec!["/api/totp/verify"];
         let path = req.path().to_owned();
         let svc = self.service.clone();
 
@@ -94,9 +96,7 @@ where
                     svc.call(req).await?.map_into_left_body()
                 )
             }
-            
             else {
-                
                 let session = {
                     get_session_from_req(req.request(), "session")
                 };
@@ -119,7 +119,14 @@ where
                         let login_t = LoginToken {
                             pool: g_pool.clone()
                         };
-                        match login_t.check_token(&se).await {
+
+                        let v_csrf_token = if no_ckeck_csrft.iter().any(|t| path.starts_with(t)) {
+                            false
+                        } else {
+                            true
+                        };
+
+                        match login_t.check_token(&se, v_csrf_token).await {
                             Ok((true, uid)) => {
                                 let tmp_info = match get_user_base_info(g_pool, uid).await {
                                     Ok(o) => o,
