@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
 use crate::handlers::{self, user, utils};
+use crate::{encrypt_data, decrypt_data};
 
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +138,40 @@ impl SystemConfig {
             update_at: None 
         }
     }
+
+    /// 该函数返回的值为 nonce + tag + 密文
+    /// 
+    /// 该函数可以直接更改 value
+    pub fn encrypt(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_value = self.value;
+        if tmp_value.len() <= 0 {
+            return Err("空值".into())
+        } else {
+            let (nonce, tag, ciphertext) = encrypt_data(tmp_value.as_bytes())?;
+
+            let mut encrypted = Vec::new();
+
+            encrypted.extend_from_slice(&nonce);
+            encrypted.extend_from_slice(&tag);
+            encrypted.extend_from_slice(&ciphertext);
+            self.value = openssl::base64::encode_block(&encrypted);
+
+            Ok(())
+        }
+    }
+
+    /// 函数
+    pub fn decrypt(mut self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_value = self.value;
+        if tmp_value.len() <= 0 {
+            return Err("空值".into())
+        } else {
+            let v = openssl::base64::decode_block(&tmp_value)?;
+            let t = decrypt_data(&v, key.as_bytes())?;
+            self.value = openssl::base64::encode_block(&t);
+            return Ok(())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -151,4 +186,3 @@ pub struct MailConfig {
     pub account_username: String,
     pub account_password: String,
 }
-
