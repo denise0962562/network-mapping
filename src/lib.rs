@@ -36,6 +36,8 @@ use password_hash::{PasswordHash, SaltString};
 use password_hash::rand_core::OsRng;
 use cidr::IpInet;
 use serde_json::Value;
+use openssl::symm::{Cipher, Crypter, Mode};
+use openssl::rand;
 
 use db::{get_sql_from_file};
 use config::PasswordHashConfig;
@@ -1187,4 +1189,96 @@ pub async fn get_system_status_info(
     }
     Ok((vec_status, tmp_count))
 
+}
+
+/// 加密关键数据
+/// 
+/// 该函数接受一个参数 明文。返回三个参数，分别为 nonce、tag、密文
+pub fn encrypt_data(
+    plaintext: &[u8],
+    key: &[u8]
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), openssl::error::ErrorStack> {
+
+    // 32 字节密钥，且初始化为 1
+    // let mut key = [1u8; 32];
+    // rand::rand_bytes(&mut key)?;
+
+    // 12 字节nonce ，初始化为 0
+    let mut nonce = [0u8; 12];
+    rand::rand_bytes(&mut nonce)?;
+
+    let cipher = Cipher::aes_256_gcm();
+
+    let mut crypter = Crypter::new(
+        cipher,
+        Mode::Encrypt,
+        &key,
+        Some(&nonce),
+    )?;
+
+    // GCM 不需要 padding
+    crypter.pad(false);
+
+    let mut ciphertext = vec![0u8; plaintext.len() + cipher.block_size()];
+
+    let count = crypter.update(
+        plaintext,
+        &mut ciphertext,
+    )?;
+
+    let rest = crypter.finalize(
+        &mut ciphertext[count..],
+    )?;
+
+    ciphertext.truncate(count + rest);
+
+    let mut tag = [0u8; 16];
+    crypter.get_tag(&mut tag)?;
+
+    Ok((nonce.to_vec(), tag.to_vec(), ciphertext))
+}
+
+/// 解密
+/// 
+pub fn decrypt_data(
+    // value: &[u8],
+    value: &Vec<u8>,
+    // ciphertext: &[u8],
+    key: &[u8],
+    // nonce: &[u8],
+    // tag: &[u8],
+) -> Result<Vec<u8>, openssl::error::ErrorStack> {
+
+    let nonce = &value[..12];
+    let tag = &value[12..28];
+    let ciphertext = &value[28..];
+
+    let cipher = Cipher::aes_256_gcm();
+
+    let mut crypter = Crypter::new(
+        cipher,
+        Mode::Decrypt,
+        key,
+        Some(nonce),
+    )?;
+
+    crypter.pad(false);
+
+    crypter.set_tag(tag)?;
+
+    let mut plaintext =
+        vec![0u8; ciphertext.len() + cipher.block_size()];
+
+    let count = crypter.update(
+        ciphertext,
+        &mut plaintext,
+    )?;
+
+    let rest = crypter.finalize(
+        &mut plaintext[count..],
+    )?;
+
+    plaintext.truncate(count + rest);
+
+    Ok(plaintext)
 }

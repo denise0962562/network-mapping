@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
 use crate::handlers::{self, user, utils};
+use crate::{encrypt_data, decrypt_data};
 
 
 #[derive(Debug, Deserialize)]
@@ -20,10 +21,11 @@ pub struct Config {
     pub email_config: Option<EmailConfig>
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub encrypt_key: String
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +99,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(user::bind_twofa_h)
         .service(user::get_user_info_h)
         .service(user::update_user_info_h)
+        .service(user::totp_config_h)
+        .service(user::unbind_2fa_h)
         .service(utils::get_config_h)
         .service(utils::test_mail_server_h)
         .default_service(web::to(handlers::utils::not_found));
@@ -137,6 +141,40 @@ impl SystemConfig {
             update_at: None 
         }
     }
+
+    /// 该函数返回的值为 nonce + tag + 密文
+    /// 
+    /// 该函数可以直接更改 value
+    pub fn encrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_value = self.value;
+        if tmp_value.len() <= 0 {
+            return Err("空值".into())
+        } else {
+            let (nonce, tag, ciphertext) = encrypt_data(tmp_value.as_bytes(), e_key.as_bytes())?;
+
+            let mut encrypted = Vec::new();
+
+            encrypted.extend_from_slice(&nonce);
+            encrypted.extend_from_slice(&tag);
+            encrypted.extend_from_slice(&ciphertext);
+            self.value = openssl::base64::encode_block(&encrypted);
+
+            Ok(())
+        }
+    }
+
+    /// 函数
+    pub fn decrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_value = self.value;
+        if tmp_value.len() <= 0 {
+            return Err("空值".into())
+        } else {
+            let v = openssl::base64::decode_block(&tmp_value)?;
+            let t = decrypt_data(&v, e_key.as_bytes())?;
+            self.value = openssl::base64::encode_block(&t);
+            return Ok(())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -151,4 +189,3 @@ pub struct MailConfig {
     pub account_username: String,
     pub account_password: String,
 }
-

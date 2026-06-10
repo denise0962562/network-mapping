@@ -66,7 +66,9 @@ where
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = vec!["/api", "/dashboard", "/logout"];
         // 白名单
-        let white_path = vec!["/api/login", "/api/totp/verify"];
+        let white_path = vec!["/api/login"];
+        // 不检查 csrf token
+        let no_ckeck_csrft = vec!["/api/totp/verify"];
         let path = req.path().to_owned();
         let svc = self.service.clone();
 
@@ -88,95 +90,89 @@ where
         );
 
         Box::pin(async move {
-            if !need_check {
+            if need_check == false {
                 // 当请求不是以 path_list 开头则直接放行
-                Ok(
+                return Ok(
                     svc.call(req).await?.map_into_left_body()
                 )
             }
-            
-            else {
-                
-                let session = {
-                    get_session_from_req(req.request(), "session")
-                };
-                match session {
-                    Some(se) => {
-                        let g_pool = match get_pool_from_app_data(&req) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                error!(
-                                    event = "GetPoolError",
-                                    path = "fn call",
-                                    message = %e
-                                );
-                                let resp = HttpResponse::InternalServerError().finish();
-                                return Ok(
-                                    req.into_response(resp).map_into_right_body()
-                                )
-                            }
-                        };
-                        let login_t = LoginToken {
-                            pool: g_pool.clone()
-                        };
-                        match login_t.check_token(&se).await {
-                            Ok((true, uid)) => {
-                                let tmp_info = match get_user_base_info(g_pool, uid).await {
-                                    Ok(o) => o,
-                                    Err(e) => {
-                                        error!(
-                                            event = "GetUserBaseInfoError",
-                                            path = "fn call",
-                                            message = e.to_string()
-                                        );
-                                        let res = HttpResponse::InternalServerError().finish();
-                                        return Ok(req.into_response(res).map_into_right_body())
-                                    }
-                                };
 
-                                // 向通过检查的请求注入用户基础数据
-                                req.extensions_mut().insert(tmp_info);
+            let session = match get_session_from_req(req.request(), "session") {
+                Some(se) => se,
+                None => {
+                    info_logs(req.request(), "InvalidSession", "未能从请求中获取到 Session", false);
+                    let resp = HttpResponse::Unauthorized()
+                        .body("401");
+                    return Ok(
+                        req.into_response(resp).map_into_right_body()
+                    )
+                }
+            };
 
-                                // 向通过检查的请求注入 session ，这样就不需要在每个 handler 中都读取一个 session 了
-                                req.extensions_mut().insert(UserSession { session: se });
+            let g_pool = match get_pool_from_app_data(&req) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(
+                        event = "GetPoolError",
+                        path = "fn call",
+                        message = %e
+                    );
+                    let resp = HttpResponse::InternalServerError().finish();
+                    return Ok(
+                        req.into_response(resp).map_into_right_body()
+                    )
+                }
+            };
+            let login_t = LoginToken {
+                pool: g_pool.clone()
+            };
 
-                                Ok(
-                                    svc.call(req).await?.map_into_left_body()
-                                )
-                            },
-                            Ok((false, _)) => {
-                                info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session", false);
-                                let resp = HttpResponse::Unauthorized()
-                                    .body("401");
-                                Ok(
-                                    req.into_response(resp).map_into_right_body()
-                            )},
-                            Err(e) => {
-                                    error!(
-                                        event = "TokenVerifyError",
-                                        path = "fn call",
-                                        message = %e
-                                    );
-                                    let resp = HttpResponse::InternalServerError().finish();
-                                    return Ok(
-                                        req.into_response(resp).map_into_right_body()
-                                    )
-                            }
+            let v_csrf_token = !no_ckeck_csrft.iter().any(|t| path.starts_with(t));
+
+            match login_t.check_token(&session, v_csrf_token).await {
+                Ok((true, uid)) => {
+                    let tmp_info = match get_user_base_info(g_pool, uid).await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            error!(
+                                event = "GetUserBaseInfoError",
+                                path = "fn call",
+                                message = e.to_string()
+                            );
+                            let res = HttpResponse::InternalServerError().finish();
+                            return Ok(req.into_response(res).map_into_right_body())
                         }
-                    },
-                    None => {
-                        info_logs(req.request(), "InvalidSession", "未能从请求中获取到 Session", false);
-                        let resp = HttpResponse::Unauthorized()
-                            .body("401");
-                        Ok(
-                            req.into_response(resp).map_into_right_body()
-                        )
-                    }
+                    };
+
+                    // 向通过检查的请求注入用户基础数据
+                    req.extensions_mut().insert(tmp_info);
+
+                    // 向通过检查的请求注入 session ，这样就不需要在每个 handler 中都读取一个 session 了
+                    req.extensions_mut().insert(UserSession { session: session });
+
+                    Ok(
+                        svc.call(req).await?.map_into_left_body()
+                    )
+                },
+                Ok((false, _)) => {
+                    info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session", false);
+                    let resp = HttpResponse::Unauthorized()
+                        .body("401");
+                    Ok(
+                        req.into_response(resp).map_into_right_body()
+                )},
+                Err(e) => {
+                    error!(
+                        event = "TokenVerifyError",
+                        path = "fn call",
+                        message = %e
+                    );
+                    let resp = HttpResponse::InternalServerError().finish();
+                    return Ok(
+                        req.into_response(resp).map_into_right_body()
+                    )
                 }
             }
         })
-        
-
-
     }
 }

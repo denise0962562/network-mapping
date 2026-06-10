@@ -1,17 +1,18 @@
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
+use postgres_types::IsNull::No;
 use tracing::error;
 use serde_json::json;
 use std::time::Instant;
 
-use crate::admin::{GetUserInfoH, UserBaseInfo, UserSession, get_user_info, totp_verify_status_change, update_user_info, UserBaseI};
+use crate::admin::{GetUserInfoH, UserBaseI, UserBaseInfo, UserSession, check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info};
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
 use crate::login::{user_login};
 use crate::{TEXT_HTML_UTF_8};
 use crate::logs::write::{error_logs, info_logs};
-use crate::config::{EmailConfig, PasswordHashConfig};
+use crate::config::{EmailConfig, PasswordHashConfig, ServerConfig};
 use crate::TemplatesInit;
 use admin::{
     ReceiveAddUserInfo, 
@@ -217,6 +218,40 @@ async fn user_logout(
 }
 
 
+/// totp 配置
+/// 
+#[get("/api/totp/get")]
+async fn totp_config_h(
+    req: HttpRequest,
+    user_base_i: UserBaseI,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_r = pool.get_ref();
+
+    match check_twofa_bind(&user_base_i.username, pool_r).await {
+        Ok(true) => {
+            HttpResponse::Ok().json(
+                json!({
+                    "success": true,
+                    "message": "已绑定"
+                })
+            )
+        },
+        Ok(false) => {
+            HttpResponse::Ok().json(
+                json!({
+                    "success": false,
+                    "message": "未绑定"
+                })
+            )
+        },
+        Err(e) => {
+            error_logs(&req, "CheckTwofa", &e.to_string());
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
 /// 绑定 2FA 验证器
 /// 
 /// 直接返回 optauth url
@@ -224,11 +259,12 @@ async fn user_logout(
 async fn bind_twofa_h(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
-    user_base_i: UserBaseI
+    user_base_i: UserBaseI,
+    s_config: web::Data<ServerConfig>
 ) -> impl Responder {
     let pool_r = pool.get_ref();
-    
-    match bind_twofa(user_base_i.username, pool_r).await {
+
+    match bind_twofa(user_base_i.username, pool_r, &s_config.encrypt_key).await {
         Ok(tmp) => {
             return HttpResponse::ImUsed()
                 .json(json!({"success": true, "data": tmp}))
@@ -248,12 +284,14 @@ async fn verify_totp_h(
     pool: web::Data<deadpool_postgres::Pool>,
     req: HttpRequest,
     session: UserSession,
-    user_base_i: UserBaseI
+    user_base_i: UserBaseI,
+    s_config: web::Data<ServerConfig>
 ) -> impl Responder {
 
     let database_conn = pool.get_ref();
     let username = user_base_i.username;
-    let totp = match totp_struct(username, database_conn).await {
+
+    let totp = match totp_struct(username, &s_config.encrypt_key, database_conn).await {
         Ok(Some(tmp)) => tmp,
         Ok(None) => {
             info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);
