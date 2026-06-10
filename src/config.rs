@@ -5,6 +5,7 @@ use postgres_from_row::FromRow;
 use std::{path::Path, fs};
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use clap::Parser;
 
 use crate::handlers::{self, user, utils};
 use crate::{encrypt_data, decrypt_data};
@@ -33,7 +34,6 @@ pub struct LogConfig {
     pub directory: String,
     pub file_name: String,
     pub file_rolling: u8,
-    pub debug_mode: bool,
     pub status_duration: u64
 }
 
@@ -52,7 +52,6 @@ pub struct ScanTargetConfig {
 pub struct DatabaseConfig {
     pub host: String,                             //数据库主机地址
     pub port: u16,                                //数据库端口
-    pub database_type: String,                    //数据库类型
     pub username: String,                         //用户名
     pub password: String,                         //密码
     pub db_name: String,                          //数据库名
@@ -188,4 +187,18 @@ pub struct MailConfig {
     pub host: String,
     pub account_username: String,
     pub account_password: String,
+}
+
+
+#[derive(Parser, Debug)]
+#[command(name = "networkm", version = "0.1.0", about = "这是一个网络测绘系统的服务端，可用于向扫描器分发扫描任务，并接收扫描器上传的数据，然后存入数据库。")]
+pub struct Clis {
+    /// 配置文件路径
+    #[arg(long, default_value = "config.toml")]
+    pub config: String,
+
+    /// 调试模式，该模式可以输出详细的信息
+    #[arg(short, long, default_value = "false")]
+    pub debug_model: bool
+
 }

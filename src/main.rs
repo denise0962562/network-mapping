@@ -1,21 +1,26 @@
 use actix_web::{web, App, HttpServer};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use rust_web_test::middlewares::smiddleware::AuthMiddleware;
-use rust_web_test::middlewares::hmiddleware::SHeaderM;
-use rust_web_test::middlewares::csrfmiddleware::CsrfMiddleware;
 use core::panic;
 use std::{io};
-use rust_web_test::logs::{self, LogRollingMode};
-use rust_web_test::{config, db, Systems, TemplatesInit, insert_system_status};
 use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
-// use lettre::message::{Mailbox, header::ContentType};
-use rust_web_test::admin::{check_system_user};
+use clap::Parser;
+
+use rust_web_test::config::Clis;
+use rust_web_test::middlewares::{
+    smiddleware::AuthMiddleware,
+    hmiddleware::SHeaderM,
+    csrfmiddleware::CsrfMiddleware
+};
+use rust_web_test::logs::{self, LogRollingMode};
+use rust_web_test::{config, db, Systems, TemplatesInit, insert_system_status};
+use rust_web_test::admin::check_system_user;
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
+    let args = Clis::parse();
 
-    let config = config::Config::from_file("config.toml");
+    let config = config::Config::from_file(&args.config);
     let ser_con = config.server.clone();
     let server = config.server;
     let server_host = server.host;
@@ -34,7 +39,7 @@ async fn main() -> io::Result<()> {
         2 => LogRollingMode::Minutely,
         _ => LogRollingMode::Never
     }; 
-    let log_debug_mode = log.debug_mode;
+    let log_debug_mode = args.debug_model;
 
     //模板系统配置
     let template = config.templates;
