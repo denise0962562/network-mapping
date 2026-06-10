@@ -127,11 +127,7 @@ where
                 pool: g_pool.clone()
             };
 
-            let v_csrf_token = if no_ckeck_csrft.iter().any(|t| path.starts_with(t)) {
-                false
-            } else {
-                true
-            };
+            let v_csrf_token = !no_ckeck_csrft.iter().any(|t| path.starts_with(t));
 
             match login_t.check_token(&session, v_csrf_token).await {
                 Ok((true, uid)) => {

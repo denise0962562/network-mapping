@@ -1,5 +1,6 @@
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
+use postgres_types::IsNull::No;
 use tracing::error;
 use serde_json::json;
 use std::time::Instant;
@@ -11,7 +12,7 @@ use crate::handlers::{ReceiveLoginInfo};
 use crate::login::{user_login};
 use crate::{TEXT_HTML_UTF_8};
 use crate::logs::write::{error_logs, info_logs};
-use crate::config::{EmailConfig, PasswordHashConfig};
+use crate::config::{EmailConfig, PasswordHashConfig, ServerConfig};
 use crate::TemplatesInit;
 use admin::{
     ReceiveAddUserInfo, 
@@ -224,11 +225,12 @@ async fn user_logout(
 async fn bind_twofa_h(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
-    user_base_i: UserBaseI
+    user_base_i: UserBaseI,
+    s_config: web::Data<ServerConfig>
 ) -> impl Responder {
     let pool_r = pool.get_ref();
-    
-    match bind_twofa(user_base_i.username, pool_r).await {
+
+    match bind_twofa(user_base_i.username, pool_r, &s_config.encrypt_key).await {
         Ok(tmp) => {
             return HttpResponse::ImUsed()
                 .json(json!({"success": true, "data": tmp}))
@@ -248,12 +250,14 @@ async fn verify_totp_h(
     pool: web::Data<deadpool_postgres::Pool>,
     req: HttpRequest,
     session: UserSession,
-    user_base_i: UserBaseI
+    user_base_i: UserBaseI,
+    s_config: web::Data<ServerConfig>
 ) -> impl Responder {
 
     let database_conn = pool.get_ref();
     let username = user_base_i.username;
-    let totp = match totp_struct(username, database_conn).await {
+
+    let totp = match totp_struct(username, &s_config.encrypt_key, database_conn).await {
         Ok(Some(tmp)) => tmp,
         Ok(None) => {
             info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);

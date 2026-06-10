@@ -10,6 +10,7 @@ use deadpool_postgres::Pool;
 
 use crate::config::SystemConfig;
 use crate::{AddUserInfo, config::EmailConfig};
+use crate::{encrypt_data, decrypt_data};
 
 /// 该结构体用于接收测试使用的创建用户信息
 #[derive(Deserialize)]
@@ -175,6 +176,7 @@ pub async fn send_email(
 // 
 pub async fn totp_struct(
     username: String,
+    d_key: &str,
     pool: &deadpool_postgres::Pool
 ) -> Result<Option<TOTP>, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
@@ -184,13 +186,20 @@ pub async fn totp_struct(
         &[&username]
     ).await? {
         Some(r) => {
+            // 从数据库中获取 base64 编码后的数据
+            let tmp_secret = r.get::<_, String>("totp_secret");
+            let t_d_key = openssl::base64::decode_block(d_key)?;
+            // 将 secret 解码
+            let decode_secret = openssl::base64::decode_block(&tmp_secret)?;
+            // 解密 secret
+            let decrypt_result = decrypt_data(&decode_secret, &t_d_key)?;
             Ok(Some(
                 TOTP::new(
                 Algorithm::SHA1, 
                 6, 
                 1, 
                 30, 
-                Secret::Encoded(r.get::<_, String>("totp_secret")).to_bytes()?, 
+                decrypt_result, 
                 Some("Network Mapping".to_string()), 
                 username
             )?))
@@ -222,7 +231,8 @@ pub async fn check_twofa_bind(
 /// 
 pub async fn bind_twofa(
     username: String,
-    pool: &deadpool_postgres::Pool
+    pool: &deadpool_postgres::Pool,
+    e_key: &str
 ) -> Result<String, Box<dyn std::error::Error>> {
     let secret32 = Secret::generate_secret();
 
@@ -239,11 +249,24 @@ pub async fn bind_twofa(
     let url = totp.get_url();
     let mut c = pool.get().await?;
     let transaction = c.transaction().await?;
+
+    let t_e_key = openssl::base64::decode_block(e_key)?;
+
+    let (nonce, tag, ciphertext) = encrypt_data(&secret32.to_bytes()?, &t_e_key)?;
+    
+    let mut encrypted = Vec::new();
+
+    encrypted.extend_from_slice(&nonce);
+    encrypted.extend_from_slice(&tag);
+    encrypted.extend_from_slice(&ciphertext);
+
+    let enc_se = openssl::base64::encode_block(&encrypted);
+
     let _r = transaction.execute(
         "UPDATE users SET totp_secret = $1, enable_2fa = true WHERE username = $2;",
 
-        // 此处的 secret32 是经过 base32 编码后的数据
-        &[&secret32.to_encoded().to_string(), &username]
+        // 此处的 secret32 是经过 base64 编码后的数据
+        &[&enc_se, &username]
     ).await?;
     transaction.commit().await?;
     println!("otpauth url:{}", url);

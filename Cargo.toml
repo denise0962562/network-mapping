@@ -35,6 +35,7 @@ openssl = "0.10"
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "pool"]}
 totp-rs = { version = "5.7", features = ["gen_secret", "qr"]}
 postgres-from-row = "0.5"
+toml_edit = "0.25"
 
 [profile.dev]
 opt-level = 0

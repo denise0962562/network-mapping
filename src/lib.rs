@@ -1195,12 +1195,13 @@ pub async fn get_system_status_info(
 /// 
 /// 该函数接受一个参数 明文。返回三个参数，分别为 nonce、tag、密文
 pub fn encrypt_data(
-    plaintext: &[u8]
+    plaintext: &[u8],
+    key: &[u8]
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), openssl::error::ErrorStack> {
 
     // 32 字节密钥，且初始化为 1
-    let mut key = [1u8; 32];
-    rand::rand_bytes(&mut key)?;
+    // let mut key = [1u8; 32];
+    // rand::rand_bytes(&mut key)?;
 
     // 12 字节nonce ，初始化为 0
     let mut nonce = [0u8; 12];

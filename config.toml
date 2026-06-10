@@ -1,6 +1,7 @@
 [server]
 host = "0.0.0.0"
 port = 9999
+encrypt_key = "ABIMkzg+afPN3/83DNciEmt6L2M9OMPJ2DPGiAwWC5E="
 
 [log]
 directory = "logs"

@@ -21,10 +21,11 @@ pub struct Config {
     pub email_config: Option<EmailConfig>
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub encrypt_key: String
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,12 +143,12 @@ impl SystemConfig {
     /// 该函数返回的值为 nonce + tag + 密文
     /// 
     /// 该函数可以直接更改 value
-    pub fn encrypt(mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn encrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_value = self.value;
         if tmp_value.len() <= 0 {
             return Err("空值".into())
         } else {
-            let (nonce, tag, ciphertext) = encrypt_data(tmp_value.as_bytes())?;
+            let (nonce, tag, ciphertext) = encrypt_data(tmp_value.as_bytes(), e_key.as_bytes())?;
 
             let mut encrypted = Vec::new();
 
@@ -161,13 +162,13 @@ impl SystemConfig {
     }
 
     /// 函数
-    pub fn decrypt(mut self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn decrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_value = self.value;
         if tmp_value.len() <= 0 {
             return Err("空值".into())
         } else {
             let v = openssl::base64::decode_block(&tmp_value)?;
-            let t = decrypt_data(&v, key.as_bytes())?;
+            let t = decrypt_data(&v, e_key.as_bytes())?;
             self.value = openssl::base64::encode_block(&t);
             return Ok(())
         }

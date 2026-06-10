@@ -16,9 +16,13 @@ use rust_web_test::admin::{check_system_user};
 async fn main() -> io::Result<()> {
 
     let config = config::Config::from_file("config.toml");
+    let ser_con = config.server.clone();
     let server = config.server;
     let server_host = server.host;
     let server_port = server.port;
+    if server.encrypt_key.is_empty() {
+        panic!("加密密钥为空")
+    }
     
     //日志系统配置
     let log =  config.log;
@@ -128,6 +132,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
             .app_data(web::Data::new(mail_c.clone()))
+            .app_data(web::Data::new(ser_con.clone()))
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
