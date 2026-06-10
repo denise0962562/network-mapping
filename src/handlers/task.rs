@@ -6,7 +6,7 @@ use crate::logs::write::{error_logs, info_logs};
 use crate::{TemplatesInit, TEXT_HTML_UTF_8, Permission};
 use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery, get_task_item, TaskItemJson, ReceiveTaskItemQueryInfo};
 use crate::middlewares::{render_500};
-use crate::admin::{UserBaseI, UserSession};
+use crate::admin::{UserBaseI};
 
 /// TODO 让我想想这个接口是干啥的
 #[get("/api/task/{task_id}")]
@@ -50,7 +50,7 @@ async fn create_task(
     match create_data.level {
         0..5 => (),
         _ => {
-            info_logs(&req, "InvalidParams", format!("任务优先级level不符合要求{}",create_data.level).as_str(), false);
+            info_logs(&req, "InvalidParams", format!("任务优先级level不符合要求{}",create_data.level).as_str());
             return HttpResponse::BadRequest()
                 .body("400 Bad Request")
         }

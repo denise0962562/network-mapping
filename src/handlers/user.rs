@@ -1,6 +1,5 @@
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
-use postgres_types::IsNull::No;
 use tracing::error;
 use serde_json::json;
 use std::time::Instant;
@@ -294,7 +293,7 @@ async fn verify_totp_h(
     let totp = match totp_struct(username, &s_config.encrypt_key, database_conn).await {
         Ok(Some(tmp)) => tmp,
         Ok(None) => {
-            info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);
+            info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误");
             return HttpResponse::NotFound();
         },
         Err(e) => {
@@ -311,7 +310,7 @@ async fn verify_totp_h(
             // HttpResponse::Ok()
         },
         Ok(false) => {
-            info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
+            info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过");
             HttpResponse::Unauthorized()
         },
         Err(e) => {
@@ -338,7 +337,7 @@ async fn unbind_2fa_h(
     };
     match unbind_2fa(&unbind_info.username, pool_c).await {
         Ok(true) => {
-            info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功", false);
+            info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功");
             HttpResponse::Ok()
         },
         Ok(false) => {

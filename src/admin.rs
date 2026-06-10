@@ -269,7 +269,6 @@ pub async fn bind_twofa(
         &[&enc_se, &username]
     ).await?;
     transaction.commit().await?;
-    println!("otpauth url:{}", url);
 
     Ok(url)
 }

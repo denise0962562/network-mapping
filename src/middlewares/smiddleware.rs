@@ -100,7 +100,7 @@ where
             let session = match get_session_from_req(req.request(), "session") {
                 Some(se) => se,
                 None => {
-                    info_logs(req.request(), "InvalidSession", "未能从请求中获取到 Session", false);
+                    info_logs(req.request(), "InvalidSession", "未能从请求中获取到 Session");
                     let resp = HttpResponse::Unauthorized()
                         .body("401");
                     return Ok(
@@ -155,7 +155,7 @@ where
                     )
                 },
                 Ok((false, _)) => {
-                    info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session", false);
+                    info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session");
                     let resp = HttpResponse::Unauthorized()
                         .body("401");
                     Ok(

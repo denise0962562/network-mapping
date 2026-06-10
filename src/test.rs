@@ -1,7 +1,7 @@
-use actix_web::{http::header::ContentType, test, App, web};
+use actix_web::{test, App, web};
 use crate::config;
 use crate::middlewares::smiddleware::AuthMiddleware;
-use crate::{handlers, login::user_login, logs};
+use crate::{logs};
 use crate::logs::{LogRollingMode};
 use crate::db;
 use crate::handlers::ReceiveLoginInfo;
@@ -11,9 +11,6 @@ use crate::handlers::ReceiveLoginInfo;
 async fn login_test() {
 
     let config = config::Config::from_file("config.toml");
-    let server = config.server;
-    let server_host = server.host;
-    let server_port = server.port;
     
     //日志系统配置
     let log =  config.log;

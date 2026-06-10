@@ -111,7 +111,7 @@ async fn test_mail_server_h(
     let username = user_base_i.username;
 
     if u_role != 1 {
-        info_logs(&req, "UserPermissionDenied", "用户权限不足，操作请求已被拒绝。", false);
+        info_logs(&req, "UserPermissionDenied", "用户权限不足，操作请求已被拒绝。");
         return HttpResponse::Forbidden().finish()
     }
 
