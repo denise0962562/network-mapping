@@ -21,8 +21,7 @@ deadpool-postgres = { version = "0.14"}
 deadpool = "0.12"
 argon2 = "0.5"
 password-hash = "0.5"
-tokio = { version = "1", features = ["full"] }
-#tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 uuid = { version = "1.18", features = ["v4", "v7", "serde"]}
 sysinfo = "0.38"
 chrono = {version = "0.4", features = ["serde"]}
@@ -33,7 +32,7 @@ ipnet = "2.12"
 regex = "1.12"
 openssl = "0.10"
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "pool"]}
-totp-rs = { version = "5.7", features = ["gen_secret", "qr"]}
+totp-rs = { version = "5.7", features = ["gen_secret", "otpauth"]}
 postgres-from-row = "0.5"
 toml_edit = "0.25"
 clap = { version = "4.6", features = ["derive"]}
