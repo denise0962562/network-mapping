@@ -339,6 +339,7 @@ pub async fn unbind_2fa(
             path = "fn unbind_2fa",
             message = format!("用户 {} 解绑 2FA 成功", username)
         );
+        db_transaction.commit().await?;
         Ok(true)
     } else if r == 0 {
         warn!(
