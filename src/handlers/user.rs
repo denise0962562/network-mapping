@@ -5,7 +5,7 @@ use tracing::error;
 use serde_json::json;
 use std::time::Instant;
 
-use crate::admin::{GetUserInfoH, UserBaseInfo, UserSession, get_user_info, totp_verify_status_change, update_user_info, UserBaseI};
+use crate::admin::{GetUserInfoH, UserBaseI, UserBaseInfo, UserSession, check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info};
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
@@ -217,6 +217,40 @@ async fn user_logout(
     
 }
 
+
+/// totp 配置
+/// 
+#[get("/api/totp/get")]
+async fn totp_config_h(
+    req: HttpRequest,
+    user_base_i: UserBaseI,
+    pool: web::Data<deadpool_postgres::Pool>
+) -> impl Responder {
+    let pool_r = pool.get_ref();
+
+    match check_twofa_bind(&user_base_i.username, pool_r).await {
+        Ok(true) => {
+            HttpResponse::Ok().json(
+                json!({
+                    "success": true,
+                    "message": "已绑定"
+                })
+            )
+        },
+        Ok(false) => {
+            HttpResponse::Ok().json(
+                json!({
+                    "success": false,
+                    "message": "未绑定"
+                })
+            )
+        },
+        Err(e) => {
+            error_logs(&req, "CheckTwofa", &e.to_string());
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
 
 /// 绑定 2FA 验证器
 /// 
