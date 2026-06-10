@@ -218,7 +218,7 @@ pub async fn check_twofa_bind(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let database_conn = pool.get().await?;
     if let Some(_r) = database_conn.query_opt(
-        "SELECT username FROM users WHERE username = $1 AND enable_2fa = true AND totp_secret <> NULL;",
+        "SELECT username FROM users WHERE username = $1 AND enable_2fa = true AND totp_secret IS NOT NULL;",
         &[&username]
     ).await? {
         return Ok(true)
