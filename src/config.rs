@@ -5,20 +5,48 @@ use postgres_from_row::FromRow;
 use std::{path::Path, fs};
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use clap::Parser;
 
 use crate::handlers::{self, user, utils};
 use crate::{encrypt_data, decrypt_data};
 
+
+pub trait SelfChecking {
+
+    /// 该方法会直接 **Panic**
+    fn check(&self);
+
+    /// 该方法返回一个 Result 避免 Panic，
+    /// 
+    /// Ok(true) 表示检验成功（符合预期）
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>>;
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     pub log: LogConfig,
     pub templates: TemplatesConfig,
-    pub scan_target_generated: ScanTargetConfig,
+    // pub scan_target_generated: ScanTargetConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub email_config: Option<EmailConfig>
+}
+
+impl SelfChecking for Config {
+    fn check(&self) {
+        let _ = &self.server.check();
+        let _ = &self.database.check();
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        match self.server.try_check() {
+            Ok(true) => (),
+            Ok(false) => return Ok(false),
+            Err(e) => return Err(e)
+        }
+        self.database.try_check()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -28,12 +56,51 @@ pub struct ServerConfig {
     pub encrypt_key: String
 }
 
+impl SelfChecking for ServerConfig {
+    fn check(&self) {
+        if self.host.is_empty() {
+            panic!("监听地址为空")
+        } 
+
+        match &self.encrypt_key.len() {
+            44 => (),
+            0 => panic!("加密密钥为空，请生成 Base64 格式的密钥\n如：openssl rand -base64 32"),
+            ..44 => panic!("加密密钥过短，base64 编码后应为 44 个字符,请生成 Base64 格式的密钥\n如：openssl rand -base64 32"),
+            45.. => panic!("加密密钥过长，base64 编码后应为 44 个字符,请生成 Base64 格式的密钥\n如：openssl rand -base64 32")
+        }
+
+        println!("[server] 通过检查");
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.host.is_empty() {
+            println!("监听地址为空");
+            return Ok(false)
+        } 
+
+        match &self.encrypt_key.len() {
+            44 => Ok(true),
+            0 => {
+                println!("加密密钥为空，请生成 Base64 格式的密钥\n如：openssl rand -base64 32");
+                Ok(false)
+            },
+            ..44 => {
+                println!("加密密钥过短，base64 编码后应为 44 个字符,请生成 Base64 格式的密钥\n如：openssl rand -base64 32");
+                Ok(false)
+            },
+            45.. => {
+                println!("加密密钥过长，base64 编码后应为 44 个字符,请生成 Base64 格式的密钥\n如：openssl rand -base64 32");
+                Ok(false)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LogConfig {
     pub directory: String,
     pub file_name: String,
     pub file_rolling: u8,
-    pub debug_mode: bool,
     pub status_duration: u64
 }
 
@@ -43,22 +110,34 @@ pub struct TemplatesConfig {
     pub templates_name: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ScanTargetConfig {
-    pub generated_mode: String,
-}
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub host: String,                             //数据库主机地址
     pub port: u16,                                //数据库端口
-    pub database_type: String,                    //数据库类型
     pub username: String,                         //用户名
     pub password: String,                         //密码
     pub db_name: String,                          //数据库名
     pub tls: bool,                                //是否使用tls
     pub init_database_file: String,               //初始化数据库表的sql文件
     pub sql_file_path: String,                    //sql文件存放路径（相对）
+}
+
+impl SelfChecking for DatabaseConfig {
+    fn check(&self) {
+        if self.host.is_empty() || self.username.is_empty() || self.password.is_empty() || self.db_name.is_empty() || self.init_database_file.is_empty() {
+            panic!("数据库关键字段为空")
+        }
+
+        println!("[database] 通过检查");
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.host.is_empty() || self.username.is_empty() || self.password.is_empty() || self.db_name.is_empty() || self.init_database_file.is_empty() {
+            println!("数据库关键字段为空");
+            return Ok(false)
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -101,6 +180,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(user::update_user_info_h)
         .service(user::totp_config_h)
         .service(user::unbind_2fa_h)
+        .service(user::web_add_scanner_h)
+        .service(user::scanner_register_h)
         .service(utils::get_config_h)
         .service(utils::test_mail_server_h)
         .default_service(web::to(handlers::utils::not_found));
@@ -188,4 +269,18 @@ pub struct MailConfig {
     pub host: String,
     pub account_username: String,
     pub account_password: String,
+}
+
+
+#[derive(Parser, Debug)]
+#[command(name = "networkm", version = "0.1.0", about = "这是一个网络测绘系统的服务端，可用于向扫描器分发扫描任务，并接收扫描器上传的数据，然后存入数据库。")]
+pub struct Clis {
+    /// 配置文件路径
+    #[arg(long, default_value = "config.toml")]
+    pub config: String,
+
+    /// 调试模式，该模式可以输出详细的信息
+    #[arg(short, long, default_value = "false")]
+    pub debug_model: bool
+
 }

@@ -1,6 +1,5 @@
-use std::path::{Path, PathBuf};
-use tracing_appender::{rolling as import_log_rolling, rolling::RollingFileAppender};
-use tracing_subscriber::{fmt::time::FormatTime, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use std::path::{Path};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use crate::logs::{LogRollingMode, LogTime};
 
 

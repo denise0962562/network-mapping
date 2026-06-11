@@ -1,13 +1,12 @@
 [server]
 host = "0.0.0.0"
 port = 9999
-encrypt_key = "ABIMkzg+afPN3/83DNciEmt6L2M9OMPJ2DPGiAwWC5E="
+encrypt_key = ""
 
 [log]
 directory = "logs"
 file_name = "server.json"
 file_rolling = 0                                         # daliy: 0, hourly: 1, minutely: 2, never: 3
-debug_mode = true #false or true
 
 status_duration = 5                                      # 系统信息采集频率，单位 秒 且为 u64，表示每隔 * 秒采集一次基本信息
 
@@ -15,16 +14,12 @@ status_duration = 5                                      # 系统信息采集频
 templates_directory = "templates/**/*.html"
 templates_name = "error.html"
 
-[scan_target_generated]
-generated_mode = "sequence" # sequence 和random
-
 [database]
 host = "127.0.0.1"
-port = 54433
-database_type = "postgresql"
-username = "nmapping"
-password = "123456"
-db_name = "nmapping"
+port = 5432
+username = ""
+password = ""
+db_name = ""
 tls = false # true or false
 
 init_database_file = "source/database/init.sql"          #用于初始化数据库表的sql文件位置

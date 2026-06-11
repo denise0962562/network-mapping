@@ -1,7 +1,9 @@
-use actix_web::{http::header::ContentType, test, App, web};
-use crate::config;
+use actix_web::{test, App, web};
+use clap::Parser;
+
+use crate::config::{self, Clis};
 use crate::middlewares::smiddleware::AuthMiddleware;
-use crate::{handlers, login::user_login, logs};
+use crate::{logs};
 use crate::logs::{LogRollingMode};
 use crate::db;
 use crate::handlers::ReceiveLoginInfo;
@@ -9,11 +11,9 @@ use crate::handlers::ReceiveLoginInfo;
 
 #[actix_web::test]
 async fn login_test() {
+    let args = Clis::parse();
 
-    let config = config::Config::from_file("config.toml");
-    let server = config.server;
-    let server_host = server.host;
-    let server_port = server.port;
+    let config = config::Config::from_file(&args.config);
     
     //日志系统配置
     let log =  config.log;
@@ -25,7 +25,7 @@ async fn login_test() {
         2 => LogRollingMode::Minutely,
         _ => LogRollingMode::Never
     }; 
-    let log_debug_mode = log.debug_mode;
+    let log_debug_mode = args.debug_model;
 
 
     // let _guard = init_tracing(&log_file_directory, &log_file_name, &log_file_rolling, &log_debug_mode);

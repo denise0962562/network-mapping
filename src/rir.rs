@@ -5,11 +5,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use deadpool_postgres::Pool;
-use ipnet::IpAdd;
 use ipnet::Ipv4Net;
 use std::net::Ipv4Addr;
-use std::net::IpAddr;
-use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 
 

@@ -7,6 +7,7 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use postgres_from_row::FromRow;
 use cidr::IpInet;
 use deadpool_postgres::Pool;
+use uuid::Uuid;
 
 use crate::config::SystemConfig;
 use crate::{AddUserInfo, config::EmailConfig};
@@ -43,6 +44,22 @@ pub struct VerifyTotp {
 #[derive(Deserialize)]
 pub struct Unbind2FAH {
     pub username: String
+}
+
+/// web 添加扫描器
+#[derive(Deserialize)]
+pub struct AddScanner {
+    pub name: String,
+    pub location: Option<String>,
+    pub remark: Option<String>,
+    pub tag: Option<String>
+}
+
+/// 扫描器注册
+#[derive(Deserialize, Serialize)]
+pub struct ScannerRegisterData {
+    pub scanner_id: String,
+    pub token: String,
 }
 
 
@@ -269,7 +286,6 @@ pub async fn bind_twofa(
         &[&enc_se, &username]
     ).await?;
     transaction.commit().await?;
-    println!("otpauth url:{}", url);
 
     Ok(url)
 }
@@ -601,4 +617,60 @@ pub async fn get_user_base_info(
         )
     )
     
+}
+
+/// web 端添加扫描器
+/// 
+/// 返回 ScannerRegisterData 
+pub async fn web_add_scanner(
+    pool: &Pool,
+    user_id: i32,
+    add_data: &AddScanner
+) -> Result<ScannerRegisterData, Box<dyn std::error::Error>> {
+    let mut db_conn = pool.get().await?;
+    let db_transaction = db_conn.transaction().await?;
+
+    // 生成扫描器 id （uuid v7）
+    let scanner_id = Uuid::now_v7().to_string();
+    // 生成注册 id （普通字符）
+    let mut token_buffer = [1u8; 36];
+    openssl::rand::rand_bytes(&mut token_buffer)?;
+    let token = openssl::base64::encode_block(&token_buffer);
+    
+    match db_transaction.execute(
+        "INSERT INTO scanner_info (name, scanner_id, create_user, token, location, create_time, remark, tag) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7);",
+        &[&add_data.name, &scanner_id, &user_id, &token, &add_data.location, &add_data.remark, &add_data.tag]
+    ).await? {
+        1 => {
+            db_transaction.commit().await?;
+            Ok(ScannerRegisterData {
+                scanner_id: scanner_id,
+                token: token
+            })
+        },
+        _ => Err("创建影响多行".into())
+    }
+}
+
+/// 扫描器注册
+/// 
+pub async fn scanner_register(
+    pool: &Pool,
+    register_data: &ScannerRegisterData
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut db_conn = pool.get().await?;
+    let db_transaction = db_conn.transaction().await?;
+
+    match db_transaction.execute(
+        "UPDATE scanner_info SET register_time = NOW(), update_time = Now(), is_enable = true WHERE scanner_id = $1 AND token = $2;",
+        &[&register_data.scanner_id, &register_data.token]
+    ).await? {
+        1 => {
+            db_transaction.commit().await?;
+            Ok(())
+        },
+        _ => {
+            Err("更新影响多行".into())
+        }
+    }
 }

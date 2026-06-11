@@ -56,9 +56,18 @@ where
 
 
         let svc = self.service.clone();
+        let no_ckeck_csrft = vec!["/api/scanner/register"];
+        let path = req.path().to_owned();
+
+        let pass = no_ckeck_csrft.iter().any(|p| &path == p);
         
 
         Box::pin(async move {
+
+            // 如果路径是扫描器相关直接放行
+            if pass {
+                return Ok(svc.call(req).await?.map_into_left_body())
+            }
 
             // MARK: 对 GET 请求也校验 csrf token
             // if req.method().as_str() == "GET" {

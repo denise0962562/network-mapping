@@ -1,11 +1,11 @@
 
 use tracing::{info, warn, error};
-use actix_web::{HttpRequest, dev::ConnectionInfo};
+use actix_web::{HttpRequest};
 
 // use crate::logs::LogEventType;
 use crate::{get_conn_ip, get_user_agent, logs::LoginLog};
 //TODO:需要获取代理状态下用户的原始ip
-pub fn info_logs(req: &HttpRequest, event: &str, message: &str, proxy: bool)  {
+pub fn info_logs(req: &HttpRequest, event: &str, message: &str)  {
 
     let req_method = req.method();
     let req_path = req.path();

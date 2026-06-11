@@ -66,9 +66,9 @@ where
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = vec!["/api", "/dashboard", "/logout"];
         // 白名单
-        let white_path = vec!["/api/login"];
+        let white_path = vec!["/api/login", "/api/scanner/register"];
         // 不检查 csrf token
-        let no_ckeck_csrft = vec!["/api/totp/verify"];
+        let no_ckeck_csrft = vec!["/api/totp/verify", "/api/scanner/register"];
         let path = req.path().to_owned();
         let svc = self.service.clone();
 
@@ -100,7 +100,7 @@ where
             let session = match get_session_from_req(req.request(), "session") {
                 Some(se) => se,
                 None => {
-                    info_logs(req.request(), "InvalidSession", "未能从请求中获取到 Session", false);
+                    info_logs(req.request(), "InvalidSession", "未能从请求中获取到 Session");
                     let resp = HttpResponse::Unauthorized()
                         .body("401");
                     return Ok(
@@ -155,7 +155,7 @@ where
                     )
                 },
                 Ok((false, _)) => {
-                    info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session", false);
+                    info_logs(req.request(), "InvalidSession", "数据库中未找到符合条件的 Session");
                     let resp = HttpResponse::Unauthorized()
                         .body("401");
                     Ok(

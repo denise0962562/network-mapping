@@ -1,11 +1,12 @@
 use actix_web::cookie::time::OffsetDateTime;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, get, post, cookie, cookie::Cookie};
-use postgres_types::IsNull::No;
 use tracing::error;
 use serde_json::json;
+use std::ops::Deref;
 use std::time::Instant;
+use deadpool_postgres::Pool;
 
-use crate::admin::{GetUserInfoH, UserBaseI, UserBaseInfo, UserSession, check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info};
+use crate::admin::{AddScanner, GetUserInfoH, ScannerRegisterData, UserBaseI, UserBaseInfo, UserSession, check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info};
 use crate::middlewares::render_500;
 use crate::{admin, generate_hash_password, AddUserInfo, log_out};
 use crate::handlers::{ReceiveLoginInfo};
@@ -21,7 +22,9 @@ use admin::{
     bind_twofa, 
     totp_struct, 
     totp_token_verify, 
-    unbind_2fa
+    unbind_2fa,
+    web_add_scanner,
+    scanner_register
 };
 
 // BUG 暂时使用 bug 标签用于提示
@@ -294,7 +297,7 @@ async fn verify_totp_h(
     let totp = match totp_struct(username, &s_config.encrypt_key, database_conn).await {
         Ok(Some(tmp)) => tmp,
         Ok(None) => {
-            info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误", false);
+            info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误");
             return HttpResponse::NotFound();
         },
         Err(e) => {
@@ -311,7 +314,7 @@ async fn verify_totp_h(
             // HttpResponse::Ok()
         },
         Ok(false) => {
-            info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过", false);
+            info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过");
             HttpResponse::Unauthorized()
         },
         Err(e) => {
@@ -338,7 +341,7 @@ async fn unbind_2fa_h(
     };
     match unbind_2fa(&unbind_info.username, pool_c).await {
         Ok(true) => {
-            info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功", false);
+            info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功");
             HttpResponse::Ok()
         },
         Ok(false) => {
@@ -412,6 +415,52 @@ async fn update_user_info_h(
         },
         Err(e) => {
             error_logs(&req, "UpdateUserInfoError", &e.to_string());
+            HttpResponse::InternalServerError()
+        }
+    }
+}
+
+
+/// 添加扫描器
+/// 
+/// 主要是 web 端添加用的
+#[post("/api/scanner/add")]
+async fn web_add_scanner_h(
+    req:HttpRequest,
+    pool: web::Data<Pool>,
+    user_base_i: UserBaseI,
+    add_data: web::Json<AddScanner>
+) -> impl Responder {
+    let pool_ref = pool.get_ref();
+    let s_id = match web_add_scanner(pool_ref, user_base_i.id, add_data.deref()).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            error_logs(&req, "AddScannerError", &e.to_string());
+            return HttpResponse::InternalServerError().finish()
+        }
+    };
+    let res_data = json!({
+        "success": true,
+        "data": s_id
+    });
+    HttpResponse::Ok().json(res_data)
+}
+
+/// 扫描器注册
+/// 
+#[post("/api/scanner/register")]
+async fn scanner_register_h(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    register_data: web::Json<ScannerRegisterData>
+) -> impl Responder {
+    
+    match scanner_register(&pool, &register_data).await {
+        Ok(_) => {
+            HttpResponse::Ok()
+        },
+        Err(e) => {
+            error_logs(&req, "ScannerRegister", &e.to_string());
             HttpResponse::InternalServerError()
         }
     }
