@@ -127,14 +127,19 @@ CREATE TABLE IF NOT EXISTS login_logs (
 -- 表 scanner_info 用于存储扫描器的各种信息，可以存放扫描器的 ID (UUIDV4) ，扫描器的版本，所支持的网络环境 IPV4/IPV6/ALL ，当前状态（RUN/STOP）
 CREATE TABLE IF NOT EXISTS scanner_info (
 	id SERIAL PRIMARY KEY,
-	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         --该字段为扫描器的 ID ，UUIDV4
+	name VARCHAR(50),                                                               -- 扫描器的名称
+	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         -- 该字段为扫描器的 ID ，UUIDV7
+	create_user INT NOT NULL,                                                       -- 由谁创建
+	token TEXT,                                                                     -- 扫描器 token
 	location TEXT,                                                                  -- 扫描器的位置描述
 	system_version TEXT,                                                            -- 扫描器所在的系统名称及版本
 	scanner_version TEXT,                                                           -- 扫描器的版本
 	cpus INT,                                                                       -- 扫描器 CPU 数量
 	ram INT,                                                                        -- 扫描器 RAM 大小
 	uptime INT,                                                                     -- 扫描器总共运行的时间
-	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT,     -- 扫描器创建的时间
+	create_time TIMESTAMPTZ,                                                        -- 扫描器创建的时间
+	register_time TIMESTAMPTZ,                                                      -- 扫描器注册时间
+	update_time TIMESTAMPTZ,                                                        -- 更新时间
 	ip_address INET,                                                                -- 扫描器的IP地址
 	is_run boolean,                                                                 -- 扫描器是否在运行
 	is_enable boolean,                                                              -- 扫描器是否启用
