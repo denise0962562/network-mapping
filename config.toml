@@ -14,9 +14,6 @@ status_duration = 5                                      # 系统信息采集频
 templates_directory = "templates/**/*.html"
 templates_name = "error.html"
 
-[scan_target_generated]
-generated_mode = "sequence" # sequence 和random
-
 [database]
 host = "127.0.0.1"
 port = 5432

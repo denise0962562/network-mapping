@@ -6,7 +6,7 @@ use tracing::{error};
 use tokio::time::{Instant, interval_at, Duration};
 use clap::Parser;
 
-use rust_web_test::config::Clis;
+use rust_web_test::config::{Clis, SelfChecking};
 use rust_web_test::middlewares::{
     smiddleware::AuthMiddleware,
     hmiddleware::SHeaderM,
@@ -20,14 +20,17 @@ use rust_web_test::admin::check_system_user;
 async fn main() -> io::Result<()> {
     let args = Clis::parse();
 
+    println!("开始加载配置文件。");
     let config = config::Config::from_file(&args.config);
+
+    println!("配置文件加载完毕。");
+    config.check();
+    println!();
+
     let ser_con = config.server.clone();
     let server = config.server;
     let server_host = server.host;
     let server_port = server.port;
-    if server.encrypt_key.is_empty() {
-        panic!("加密密钥为空")
-    }
     
     //日志系统配置
     let log =  config.log;
@@ -48,14 +51,12 @@ async fn main() -> io::Result<()> {
         templates_name: template.templates_name,
     };
 
-    // let _guard = init_tracing(&log_file_directory, &log_file_name, &log_file_rolling, &log_debug_mode);
     let _guard = logs::init::init(&log_file_directory, &log_file_name, &log_file_rolling, &log_debug_mode);
     println!("日志系统已启动");
     let db_config = config.database;
     let database_c = db_config.clone();
     let database_c2 = db_config.clone();
 
-    // let database = format!("postgresql://{}:{}@{}/{}", db_config.username, db_config.password, db_config.host, db_config.db_name);
     let db_pool = db::create_postgresql_pool(
         db_config.host, 
         db_config.port, 
