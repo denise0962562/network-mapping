@@ -465,3 +465,14 @@ async fn scanner_register_h(
         }
     }
 }
+
+// 扫描器状态
+//
+// 通过定时接收扫描器发送的请求来判断扫描器是否在线，以及当前状态
+// #[post("/api/scanner/health")]
+// async fn scanner_health_h(
+//     req: HttpRequest,
+//     pool: web::Data<Pool>
+// ) -> {
+
+// }

@@ -62,6 +62,21 @@ pub struct ScannerRegisterData {
     pub token: String,
 }
 
+pub enum ScannerEvent {
+    Start = 0,
+    Shutdown = 1,
+    Normal = 2,
+}
+
+/// 扫描器健康数据
+#[derive(Deserialize)]
+pub struct ScannerHealthData {
+    pub scanner_id: Uuid,
+    pub status: String,
+    pub uptime: u32,
+    pub event: String,
+}
+
 
 ///该函数用于添加用户，且需要调用者处理日志。
 pub async fn add_user<'a>(user: AddUserInfo<'a>, pool: &deadpool_postgres::Pool) -> Result<(), Box<dyn std::error::Error>> {
@@ -674,3 +689,10 @@ pub async fn scanner_register(
         }
     }
 }
+
+// 扫描器健康检查
+// 
+// pub async fn scanner_health(
+//     pool: &Pool,
+
+// )

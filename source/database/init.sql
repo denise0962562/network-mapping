@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	name VARCHAR(50),                                                               -- 扫描器的名称
 	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         -- 该字段为扫描器的 ID ，UUIDV7
 	create_user INT NOT NULL,                                                       -- 由谁创建
-	token TEXT,                                                                     -- 扫描器 token
+	token TEXT UNIQUE,                                                              -- 扫描器 token
 	location TEXT,                                                                  -- 扫描器的位置描述
 	system_version TEXT,                                                            -- 扫描器所在的系统名称及版本
 	scanner_version TEXT,                                                           -- 扫描器的版本
