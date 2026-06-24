@@ -809,6 +809,7 @@ pub async fn scanner_register(
             db_transaction.commit().await?;
             Ok(())
         },
+        0 => Err("scanner unauthorized".into()),
         _ => {
             Err("更新影响多行".into())
         }

@@ -461,6 +461,9 @@ async fn scanner_register_h(
         },
         Err(e) => {
             error_logs(&req, "ScannerRegister", &e.to_string());
+            if e.to_string() == "scanner unauthorized" {
+                return HttpResponse::Unauthorized();
+            }
             HttpResponse::InternalServerError()
         }
     }

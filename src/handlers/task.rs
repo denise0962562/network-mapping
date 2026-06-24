@@ -4,7 +4,7 @@ use deadpool_postgres::{Pool};
 use tracing::error;
 use crate::logs::write::{error_logs, info_logs};
 use crate::{TemplatesInit, TEXT_HTML_UTF_8, Permission};
-use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery, get_task_item, TaskItemJson, ReceiveTaskItemQueryInfo};
+use crate::{CreateTask, STask, TargetIP, apply_task, validate_scanner_credentials, ApplyTaskError, ApplyTaskQuery, get_task_item, TaskItemJson, ReceiveTaskItemQueryInfo};
 use crate::{ScannerResultUpload, SaveScannerResultsError, save_scanner_results};
 use crate::middlewares::{render_500};
 use crate::admin::{UserBaseI};
@@ -86,23 +86,43 @@ async fn create_task(
 /// 用于扫描器申请一个扫描目标
 #[get("/api/task/apply")]
 async fn apply_task_handler(
-    _req: HttpRequest,
+    req: HttpRequest,
     scanner_id: web::Query<ApplyTaskQuery>,
     pool: web::Data<Pool>
 ) -> impl Responder {
     let database_conn = pool.get_ref();
-    let task_data = apply_task(database_conn, scanner_id).await;
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
 
-    if task_data.is_ok() {
-        task_data.map(|a_t| {
-            HttpResponse::Ok()
-                .json(a_t)
-        }).unwrap()
+    let Some(token) = token else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+
+    if scanner_id.dryrun.unwrap_or(false) {
+        return match validate_scanner_credentials(database_conn, scanner_id.scannerid, token).await {
+            Ok(()) => HttpResponse::Ok().finish(),
+            Err(ApplyTaskError::ScannerUnauthorized) => HttpResponse::Unauthorized().body("unauthorized"),
+            Err(ApplyTaskError::NoTask) => HttpResponse::NotFound().finish(),
+            Err(ApplyTaskError::Database(e)) => {
+                error_logs(&req, "ScannerCredentialCheckError", &e.to_string());
+                HttpResponse::InternalServerError().finish()
+            }
+        };
     }
-    else {
-        HttpResponse::NotFound()
+
+    match apply_task(database_conn, scanner_id.scannerid, token).await {
+        Ok(a_t) => HttpResponse::Ok().json(a_t),
+        Err(ApplyTaskError::ScannerUnauthorized) => HttpResponse::Unauthorized().body("unauthorized"),
+        Err(ApplyTaskError::NoTask) => HttpResponse::NotFound()
             .content_type(TEXT_HTML_UTF_8)
-            .body("没有找到或内部错误")
+            .body("没有可领取的任务"),
+        Err(ApplyTaskError::Database(e)) => {
+            error_logs(&req, "ApplyTaskError", &e.to_string());
+            HttpResponse::InternalServerError().finish()
+        }
     }
     
 }

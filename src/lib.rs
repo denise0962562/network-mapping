@@ -957,6 +957,57 @@ pub enum SaveScannerResultsError {
     TaskNotFound,
 }
 
+#[derive(Debug)]
+pub enum ApplyTaskError {
+    Database(Box<dyn std::error::Error + Send + Sync>),
+    ScannerUnauthorized,
+    NoTask,
+}
+
+pub async fn validate_scanner_credentials(
+    pool: &deadpool_postgres::Pool,
+    scanner_id: Uuid,
+    token: &str,
+) -> Result<(), ApplyTaskError> {
+    let p = pool.get().await.map_err(apply_task_database_error)?;
+    let scanner = p.query_opt(
+        "SELECT id FROM scanner_info WHERE scanner_id = $1 AND token = $2 AND is_enable = true;",
+        &[&scanner_id.to_string(), &token]
+    ).await.map_err(apply_task_database_error)?;
+
+    if scanner.is_some() {
+        Ok(())
+    } else {
+        Err(ApplyTaskError::ScannerUnauthorized)
+    }
+}
+
+impl fmt::Display for ApplyTaskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(e) => write!(f, "{}", e),
+            Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
+            Self::NoTask => write!(f, "没有可领取的任务"),
+        }
+    }
+}
+
+impl std::error::Error for ApplyTaskError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(e) => Some(e.as_ref()),
+            Self::ScannerUnauthorized | Self::NoTask => None,
+        }
+    }
+}
+
+fn apply_task_database_error<E>(value: E) -> ApplyTaskError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ApplyTaskError::Database(Box::new(value))
+}
+
 impl fmt::Display for SaveScannerResultsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1071,64 +1122,53 @@ pub async fn save_scanner_results(
 /// 首先搜索合适的任务，如果没有任务则会创建一个系统任务，该任务也会写入 scan_task 中
 pub async fn apply_task(
     pool: &deadpool_postgres::Pool,
-    _scanner_id: web::Query<ApplyTaskQuery>
-) -> Result<ApplyTask, Box<dyn std::error::Error>> {
-    let p = pool.get().await?;
-    let row = p.query_opt(
-        "SELECT user_id, task_id, task_target::text[], task_port FROM scan_task WHERE task_start_time IS NULL
-                    AND task_end_time IS NULL 
-                    ORDER BY task_level DESC, task_create_time LIMIT 1;", 
+    scanner_id: Uuid,
+    token: &str,
+) -> Result<ApplyTask, ApplyTaskError> {
+    validate_scanner_credentials(pool, scanner_id, token).await?;
+
+    let mut p = pool.get().await.map_err(apply_task_database_error)?;
+    let transaction = p.transaction().await.map_err(apply_task_database_error)?;
+
+    let row = transaction.query_opt(
+        "SELECT id, user_id, task_id, task_target::text[], task_port \
+         FROM scan_task \
+         WHERE task_start_time IS NULL AND task_end_time IS NULL \
+         ORDER BY task_level DESC, task_create_time \
+         FOR UPDATE SKIP LOCKED \
+         LIMIT 1;", 
         &[]
-    ).await?;
+    ).await.map_err(apply_task_database_error)?;
 
-    if let Some(r_applytask) = row.map(|r| {
-        let uid = Uuid::parse_str(r.get("task_id")).unwrap_or_default();
-
-        ApplyTask {
-            user_id: r.get("user_id"),
-            task_id: uid,
-            task_target: r.get("task_target"),
-            task_port: r.get("task_port")
-        }
-    }) {
-        info!(event = "SEARCH-TASK", path = "fn apply_task", message = r_applytask.task_id.to_string());
-        return Ok(r_applytask)
-    }
-
-
-    info!(event = "NOTFOUND-TASK-1", path = "fn apply_task", message = "数据库表 scan_task 中没有合适的任务");
-
-    // TODO: 到时需要实现 IP 生成，根据上次扫描的 IP 生成此次的 IP 
-    let c_task = STask {
-        task_id: Some(Uuid::now_v7()),
-        task_initiator: "System",
-        ip: vec!["47.122.119.248/24".parse::<IpNet>()?],
-        port: Some("1-65535"),
-        start_at: Some(get_unix_epoch_ms()),
-        end_at: None,
-        remark: None
+    let Some(row) = row else {
+        info!(event = "NOTFOUND-TASK", path = "fn apply_task", message = "没有可领取的扫描任务");
+        return Err(ApplyTaskError::NoTask);
     };
 
-    if c_task.task_id.is_none() || c_task.ip.is_empty() || c_task.port.is_none() || c_task.start_at.is_none() {
-        Err("c_task 值出现错误".into())
-    } 
-    else {
-        c_task.add(pool, 0, 1).await?;
-        info!(event = "CREATE-TASK", path = "fn apply_task", message = "创建系统默认扫描任务");
-        let i = ApplyTask {
-            user_id: 1,
-            task_id: c_task.task_id.unwrap(),
-            task_target: c_task.ip.iter().map(|ip| ip.to_string() ).collect(),
-            task_port: c_task.port.unwrap().to_string()
-        };
-        info!(event = "CREATE-TASK", path = "fn apply_task", message = i.task_id.to_string());
-        Ok(i)
-    }
+    let task_pk: i32 = row.get("id");
+    transaction.execute(
+        "UPDATE scan_task SET task_start_time = COALESCE(task_start_time, $1) WHERE id = $2;",
+        &[&get_unix_epoch_ms(), &task_pk]
+    ).await.map_err(apply_task_database_error)?;
+
+    let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
+        .map_err(apply_task_database_error)?;
+    let apply_task = ApplyTask {
+        user_id: row.get("user_id"),
+        task_id,
+        task_target: row.get("task_target"),
+        task_port: row.get("task_port")
+    };
+
+    transaction.commit().await.map_err(apply_task_database_error)?;
+    info!(event = "SEARCH-TASK", path = "fn apply_task", message = apply_task.task_id.to_string());
+    Ok(apply_task)
 }
 
 #[derive(Deserialize)]
 pub struct ApplyTaskQuery {
-    pub scannerid: Uuid
+    pub scannerid: Uuid,
+    pub dryrun: Option<bool>,
 }
 
 
