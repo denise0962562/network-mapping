@@ -11,7 +11,8 @@ use rust_web_test::config::{Clis, SelfChecking};
 use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::maxmind::MaxMindState;
 use rust_web_test::middlewares::{
-    csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, smiddleware::AuthMiddleware,
+    csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, ratelimit::RateLimitMiddleware,
+    smiddleware::AuthMiddleware,
 };
 use rust_web_test::{Systems, TemplatesInit, config, db, insert_system_status};
 
@@ -99,6 +100,7 @@ async fn main() -> io::Result<()> {
     let sys = Systems::new();
     let sys_2 = sys.clone();
     let maxmind_state = web::Data::new(MaxMindState::from_default_paths());
+    let rate_limiter = RateLimitMiddleware::default();
 
     println!("服务已启动");
     println!("监听 {}:{}", server_host, server_port);
@@ -165,6 +167,7 @@ async fn main() -> io::Result<()> {
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
+            .wrap(rate_limiter.clone())
             .configure(config::init_routes)
     })
     .bind_openssl((server_host, server_port), tls)?

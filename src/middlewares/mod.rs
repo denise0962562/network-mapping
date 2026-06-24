@@ -16,6 +16,8 @@ pub mod smiddleware;
 pub mod hmiddleware;
 // 该中间件用于处理 CSRF TOKEN
 pub mod csrfmiddleware;
+// 该中间件用于限制公开入口请求频率
+pub mod ratelimit;
 
 /// 该函数用于从 app_data 中获取数据库连接池
 ///
