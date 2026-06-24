@@ -764,7 +764,7 @@ pub struct UserBaseI {
     pub id: i32,
     pub username: String,
     pub role: i32,
-    pub email: String,
+    pub email: Option<String>,
     pub limit_login: bool,
     pub enable_2fa: bool,
 }
@@ -794,7 +794,7 @@ pub async fn get_user_base_info(
             id: -1,
             username: String::new(),
             role: -1,
-            email: String::new(),
+            email: None,
             limit_login: true,
             enable_2fa: true,
         }))
