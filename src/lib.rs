@@ -1,51 +1,53 @@
-
-pub mod logs;
+pub mod admin;
 pub mod config;
 pub mod db;
-pub mod target_generated;
-pub mod login;
-pub mod admin;
 pub mod handlers;
+pub mod login;
+pub mod logs;
 pub mod maxmind;
+pub mod target_generated;
 
 #[cfg(feature = "rir")]
-pub mod rir;                                                  // 该模块用于从五大 RIR 获取 ASN 和组织等信息
+pub mod rir; // 该模块用于从五大 RIR 获取 ASN 和组织等信息
 
 // 自己的中间件
 pub mod middlewares;
 
-
 #[cfg(test)]
-pub mod test;                                                 // 测试模块
+pub mod test; // 测试模块
 
-use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::{HttpRequest, web};
-use tokio_postgres::Row;
-use tracing::{error, info, warn};
-use std::path::{Path, PathBuf};
-use tera::{Tera, Context};
-use std::collections::HashMap;
-use sysinfo;
-use std::sync::{Arc, Mutex};
-use serde::{Serialize, Deserialize};
-use serde_json;
-use tokio_postgres::types::ToSql;
-use uuid::{Uuid};
-use regex::Regex;
-use std::time::Instant;
-use ipnet::{AddrParseError, IpNet};
-use argon2::{Argon2, Algorithm, Params, Version, PasswordHasher, PasswordVerifier};
-use password_hash::{PasswordHash, SaltString};
-use password_hash::rand_core::OsRng;
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
 use cidr::IpInet;
-use serde_json::Value;
-use openssl::symm::{Cipher, Crypter, Mode};
+use ipnet::{AddrParseError, IpNet};
+use openssl::hash::MessageDigest;
+use openssl::pkey::PKey;
 use openssl::rand;
+use openssl::sign::Signer;
+use openssl::symm::{Cipher, Crypter, Mode};
+use password_hash::rand_core::OsRng;
+use password_hash::{PasswordHash, SaltString};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
+use sysinfo;
+use tera::{Context, Tera};
+use tokio_postgres::Row;
+use tokio_postgres::types::ToSql;
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
-use db::{get_sql_from_file};
-use config::PasswordHashConfig;
 use admin::TotpInfo;
+use config::PasswordHashConfig;
+use db::get_sql_from_file;
 use maxmind::MaxMindState;
 
 //常量
@@ -56,6 +58,41 @@ pub const IMAGE_PNG: &str = "image/png";
 pub const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 pub const APPLICATION_JSON: &str = "application/json";
 pub const _SYSTEM_TIME_ZONE: &str = "Asia/Shanghai";
+const SCANNER_TOKEN_PEPPER_ENV: &str = "NM_SCANNER_TOKEN_PEPPER";
+
+pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
+    let mut token_buffer = [0u8; 36];
+    rand::rand_bytes(&mut token_buffer)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok(format!(
+        "{}_{}",
+        prefix,
+        openssl::base64::encode_block(&token_buffer)
+    ))
+}
+
+pub fn hash_scanner_token(token: &str) -> Result<String, io::Error> {
+    let pepper = std::env::var(SCANNER_TOKEN_PEPPER_ENV).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "missing required environment variable {}",
+                SCANNER_TOKEN_PEPPER_ENV
+            ),
+        )
+    })?;
+    let key = PKey::hmac(pepper.as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let mut signer = Signer::new(MessageDigest::sha256(), &key)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    signer
+        .update(token.as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let digest = signer
+        .sign_to_vec()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok(openssl::base64::encode_block(&digest))
+}
 
 struct FrontEndErrorInfo<'a> {
     status_code: u16,
@@ -71,25 +108,23 @@ pub struct _ProxySetting {
 pub struct AddUserInfo<'a> {
     pub username: &'a str,
     pub password_hash: &'a str,
-    pub role: i32
+    pub role: i32,
 }
 
-
 impl<'a> AddUserInfo<'a> {
-    fn check(&self) -> Result<(),Box<dyn std::error::Error>> {
+    fn check(&self) -> Result<(), Box<dyn std::error::Error>> {
         match self.role {
             0..=2 => Ok(()),
-            _ => Err("角色值不符合规则".into())
+            _ => Err("角色值不符合规则".into()),
         }
     }
 }
-
 
 pub struct UserLoginInfo {
     pub username: String,
     pub role: i32,
     pub email_address: Option<String>,
-    pub twofa: Option<TotpInfo>
+    pub twofa: Option<TotpInfo>,
 }
 
 pub struct ReadFile {
@@ -115,13 +150,13 @@ pub struct DbResource {
 pub struct DbTableSizeInfo {
     pub total: i64,
     pub data: i64,
-    pub index: i64
+    pub index: i64,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SystemCPU {
-    pub cpu_usage: f32,                 //cpu总体使用率
-    pub cpu: HashMap<String, f32>       //单个cpu使用率
+    pub cpu_usage: f32,            //cpu总体使用率
+    pub cpu: HashMap<String, f32>, //单个cpu使用率
 }
 
 //系统缓存大小，包括swap
@@ -132,25 +167,25 @@ pub struct SystemRAM {
     pub ram_usage: f32,
     pub total_swap: u64,
     pub use_swap: u64,
-    pub swap_usage: f32
+    pub swap_usage: f32,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SystemDisk {
     pub disk_total_space: u64,
     pub disk_total_usage: u64,
-    pub disk: HashMap<String, Vec<u64>>
+    pub disk: HashMap<String, Vec<u64>>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SystemNetInfo {
     pub send: String,
-    pub receive: String
+    pub receive: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SystemNetwork {
-    pub net: HashMap<String, SystemNetInfo>
+    pub net: HashMap<String, SystemNetInfo>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -161,7 +196,7 @@ pub struct SystemResource {
     pub disk: SystemDisk,
     pub db_postgresql: DbResource,
     pub network: SystemNetwork,
-    pub create_at: Option<i64>
+    pub create_at: Option<i64>,
 }
 
 pub fn get_unix_epoch_ms() -> i64 {
@@ -171,11 +206,7 @@ pub fn get_unix_epoch_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as i64,
         Err(e) => {
-
-            error!(
-                event = "UnixEpochGenerateError",
-                message = e.to_string()
-            );
+            error!(event = "UnixEpochGenerateError", message = e.to_string());
             -1 as i64
         }
     }
@@ -186,15 +217,15 @@ pub fn get_unix_epoch_ms() -> i64 {
 pub struct Systems {
     pub sys: Arc<Mutex<sysinfo::System>>,
     pub disk: Arc<Mutex<sysinfo::Disks>>,
-    pub network: Arc<Mutex<sysinfo::Networks>>
-} 
+    pub network: Arc<Mutex<sysinfo::Networks>>,
+}
 
 impl Systems {
     pub fn new() -> Self {
-        Self { 
-            sys: Arc::new(Mutex::new(sysinfo::System::new_all())), 
-            disk: Arc::new(Mutex::new(sysinfo::Disks::new_with_refreshed_list())), 
-            network:  Arc::new(Mutex::new(sysinfo::Networks::new_with_refreshed_list()))
+        Self {
+            sys: Arc::new(Mutex::new(sysinfo::System::new_all())),
+            disk: Arc::new(Mutex::new(sysinfo::Disks::new_with_refreshed_list())),
+            network: Arc::new(Mutex::new(sysinfo::Networks::new_with_refreshed_list())),
         }
     }
 }
@@ -212,14 +243,16 @@ impl SystemCPU {
         // let mut c_hash: HashMap<&str, f32> = HashMap::new();
         // cpu_usages.cpus().iter().map(|cpu| c_hash.insert(cpu.name(), cpu.cpu_usage()));
 
-        let c_hash: HashMap<String, f32> = cpu_usages.cpus().iter().map( |cpu|
-            (cpu.name().to_string(), cpu.cpu_usage())
-        ).collect();
-        
-        Self { 
+        let c_hash: HashMap<String, f32> = cpu_usages
+            .cpus()
+            .iter()
+            .map(|cpu| (cpu.name().to_string(), cpu.cpu_usage()))
+            .collect();
+
+        Self {
             cpu_usage: cpu_usages.global_cpu_usage(),
-            cpu: c_hash
-         }
+            cpu: c_hash,
+        }
     }
 }
 
@@ -237,7 +270,7 @@ impl SystemRAM {
             used_ram: used_m,
             total_swap: total_s,
             use_swap: used_s,
-            swap_usage: (used_s / total_s) as f32 * 100.0
+            swap_usage: (used_s / total_s) as f32 * 100.0,
         }
     }
 }
@@ -245,27 +278,30 @@ impl SystemRAM {
 impl SystemDisk {
     pub fn new(disk: Arc<Mutex<sysinfo::Disks>>) -> Self {
         let disk = disk.lock().unwrap();
-        let mut disk_total:u64 = 0; 
-        let mut disk_total_usage:u64 = 0;
+        let mut disk_total: u64 = 0;
+        let mut disk_total_usage: u64 = 0;
         let mut d_h: HashMap<String, Vec<u64>> = HashMap::new();
         // disk.list().iter().map( |disk|
         //     disk_w(&mut disk_total, &mut disk_total_usage, &mut d_h, disk)
         // );
         // let d_h: HashMap<&str, Vec<u64>> = disk.list().iter().map( |disk|
         //     (disk.name(), ver!<disk.total_space(), disk.available_space()>)
-            
+
         // )
         for d in disk.list() {
             disk_total += d.total_space();
             disk_total_usage += d.total_space() - d.available_space();
-            d_h.insert(d.name().to_string_lossy().to_string(), vec![d.total_space(), d.available_space()]);
+            d_h.insert(
+                d.name().to_string_lossy().to_string(),
+                vec![d.total_space(), d.available_space()],
+            );
         }
 
-        Self { 
+        Self {
             disk_total_space: disk_total,
             disk_total_usage: disk_total_usage,
-            disk: d_h
-         }
+            disk: d_h,
+        }
     }
 }
 
@@ -273,19 +309,26 @@ impl SystemNetwork {
     pub fn new(net: Arc<Mutex<sysinfo::Networks>>) -> Self {
         let net = net.lock().unwrap();
         // net.refresh(true);
-        let n_h: HashMap<String, SystemNetInfo> = net.list().iter().map( |(net_name, net_data)|
-            (net_name.to_string(), SystemNetInfo{send: net_data.transmitted().to_string(), receive: net_data.received().to_string()})
-        ).collect();
+        let n_h: HashMap<String, SystemNetInfo> = net
+            .list()
+            .iter()
+            .map(|(net_name, net_data)| {
+                (
+                    net_name.to_string(),
+                    SystemNetInfo {
+                        send: net_data.transmitted().to_string(),
+                        receive: net_data.received().to_string(),
+                    },
+                )
+            })
+            .collect();
 
-        Self {
-            net: n_h
-        }
-
+        Self { net: n_h }
     }
 }
 
 impl DbResource {
-    pub async fn new(pool: &deadpool_postgres::Pool, sql_file_path: &str ) -> Self {
+    pub async fn new(pool: &deadpool_postgres::Pool, sql_file_path: &str) -> Self {
         let client = pool.get().await;
         // let mut db_h: HashMap<String, String> = HashMap::new();
 
@@ -296,16 +339,16 @@ impl DbResource {
         // };
         match client {
             Ok(o) => {
-
                 //返回值的单位均为字节
 
                 let db_library_size_sql = "SELECT pg_database_size('nmapping') AS db_size;";
 
-                let db_table_size_sql = get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
+                let db_table_size_sql =
+                    get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
                 let db_conn_sql = "SELECT COUNT(*) AS db_conn FROM pg_stat_activity;";
                 //获取数据库大小(Byte)
                 let table = vec!["ips", "ports", "scaninfo"];
-                
+
                 let sql = match db_table_size_sql {
                     Ok(sql) => sql,
                     Err(e) => {
@@ -314,21 +357,16 @@ impl DbResource {
                         "".to_string()
                     }
                 };
-                
-                
+
                 Self {
                     db_library_size: get_db_library_size_byte(&o, db_library_size_sql, &[]).await,
                     db_table_size: get_db_table_size_byte(&o, &sql, &[&table]).await,
-                    db_conn: get_db_conn(&o, db_conn_sql, &[]).await
+                    db_conn: get_db_conn(&o, db_conn_sql, &[]).await,
                 }
-            },
+            }
             Err(e) => {
                 let message = format!("无法从连接池中获得连接 {}", e);
-                error!(
-                    event = "DATABASE-ERROR",
-                    path = "DbResource::new",
-                    message
-                );
+                error!(event = "DATABASE-ERROR", path = "DbResource::new", message);
                 //返回默认值
                 DbResource::default()
             }
@@ -336,24 +374,24 @@ impl DbResource {
     }
 }
 
-impl Default for DbResource  {
+impl Default for DbResource {
     fn default() -> Self {
         let tmp = vec![("error".to_string(), DbTableSizeInfo::default())];
         let h: HashMap<String, DbTableSizeInfo> = tmp.into_iter().collect();
         Self {
             db_library_size: "none".to_string(),
             db_table_size: h,
-            db_conn: "none".to_string()
+            db_conn: "none".to_string(),
         }
     }
 }
 
-impl Default for DbTableSizeInfo  {
+impl Default for DbTableSizeInfo {
     fn default() -> Self {
         Self {
             total: -1,
             data: -1,
-            index: -1
+            index: -1,
         }
     }
 }
@@ -367,7 +405,7 @@ impl SystemResource {
             disk: SystemDisk::new(sys.disk.clone()),
             db_postgresql: DbResource::new(pool, "source/database/").await,
             network: SystemNetwork::new(sys.network.clone()),
-            create_at: None
+            create_at: None,
         }
     }
 }
@@ -375,50 +413,43 @@ impl SystemResource {
 /// 用于存储目标 IP ，适配 IpAddr 和 str
 pub enum TargetIP<'a> {
     S(&'a str),
-    I(IpNet)
+    I(IpNet),
 }
 
 pub enum TargetPort<'a> {
     S(&'a str),
-    I(u16)
+    I(u16),
 }
 
 /// 该函数用于解析ip地址，
 /// 可以接收传入字符串IP，会自动解析，然后返回一个向量
 fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
-    let mut n_v:Vec<IpNet> = Vec::new();
+    let mut n_v: Vec<IpNet> = Vec::new();
     match ip {
         TargetIP::S(i_str) => {
-            
             for tmp in i_str.split(",") {
-                
                 let mut t = tmp.to_string();
                 if t.contains("/") {
                     ()
-                } 
-                else if t.contains(":") {
+                } else if t.contains(":") {
                     t.push_str("/128");
-                }
-                else {
-                    t.push_str("/32");    
+                } else {
+                    t.push_str("/32");
                 }
                 let t = (&t).parse::<IpNet>();
                 match t {
                     Ok(o) => n_v.push(o),
                     Err(e) => {
-                        error!(
-                            event = "PARSING-ERROR",
-                            message = e.to_string()
-                        );
+                        error!(event = "PARSING-ERROR", message = e.to_string());
                         return Err(e);
                     }
                 }
             }
-            return Ok(n_v)
-        },
+            return Ok(n_v);
+        }
         TargetIP::I(ipadd) => {
             n_v.push(ipadd);
-            return Ok(n_v)
+            return Ok(n_v);
         }
     }
 }
@@ -426,23 +457,18 @@ fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
 /// 该函数用于检查传入的 端口 是否合法
 /// 返回 布尔 值，如果含有不合法字符就会返回 false
 fn check_port(port: &str) -> bool {
-
     let re = Regex::new(r"^[0-9,\-]+$");
     match re {
         Ok(o) => {
             if o.is_match(port) {
-                return true
+                return true;
+            } else {
+                return false;
             }
-            else {
-                return false
-            }
-        },
+        }
         Err(e) => {
-            error!(
-                event = "REGEX-ERROR",
-                message = e.to_string()
-            );
-            return false
+            error!(event = "REGEX-ERROR", message = e.to_string());
+            return false;
         }
     }
 }
@@ -454,7 +480,7 @@ pub struct CreateTask {
     pub ip: String,
     pub port: String,
     pub level: i8,
-    pub remark: Option<String>
+    pub remark: Option<String>,
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
@@ -466,7 +492,7 @@ pub struct STask<'a> {
     pub port: Option<&'a str>,
     pub start_at: Option<i64>,
     pub end_at: Option<i64>,
-    pub remark: Option<&'a str>
+    pub remark: Option<&'a str>,
 }
 
 impl<'a> STask<'a> {
@@ -474,29 +500,28 @@ impl<'a> STask<'a> {
         ip: TargetIP,
         initiator: &'a str,
         port: Option<&'a str>,
-        remark: Option<&'a str>
+        remark: Option<&'a str>,
     ) -> Result<Self, AddrParseError> {
         let t_ip = parsing_target(ip)?;
-        
+
         let t_port = match port {
             Some(p) => {
                 if check_port(p) {
                     p
-                }
-                else {
+                } else {
                     "1-65535"
                 }
-            },
-            None => "1-65535"
+            }
+            None => "1-65535",
         };
-        Ok(Self { 
-            task_id: Some(Uuid::now_v7()), 
-            task_initiator: initiator, 
-            ip: t_ip, 
-            port: Some(t_port), 
-            start_at: None, 
-            end_at: None, 
-            remark: remark 
+        Ok(Self {
+            task_id: Some(Uuid::now_v7()),
+            task_initiator: initiator,
+            ip: t_ip,
+            port: Some(t_port),
+            start_at: None,
+            end_at: None,
+            remark: remark,
         })
     }
 
@@ -506,55 +531,58 @@ impl<'a> STask<'a> {
         &self,
         pool: &deadpool_postgres::Pool,
         level: i32,
-        user_id: i32
+        user_id: i32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut p = pool.get().await?;
         let client = p.transaction().await?;
-        let t_id:String;
+        let t_id: String;
         match self.task_id {
             Some(o) => t_id = o.to_string(),
-            None => return Err("task_id 为 None".into())
+            None => return Err("task_id 为 None".into()),
         };
 
         // 将 ipnet转换为 String
-        let tmp_ip:Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
+        let tmp_ip: Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
 
         client.execute(
-            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7)", 
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7)",
             &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark]
         ).await?;
 
         client.commit().await?;
-        return Ok(())
+        return Ok(());
     }
 }
 
-
 ///获取数据库表的大小，单位为字节
 async fn get_db_table_size_byte(
-    pool: &deadpool::managed::Object<deadpool_postgres::Manager>, 
+    pool: &deadpool::managed::Object<deadpool_postgres::Manager>,
     // db_h: &mut HashMap<String, DbTableSizeInfo>,
-    sql: &str, 
-    params: &[&(dyn ToSql + Sync)]
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
 ) -> HashMap<String, DbTableSizeInfo> {
     let result = pool.query(sql, params).await;
     match result {
         Ok(rows) => {
-            rows.iter().map( |row|
-                (row.get("table_name"), DbTableSizeInfo{ 
-                    total: row.get("total_size"), 
-                    data: row.get("data_size"), 
-                    index: row.get("index_size")
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get("table_name"),
+                        DbTableSizeInfo {
+                            total: row.get("total_size"),
+                            data: row.get("data_size"),
+                            index: row.get("index_size"),
+                        },
+                    )
                 })
-
-            ).collect()
+                .collect()
             // for row in rows {
             //     let key = row.get("table_name");
             //     let value: i64 = row.get("total_size");
             //     // let value = values.to_s
             //     db_h.insert(key, value.to_string());
             // }
-        },
+        }
         Err(e) => {
             let message = format!("执行sql语句错误 {:?}", e);
             error!(
@@ -562,8 +590,9 @@ async fn get_db_table_size_byte(
                 path = "DbResource::new.get_db_table_size_byte",
                 message
             );
-            vec![("error".to_string(), DbTableSizeInfo::default())].into_iter().collect()
-            
+            vec![("error".to_string(), DbTableSizeInfo::default())]
+                .into_iter()
+                .collect()
         }
     }
 }
@@ -572,14 +601,13 @@ async fn get_db_table_size_byte(
 async fn get_db_library_size_byte(
     pool: &deadpool::managed::Object<deadpool_postgres::Manager>,
     sql: &str,
-    params: &[&(dyn ToSql + Sync)]
+    params: &[&(dyn ToSql + Sync)],
 ) -> String {
     if let Ok(result) = pool.query_opt(sql, params).await {
         if let Some(row) = result {
-            let r:i64 = row.get("db_size");
-            r.to_string() 
-        }
-        else {
+            let r: i64 = row.get("db_size");
+            r.to_string()
+        } else {
             let message = format!("没有找到数据库的返回值 {}", sql);
             warn!(
                 event = "DATABASE-WARNING",
@@ -588,8 +616,7 @@ async fn get_db_library_size_byte(
             );
             "null".to_string()
         }
-    } 
-    else {
+    } else {
         let message = format!("执行sql语句错误 {}", sql);
         error!(
             event = "DATABASE-ERROR",
@@ -604,14 +631,13 @@ async fn get_db_library_size_byte(
 async fn get_db_conn(
     pool: &deadpool::managed::Object<deadpool_postgres::Manager>,
     sql: &str,
-    params: &[&(dyn ToSql + Sync)]
+    params: &[&(dyn ToSql + Sync)],
 ) -> String {
     if let Ok(result) = pool.query_opt(sql, params).await {
         if let Some(row) = result {
-            let r:i64 = row.get("db_conn");
+            let r: i64 = row.get("db_conn");
             r.to_string()
-        }
-        else {
+        } else {
             let message = format!("没有找到数据库的返回值 {}", sql);
             warn!(
                 event = "DATABASE-WARNING",
@@ -620,8 +646,7 @@ async fn get_db_conn(
             );
             "null".to_string()
         }
-    }
-    else {
+    } else {
         let message = format!("执行sql语句错误 {}", sql);
         error!(
             event = "DATABASE-ERROR",
@@ -638,24 +663,29 @@ fn get_server_uptime() -> u64 {
 }
 
 /// 生成 Argon2id 哈希
-/// 
+///
 /// 用于添加用户
-pub fn generate_hash_password(password: &str, config: PasswordHashConfig) -> Result<String, password_hash::Error> {
+pub fn generate_hash_password(
+    password: &str,
+    config: PasswordHashConfig,
+) -> Result<String, password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
     let params = Params::new(config.m * 1024, config.t, config.p, None)?; // 配置文件中默认 64 MiB, 2 次迭代, 2 并行
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    Ok(argon2.hash_password(password.as_bytes(), &salt)?.to_string())
+    Ok(argon2
+        .hash_password(password.as_bytes(), &salt)?
+        .to_string())
 }
 
 /// 用于从数据库中获得用户的密码哈希值和在表中的 ID ，返回一个 Result<(i32, String), Error>
 pub async fn get_password_and_id_from_database(
     pool: &deadpool_postgres::Pool,
-    username: &str
+    username: &str,
 ) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
-        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1", 
+        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1",
         &[&username]
     ).await? {
         // TODO 需要改进，避免闭包获得所有权
@@ -700,10 +730,12 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     match PasswordHash::new(hash) {
         Ok(parsed_hash) => {
             let argon2 = Argon2::default();
-            let result = argon2.verify_password(password.as_bytes(), &parsed_hash).is_ok();
+            let result = argon2
+                .verify_password(password.as_bytes(), &parsed_hash)
+                .is_ok();
             println!("verify_pwd {:>6} ms", start.elapsed().as_millis());
             result
-        },
+        }
         Err(e) => {
             error!(
                 event = "ParsedHashError",
@@ -731,13 +763,12 @@ fn mime_system(file_suffix: &str) -> &str {
 ///获取文件后缀，可以输入文件名或者是带路径的文件名 e.g example.png 、 directory/example.png
 #[allow(dead_code)]
 fn get_file_suffix(path_or_file_name: &Path) -> Result<&str, &str> {
-    
     match path_or_file_name.extension().and_then(|s| s.to_str()) {
         Some(ext) => Ok(ext),
         None => {
             warn!("没有扩展名或无法获取扩展名");
             Err("没有扩展名或无法获取扩展名")
-        },
+        }
     }
 }
 
@@ -749,9 +780,9 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
     let tera = match Tera::new(&templates.templates_directory) {
         Ok(t) => t,
         Err(_) => {
-                error!("tera模板系统初始化错误");
-                panic!("tera初始化错误");
-            }
+            error!("tera模板系统初始化错误");
+            panic!("tera初始化错误");
+        }
     };
 
     let mut context = Context::new();
@@ -762,12 +793,11 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
     match tera.render(&templates.templates_name, &context) {
         Ok(body) => body,
         Err(e) => {
-                error!("Render error: {}", e);
-                eprintln!("Render error: {}", e);
-                "<h1>系统故障</h1><p>故障组件：模板系统</p>".to_string()
-            }
+            error!("Render error: {}", e);
+            eprintln!("Render error: {}", e);
+            "<h1>系统故障</h1><p>故障组件：模板系统</p>".to_string()
+        }
     }
-
 }
 
 //获取系统状态
@@ -775,7 +805,7 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
 //     let mut client = pool.get().await;
 //     match client {
 //         Ok(o) => {
-//             let 
+//             let
 //         },
 //         Err(e) => {
 
@@ -783,9 +813,12 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
 //     };
 // }
 
-
 ///系统信息api基准测试
-pub async fn benchmark(sys: web::Data<Systems>, pool: web::Data<&deadpool_postgres::Pool>, _db_name: String) {
+pub async fn benchmark(
+    sys: web::Data<Systems>,
+    pool: web::Data<&deadpool_postgres::Pool>,
+    _db_name: String,
+) {
     let total_start = Instant::now();
     let pool = pool.get_ref();
 
@@ -839,18 +872,16 @@ pub fn path_secure_join(root: &str, input: &str) -> Option<PathBuf> {
 
     if canonical.starts_with(root.canonicalize().ok()?) {
         Some(canonical)
-    }
-    else {
+    } else {
         None
     }
-
 }
 
 ///向数据库插入系统数据
 pub async fn insert_system_status(
-    pool: &deadpool_postgres::Pool, 
+    pool: &deadpool_postgres::Pool,
     db_name: String,
-    sys: Systems
+    sys: Systems,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = pool.get().await?;
     let s = SystemResource::new(sys, pool, db_name).await;
@@ -863,11 +894,23 @@ pub async fn insert_system_status(
     let disk = serde_json::to_value(s.disk).unwrap();
     let db_postgresql = serde_json::to_value(s.db_postgresql).unwrap();
     let network = serde_json::to_value(s.network).unwrap();
-    let raw = transaction.execute(&statement, &[&server_run_time, &cpu, &ram, &disk, &db_postgresql, &network]).await?;
+    let raw = transaction
+        .execute(
+            &statement,
+            &[
+                &server_run_time,
+                &cpu,
+                &ram,
+                &disk,
+                &db_postgresql,
+                &network,
+            ],
+        )
+        .await?;
     if raw == 1 {
         transaction.commit().await?;
         Ok(())
-    }else {
+    } else {
         let message = format!("插入表影响行数为 {}", raw);
         transaction.rollback().await?;
         warn!(
@@ -880,9 +923,7 @@ pub async fn insert_system_status(
 }
 
 ///通过该函数获取到访问者的ip，如果失败则会返回一个字符串
-pub fn get_conn_ip(
-    req: &HttpRequest
-) -> String{
+pub fn get_conn_ip(req: &HttpRequest) -> String {
     match req.connection_info().realip_remote_addr() {
         Some(o) => o.to_string(),
         None => {
@@ -896,28 +937,18 @@ pub fn get_conn_ip(
 }
 
 ///通过该函数获取收到的http请求头，如果获取失败则会返回一个字符串
-pub fn get_user_agent(
-    req: &HttpRequest
-) -> String {
+pub fn get_user_agent(req: &HttpRequest) -> String {
     // req.headers().get("User-Agent").and_then(|v| v.to_str().ok()).unwrap_or("unknown").to_string()
     match req.headers().get("User-Agent") {
-        Some(o) => {
-            match o.to_str() {
-                Ok(o) => o.to_string(),
-                Err(e) => {
-                    warn!(
-                        event = "GetHTTPHeadersError",
-                        message = e.to_string()
-                    );
-                    "Unknown".to_string()
-                }
+        Some(o) => match o.to_str() {
+            Ok(o) => o.to_string(),
+            Err(e) => {
+                warn!(event = "GetHTTPHeadersError", message = e.to_string());
+                "Unknown".to_string()
             }
         },
         None => {
-            error!(
-                event = "GetHTTPHeadersError",
-                message = "无法获取到请求头"
-            );
+            error!(event = "GetHTTPHeadersError", message = "无法获取到请求头");
             "Unknown".to_string()
         }
     }
@@ -928,13 +959,12 @@ pub struct ApplyTask {
     pub user_id: i32,
     pub task_id: Uuid,
     pub task_target: Vec<String>,
-    pub task_port: String
+    pub task_port: String,
 }
 
 #[derive(Deserialize)]
 pub struct ScannerResultUpload {
     pub scanner_id: Uuid,
-    pub token: String,
     pub task_id: Uuid,
     pub results: Vec<ScannerResultItem>,
 }
@@ -969,10 +999,11 @@ pub async fn validate_scanner_credentials(
     scanner_id: Uuid,
     token: &str,
 ) -> Result<(), ApplyTaskError> {
+    let token_hash = hash_scanner_token(token).map_err(apply_task_database_error)?;
     let p = pool.get().await.map_err(apply_task_database_error)?;
     let scanner = p.query_opt(
-        "SELECT id FROM scanner_info WHERE scanner_id = $1 AND token = $2 AND is_enable = true;",
-        &[&scanner_id.to_string(), &token]
+        "SELECT id FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
+        &[&scanner_id.to_string(), &token_hash]
     ).await.map_err(apply_task_database_error)?;
 
     if scanner.is_some() {
@@ -1040,24 +1071,34 @@ pub async fn save_scanner_results(
     pool: &deadpool_postgres::Pool,
     maxmind: &MaxMindState,
     upload: &ScannerResultUpload,
+    token: &str,
 ) -> Result<usize, SaveScannerResultsError> {
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
-    let transaction = client.transaction().await.map_err(scanner_result_database_error)?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(scanner_result_database_error)?;
+    let token_hash = hash_scanner_token(token).map_err(scanner_result_database_error)?;
 
     let scanner = transaction.query_opt(
-        "SELECT id, name FROM scanner_info WHERE scanner_id = $1 AND token = $2 AND is_enable = true;",
-        &[&upload.scanner_id.to_string(), &upload.token]
+        "SELECT id, name FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
+        &[&upload.scanner_id.to_string(), &token_hash]
     ).await.map_err(scanner_result_database_error)?;
 
     let scanner_name: String = match scanner {
-        Some(row) => row.get::<_, Option<String>>("name").unwrap_or_else(|| upload.scanner_id.to_string()),
+        Some(row) => row
+            .get::<_, Option<String>>("name")
+            .unwrap_or_else(|| upload.scanner_id.to_string()),
         None => return Err(SaveScannerResultsError::ScannerUnauthorized),
     };
 
-    let task_row = transaction.query_opt(
-        "SELECT id FROM scan_task WHERE task_id = $1;",
-        &[&upload.task_id.to_string()]
-    ).await.map_err(scanner_result_database_error)?;
+    let task_row = transaction
+        .query_opt(
+            "SELECT id FROM scan_task WHERE task_id = $1;",
+            &[&upload.task_id.to_string()],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
 
     let task_db_id: i32 = match task_row {
         Some(row) => row.get("id"),
@@ -1067,54 +1108,69 @@ pub async fn save_scanner_results(
     let mut saved = 0usize;
 
     for item in &upload.results {
-        let parsed_ip: IpNet = item.ip.parse().map_err(|source| SaveScannerResultsError::InvalidIp {
-            ip: item.ip.clone(),
-            source,
-        })?;
+        let parsed_ip: IpNet =
+            item.ip
+                .parse()
+                .map_err(|source| SaveScannerResultsError::InvalidIp {
+                    ip: item.ip.clone(),
+                    source,
+                })?;
         let ip_addr = parsed_ip.addr();
         let intel = maxmind.lookup(ip_addr);
         let ip_text = parsed_ip.to_string();
 
-        let ip_row = transaction.query_one(
-            "INSERT INTO ips (task_id, ip_address, asn, isp) \
+        let ip_row = transaction
+            .query_one(
+                "INSERT INTO ips (task_id, ip_address, asn, isp) \
              VALUES ($1, $2::text::inet, $3, $4) \
              ON CONFLICT (ip_address) DO UPDATE SET \
                 asn = COALESCE(EXCLUDED.asn, ips.asn), \
                 isp = COALESCE(EXCLUDED.isp, ips.isp), \
                 update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
              RETURNING ip_id;",
-            &[&task_db_id, &ip_text, &intel.asn, &intel.isp]
-        ).await.map_err(scanner_result_database_error)?;
+                &[&task_db_id, &ip_text, &intel.asn, &intel.isp],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
         let ip_id: i32 = ip_row.get("ip_id");
 
         let port_i32 = i32::from(item.port);
-        let port_row = transaction.query_one(
-            "INSERT INTO ports (ip_id, port) \
+        let port_row = transaction
+            .query_one(
+                "INSERT INTO ports (ip_id, port) \
              VALUES ($1, $2) \
              ON CONFLICT (ip_id, port) DO UPDATE SET \
                 update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
              RETURNING port_id;",
-            &[&ip_id, &port_i32]
-        ).await.map_err(scanner_result_database_error)?;
+                &[&ip_id, &port_i32],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
         let port_id: i32 = port_row.get("port_id");
 
-        transaction.execute(
-            "INSERT INTO scaninfo (port_id, scanner_name, protocol, service, banner, other) \
+        transaction
+            .execute(
+                "INSERT INTO scaninfo (port_id, scanner_name, protocol, service, banner, other) \
              VALUES ($1, $2, $3, $4, $5, $6);",
-            &[
-                &port_id,
-                &scanner_name,
-                &item.protocol,
-                &item.service,
-                &item.banner,
-                &item.other,
-            ]
-        ).await.map_err(scanner_result_database_error)?;
+                &[
+                    &port_id,
+                    &scanner_name,
+                    &item.protocol,
+                    &item.service,
+                    &item.banner,
+                    &item.other,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
 
         saved += 1;
     }
 
-    transaction.commit().await.map_err(scanner_result_database_error)?;
+    transaction
+        .commit()
+        .await
+        .map_err(scanner_result_database_error)?;
     Ok(saved)
 }
 
@@ -1130,26 +1186,36 @@ pub async fn apply_task(
     let mut p = pool.get().await.map_err(apply_task_database_error)?;
     let transaction = p.transaction().await.map_err(apply_task_database_error)?;
 
-    let row = transaction.query_opt(
-        "SELECT id, user_id, task_id, task_target::text[], task_port \
+    let row = transaction
+        .query_opt(
+            "SELECT id, user_id, task_id, task_target::text[], task_port \
          FROM scan_task \
          WHERE task_start_time IS NULL AND task_end_time IS NULL \
          ORDER BY task_level DESC, task_create_time \
          FOR UPDATE SKIP LOCKED \
-         LIMIT 1;", 
-        &[]
-    ).await.map_err(apply_task_database_error)?;
+         LIMIT 1;",
+            &[],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
 
     let Some(row) = row else {
-        info!(event = "NOTFOUND-TASK", path = "fn apply_task", message = "没有可领取的扫描任务");
+        info!(
+            event = "NOTFOUND-TASK",
+            path = "fn apply_task",
+            message = "没有可领取的扫描任务"
+        );
         return Err(ApplyTaskError::NoTask);
     };
 
     let task_pk: i32 = row.get("id");
-    transaction.execute(
-        "UPDATE scan_task SET task_start_time = COALESCE(task_start_time, $1) WHERE id = $2;",
-        &[&get_unix_epoch_ms(), &task_pk]
-    ).await.map_err(apply_task_database_error)?;
+    transaction
+        .execute(
+            "UPDATE scan_task SET task_start_time = COALESCE(task_start_time, $1) WHERE id = $2;",
+            &[&get_unix_epoch_ms(), &task_pk],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
 
     let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
         .map_err(apply_task_database_error)?;
@@ -1157,11 +1223,18 @@ pub async fn apply_task(
         user_id: row.get("user_id"),
         task_id,
         task_target: row.get("task_target"),
-        task_port: row.get("task_port")
+        task_port: row.get("task_port"),
     };
 
-    transaction.commit().await.map_err(apply_task_database_error)?;
-    info!(event = "SEARCH-TASK", path = "fn apply_task", message = apply_task.task_id.to_string());
+    transaction
+        .commit()
+        .await
+        .map_err(apply_task_database_error)?;
+    info!(
+        event = "SEARCH-TASK",
+        path = "fn apply_task",
+        message = apply_task.task_id.to_string()
+    );
     Ok(apply_task)
 }
 
@@ -1171,17 +1244,21 @@ pub struct ApplyTaskQuery {
     pub dryrun: Option<bool>,
 }
 
-
 /// 该函数用于退出登录
-/// 
+///
 /// 返回一个 Result<bool> ，返回 true 代表该 token 已被正常销毁，返回 false 代表 token 本身就是无效的。
 pub async fn log_out(
     session: &str,
-    pool: &deadpool_postgres::Pool
+    pool: &deadpool_postgres::Pool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
-    if let Some(tmp_r) = c.query_opt("UPDATE session SET is_enable = false WHERE token = $1;", &[&session]).await? {
-
+    if let Some(tmp_r) = c
+        .query_opt(
+            "UPDATE session SET is_enable = false WHERE token = $1;",
+            &[&session],
+        )
+        .await?
+    {
         info!(
             event = "UserLogout",
             path = "fn log_out",
@@ -1196,8 +1273,7 @@ pub async fn log_out(
             );
         }
         Ok(true)
-    }
-    else {
+    } else {
         info!(
             event = "TokenInvaild",
             path = "fn log_out",
@@ -1207,13 +1283,12 @@ pub async fn log_out(
     }
 }
 
-
 /// 该枚举定义了权限，其中系统权限最高，该级别的用户由初始化数据库时创建，且该权限的用户无法查看其他用户的数据，该权限主要用于系统自动创建的扫描任务
 /// Administrator 为管理员权限，该权限可以查看所有的任务
 /// 使用枚举时需要传入一个用户id
 pub enum Permission {
     Administrator(i32),
-    Users(i32)
+    Users(i32),
 }
 
 /// 表示单个任务条目
@@ -1228,7 +1303,7 @@ pub struct TaskItem {
     pub scanner_id: Option<Uuid>,
     pub start_at: Option<i64>,
     pub end_at: Option<i64>,
-    pub remarks: Option<String>
+    pub remarks: Option<String>,
 }
 
 /// 表示 Json 格式的任务列表
@@ -1237,7 +1312,7 @@ pub struct TaskItemJson {
     pub total_c: i64,
     pub item_c: i64,
     pub start_id: i32,
-    pub task_item: Vec<TaskItem>
+    pub task_item: Vec<TaskItem>,
 }
 
 /// 该结构体表示接收查询任务列表信息
@@ -1248,13 +1323,13 @@ pub struct ReceiveTaskItemQueryInfo {
 }
 
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
-/// 
-/// 接收多个参数，分别为 
+///
+/// 接收多个参数，分别为
 pub async fn get_task_item(
     pool: &deadpool_postgres::Pool,
     s_count: i64,
     start_id: Option<i32>,
-    permissions: Permission
+    permissions: Permission,
 ) -> Result<(Vec<TaskItem>, i64, i64, i32), Box<dyn std::error::Error>> {
     let c = pool.get().await?;
 
@@ -1272,11 +1347,11 @@ pub async fn get_task_item(
                     &[&s_count]
                 ).await?
             }
-            
+
         },
         Permission::Users(u_id) => {
             c.query(
-                "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;", 
+                "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;",
                 &[&u_id, &s_count]
             ).await?
         }
@@ -1286,7 +1361,7 @@ pub async fn get_task_item(
     let mut total_count_item: i64 = 0;
     let mut count: i64 = 0;
     let mut start_id: i32 = 0;
-    
+
     for (index, r) in row.iter().enumerate() {
         if index == 0 {
             start_id = r.get::<_, i32>("id");
@@ -1302,7 +1377,7 @@ pub async fn get_task_item(
             scanner_id: None,
             start_at: r.get::<_, Option<i64>>("task_start_time"),
             end_at: r.get::<_, Option<i64>>("task_end_time"),
-            remarks: r.get::<_, Option<String>>("remarks")  
+            remarks: r.get::<_, Option<String>>("remarks"),
         };
         task_item_r.push(titem);
         count += 1;
@@ -1310,19 +1385,18 @@ pub async fn get_task_item(
     Ok((task_item_r, total_count_item, count, start_id))
 }
 
-
 /// 用于接收系统信息查询
 #[derive(Deserialize)]
 pub struct ReceiveSystemStatusInfo {
     pub count: Option<i64>,
     pub start_at: Option<i64>,
-    pub end_at: Option<i64>
+    pub end_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SystemStatusJson {
     pub total_c: i32,
-    pub status_item: Vec<SystemResource>
+    pub status_item: Vec<SystemResource>,
 }
 
 /// 获取系统状态信息
@@ -1330,28 +1404,31 @@ pub async fn get_system_status_info(
     start_at: Option<i64>,
     end_at: Option<i64>,
     count: i64,
-    pool: &deadpool_postgres::Pool
+    pool: &deadpool_postgres::Pool,
 ) -> Result<(Vec<SystemResource>, i32), Box<dyn std::error::Error>> {
     let connect = pool.get().await?;
 
     let row = if start_at.is_some() || end_at.is_some() {
-        connect.query(
-            "SELECT * 
-                        FROM system_status 
-                        WHERE create_time BETWEEN 
+        connect
+            .query(
+                "SELECT *
+                        FROM system_status
+                        WHERE create_time BETWEEN
                             COALESCE($1, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
-                            AND 
+                            AND
                             COALESCE($2, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
-                        ORDER BY id DESC 
+                        ORDER BY id DESC
                         LIMIT $3;",
-            &[&start_at, &end_at, &count]
-        ).await?
-    }
-    else {
-        connect.query(
-            "SELECT * FROM system_status ORDER BY id DESC LIMIT $1;",
-            &[&count]
-        ).await?
+                &[&start_at, &end_at, &count],
+            )
+            .await?
+    } else {
+        connect
+            .query(
+                "SELECT * FROM system_status ORDER BY id DESC LIMIT $1;",
+                &[&count],
+            )
+            .await?
     };
 
     let mut vec_status: Vec<SystemResource> = Vec::new();
@@ -1365,23 +1442,21 @@ pub async fn get_system_status_info(
             disk: serde_json::from_value(r.get::<_, Value>("disk"))?,
             db_postgresql: serde_json::from_value(r.get::<_, Value>("db_postgresql"))?,
             network: serde_json::from_value(r.get::<_, Value>("network"))?,
-            create_at: Some(r.get::<_, i64>("create_time"))
+            create_at: Some(r.get::<_, i64>("create_time")),
         };
         tmp_count += 1;
         vec_status.push(tmp);
     }
     Ok((vec_status, tmp_count))
-
 }
 
 /// 加密关键数据
-/// 
+///
 /// 该函数接受一个参数 明文。返回三个参数，分别为 nonce、tag、密文
 pub fn encrypt_data(
     plaintext: &[u8],
-    key: &[u8]
+    key: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), openssl::error::ErrorStack> {
-
     // 32 字节密钥，且初始化为 1
     // let mut key = [1u8; 32];
     // rand::rand_bytes(&mut key)?;
@@ -1392,26 +1467,16 @@ pub fn encrypt_data(
 
     let cipher = Cipher::aes_256_gcm();
 
-    let mut crypter = Crypter::new(
-        cipher,
-        Mode::Encrypt,
-        &key,
-        Some(&nonce),
-    )?;
+    let mut crypter = Crypter::new(cipher, Mode::Encrypt, &key, Some(&nonce))?;
 
     // GCM 不需要 padding
     crypter.pad(false);
 
     let mut ciphertext = vec![0u8; plaintext.len() + cipher.block_size()];
 
-    let count = crypter.update(
-        plaintext,
-        &mut ciphertext,
-    )?;
+    let count = crypter.update(plaintext, &mut ciphertext)?;
 
-    let rest = crypter.finalize(
-        &mut ciphertext[count..],
-    )?;
+    let rest = crypter.finalize(&mut ciphertext[count..])?;
 
     ciphertext.truncate(count + rest);
 
@@ -1422,7 +1487,7 @@ pub fn encrypt_data(
 }
 
 /// 解密
-/// 
+///
 pub fn decrypt_data(
     // value: &[u8],
     value: &Vec<u8>,
@@ -1431,35 +1496,23 @@ pub fn decrypt_data(
     // nonce: &[u8],
     // tag: &[u8],
 ) -> Result<Vec<u8>, openssl::error::ErrorStack> {
-
     let nonce = &value[..12];
     let tag = &value[12..28];
     let ciphertext = &value[28..];
 
     let cipher = Cipher::aes_256_gcm();
 
-    let mut crypter = Crypter::new(
-        cipher,
-        Mode::Decrypt,
-        key,
-        Some(nonce),
-    )?;
+    let mut crypter = Crypter::new(cipher, Mode::Decrypt, key, Some(nonce))?;
 
     crypter.pad(false);
 
     crypter.set_tag(tag)?;
 
-    let mut plaintext =
-        vec![0u8; ciphertext.len() + cipher.block_size()];
+    let mut plaintext = vec![0u8; ciphertext.len() + cipher.block_size()];
 
-    let count = crypter.update(
-        ciphertext,
-        &mut plaintext,
-    )?;
+    let count = crypter.update(ciphertext, &mut plaintext)?;
 
-    let rest = crypter.finalize(
-        &mut plaintext[count..],
-    )?;
+    let rest = crypter.finalize(&mut plaintext[count..])?;
 
     plaintext.truncate(count + rest);
 

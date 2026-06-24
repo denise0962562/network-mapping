@@ -1,29 +1,24 @@
-use std::collections::HashSet;
-use std::path::Path;
-use std::fs;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use deadpool_postgres::Pool;
 use ipnet::Ipv4Net;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::str::FromStr;
 
-
-fn get_st<'a>(
-    record: &'a HashMap<String, String>,
-    key: &str
-) -> Option<&'a str> {
+fn get_st<'a>(record: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     record.get(key).map(String::as_str)
 }
 
-
 /// 对应数据开头键为 organisation
 struct OrgData<'a> {
-    org_name: Option<&'a str>,                                                          // 组织名称
-    organisation: Option<&'a str>,                                                      // 组织唯一标识符
-    org_type: Option<&'a str>,                                                          // 组织类型
-    org_descr: Option<&'a str>,                                                         // 组织描述信息
+    org_name: Option<&'a str>,     // 组织名称
+    organisation: Option<&'a str>, // 组织唯一标识符
+    org_type: Option<&'a str>,     // 组织类型
+    org_descr: Option<&'a str>,    // 组织描述信息
     created: Option<&'a str>,
     last_modified: Option<&'a str>,
     address: Option<&'a str>,
@@ -33,27 +28,24 @@ struct OrgData<'a> {
     abuse_c: Option<&'a str>,
     country: Option<&'a str>,
     source: Option<&'a str>,
-
 }
 
 impl<'a> OrgData<'a> {
-    fn new(
-        record: &'a HashMap<String, String>
-    ) -> Self {
-        Self { 
-            org_name: get_st(record, "org-name"), 
+    fn new(record: &'a HashMap<String, String>) -> Self {
+        Self {
+            org_name: get_st(record, "org-name"),
             organisation: get_st(record, "organisation"),
-            org_type: get_st(record, "org-type"), 
-            org_descr: get_st(record, "descr"), 
-            created: get_st(record, "created"), 
-            last_modified: get_st(record, "last-modified"), 
-            address: get_st(record, "address"), 
+            org_type: get_st(record, "org-type"),
+            org_descr: get_st(record, "descr"),
+            created: get_st(record, "created"),
+            last_modified: get_st(record, "last-modified"),
+            address: get_st(record, "address"),
             phone: get_st(record, "phone"),
-            email: get_st(record, "e-mail"), 
-            abuse_c: get_st(record, "abuse-c"), 
-            country: get_st(record, "country"), 
+            email: get_st(record, "e-mail"),
+            abuse_c: get_st(record, "abuse-c"),
+            country: get_st(record, "country"),
             source: get_st(record, "source"),
-            changed: get_st(record, "changed")
+            changed: get_st(record, "changed"),
         }
     }
 }
@@ -63,47 +55,40 @@ struct RouteData<'a> {
     ip: Option<String>,
     descr: Option<&'a str>,
     country: Option<&'a str>,
-    origin: Option<&'a str>,                                                             // 声明该 IP/CIDR 的 ASN
+    origin: Option<&'a str>, // 声明该 IP/CIDR 的 ASN
     mnt_by: Option<&'a str>,
     remarks: Option<&'a str>,
     notify: Option<&'a str>,
     source: Option<&'a str>,
     created: Option<&'a str>,
     last_modified: Option<&'a str>,
-
 }
 
 impl<'a> RouteData<'a> {
-    fn new(
-        record: &'a HashMap<String, String>
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-
+    fn new(record: &'a HashMap<String, String>) -> Result<Self, Box<dyn std::error::Error>> {
         let tmp_ip = if let Some(ip) = record.get("route") {
             // println!("{}", ip);
             Some(parse_to_ipv4net(ip)?.to_string().trim().to_string())
-        }
-        else if let Some(ip) = record.get("route6") {
+        } else if let Some(ip) = record.get("route6") {
             Some(ip.trim().to_string())
-        }
-        else {
+        } else {
             None
         };
 
-        Ok(Self { 
-            ip: tmp_ip, 
-            descr: record.get("descr").map(|t| t.as_str()), 
-            country: get_st(record, "country"), 
-            origin: get_st(record, "origin"), 
-            mnt_by: get_st(record, "mnt-by"), 
-            remarks: get_st(record, "remarks"), 
+        Ok(Self {
+            ip: tmp_ip,
+            descr: record.get("descr").map(|t| t.as_str()),
+            country: get_st(record, "country"),
+            origin: get_st(record, "origin"),
+            mnt_by: get_st(record, "mnt-by"),
+            remarks: get_st(record, "remarks"),
             notify: get_st(record, "notify"),
-            source: get_st(record, "source"), 
+            source: get_st(record, "source"),
             created: get_st(record, "created"),
-            last_modified: get_st(record, "last-modified") 
+            last_modified: get_st(record, "last-modified"),
         })
     }
 }
-
 
 /// 对应开头键为 inetnum/inet6num
 struct InetNum<'a> {
@@ -119,54 +104,50 @@ struct InetNum<'a> {
     mnt_irt: Option<&'a str>,
     remarks: Option<&'a str>,
     last_modified: Option<&'a str>,
-    source: Option<&'a str>
+    source: Option<&'a str>,
 }
 
 impl<'a> InetNum<'a> {
-    fn new(
-        record: &'a HashMap<String, String>
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(record: &'a HashMap<String, String>) -> Result<Self, Box<dyn std::error::Error>> {
         let tmp_ip = if let Some(ip) = record.get("inetnum") {
             // println!("{}", ip);
             Some(parse_to_ipv4net(ip)?.to_string().trim().to_string())
-        }
-        else if let Some(ip) = record.get("inet6num") {
+        } else if let Some(ip) = record.get("inet6num") {
             Some(ip.trim().to_string())
-        }
-        else {
+        } else {
             None
         };
 
-        Ok(Self { 
-            ip: tmp_ip, 
-            netname: get_st(record, "netname"), 
-            descr: get_st(record, "descr"), 
-            country: get_st(record, "country"), 
-            admin_c: get_st(record, "admin-c"), 
-            tech_c: get_st(record, "tech-c"), 
-            notify: get_st(record, "notify"), 
-            status: get_st(record, "status"), 
-            mnt_by: get_st(record, "mnt-by"), 
-            mnt_irt: get_st(record, "mnt-irt"), 
-            remarks: get_st(record, "remarks"), 
-            last_modified: get_st(record, "last-modified"), 
-            source: get_st(record, "source") 
+        Ok(Self {
+            ip: tmp_ip,
+            netname: get_st(record, "netname"),
+            descr: get_st(record, "descr"),
+            country: get_st(record, "country"),
+            admin_c: get_st(record, "admin-c"),
+            tech_c: get_st(record, "tech-c"),
+            notify: get_st(record, "notify"),
+            status: get_st(record, "status"),
+            mnt_by: get_st(record, "mnt-by"),
+            mnt_irt: get_st(record, "mnt-irt"),
+            remarks: get_st(record, "remarks"),
+            last_modified: get_st(record, "last-modified"),
+            source: get_st(record, "source"),
         })
     }
 }
 
-
 /// 每个 record 是 HashMap<key, Vec<value>>
-fn parse_rir_records(reader: &mut BufReader<File>) -> Result<Option<HashMap<String, String>>, Box<dyn std::error::Error>>
-{
+fn parse_rir_records(
+    reader: &mut BufReader<File>,
+) -> Result<Option<HashMap<String, String>>, Box<dyn std::error::Error>> {
     let mut current_record: HashMap<String, String> = HashMap::new();
-    let mut last_key: Option<String> = None;  // ← 追踪当前 key
+    let mut last_key: Option<String> = None; // ← 追踪当前 key
     let mut buf = Vec::new();
 
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
-        
+
         // ← 关键：n == 0 表示文件结束
         if n == 0 {
             // 返回最后一个 record（如果非空）
@@ -191,7 +172,7 @@ fn parse_rir_records(reader: &mut BufReader<File>) -> Result<Option<HashMap<Stri
         // 空行或注释：结束当前 record
         if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
             if !current_record.is_empty() {
-                return Ok(Some(current_record));  // ← 返回当前 record，下次调用继续读
+                return Ok(Some(current_record)); // ← 返回当前 record，下次调用继续读
             }
             last_key = None;
             continue;
@@ -208,7 +189,11 @@ fn parse_rir_records(reader: &mut BufReader<File>) -> Result<Option<HashMap<Stri
         }
 
         // 跳过非法行
-        if !line.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
+        if !line
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_alphabetic())
+        {
             continue;
         }
 
@@ -229,12 +214,7 @@ fn parse_rir_records(reader: &mut BufReader<File>) -> Result<Option<HashMap<Stri
     }
 }
 
-
-
-async fn w_records(
-    pool: &Pool,
-    path: impl AsRef<Path>
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn w_records(pool: &Pool, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
     let mut c = pool.get().await?;
 
     let stat_organisation = c.prepare_cached(
@@ -254,7 +234,6 @@ async fn w_records(
     let file = File::open(path)?;
     let mut buf = BufReader::new(file);
 
-
     loop {
         if let Some(tmp) = parse_rir_records(&mut buf)? {
             if tmp.contains_key("organisation") {
@@ -262,45 +241,47 @@ async fn w_records(
 
                 let org_data = OrgData::new(&tmp);
 
-                let _re = transaction.execute(
-                    &stat_organisation, 
-                    &[
-                        &org_data.org_name,
-                        &org_data.organisation,
-                        &org_data.org_type,
-                        &org_data.org_descr,
-                        &org_data.country,
-                        &org_data.address,
-                        &org_data.phone,
-                        &org_data.email,
-                        &org_data.abuse_c,
-                        &org_data.last_modified,
-                        &org_data.source
-                    ]
-                ).await?;
+                let _re = transaction
+                    .execute(
+                        &stat_organisation,
+                        &[
+                            &org_data.org_name,
+                            &org_data.organisation,
+                            &org_data.org_type,
+                            &org_data.org_descr,
+                            &org_data.country,
+                            &org_data.address,
+                            &org_data.phone,
+                            &org_data.email,
+                            &org_data.abuse_c,
+                            &org_data.last_modified,
+                            &org_data.source,
+                        ],
+                    )
+                    .await?;
 
                 transaction.commit().await?;
-            }
-            else if tmp.contains_key("route") || tmp.contains_key("route6") {
+            } else if tmp.contains_key("route") || tmp.contains_key("route6") {
                 let transaction = c.transaction().await?;
 
                 match RouteData::new(&tmp) {
                     Ok(route_data) => {
-                        
-                        transaction.execute(
-                            &stat_route,
-                            &[
-                                &route_data.ip,
-                                &route_data.origin,
-                                &route_data.descr,
-                                &route_data.mnt_by,
-                                &route_data.created,
-                                &route_data.last_modified,
-                                &route_data.remarks,
-                                &route_data.source
-                            ] 
-                        ).await?;
-                    },
+                        transaction
+                            .execute(
+                                &stat_route,
+                                &[
+                                    &route_data.ip,
+                                    &route_data.origin,
+                                    &route_data.descr,
+                                    &route_data.mnt_by,
+                                    &route_data.created,
+                                    &route_data.last_modified,
+                                    &route_data.remarks,
+                                    &route_data.source,
+                                ],
+                            )
+                            .await?;
+                    }
                     Err(e) => {
                         println!("字段错误 {}", e.to_string());
                         continue;
@@ -308,32 +289,32 @@ async fn w_records(
                 }
 
                 transaction.commit().await?;
-            }
-            else if tmp.contains_key("inetnum") || tmp.contains_key("inet6num") {
+            } else if tmp.contains_key("inetnum") || tmp.contains_key("inet6num") {
                 let transaction = c.transaction().await?;
 
                 match InetNum::new(&tmp) {
                     Ok(inet_data) => {
-                        
-                        transaction.execute(
-                            &stat_inetnum,
-                            &[
-                                &inet_data.ip,
-                                &inet_data.netname,
-                                &inet_data.descr,
-                                &inet_data.country,
-                                &inet_data.admin_c,
-                                &inet_data.tech_c,
-                                &inet_data.notify,
-                                &inet_data.status,
-                                &inet_data.mnt_by,
-                                &inet_data.mnt_irt,
-                                &inet_data.remarks,
-                                &inet_data.last_modified,
-                                &inet_data.source
-                            ]
-                        ).await?;
-                    },
+                        transaction
+                            .execute(
+                                &stat_inetnum,
+                                &[
+                                    &inet_data.ip,
+                                    &inet_data.netname,
+                                    &inet_data.descr,
+                                    &inet_data.country,
+                                    &inet_data.admin_c,
+                                    &inet_data.tech_c,
+                                    &inet_data.notify,
+                                    &inet_data.status,
+                                    &inet_data.mnt_by,
+                                    &inet_data.mnt_irt,
+                                    &inet_data.remarks,
+                                    &inet_data.last_modified,
+                                    &inet_data.source,
+                                ],
+                            )
+                            .await?;
+                    }
                     Err(e) => {
                         println!("字段错误 {}", e.to_string());
                         continue;
@@ -341,26 +322,20 @@ async fn w_records(
                 }
 
                 transaction.commit().await?;
-            }
-            else {
+            } else {
                 continue;
             }
-        }
-        else {
+        } else {
             // 返回 NONE 意味没有数据了
             println!("一个文件处理完毕");
             break;
         }
-
     }
 
     Ok(())
 }
 
-async fn read_all(
-    pool: &Pool,
-    p_set: HashSet<String>
-) {
+async fn read_all(pool: &Pool, p_set: HashSet<String>) {
     println!("开始读取文件路径");
     if p_set.is_empty() {
         println!("文件目录为空");
@@ -370,7 +345,7 @@ async fn read_all(
         match w_records(pool, i).await {
             Ok(_) => {
                 println!("文件: 处理完毕");
-            },
+            }
             Err(e) => {
                 println!("{}", e.to_string())
             }
@@ -378,26 +353,26 @@ async fn read_all(
     }
 }
 
-
 /// 该函数用于根据一个输入路径获取该路径下所有文件路径
 fn get_all_filename(path: impl AsRef<Path>) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
-
     let entry = fs::read_dir(path)?;
-    
+
     // let file_set = entry.filter_map(|e| e.ok()).map(|i| file_set.insert(i.path().to_string_lossy().to_string()));
 
-    let file_set: HashSet<String> = entry.filter_map(|e| e.ok()).map(|t| t.path().to_string_lossy().to_string()).collect();
+    let file_set: HashSet<String> = entry
+        .filter_map(|e| e.ok())
+        .map(|t| t.path().to_string_lossy().to_string())
+        .collect();
 
     Ok(file_set)
 }
-
-
 
 fn parse_to_ipv4net(input: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
     let s = input.trim();
 
     // 检查输入长度限制，防止过长的输入造成潜在问题
-    if s.len() > 43 {  // IP地址和CIDR格式通常不会超过这个长度 (xxx.xxx.xxx.xxx/xx)
+    if s.len() > 43 {
+        // IP地址和CIDR格式通常不会超过这个长度 (xxx.xxx.xxx.xxx/xx)
         return Err("输入字符串过长".into());
     }
 
@@ -413,7 +388,7 @@ fn parse_to_ipv4net(input: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> 
                     return Err("不允许使用0.0.0.0/0这样的全局通配符".into());
                 }
                 Ok(net)
-            },
+            }
             Err(_) => {
                 // 如果CIDR格式解析失败，尝试自动补全IP地址
                 let corrected_input = auto_complete_ip(s)?;
@@ -428,7 +403,7 @@ fn auto_complete_ip(input: &str) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(pos) = input.find('/') {
         let ip_part = &input[..pos];
         let cidr_part = &input[pos..]; // includes '/'
-        
+
         let completed_ip = complete_ip_address(ip_part)?;
         Ok(format!("{}{}", completed_ip, cidr_part))
     } else {
@@ -440,26 +415,26 @@ fn auto_complete_ip(input: &str) -> Result<String, Box<dyn std::error::Error>> {
 /// 补全IP地址部分，例如 "24.152.12" -> "24.152.12.0"
 fn complete_ip_address(ip_str: &str) -> Result<String, Box<dyn std::error::Error>> {
     let parts: Vec<&str> = ip_str.split('.').collect();
-    
+
     if parts.len() > 4 {
         return Err("IP地址段数过多".into());
     }
-    
+
     if parts.iter().any(|part| part.is_empty()) {
         return Err("IP地址格式无效，包含空段".into());
     }
-    
+
     // 验证现有部分是否都是有效的数字
     for part in &parts {
         if part.starts_with('0') && part.len() > 1 {
             // 拒绝前导零（除了单独的"0"）
             return Err("IP地址段不应有前导零".into());
         }
-        
+
         part.parse::<u8>()
             .map_err(|_| format!("IP地址段 '{}' 不是有效的数字", part))?;
     }
-    
+
     // 构建完整的IP地址，缺失的部分用0填充
     let mut completed_parts = Vec::new();
     for i in 0..4 {
@@ -469,7 +444,7 @@ fn complete_ip_address(ip_str: &str) -> Result<String, Box<dyn std::error::Error
             completed_parts.push("0".to_string());
         }
     }
-    
+
     Ok(completed_parts.join("."))
 }
 
@@ -514,14 +489,16 @@ fn parse_range(s: &str) -> Result<Ipv4Net, Box<dyn std::error::Error>> {
     // 额外的安全检查：防止过于宽泛的范围（例如跨越整个IP空间）
     let start_u32 = u32::from(start);
     let end_u32 = u32::from(end);
-    
+
     // 检查范围大小，防止过大范围的IP段
-    if end_u32 < start_u32 {  // 溢出保护
+    if end_u32 < start_u32 {
+        // 溢出保护
         return Err("IP地址范围无效，可能发生整数溢出".into());
     }
-    
+
     let range_size = end_u32 - start_u32;
-    if range_size > 1 << 26 {  // 限制在最多2^26个地址（约6700万个）以内
+    if range_size > 1 << 26 {
+        // 限制在最多2^26个地址（约6700万个）以内
         return Err("IP地址范围过大，超出安全限制".into());
     }
 
@@ -545,7 +522,7 @@ fn range_to_cidr(start: Ipv4Addr, end: Ipv4Addr) -> Result<Ipv4Net, Box<dyn std:
         loop {
             // 计算当前块的结束地址
             let block_end = current + block_size - 1;
-            
+
             // 检查块是否超出范围或与目标范围不兼容
             if block_end > end_u32 {
                 break;
@@ -583,18 +560,14 @@ fn range_to_cidr(start: Ipv4Addr, end: Ipv4Addr) -> Result<Ipv4Net, Box<dyn std:
     }
 }
 
-
 /// 该函数用于从指定目录读取 rir 数据并写入数据库
-pub async fn get_rir_data(
-    pool: &Pool,
-    path: &str
-) {
+pub async fn get_rir_data(pool: &Pool, path: &str) {
     match get_all_filename(path) {
         Ok(o) => {
             println!("开始处理 RIR 数据");
             read_all(pool, o).await;
             println!("RIR 数据处理完毕");
-        },
+        }
         Err(e) => {
             println!("获取 RIR 数据文件路径错误：{}", e.to_string());
         }

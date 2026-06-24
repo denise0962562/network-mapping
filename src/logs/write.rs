@@ -1,12 +1,10 @@
-
-use tracing::{info, warn, error};
-use actix_web::{HttpRequest};
+use actix_web::HttpRequest;
+use tracing::{error, info, warn};
 
 // use crate::logs::LogEventType;
 use crate::{get_conn_ip, get_user_agent, logs::LoginLog};
 //TODO:需要获取代理状态下用户的原始ip
-pub fn info_logs(req: &HttpRequest, event: &str, message: &str)  {
-
+pub fn info_logs(req: &HttpRequest, event: &str, message: &str) {
     let req_method = req.method();
     let req_path = req.path();
     let req_query = req.query_string();
@@ -22,7 +20,6 @@ pub fn info_logs(req: &HttpRequest, event: &str, message: &str)  {
 }
 
 pub fn warn_logs(req: &HttpRequest, event: &str, message: &str) {
-    
     let req_method = req.method();
     let req_path = req.path();
     let req_query = req.query_string();
@@ -39,7 +36,6 @@ pub fn warn_logs(req: &HttpRequest, event: &str, message: &str) {
 }
 
 pub fn error_logs(req: &HttpRequest, event: &str, message: &str) {
-
     let req_method = req.method();
     let req_path = req.path();
     let req_query = req.query_string();
@@ -54,13 +50,10 @@ pub fn error_logs(req: &HttpRequest, event: &str, message: &str) {
     );
 }
 
-/// 该函数可以把登录日志数据写入数据库，返回一个 bool , 
-/// 
+/// 该函数可以把登录日志数据写入数据库，返回一个 bool ,
+///
 /// 在该函数中无需其调用者处理错误，该函数 **会自动处理错误，然后返回 bool 值**
-pub async fn login_logs_to_db(
-    pool: &deadpool_postgres::Pool,
-    log: LoginLog
-) -> bool {
+pub async fn login_logs_to_db(pool: &deadpool_postgres::Pool, log: LoginLog) -> bool {
     let mut client = match pool.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -69,7 +62,7 @@ pub async fn login_logs_to_db(
                 path = "fn login_logs_to_db",
                 message = %e
             );
-            return false
+            return false;
         }
     };
     let transaction = match client.transaction().await {
@@ -80,7 +73,7 @@ pub async fn login_logs_to_db(
                 path = "fn login_logs_to_db",
                 message = %e
             );
-            return false
+            return false;
         }
     };
 
@@ -109,12 +102,11 @@ pub async fn login_logs_to_db(
                     path = "fn login_logs_to_db",
                     message = %e
                 );
-                return false
+                return false;
             }
         };
         true
-    }
-    else {
+    } else {
         error!(
             event = "INSERTDataToDatabaseError",
             path = "fn login_logs_to_db",

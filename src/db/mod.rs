@@ -1,29 +1,28 @@
-
+use crate::path_secure_join;
 use actix_web::web;
+use deadpool_postgres::{ManagerConfig, RecyclingMethod};
 use tokio::fs;
 use tracing::error;
-use crate::path_secure_join;
-use deadpool_postgres::{ManagerConfig, RecyclingMethod};
 
 pub struct SqlFile {
     pub root_path: String,
-    pub file_name: String
+    pub file_name: String,
 }
 
 impl SqlFile {
     pub fn new(root: String, name: String) -> Self {
         Self {
             root_path: root,
-            file_name: name
+            file_name: name,
         }
     }
 }
 
 pub async fn create_postgresql_pool(
-    host: String, 
-    port:u16, 
-    username: String, 
-    password: String, 
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
     dbname: String,
 ) -> Result<deadpool_postgres::Pool, Box<dyn std::error::Error>> {
     let mut db_poll_cfg = deadpool_postgres::Config::new();
@@ -32,12 +31,10 @@ pub async fn create_postgresql_pool(
     db_poll_cfg.dbname = Some(dbname);
     db_poll_cfg.host = Some(host);
     db_poll_cfg.port = Some(port);
-    db_poll_cfg.manager = Some(
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Verified
-        }
-    );
-    db_poll_cfg.pool = Some(deadpool_postgres::PoolConfig { 
+    db_poll_cfg.manager = Some(ManagerConfig {
+        recycling_method: RecyclingMethod::Verified,
+    });
+    db_poll_cfg.pool = Some(deadpool_postgres::PoolConfig {
         max_size: 10,
         timeouts: Default::default(),
         queue_mode: deadpool::managed::QueueMode::Lifo,
@@ -51,7 +48,10 @@ pub async fn create_postgresql_pool(
         }
         Err(e) => {
             // 如果连接失败，这里会返回错误
-            panic!("致命错误：无法从连接池获取连接。请检查数据库配置或服务状态。错误: {}", e)
+            panic!(
+                "致命错误：无法从连接池获取连接。请检查数据库配置或服务状态。错误: {}",
+                e
+            )
         }
     }
     Ok(pool)
@@ -85,8 +85,8 @@ pub async fn exec_sql(
 
 ///初始化数据库表结构
 pub async fn init_database_table(
-    cpool: &deadpool_postgres::Pool, 
-    file_path: &str
+    cpool: &deadpool_postgres::Pool,
+    file_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sql_from_f = fs::read_to_string(file_path).await;
     match sql_from_f {
@@ -96,13 +96,13 @@ pub async fn init_database_table(
             println!("开启事务");
             transaction.batch_execute(&o).await?;
             transaction.commit().await?;
-        },
+        }
         Err(e) => {
             tracing::error!("{}", e);
             panic!("读取目标文件失败");
         }
     };
-    
+
     Ok(())
 }
 
@@ -110,15 +110,16 @@ pub async fn init_database_table(
 
 //TODO 完成调用该函数，将所有需要sql语句的地方使用该函数
 ///该函数用于从文件中读取内容并以 String 类型返回。这不是一个安全的函数，因为他需要你自己处理错误，他只会将错误向上传。
-pub async fn get_sql_from_file(file_path: &str, file_name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn get_sql_from_file(
+    file_path: &str,
+    file_name: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let path = path_secure_join(file_path, file_name);
     match path {
         Some(s) => Ok(fs::read_to_string(s).await?),
         None => {
             let message = format!("未能获取到拼接后端路径，用户输入: {}", file_name);
-            error!(
-                message
-            );
+            error!(message);
             Err(message.into())
         }
     }

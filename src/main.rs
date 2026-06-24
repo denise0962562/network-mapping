@@ -1,21 +1,19 @@
-use actix_web::{web, App, HttpServer};
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use core::panic;
-use std::{io};
-use tracing::{error};
-use tokio::time::{Instant, interval_at, Duration};
+use actix_web::{App, HttpServer, web};
 use clap::Parser;
+use core::panic;
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use std::io;
+use tokio::time::{Duration, Instant, interval_at};
+use tracing::error;
 
-use rust_web_test::config::{Clis, SelfChecking};
-use rust_web_test::middlewares::{
-    smiddleware::AuthMiddleware,
-    hmiddleware::SHeaderM,
-    csrfmiddleware::CsrfMiddleware
-};
-use rust_web_test::logs::{self, LogRollingMode};
-use rust_web_test::{config, db, Systems, TemplatesInit, insert_system_status};
 use rust_web_test::admin::{check_default_admin_user, check_system_user};
+use rust_web_test::config::{Clis, SelfChecking};
+use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::maxmind::MaxMindState;
+use rust_web_test::middlewares::{
+    csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, smiddleware::AuthMiddleware,
+};
+use rust_web_test::{Systems, TemplatesInit, config, db, insert_system_status};
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
@@ -32,39 +30,46 @@ async fn main() -> io::Result<()> {
     let server = config.server;
     let server_host = server.host;
     let server_port = server.port;
-    
+
     //日志系统配置
-    let log =  config.log;
+    let log = config.log;
     let log_file_directory = log.directory;
     let log_file_name = log.file_name;
-    let log_file_rolling =  match log.file_rolling {
+    let log_file_rolling = match log.file_rolling {
         0 => LogRollingMode::Daily,
         1 => LogRollingMode::Hourly,
         2 => LogRollingMode::Minutely,
-        _ => LogRollingMode::Never
-    }; 
+        _ => LogRollingMode::Never,
+    };
     let log_debug_mode = args.debug_model;
 
     //模板系统配置
     let template = config.templates;
-    let template_info = TemplatesInit{
+    let template_info = TemplatesInit {
         templates_directory: template.templates_directory,
         templates_name: template.templates_name,
     };
 
-    let _guard = logs::init::init(&log_file_directory, &log_file_name, &log_file_rolling, &log_debug_mode);
+    let _guard = logs::init::init(
+        &log_file_directory,
+        &log_file_name,
+        &log_file_rolling,
+        &log_debug_mode,
+    );
     println!("日志系统已启动");
     let db_config = config.database;
     let database_c = db_config.clone();
     let database_c2 = db_config.clone();
 
     let db_pool = db::create_postgresql_pool(
-        db_config.host, 
-        db_config.port, 
-        db_config.username, 
-        db_config.password, 
-        db_config.db_name, 
-    ).await.expect("创建连接池错误");
+        db_config.host,
+        db_config.port,
+        db_config.username,
+        db_config.password,
+        db_config.db_name,
+    )
+    .await
+    .expect("创建连接池错误");
     let pool = db_pool.clone();
 
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
@@ -83,19 +88,33 @@ async fn main() -> io::Result<()> {
 
     let mail_c = config.email_config;
 
-    let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).expect("SslAcceptor::mozilla_intermediate(SslMethod::tls_server()) ERROR");
-    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM).expect("指定私钥文件错误");
-    tls.set_certificate_chain_file("./ssl/cert.pem").expect("指定证书文件错误");
+    let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls_server())
+        .expect("SslAcceptor::mozilla_intermediate(SslMethod::tls_server()) ERROR");
+    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM)
+        .expect("指定私钥文件错误");
+    tls.set_certificate_chain_file("./ssl/cert.pem")
+        .expect("指定证书文件错误");
     tls.check_private_key().expect("私钥检查错误");
-    
-    let sys = Systems::new();  
+
+    let sys = Systems::new();
     let sys_2 = sys.clone();
     let maxmind_state = web::Data::new(MaxMindState::from_default_paths());
 
     println!("服务已启动");
     println!("监听 {}:{}", server_host, server_port);
-    println!("监听地址：{}\n端口：{}\n日志使用的目录：{}\n日志文件名：{}\n日志文件滚动周期模式：{}\n日志系统调试模式：{}", &server_host, &server_port, &log_file_directory, &log_file_name, &log.file_rolling, &log_debug_mode);
-    println!("模板目录：{}\n模板文件名：{}", template_info.templates_directory, template_info.templates_name);
+    println!(
+        "监听地址：{}\n端口：{}\n日志使用的目录：{}\n日志文件名：{}\n日志文件滚动周期模式：{}\n日志系统调试模式：{}",
+        &server_host,
+        &server_port,
+        &log_file_directory,
+        &log_file_name,
+        &log.file_rolling,
+        &log_debug_mode
+    );
+    println!(
+        "模板目录：{}\n模板文件名：{}",
+        template_info.templates_directory, template_info.templates_name
+    );
     println!("系统信息采集频率：{}", log.status_duration);
 
     // 暂时取消等待
@@ -133,7 +152,6 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(pool.clone()))
@@ -152,5 +170,4 @@ async fn main() -> io::Result<()> {
     .bind_openssl((server_host, server_port), tls)?
     .run()
     .await
-
 }

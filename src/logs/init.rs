@@ -1,16 +1,14 @@
-use std::path::{Path};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use crate::logs::{LogRollingMode, LogTime};
-
+use std::path::Path;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn init(
     log_directory: impl AsRef<Path>,
     log_file_name: impl AsRef<Path>,
     log_file_rolling: &LogRollingMode,
-    log_debug_mode: &bool
+    log_debug_mode: &bool,
 ) -> tracing_appender::non_blocking::WorkerGuard {
-
-    let file_appender = log_file_rolling.build(log_directory, log_file_name);    
+    let file_appender = log_file_rolling.build(log_directory, log_file_name);
     let (nb, guard) = tracing_appender::non_blocking(file_appender);
 
     let json_layer = tracing_subscriber::fmt::layer()

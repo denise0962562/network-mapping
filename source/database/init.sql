@@ -130,7 +130,11 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	name VARCHAR(50),                                                               -- 扫描器的名称
 	scanner_id VARCHAR(36) NOT NULL UNIQUE,                                         -- 该字段为扫描器的 ID ，UUIDV7
 	create_user INT NOT NULL,                                                       -- 由谁创建
-	token TEXT UNIQUE,                                                              -- 扫描器 token
+	registration_token_hash TEXT UNIQUE,                                            -- 一次性注册 token 的 HMAC 哈希
+	registration_token_expires_at TIMESTAMPTZ,                                      -- 注册 token 过期时间
+	registration_consumed_at TIMESTAMPTZ,                                           -- 注册 token 消费时间
+	runtime_token_hash TEXT UNIQUE,                                                 -- 扫描器运行 token 的 HMAC 哈希
+	runtime_token_rotated_at TIMESTAMPTZ,                                           -- 运行 token 最近轮换时间
 	location TEXT,                                                                  -- 扫描器的位置描述
 	system_version TEXT,                                                            -- 扫描器所在的系统名称及版本
 	scanner_version TEXT,                                                           -- 扫描器的版本
