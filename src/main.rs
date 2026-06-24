@@ -14,7 +14,7 @@ use rust_web_test::middlewares::{
 };
 use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::{config, db, Systems, TemplatesInit, insert_system_status};
-use rust_web_test::admin::check_system_user;
+use rust_web_test::admin::{check_default_admin_user, check_system_user};
 use rust_web_test::maxmind::MaxMindState;
 
 #[actix_web::main]
@@ -78,6 +78,8 @@ async fn main() -> io::Result<()> {
 
     // 定义密码加密相关配置文件
     let pwd_h = config.pwd_hash;
+
+    check_default_admin_user(&db_pool, pwd_h.clone()).await;
 
     let mail_c = config.email_config;
 

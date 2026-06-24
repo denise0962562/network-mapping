@@ -3,15 +3,22 @@ use tracing::{info, warn, error};
 use lettre::{Message, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use lettre::transport::smtp::authentication::Credentials;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::env;
+use openssl::rand;
 use totp_rs::{Algorithm, Secret, TOTP};
 use postgres_from_row::FromRow;
 use cidr::IpInet;
 use deadpool_postgres::Pool;
 use uuid::Uuid;
 
-use crate::config::SystemConfig;
-use crate::{AddUserInfo, config::EmailConfig};
+use crate::config::{EmailConfig, PasswordHashConfig, SystemConfig};
+use crate::{AddUserInfo, generate_hash_password};
 use crate::{encrypt_data, decrypt_data};
+
+const DEFAULT_ADMIN_USERNAME: &str = "admin";
+const DEFAULT_ADMIN_USERNAME_ENV: &str = "NM_DEFAULT_ADMIN_USERNAME";
+const DEFAULT_ADMIN_PASSWORD_LEN: usize = 18;
+const DEFAULT_ADMIN_PASSWORD_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
 
 /// 该结构体用于接收测试使用的创建用户信息
 #[derive(Deserialize)]
@@ -171,6 +178,124 @@ pub async fn create_system_user(
         message = "创建系统用户成功"
     );
     println!("创建系统用户成功");
+    transaction.commit().await.unwrap();
+}
+
+/// 检查管理员用户数量，该操作在系统启动前执行。
+///
+/// 当没有任何管理员用户时，自动创建一个默认管理员。默认用户名可通过环境变量
+/// `NM_DEFAULT_ADMIN_USERNAME` 覆盖，密码会自动生成。
+pub async fn check_default_admin_user(
+    pool: &deadpool_postgres::Pool,
+    pwd_hash_config: PasswordHashConfig,
+) {
+    let admin_count = {
+        let c = pool.get().await.unwrap();
+        let row = c
+            .query_one("SELECT COUNT(*) AS count FROM users WHERE role = 1;", &[])
+            .await
+            .unwrap();
+        row.get::<_, i64>("count")
+    };
+
+    match admin_count {
+        0 => {
+            warn!(
+                event = "AdminRoleNotFound",
+                path = "fn check_default_admin_user",
+                message = "没有找到管理员用户，正在创建一个默认管理员用户"
+            );
+            println!("没有找到管理员用户，正在创建一个默认管理员用户");
+            create_default_admin_user(pool, pwd_hash_config).await;
+        },
+        _ => println!("找到管理员用户")
+    }
+}
+
+fn default_admin_username() -> String {
+    env::var(DEFAULT_ADMIN_USERNAME_ENV)
+        .ok()
+        .filter(|username| !username.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_ADMIN_USERNAME.to_string())
+}
+
+fn generate_default_admin_password() -> String {
+    let mut random_bytes = [0u8; DEFAULT_ADMIN_PASSWORD_LEN];
+    rand::rand_bytes(&mut random_bytes).unwrap();
+
+    random_bytes
+        .iter()
+        .map(|byte| {
+            let index = *byte as usize % DEFAULT_ADMIN_PASSWORD_CHARS.len();
+            DEFAULT_ADMIN_PASSWORD_CHARS[index] as char
+        })
+        .collect()
+}
+
+/// 创建默认管理员角色。
+///
+/// 如果默认用户名已被占用，会使用 admin_1、admin_2 等后缀创建用户，避免修改已有账号。
+pub async fn create_default_admin_user(
+    pool: &deadpool_postgres::Pool,
+    pwd_hash_config: PasswordHashConfig,
+) {
+    let username_prefix = default_admin_username();
+    let password = generate_default_admin_password();
+    let password_hash = generate_hash_password(&password, pwd_hash_config).unwrap();
+
+    let mut c = pool.get().await.unwrap();
+    let transaction = c.transaction().await.unwrap();
+    transaction.execute("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE;", &[]).await.unwrap();
+
+    let row = transaction
+        .query_one("SELECT COUNT(*) AS count FROM users WHERE role = 1;", &[])
+        .await
+        .unwrap();
+    if row.get::<_, i64>("count") > 0 {
+        println!("找到管理员用户");
+        transaction.commit().await.unwrap();
+        return;
+    }
+
+    let mut username = username_prefix.clone();
+
+    for index in 0..1000 {
+        let candidate = if index == 0 {
+            username_prefix.clone()
+        } else {
+            format!("{}_{}", username_prefix, index)
+        };
+
+        if transaction
+            .query_opt("SELECT id FROM users WHERE username = $1;", &[&candidate])
+            .await
+            .unwrap()
+            .is_none()
+        {
+            username = candidate;
+            break;
+        }
+
+        if index == 999 {
+            panic!("默认管理员用户名均已被占用，请调整环境变量 NM_DEFAULT_ADMIN_USERNAME");
+        }
+    }
+
+    transaction.execute(
+        "INSERT INTO users (username, password, role, limit_login) VALUES ($1, $2, $3, $4);",
+        &[&username, &password_hash, &1, &false]
+    ).await.unwrap();
+
+    info!(
+        event = "CreateDefaultAdminUser",
+        path = "fn create_default_admin_user",
+        username,
+        message = "创建默认管理员用户成功"
+    );
+
+    println!("创建默认管理员用户成功，用户名：{}", username);
+    println!("默认管理员随机初始密码：{}，请登录后尽快修改", password);
+
     transaction.commit().await.unwrap();
 }
 
