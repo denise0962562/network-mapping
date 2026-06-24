@@ -6,8 +6,10 @@ use crate::admin::{get_config_from_database, get_user_info, send_email, UserBase
 use crate::{target_generated::{ScanTargetGetResponse, targetgenerated::random_generate_target}};
 use crate::{TEXT_HTML_UTF_8};
 use crate::{logs::write::{info_logs}, FrontEndErrorInfo, front_end_error_page, TemplatesInit};
-use crate::rir::get_rir_data;
 use crate::config::{GetConfig, EmailConfig, DatabaseConfig};
+
+#[cfg(feature = "rir")]
+use crate::rir::get_rir_data;
 
 //基准测试
 use crate::{Systems, benchmark};
@@ -59,6 +61,7 @@ pub async fn not_found(
 
 
 /// 用于启动加载 RIR 数据
+#[cfg(feature = "rir")]
 #[get("/api/updaterir")]
 async fn update_rir(
     pool: web::Data<deadpool_postgres::Pool>

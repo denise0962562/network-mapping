@@ -5,8 +5,10 @@ use tracing::error;
 use crate::logs::write::{error_logs, info_logs};
 use crate::{TemplatesInit, TEXT_HTML_UTF_8, Permission};
 use crate::{CreateTask, STask, TargetIP, apply_task, ApplyTaskQuery, get_task_item, TaskItemJson, ReceiveTaskItemQueryInfo};
+use crate::{ScannerResultUpload, SaveScannerResultsError, save_scanner_results};
 use crate::middlewares::{render_500};
 use crate::admin::{UserBaseI};
+use crate::maxmind::MaxMindState;
 
 /// TODO 让我想想这个接口是干啥的
 #[get("/api/task/{task_id}")]
@@ -103,6 +105,31 @@ async fn apply_task_handler(
             .body("没有找到或内部错误")
     }
     
+}
+
+/// 用于扫描器上传扫描结果。
+#[post("/api/scanner/result")]
+async fn upload_scanner_result_handler(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    maxmind: web::Data<MaxMindState>,
+    upload_data: web::Json<ScannerResultUpload>,
+) -> impl Responder {
+    match save_scanner_results(pool.get_ref(), maxmind.get_ref(), &upload_data).await {
+        Ok(saved) => HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "saved": saved,
+        })),
+        Err(e) => {
+            error_logs(&req, "SaveScannerResultError", &e.to_string());
+            match e {
+                SaveScannerResultsError::InvalidIp { .. } => HttpResponse::BadRequest().body("invalid ip"),
+                SaveScannerResultsError::ScannerUnauthorized => HttpResponse::Unauthorized().body("unauthorized"),
+                SaveScannerResultsError::TaskNotFound => HttpResponse::NotFound().body("task not found"),
+                SaveScannerResultsError::Database(_) => HttpResponse::InternalServerError().body("500"),
+            }
+        }
+    }
 }
 
 /// 获取所有任务接口

@@ -15,6 +15,7 @@ use rust_web_test::middlewares::{
 use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::{config, db, Systems, TemplatesInit, insert_system_status};
 use rust_web_test::admin::check_system_user;
+use rust_web_test::maxmind::MaxMindState;
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
@@ -87,6 +88,7 @@ async fn main() -> io::Result<()> {
     
     let sys = Systems::new();  
     let sys_2 = sys.clone();
+    let maxmind_state = web::Data::new(MaxMindState::from_default_paths());
 
     println!("服务已启动");
     println!("监听 {}:{}", server_host, server_port);
@@ -139,6 +141,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(pwd_h.clone()))
             .app_data(web::Data::new(mail_c.clone()))
             .app_data(web::Data::new(ser_con.clone()))
+            .app_data(maxmind_state.clone())
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)

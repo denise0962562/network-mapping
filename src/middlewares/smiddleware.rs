@@ -66,9 +66,9 @@ where
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = vec!["/api", "/dashboard", "/logout"];
         // 白名单
-        let white_path = vec!["/api/login", "/api/scanner/register"];
+        let white_path = vec!["/api/login", "/api/scanner/register", "/api/scanner/result"];
         // 不检查 csrf token
-        let no_ckeck_csrft = vec!["/api/totp/verify", "/api/scanner/register"];
+        let no_ckeck_csrft = vec!["/api/totp/verify", "/api/scanner/register", "/api/scanner/result"];
         let path = req.path().to_owned();
         let svc = self.service.clone();
 

@@ -170,9 +170,9 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(handlers::utils::benchmark_route)
         .service(handlers::task::create_task)
         .service(handlers::task::apply_task_handler)     //更换了 apply_task_handler 和 get_task的注册顺序
+        .service(handlers::task::upload_scanner_result_handler)
         .service(handlers::task::get_all_task_handler)
         .service(handlers::task::get_task)
-        .service(handlers::utils::update_rir)
         .service(user::user_logout)
         .service(user::verify_totp_h)
         .service(user::bind_twofa_h)
@@ -185,6 +185,9 @@ pub fn init_routes(cfg: &mut web::ServiceConfig, ) {
         .service(utils::get_config_h)
         .service(utils::test_mail_server_h)
         .default_service(web::to(handlers::utils::not_found));
+
+    #[cfg(feature = "rir")]
+    cfg.service(handlers::utils::update_rir);
 }
 
 #[derive(Serialize)]

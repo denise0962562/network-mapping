@@ -6,6 +6,9 @@ pub mod target_generated;
 pub mod login;
 pub mod admin;
 pub mod handlers;
+pub mod maxmind;
+
+#[cfg(feature = "rir")]
 pub mod rir;                                                  // 该模块用于从五大 RIR 获取 ASN 和组织等信息
 
 // 自己的中间件
@@ -15,6 +18,7 @@ pub mod middlewares;
 #[cfg(test)]
 pub mod test;                                                 // 测试模块
 
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::{HttpRequest, web};
 use tokio_postgres::Row;
@@ -42,6 +46,7 @@ use openssl::rand;
 use db::{get_sql_from_file};
 use config::PasswordHashConfig;
 use admin::TotpInfo;
+use maxmind::MaxMindState;
 
 //常量
 pub const TEXT_HTML_UTF_8: &str = "text/html; charset=utf-8";
@@ -712,6 +717,7 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 }
 
 ///自实现MIME系统。接受一个&str类型的文件后缀，返回一个&str。
+#[allow(dead_code)]
 fn mime_system(file_suffix: &str) -> &str {
     match file_suffix.to_lowercase().as_str() {
         "html" => TEXT_HTML_UTF_8,
@@ -723,6 +729,7 @@ fn mime_system(file_suffix: &str) -> &str {
 }
 
 ///获取文件后缀，可以输入文件名或者是带路径的文件名 e.g example.png 、 directory/example.png
+#[allow(dead_code)]
 fn get_file_suffix(path_or_file_name: &Path) -> Result<&str, &str> {
     
     match path_or_file_name.extension().and_then(|s| s.to_str()) {
@@ -922,6 +929,142 @@ pub struct ApplyTask {
     pub task_id: Uuid,
     pub task_target: Vec<String>,
     pub task_port: String
+}
+
+#[derive(Deserialize)]
+pub struct ScannerResultUpload {
+    pub scanner_id: Uuid,
+    pub token: String,
+    pub task_id: Uuid,
+    pub results: Vec<ScannerResultItem>,
+}
+
+#[derive(Deserialize)]
+pub struct ScannerResultItem {
+    pub ip: String,
+    pub port: u16,
+    pub protocol: Option<String>,
+    pub service: Option<String>,
+    pub banner: Option<String>,
+    pub other: Option<Value>,
+}
+
+#[derive(Debug)]
+pub enum SaveScannerResultsError {
+    Database(Box<dyn std::error::Error + Send + Sync>),
+    InvalidIp { ip: String, source: AddrParseError },
+    ScannerUnauthorized,
+    TaskNotFound,
+}
+
+impl fmt::Display for SaveScannerResultsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(e) => write!(f, "{}", e),
+            Self::InvalidIp { ip, source } => write!(f, "无效 IP/CIDR: {} ({})", ip, source),
+            Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
+            Self::TaskNotFound => write!(f, "任务不存在"),
+        }
+    }
+}
+
+impl std::error::Error for SaveScannerResultsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(e) => Some(e.as_ref()),
+            Self::InvalidIp { source, .. } => Some(source),
+            Self::ScannerUnauthorized | Self::TaskNotFound => None,
+        }
+    }
+}
+
+fn scanner_result_database_error<E>(value: E) -> SaveScannerResultsError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    SaveScannerResultsError::Database(Box::new(value))
+}
+
+pub async fn save_scanner_results(
+    pool: &deadpool_postgres::Pool,
+    maxmind: &MaxMindState,
+    upload: &ScannerResultUpload,
+) -> Result<usize, SaveScannerResultsError> {
+    let mut client = pool.get().await.map_err(scanner_result_database_error)?;
+    let transaction = client.transaction().await.map_err(scanner_result_database_error)?;
+
+    let scanner = transaction.query_opt(
+        "SELECT id, name FROM scanner_info WHERE scanner_id = $1 AND token = $2 AND is_enable = true;",
+        &[&upload.scanner_id.to_string(), &upload.token]
+    ).await.map_err(scanner_result_database_error)?;
+
+    let scanner_name: String = match scanner {
+        Some(row) => row.get::<_, Option<String>>("name").unwrap_or_else(|| upload.scanner_id.to_string()),
+        None => return Err(SaveScannerResultsError::ScannerUnauthorized),
+    };
+
+    let task_row = transaction.query_opt(
+        "SELECT id FROM scan_task WHERE task_id = $1;",
+        &[&upload.task_id.to_string()]
+    ).await.map_err(scanner_result_database_error)?;
+
+    let task_db_id: i32 = match task_row {
+        Some(row) => row.get("id"),
+        None => return Err(SaveScannerResultsError::TaskNotFound),
+    };
+
+    let mut saved = 0usize;
+
+    for item in &upload.results {
+        let parsed_ip: IpNet = item.ip.parse().map_err(|source| SaveScannerResultsError::InvalidIp {
+            ip: item.ip.clone(),
+            source,
+        })?;
+        let ip_addr = parsed_ip.addr();
+        let intel = maxmind.lookup(ip_addr);
+        let ip_text = parsed_ip.to_string();
+
+        let ip_row = transaction.query_one(
+            "INSERT INTO ips (task_id, ip_address, asn, isp) \
+             VALUES ($1, $2::text::inet, $3, $4) \
+             ON CONFLICT (ip_address) DO UPDATE SET \
+                asn = COALESCE(EXCLUDED.asn, ips.asn), \
+                isp = COALESCE(EXCLUDED.isp, ips.isp), \
+                update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+             RETURNING ip_id;",
+            &[&task_db_id, &ip_text, &intel.asn, &intel.isp]
+        ).await.map_err(scanner_result_database_error)?;
+        let ip_id: i32 = ip_row.get("ip_id");
+
+        let port_i32 = i32::from(item.port);
+        let port_row = transaction.query_one(
+            "INSERT INTO ports (ip_id, port) \
+             VALUES ($1, $2) \
+             ON CONFLICT (ip_id, port) DO UPDATE SET \
+                update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+             RETURNING port_id;",
+            &[&ip_id, &port_i32]
+        ).await.map_err(scanner_result_database_error)?;
+        let port_id: i32 = port_row.get("port_id");
+
+        transaction.execute(
+            "INSERT INTO scaninfo (port_id, scanner_name, protocol, service, banner, other) \
+             VALUES ($1, $2, $3, $4, $5, $6);",
+            &[
+                &port_id,
+                &scanner_name,
+                &item.protocol,
+                &item.service,
+                &item.banner,
+                &item.other,
+            ]
+        ).await.map_err(scanner_result_database_error)?;
+
+        saved += 1;
+    }
+
+    transaction.commit().await.map_err(scanner_result_database_error)?;
+    Ok(saved)
 }
 
 /// 通过该函数实现扫描器申请任务

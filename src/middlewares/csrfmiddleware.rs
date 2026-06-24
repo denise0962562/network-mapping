@@ -56,7 +56,7 @@ where
 
 
         let svc = self.service.clone();
-        let no_ckeck_csrft = vec!["/api/scanner/register"];
+        let no_ckeck_csrft = vec!["/api/scanner/register", "/api/scanner/result"];
         let path = req.path().to_owned();
 
         let pass = no_ckeck_csrft.iter().any(|p| &path == p);
