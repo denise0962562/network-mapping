@@ -7,7 +7,7 @@ use tracing::error;
 use crate::logs::write::warn_logs;
 use crate::{
     TemplatesInit,
-    middlewares::{get_pool_from_app_data, render_500, render_500_simple},
+    middlewares::{get_pool_from_app_data, is_scanner_api_path, render_500, render_500_simple},
 };
 
 use actix_web::{
@@ -65,10 +65,8 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let svc = self.service.clone();
-        let no_ckeck_csrft = vec!["/api/scanner/register", "/api/scanner/result"];
         let path = req.path().to_owned();
-
-        let pass = no_ckeck_csrft.iter().any(|p| &path == p);
+        let pass = is_scanner_api_path(&path);
 
         Box::pin(async move {
             // 如果路径是扫描器相关直接放行

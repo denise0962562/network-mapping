@@ -15,7 +15,7 @@ use crate::login::get_session_from_req;
 use crate::logs::write::info_logs;
 use tracing::{error, info};
 
-use crate::middlewares::get_pool_from_app_data;
+use crate::middlewares::{get_pool_from_app_data, is_scanner_api_path};
 
 /// 用于 session 检查的中间件的 Transform
 pub struct AuthMiddleware;
@@ -63,24 +63,13 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         // 向量 path_list 定义了需要做权限校验的路径
-        let path_list = vec!["/api", "/dashboard", "/logout"];
-        // 白名单
-        let white_path = vec!["/api/login", "/api/scanner/register", "/api/scanner/result"];
-        // 不检查 csrf token
-        let no_ckeck_csrft = vec![
-            "/api/totp/verify",
-            "/api/scanner/register",
-            "/api/scanner/result",
-        ];
+        let path_list = ["/api", "/dashboard", "/logout"];
         let path = req.path().to_owned();
         let svc = self.service.clone();
 
-        let need_check: bool;
-        if white_path.iter().any(|p| p == &path) {
-            need_check = false
-        } else {
-            need_check = path_list.iter().any(|p| path.starts_with(p));
-        }
+        let need_check = path != "/api/login"
+            && !is_scanner_api_path(&path)
+            && path_list.iter().any(|prefix| path.starts_with(prefix));
 
         info!(
             event = "received_requests",
@@ -99,7 +88,7 @@ where
         );
 
         Box::pin(async move {
-            if need_check == false {
+            if !need_check {
                 // 当请求不是以 path_list 开头则直接放行
                 return Ok(svc.call(req).await?.map_into_left_body());
             }
@@ -133,7 +122,7 @@ where
                 pool: g_pool.clone(),
             };
 
-            let v_csrf_token = !no_ckeck_csrft.iter().any(|t| path.starts_with(t));
+            let v_csrf_token = path != "/api/totp/verify" && !is_scanner_api_path(&path);
 
             match login_t.check_token(&session, v_csrf_token).await {
                 Ok((true, uid)) => {
