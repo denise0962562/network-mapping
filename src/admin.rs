@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use cidr::IpInet;
 use deadpool_postgres::Pool;
 use lettre::transport::smtp::authentication::Credentials;
@@ -7,6 +8,7 @@ use postgres_from_row::FromRow;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_postgres::Row;
 use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -79,6 +81,27 @@ pub struct ScannerRegisterSecret {
 #[derive(Serialize)]
 pub struct ScannerRuntimeSecret {
     pub runtime_token: String,
+}
+
+#[derive(Serialize)]
+pub struct ScannerInfo {
+    pub scanner_id: String,
+    pub name: Option<String>,
+    pub creator: Option<String>,
+    pub location: Option<String>,
+    pub ip_address: Option<String>,
+    pub system_version: Option<String>,
+    pub scanner_version: Option<String>,
+    pub cpus: Option<i32>,
+    pub ram: Option<i32>,
+    pub uptime: Option<i32>,
+    pub create_time: Option<DateTime<Utc>>,
+    pub register_time: Option<DateTime<Utc>>,
+    pub update_time: Option<DateTime<Utc>>,
+    pub is_run: Option<bool>,
+    pub is_enable: Option<bool>,
+    pub remark: Option<String>,
+    pub tag: Option<String>,
 }
 
 pub enum ScannerEvent {
@@ -1035,6 +1058,55 @@ pub async fn scanner_register(
         0 => Err("scanner unauthorized".into()),
         _ => Err("更新影响多行".into()),
     }
+}
+
+const SCANNER_INFO_SELECT: &str = "\
+    SELECT s.scanner_id, s.name, u.username AS creator, s.location, \
+           host(s.ip_address) AS ip_address, s.system_version, s.scanner_version, \
+           s.cpus, s.ram, s.uptime, s.create_time, s.register_time, s.update_time, \
+           s.is_run, s.is_enable, s.remark, s.tag \
+    FROM scanner_info s \
+    LEFT JOIN users u ON u.id = s.create_user";
+
+fn scanner_info_from_row(row: &Row) -> ScannerInfo {
+    ScannerInfo {
+        scanner_id: row.get("scanner_id"),
+        name: row.get("name"),
+        creator: row.get("creator"),
+        location: row.get("location"),
+        ip_address: row.get("ip_address"),
+        system_version: row.get("system_version"),
+        scanner_version: row.get("scanner_version"),
+        cpus: row.get("cpus"),
+        ram: row.get("ram"),
+        uptime: row.get("uptime"),
+        create_time: row.get("create_time"),
+        register_time: row.get("register_time"),
+        update_time: row.get("update_time"),
+        is_run: row.get("is_run"),
+        is_enable: row.get("is_enable"),
+        remark: row.get("remark"),
+        tag: row.get("tag"),
+    }
+}
+
+pub async fn get_scanners(pool: &Pool) -> Result<Vec<ScannerInfo>, Box<dyn std::error::Error>> {
+    let connection = pool.get().await?;
+    let query = format!("{SCANNER_INFO_SELECT} ORDER BY s.create_time DESC NULLS LAST, s.id DESC;");
+    let rows = connection.query(&query, &[]).await?;
+    Ok(rows.iter().map(scanner_info_from_row).collect())
+}
+
+pub async fn get_scanner(
+    pool: &Pool,
+    scanner_id: Uuid,
+) -> Result<Option<ScannerInfo>, Box<dyn std::error::Error>> {
+    let connection = pool.get().await?;
+    let query = format!("{SCANNER_INFO_SELECT} WHERE s.scanner_id = $1 LIMIT 1;");
+    let row = connection
+        .query_opt(&query, &[&scanner_id.to_string()])
+        .await?;
+    Ok(row.as_ref().map(scanner_info_from_row))
 }
 
 // 扫描器健康检查

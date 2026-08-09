@@ -19,9 +19,10 @@ use crate::logs::write::{error_logs, info_logs};
 use crate::middlewares::render_500;
 use crate::{AddUserInfo, admin, generate_hash_password, log_out, verify_password};
 use admin::{
-    ReceiveAddUserInfo, Unbind2FAH, VerifyTotp, bind_twofa, confirm_twofa_binding,
-    scanner_register, totp_struct, totp_token_verify, unbind_2fa, web_add_scanner,
+    ReceiveAddUserInfo, Unbind2FAH, VerifyTotp, bind_twofa, confirm_twofa_binding, get_scanner,
+    get_scanners, scanner_register, totp_struct, totp_token_verify, unbind_2fa, web_add_scanner,
 };
+use uuid::Uuid;
 
 fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Cookie<'static>) {
     let session_cookie = Cookie::build("session", session.to_owned())
@@ -660,6 +661,47 @@ async fn web_add_scanner_h(
         "data": s_id
     });
     HttpResponse::Ok().json(res_data)
+}
+
+#[get("/api/scanner/list")]
+async fn get_scanners_h(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    _user_base_i: UserBaseI,
+) -> impl Responder {
+    match get_scanners(pool.get_ref()).await {
+        Ok(scanners) => HttpResponse::Ok().json(json!({
+            "success": true,
+            "data": scanners,
+        })),
+        Err(error) => {
+            error_logs(&req, "GetScannersError", &error.to_string());
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
+#[get("/api/scanner/{scanner_id}")]
+async fn get_scanner_h(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    _user_base_i: UserBaseI,
+    scanner_id: web::Path<Uuid>,
+) -> impl Responder {
+    match get_scanner(pool.get_ref(), scanner_id.into_inner()).await {
+        Ok(Some(scanner)) => HttpResponse::Ok().json(json!({
+            "success": true,
+            "data": scanner,
+        })),
+        Ok(None) => HttpResponse::NotFound().json(json!({
+            "success": false,
+            "message": "scanner not found",
+        })),
+        Err(error) => {
+            error_logs(&req, "GetScannerError", &error.to_string());
+            HttpResponse::InternalServerError().finish()
+        }
+    }
 }
 
 /// 扫描器注册
