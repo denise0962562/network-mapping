@@ -32,6 +32,10 @@ private_key_file = "ssl/key.pem"
 cargo run -- --config /etc/network-mapping/config.toml
 ```
 
+## 开源项目清单
+
+`GET /api/open-source/projects` 返回编译进服务端的主要直接依赖清单。升级 `Cargo.toml`、扫描器依赖或前端 `package.json` 后，应同步复核 `source/open_source_projects.json` 中的版本、许可证和上游链接。
+
 清理缓存（可选项）
 
 ```

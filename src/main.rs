@@ -13,6 +13,7 @@ use rust_web_test::middlewares::{
     csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, ratelimit::RateLimitMiddleware,
     smiddleware::AuthMiddleware,
 };
+use rust_web_test::open_source::OpenSourceCatalog;
 use rust_web_test::tls::build_acceptor;
 use rust_web_test::{Systems, TemplatesInit, config, db, insert_system_status};
 
@@ -109,6 +110,10 @@ async fn main() -> io::Result<()> {
     let sys_2 = sys.clone();
     let maxmind_state = web::Data::new(MaxMindState::from_default_paths());
     let rate_limiter = RateLimitMiddleware::default();
+    let open_source_catalog = web::Data::new(
+        OpenSourceCatalog::from_embedded()
+            .map_err(|error| io::Error::other(format!("开源项目清单格式错误: {error}")))?,
+    );
 
     println!("服务已启动");
     println!("监听 {}:{}", server_host, server_port);
@@ -172,6 +177,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(mail_c.clone()))
             .app_data(web::Data::new(ser_con.clone()))
             .app_data(maxmind_state.clone())
+            .app_data(open_source_catalog.clone())
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)

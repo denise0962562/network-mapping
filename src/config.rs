@@ -249,6 +249,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::utils::get_scan_target)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
+        .service(handlers::open_source::get_open_source_projects)
         .service(handlers::search::search_ip)
         .service(handlers::search::search_network)
         .service(handlers::search::search_port)
