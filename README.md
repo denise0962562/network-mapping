@@ -26,6 +26,19 @@ certificate_chain_file = "ssl/cert.pem"
 private_key_file = "ssl/key.pem"
 ```
 
+扫描器令牌还需要一个长期固定的 HMAC Pepper。使用以下命令生成：
+
+```sh
+openssl rand -hex 32
+```
+
+将输出写入配置文件；修改该值会使已有扫描器令牌失效：
+
+```toml
+[security]
+scanner_token_pepper = "生成的随机值"
+```
+
 可以通过 `--config` 指定其他配置文件：
 
 ```sh

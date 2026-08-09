@@ -60,7 +60,6 @@ pub const IMAGE_PNG: &str = "image/png";
 pub const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 pub const APPLICATION_JSON: &str = "application/json";
 pub const _SYSTEM_TIME_ZONE: &str = "Asia/Shanghai";
-const SCANNER_TOKEN_PEPPER_ENV: &str = "NM_SCANNER_TOKEN_PEPPER";
 
 pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
     let mut token_buffer = [0u8; 36];
@@ -73,16 +72,7 @@ pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
     ))
 }
 
-pub fn hash_scanner_token(token: &str) -> Result<String, io::Error> {
-    let pepper = std::env::var(SCANNER_TOKEN_PEPPER_ENV).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "missing required environment variable {}",
-                SCANNER_TOKEN_PEPPER_ENV
-            ),
-        )
-    })?;
+pub fn hash_scanner_token(token: &str, pepper: &str) -> Result<String, io::Error> {
     let key = PKey::hmac(pepper.as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     let mut signer = Signer::new(MessageDigest::sha256(), &key)
@@ -1000,8 +990,9 @@ pub async fn validate_scanner_credentials(
     pool: &deadpool_postgres::Pool,
     scanner_id: Uuid,
     token: &str,
+    token_pepper: &str,
 ) -> Result<(), ApplyTaskError> {
-    let token_hash = hash_scanner_token(token).map_err(apply_task_database_error)?;
+    let token_hash = hash_scanner_token(token, token_pepper).map_err(apply_task_database_error)?;
     let p = pool.get().await.map_err(apply_task_database_error)?;
     let scanner = p.query_opt(
         "SELECT id FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
@@ -1074,13 +1065,15 @@ pub async fn save_scanner_results(
     maxmind: &MaxMindState,
     upload: &ScannerResultUpload,
     token: &str,
+    token_pepper: &str,
 ) -> Result<usize, SaveScannerResultsError> {
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()
         .await
         .map_err(scanner_result_database_error)?;
-    let token_hash = hash_scanner_token(token).map_err(scanner_result_database_error)?;
+    let token_hash =
+        hash_scanner_token(token, token_pepper).map_err(scanner_result_database_error)?;
 
     let scanner = transaction.query_opt(
         "SELECT id, name FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
@@ -1182,8 +1175,9 @@ pub async fn apply_task(
     pool: &deadpool_postgres::Pool,
     scanner_id: Uuid,
     token: &str,
+    token_pepper: &str,
 ) -> Result<ApplyTask, ApplyTaskError> {
-    validate_scanner_credentials(pool, scanner_id, token).await?;
+    validate_scanner_credentials(pool, scanner_id, token, token_pepper).await?;
 
     let mut p = pool.get().await.map_err(apply_task_database_error)?;
     let transaction = p.transaction().await.map_err(apply_task_database_error)?;

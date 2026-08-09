@@ -8,6 +8,11 @@ encrypt_key = ""
 certificate_chain_file = "ssl/cert.pem"
 private_key_file = "ssl/key.pem"
 
+[security]
+# 扫描器注册令牌和运行令牌的 HMAC Pepper；使用 `openssl rand -hex 32` 生成
+# 生产环境必须替换为空间独立、长期固定的随机值，修改后已有扫描器令牌会失效
+scanner_token_pepper = ""
+
 [log]
 directory = "logs"
 file_name = "server.json"

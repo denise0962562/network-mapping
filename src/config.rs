@@ -5,7 +5,7 @@ use clap::Parser;
 use postgres_from_row::FromRow;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -31,6 +31,7 @@ pub struct Config {
     // pub scan_target_generated: ScanTargetConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
+    pub security: SecurityConfig,
     pub email_config: Option<EmailConfig>,
 }
 
@@ -57,6 +58,7 @@ impl SelfChecking for Config {
     fn check(&self) {
         let _ = &self.server.check();
         let _ = &self.database.check();
+        let _ = &self.security.check();
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -65,7 +67,44 @@ impl SelfChecking for Config {
             Ok(false) => return Ok(false),
             Err(e) => return Err(e),
         }
-        self.database.try_check()
+        match self.database.try_check() {
+            Ok(true) => (),
+            Ok(false) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        self.security.try_check()
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct SecurityConfig {
+    pub scanner_token_pepper: String,
+}
+
+impl fmt::Debug for SecurityConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecurityConfig")
+            .field("scanner_token_pepper", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl SelfChecking for SecurityConfig {
+    fn check(&self) {
+        if let Err(error) = self.try_check() {
+            panic!("{error}");
+        }
+        println!("[security] 通过检查");
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.scanner_token_pepper.trim().len() < 32 {
+            return Err(
+                "scanner_token_pepper 至少需要 32 个字符，请使用 openssl rand -hex 32 生成".into(),
+            );
+        }
+        Ok(true)
     }
 }
 
@@ -204,7 +243,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::TlsConfig;
+    use super::{SecurityConfig, SelfChecking, TlsConfig};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -240,6 +279,19 @@ mod tests {
             PathBuf::from("/run/secrets/cert.pem")
         );
         assert_eq!(tls.private_key_file, PathBuf::from("/run/secrets/key.pem"));
+    }
+
+    #[test]
+    fn scanner_token_pepper_requires_sufficient_length() {
+        let short = SecurityConfig {
+            scanner_token_pepper: "too-short".into(),
+        };
+        let valid = SecurityConfig {
+            scanner_token_pepper: "0123456789abcdef0123456789abcdef".into(),
+        };
+
+        assert!(short.try_check().is_err());
+        assert!(valid.try_check().expect("valid pepper"));
     }
 }
 
@@ -319,7 +371,7 @@ impl SystemConfig {
     /// 该函数可以直接更改 value
     pub fn encrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_value = self.value;
-        if tmp_value.len() <= 0 {
+        if tmp_value.is_empty() {
             return Err("空值".into());
         } else {
             let (nonce, tag, ciphertext) = encrypt_data(tmp_value.as_bytes(), e_key.as_bytes())?;
@@ -338,7 +390,7 @@ impl SystemConfig {
     /// 函数
     pub fn decrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_value = self.value;
-        if tmp_value.len() <= 0 {
+        if tmp_value.is_empty() {
             return Err("空值".into());
         } else {
             let v = openssl::base64::decode_block(&tmp_value)?;

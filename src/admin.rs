@@ -954,6 +954,7 @@ pub async fn web_add_scanner(
     pool: &Pool,
     user_id: i32,
     add_data: &AddScanner,
+    token_pepper: &str,
 ) -> Result<ScannerRegisterSecret, Box<dyn std::error::Error>> {
     let mut db_conn = pool.get().await?;
     let db_transaction = db_conn.transaction().await?;
@@ -961,7 +962,7 @@ pub async fn web_add_scanner(
     // 生成扫描器 id （uuid v7）
     let scanner_id = Uuid::now_v7().to_string();
     let registration_token = generate_scanner_token("nm_reg")?;
-    let registration_token_hash = hash_scanner_token(&registration_token)?;
+    let registration_token_hash = hash_scanner_token(&registration_token, token_pepper)?;
 
     match db_transaction.execute(
         "INSERT INTO scanner_info \
@@ -986,10 +987,11 @@ pub async fn scanner_register(
     pool: &Pool,
     register_data: &ScannerRegisterData,
     registration_token: &str,
+    token_pepper: &str,
 ) -> Result<ScannerRuntimeSecret, Box<dyn std::error::Error>> {
     let mut db_conn = pool.get().await?;
     let db_transaction = db_conn.transaction().await?;
-    let registration_token_hash = hash_scanner_token(registration_token)?;
+    let registration_token_hash = hash_scanner_token(registration_token, token_pepper)?;
 
     let row = db_transaction
         .query_opt(
@@ -1009,7 +1011,7 @@ pub async fn scanner_register(
 
     let scanner_pk: i32 = row.get("id");
     let runtime_token = generate_scanner_token("nm_run")?;
-    let runtime_token_hash = hash_scanner_token(&runtime_token)?;
+    let runtime_token_hash = hash_scanner_token(&runtime_token, token_pepper)?;
 
     match db_transaction
         .execute(

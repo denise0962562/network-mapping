@@ -1,4 +1,5 @@
 use crate::admin::UserBaseI;
+use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::middlewares::render_500;
@@ -105,6 +106,7 @@ async fn apply_task_handler(
     req: HttpRequest,
     scanner_id: web::Query<ApplyTaskQuery>,
     pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
 ) -> impl Responder {
     let database_conn = pool.get_ref();
     let token = req
@@ -118,7 +120,13 @@ async fn apply_task_handler(
     };
 
     if scanner_id.dryrun.unwrap_or(false) {
-        return match validate_scanner_credentials(database_conn, scanner_id.scannerid, token).await
+        return match validate_scanner_credentials(
+            database_conn,
+            scanner_id.scannerid,
+            token,
+            &security.scanner_token_pepper,
+        )
+        .await
         {
             Ok(()) => HttpResponse::Ok().finish(),
             Err(ApplyTaskError::ScannerUnauthorized) => {
@@ -132,7 +140,14 @@ async fn apply_task_handler(
         };
     }
 
-    match apply_task(database_conn, scanner_id.scannerid, token).await {
+    match apply_task(
+        database_conn,
+        scanner_id.scannerid,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
         Ok(a_t) => HttpResponse::Ok().json(a_t),
         Err(ApplyTaskError::ScannerUnauthorized) => {
             HttpResponse::Unauthorized().body("unauthorized")
@@ -153,6 +168,7 @@ async fn upload_scanner_result_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     maxmind: web::Data<MaxMindState>,
+    security: web::Data<SecurityConfig>,
     upload_data: web::Json<ScannerResultUpload>,
 ) -> impl Responder {
     let token = req
@@ -165,7 +181,15 @@ async fn upload_scanner_result_handler(
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
 
-    match save_scanner_results(pool.get_ref(), maxmind.get_ref(), &upload_data, token).await {
+    match save_scanner_results(
+        pool.get_ref(),
+        maxmind.get_ref(),
+        &upload_data,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
         Ok(saved) => HttpResponse::Ok().json(serde_json::json!({
             "success": true,
             "saved": saved,

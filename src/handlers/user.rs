@@ -12,7 +12,7 @@ use crate::admin::{
     AddScanner, GetUserInfoH, ScannerRegisterData, UserBaseI, UserBaseInfo, UserSession,
     check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info,
 };
-use crate::config::{EmailConfig, PasswordHashConfig, ServerConfig};
+use crate::config::{EmailConfig, PasswordHashConfig, SecurityConfig, ServerConfig};
 use crate::handlers::ReceiveLoginInfo;
 use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
@@ -636,11 +636,19 @@ async fn change_password_h(
 async fn web_add_scanner_h(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
     user_base_i: UserBaseI,
     add_data: web::Json<AddScanner>,
 ) -> impl Responder {
     let pool_ref = pool.get_ref();
-    let s_id = match web_add_scanner(pool_ref, user_base_i.id, add_data.deref()).await {
+    let s_id = match web_add_scanner(
+        pool_ref,
+        user_base_i.id,
+        add_data.deref(),
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
         Ok(ok) => ok,
         Err(e) => {
             error_logs(&req, "AddScannerError", &e.to_string());
@@ -660,6 +668,7 @@ async fn web_add_scanner_h(
 async fn scanner_register_h(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
     register_data: web::Json<ScannerRegisterData>,
 ) -> impl Responder {
     let registration_token = req
@@ -672,7 +681,14 @@ async fn scanner_register_h(
         return HttpResponse::Unauthorized().body("missing scanner registration token");
     };
 
-    match scanner_register(&pool, &register_data, registration_token).await {
+    match scanner_register(
+        &pool,
+        &register_data,
+        registration_token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
         Ok(runtime_secret) => HttpResponse::Ok().json(runtime_secret),
         Err(e) => {
             error_logs(&req, "ScannerRegister", &e.to_string());

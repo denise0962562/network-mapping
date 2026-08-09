@@ -109,6 +109,7 @@ async fn main() -> io::Result<()> {
     let sys = Systems::new();
     let sys_2 = sys.clone();
     let maxmind_state = web::Data::new(MaxMindState::from_default_paths());
+    let security = web::Data::new(config.security);
     let rate_limiter = RateLimitMiddleware::default();
     let open_source_catalog = web::Data::new(
         OpenSourceCatalog::from_embedded()
@@ -178,6 +179,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(ser_con.clone()))
             .app_data(maxmind_state.clone())
             .app_data(open_source_catalog.clone())
+            .app_data(security.clone())
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
