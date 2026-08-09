@@ -1,4 +1,5 @@
 pub mod data_saa; //数据统计与分析
+pub mod search;
 pub mod task;
 pub mod user;
 pub mod utils;

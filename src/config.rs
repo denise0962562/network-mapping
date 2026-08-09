@@ -182,6 +182,11 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::utils::get_scan_target)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
+        .service(handlers::search::search_ip)
+        .service(handlers::search::search_network)
+        .service(handlers::search::search_port)
+        .service(handlers::search::search_service)
+        .service(handlers::search::search_banner)
         .service(handlers::task::create_task)
         .service(handlers::task::apply_task_handler) //更换了 apply_task_handler 和 get_task的注册顺序
         .service(handlers::task::upload_scanner_result_handler)
