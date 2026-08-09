@@ -1104,6 +1104,19 @@ pub async fn save_scanner_results(
                 .get::<_, Option<String>>("assigned_scanner_id")
                 .as_deref()
                 == Some(scanner_id.as_str())
+                && row.get::<_, String>("task_status") == "succeeded" =>
+        {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        }
+        Some(row)
+            if row
+                .get::<_, Option<String>>("assigned_scanner_id")
+                .as_deref()
+                == Some(scanner_id.as_str())
                 && row.get::<_, String>("task_status") == "running" =>
         {
             row.get("id")
@@ -1130,7 +1143,7 @@ pub async fn save_scanner_results(
             .query_one(
                 "INSERT INTO ips (task_id, ip_address, asn, isp) \
              VALUES ($1, $2::text::inet, $3, $4) \
-             ON CONFLICT (ip_address) DO UPDATE SET \
+             ON CONFLICT (task_id, ip_address) DO UPDATE SET \
                 asn = COALESCE(EXCLUDED.asn, ips.asn), \
                 isp = COALESCE(EXCLUDED.isp, ips.isp), \
                 update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
@@ -1326,7 +1339,11 @@ pub struct TaskItem {
     pub task_port: String,
     pub task_create_time: i64,
     pub task_level: i32,
-    pub scanner_id: Option<Uuid>,
+    pub scanner_id: Option<String>,
+    pub task_status: String,
+    pub lease_expires_at: Option<i64>,
+    pub attempt_count: i32,
+    pub failure_reason: Option<String>,
     pub start_at: Option<i64>,
     pub end_at: Option<i64>,
     pub remarks: Option<String>,
@@ -1358,6 +1375,16 @@ pub async fn get_task_item(
     permissions: Permission,
 ) -> Result<(Vec<TaskItem>, i64, i64, i32), Box<dyn std::error::Error>> {
     let c = pool.get().await?;
+    let s_count = s_count.clamp(1, 100);
+
+    c.execute(
+        "UPDATE scan_task SET task_status = 'pending', assigned_scanner_id = NULL, \
+         lease_expires_at = NULL, task_start_time = NULL, failure_reason = 'task lease expired' \
+         WHERE task_status = 'running' AND lease_expires_at IS NOT NULL \
+           AND lease_expires_at < (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT;",
+        &[],
+    )
+    .await?;
 
     let row = match permissions {
         Permission::Administrator(_id) => {
@@ -1366,20 +1393,25 @@ pub async fn get_task_item(
                     "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE id <= $1 ORDER BY id DESC LIMIT $2;",
                     &[&st, &s_count]
                 ).await?
-            }
-            else {
+            } else {
                 c.query(
                     "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task ORDER BY id DESC LIMIT $1;",
                     &[&s_count]
                 ).await?
             }
-
-        },
+        }
         Permission::Users(u_id) => {
-            c.query(
-                "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;",
-                &[&u_id, &s_count]
-            ).await?
+            if let Some(st) = start_id {
+                c.query(
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 AND id <= $2 ORDER BY id DESC LIMIT $3;",
+                    &[&u_id, &st, &s_count]
+                ).await?
+            } else {
+                c.query(
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;",
+                    &[&u_id, &s_count]
+                ).await?
+            }
         }
     };
 
@@ -1400,7 +1432,11 @@ pub async fn get_task_item(
             task_level: r.get::<_, i32>("task_level"),
             task_port: r.get::<_, String>("task_port"),
             task_create_time: r.get::<_, i64>("task_create_time"),
-            scanner_id: None,
+            scanner_id: r.get::<_, Option<String>>("assigned_scanner_id"),
+            task_status: r.get::<_, String>("task_status"),
+            lease_expires_at: r.get::<_, Option<i64>>("lease_expires_at"),
+            attempt_count: r.get::<_, i32>("attempt_count"),
+            failure_reason: r.get::<_, Option<String>>("failure_reason"),
             start_at: r.get::<_, Option<i64>>("task_start_time"),
             end_at: r.get::<_, Option<i64>>("task_end_time"),
             remarks: r.get::<_, Option<String>>("remarks"),

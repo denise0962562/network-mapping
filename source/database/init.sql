@@ -49,12 +49,13 @@ CREATE TABLE IF NOT EXISTS scan_task(
 CREATE TABLE IF NOT EXISTS ips ( 
 	task_id INT NOT NULL, 
 	ip_id SERIAL PRIMARY KEY, 
-	ip_address INET NOT NULL UNIQUE,
+	ip_address INET NOT NULL,
 	asn TEXT DEFAULT NULL, 
 	isp TEXT DEFAULT NULL, 
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
 	update_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
-    CONSTRAINT fk_task
+	UNIQUE(task_id, ip_address),
+	CONSTRAINT fk_task
         FOREIGN KEY (task_id)
         REFERENCES scan_task(id)
         ON UPDATE CASCADE
@@ -180,6 +181,10 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS runtime_state TEXT NOT NULL DEFAULT 'offline';
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
+
+-- 扫描结果必须按任务隔离，同一 IP 可以出现在多次扫描中。
+ALTER TABLE ips DROP CONSTRAINT IF EXISTS ips_ip_address_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_task_address ON ips (task_id, ip_address);
 
 -- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
 CREATE TABLE IF NOT EXISTS ip_list (

@@ -46,12 +46,6 @@ struct SearchItem {
     isp: Option<String>,
 }
 
-const ASSET_SELECT: &str = "SELECT i.ip_address::TEXT AS ip_address, p.port, s.protocol, \
-    s.service, s.banner, s.scanner_name, s.scan_time, i.asn, i.isp, COUNT(*) OVER() AS total \
-    FROM ips i \
-    LEFT JOIN ports p ON p.ip_id = i.ip_id \
-    LEFT JOIN scaninfo s ON s.port_id = p.port_id";
-
 fn pagination(limit: Option<i64>, offset: Option<i64>) -> Result<(i64, i64), &'static str> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
     let offset = offset.unwrap_or(0);
@@ -105,7 +99,13 @@ async fn search_assets(
 ) -> Result<SearchResponse, Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     let statement = format!(
-        "{ASSET_SELECT} WHERE {where_clause} ORDER BY i.ip_address, p.port NULLS LAST, s.scan_time DESC NULLS LAST LIMIT $2 OFFSET $3"
+        "SELECT latest.*, COUNT(*) OVER() AS total FROM (\
+         SELECT DISTINCT ON (i.ip_address, p.port) i.ip_address::TEXT AS ip_address, \
+         p.port, s.protocol, s.service, s.banner, s.scanner_name, s.scan_time, i.asn, i.isp \
+         FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id \
+         LEFT JOIN scaninfo s ON s.port_id = p.port_id WHERE {where_clause} \
+         ORDER BY i.ip_address, p.port NULLS LAST, s.scan_time DESC NULLS LAST\
+         ) latest ORDER BY latest.ip_address, latest.port NULLS LAST LIMIT $2 OFFSET $3"
     );
     let rows = client.query(&statement, &[&value, &limit, &offset]).await?;
     let total = rows.first().map(|row| row.get("total")).unwrap_or(0);
