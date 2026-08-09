@@ -1,7 +1,6 @@
 use actix_web::{App, HttpServer, web};
 use clap::Parser;
 use core::panic;
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use std::io;
 use tokio::time::{Duration, Instant, interval_at};
 use tracing::error;
@@ -14,6 +13,7 @@ use rust_web_test::middlewares::{
     csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, ratelimit::RateLimitMiddleware,
     smiddleware::AuthMiddleware,
 };
+use rust_web_test::tls::build_acceptor;
 use rust_web_test::{Systems, TemplatesInit, config, db, insert_system_status};
 
 #[actix_web::main]
@@ -103,13 +103,7 @@ async fn main() -> io::Result<()> {
 
     let mail_c = config.email_config;
 
-    let mut tls = SslAcceptor::mozilla_intermediate(SslMethod::tls_server())
-        .expect("SslAcceptor::mozilla_intermediate(SslMethod::tls_server()) ERROR");
-    tls.set_private_key_file("./ssl/key.pem", SslFiletype::PEM)
-        .expect("指定私钥文件错误");
-    tls.set_certificate_chain_file("./ssl/cert.pem")
-        .expect("指定证书文件错误");
-    tls.check_private_key().expect("私钥检查错误");
+    let tls = build_acceptor(&config.tls)?;
 
     let sys = Systems::new();
     let sys_2 = sys.clone();

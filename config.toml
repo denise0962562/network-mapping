@@ -3,6 +3,11 @@ host = "0.0.0.0"
 port = 9999
 encrypt_key = ""
 
+[tls]
+# 相对路径以本配置文件所在目录为基准
+certificate_chain_file = "ssl/cert.pem"
+private_key_file = "ssl/key.pem"
+
 [log]
 directory = "logs"
 file_name = "server.json"

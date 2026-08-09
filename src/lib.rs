@@ -6,6 +6,7 @@ pub mod login;
 pub mod logs;
 pub mod maxmind;
 pub mod target_generated;
+pub mod tls;
 
 #[cfg(feature = "rir")]
 pub mod rir; // 该模块用于从五大 RIR 获取 ASN 和组织等信息

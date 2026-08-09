@@ -18,6 +18,20 @@ cd network-mapping
 cargo build --release
 ```
 
+启动前需要在 `config.toml` 中配置 TLS 证书链和私钥。相对路径以配置文件所在目录为基准：
+
+```toml
+[tls]
+certificate_chain_file = "ssl/cert.pem"
+private_key_file = "ssl/key.pem"
+```
+
+可以通过 `--config` 指定其他配置文件：
+
+```sh
+cargo run -- --config /etc/network-mapping/config.toml
+```
+
 清理缓存（可选项）
 
 ```

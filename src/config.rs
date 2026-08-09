@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use postgres_from_row::FromRow;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::handlers::{self, user, utils};
 use crate::{decrypt_data, encrypt_data};
@@ -22,12 +25,32 @@ pub trait SelfChecking {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+    pub tls: TlsConfig,
     pub log: LogConfig,
     pub templates: TemplatesConfig,
     // pub scan_target_generated: ScanTargetConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub email_config: Option<EmailConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    pub certificate_chain_file: PathBuf,
+    pub private_key_file: PathBuf,
+}
+
+impl TlsConfig {
+    fn resolve_relative_to(&mut self, config_path: &Path) {
+        let base_directory = config_path.parent().unwrap_or_else(|| Path::new(""));
+
+        if self.certificate_chain_file.is_relative() {
+            self.certificate_chain_file = base_directory.join(&self.certificate_chain_file);
+        }
+        if self.private_key_file.is_relative() {
+            self.private_key_file = base_directory.join(&self.private_key_file);
+        }
+    }
 }
 
 impl SelfChecking for Config {
@@ -171,8 +194,52 @@ pub struct EmailConfig {
 
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
+        let path = path.as_ref();
         let content = fs::read_to_string(path).expect("无法读取配置文件");
-        toml::from_str(&content).expect("配置文件格式错误")
+        let mut config: Self = toml::from_str(&content).expect("配置文件格式错误");
+        config.tls.resolve_relative_to(path);
+        config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TlsConfig;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn tls_paths_are_resolved_relative_to_config_file() {
+        let mut tls = TlsConfig {
+            certificate_chain_file: PathBuf::from("ssl/cert.pem"),
+            private_key_file: PathBuf::from("ssl/key.pem"),
+        };
+
+        tls.resolve_relative_to(Path::new("/etc/network-mapping/config.toml"));
+
+        assert_eq!(
+            tls.certificate_chain_file,
+            PathBuf::from("/etc/network-mapping/ssl/cert.pem")
+        );
+        assert_eq!(
+            tls.private_key_file,
+            PathBuf::from("/etc/network-mapping/ssl/key.pem")
+        );
+    }
+
+    #[test]
+    fn absolute_tls_paths_are_unchanged() {
+        let mut tls = TlsConfig {
+            certificate_chain_file: PathBuf::from("/run/secrets/cert.pem"),
+            private_key_file: PathBuf::from("/run/secrets/key.pem"),
+        };
+
+        tls.resolve_relative_to(Path::new("/etc/network-mapping/config.toml"));
+
+        assert_eq!(
+            tls.certificate_chain_file,
+            PathBuf::from("/run/secrets/cert.pem")
+        );
+        assert_eq!(tls.private_key_file, PathBuf::from("/run/secrets/key.pem"));
     }
 }
 
