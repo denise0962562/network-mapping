@@ -1216,12 +1216,23 @@ pub async fn apply_task(
     let mut p = pool.get().await.map_err(apply_task_database_error)?;
     let transaction = p.transaction().await.map_err(apply_task_database_error)?;
 
+    transaction
+        .execute(
+            "UPDATE scan_task SET task_status = 'cancelled', task_end_time = $1, \
+             lease_expires_at = NULL, cancel_requested = false \
+             WHERE task_status = 'running' AND cancel_requested = true \
+               AND (lease_expires_at IS NULL OR lease_expires_at < $1);",
+            &[&get_unix_epoch_ms()],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+
     let row = transaction
         .query_opt(
             "SELECT id, user_id, task_id, task_target::text[], task_port \
          FROM scan_task \
          WHERE task_status = 'pending' \
-            OR (task_status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < $1)) \
+            OR (task_status = 'running' AND cancel_requested = false AND (lease_expires_at IS NULL OR lease_expires_at < $1)) \
          ORDER BY task_level DESC, task_create_time \
          FOR UPDATE SKIP LOCKED \
          LIMIT 1;",
@@ -1378,8 +1389,11 @@ pub async fn get_task_item(
     let s_count = s_count.clamp(1, 100);
 
     c.execute(
-        "UPDATE scan_task SET task_status = 'pending', assigned_scanner_id = NULL, \
-         lease_expires_at = NULL, task_start_time = NULL, failure_reason = 'task lease expired' \
+        "UPDATE scan_task SET task_status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'pending' END, \
+         assigned_scanner_id = NULL, lease_expires_at = NULL, \
+         task_start_time = CASE WHEN cancel_requested THEN task_start_time ELSE NULL END, \
+         task_end_time = CASE WHEN cancel_requested THEN (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT ELSE NULL END, \
+         cancel_requested = false, failure_reason = CASE WHEN cancel_requested THEN NULL ELSE 'task lease expired' END \
          WHERE task_status = 'running' AND lease_expires_at IS NOT NULL \
            AND lease_expires_at < (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT;",
         &[],

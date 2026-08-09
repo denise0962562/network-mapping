@@ -1108,7 +1108,9 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
 
 pub async fn get_scanners(pool: &Pool) -> Result<Vec<ScannerInfo>, Box<dyn std::error::Error>> {
     let connection = pool.get().await?;
-    let query = format!("{SCANNER_INFO_SELECT} ORDER BY s.create_time DESC NULLS LAST, s.id DESC;");
+    let query = format!(
+        "{SCANNER_INFO_SELECT} WHERE s.deleted_at IS NULL ORDER BY s.create_time DESC NULLS LAST, s.id DESC;"
+    );
     let rows = connection.query(&query, &[]).await?;
     Ok(rows.iter().map(scanner_info_from_row).collect())
 }
@@ -1118,7 +1120,8 @@ pub async fn get_scanner(
     scanner_id: Uuid,
 ) -> Result<Option<ScannerInfo>, Box<dyn std::error::Error>> {
     let connection = pool.get().await?;
-    let query = format!("{SCANNER_INFO_SELECT} WHERE s.scanner_id = $1 LIMIT 1;");
+    let query =
+        format!("{SCANNER_INFO_SELECT} WHERE s.scanner_id = $1 AND s.deleted_at IS NULL LIMIT 1;");
     let row = connection
         .query_opt(&query, &[&scanner_id.to_string()])
         .await?;

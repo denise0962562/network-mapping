@@ -47,6 +47,12 @@ pub struct ScannerTaskFailure {
     retryable: bool,
 }
 
+#[derive(Deserialize)]
+pub struct ScannerTaskCancelled {
+    scanner_id: Uuid,
+    task_id: Uuid,
+}
+
 fn default_retryable() -> bool {
     true
 }
@@ -163,6 +169,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
         return HttpResponse::InternalServerError().finish();
     }
+    let mut cancel_task_id = None;
     if let Some(task_id) = heartbeat.active_task_id {
         let lease_expires_at = crate::get_unix_epoch_ms() + TASK_LEASE_MS;
         if let Err(error) = transaction
@@ -176,12 +183,33 @@ pub(crate) async fn scanner_heartbeat_handler(
             error_logs(&req, "ScannerLeaseRenewError", &error.to_string());
             return HttpResponse::InternalServerError().finish();
         }
+        match transaction
+            .query_opt(
+                "SELECT task_id FROM scan_task WHERE task_id = $1 AND assigned_scanner_id = $2 \
+                 AND task_status = 'running' AND cancel_requested = true;",
+                &[&task_id.to_string(), &scanner_id],
+            )
+            .await
+        {
+            Ok(Some(_)) => cancel_task_id = Some(task_id),
+            Ok(None) => {}
+            Err(error) => {
+                error_logs(&req, "ScannerCancelCommandError", &error.to_string());
+                return HttpResponse::InternalServerError().finish();
+            }
+        }
     }
     if let Err(error) = transaction.commit().await {
         error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
         return HttpResponse::InternalServerError().finish();
     }
-    HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "command": cancel_task_id.map(|task_id| serde_json::json!({
+            "type": "cancel_task",
+            "task_id": task_id,
+        }))
+    }))
 }
 
 #[post("/api/scanner/task/fail")]
@@ -220,7 +248,7 @@ pub(crate) async fn scanner_task_failure_handler(
         .query_opt(
             "UPDATE scan_task SET task_status = CASE WHEN $1 OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
              task_end_time = CASE WHEN $1 OR attempt_count >= 3 THEN $2 ELSE NULL END, task_start_time = NULL, \
-             assigned_scanner_id = NULL, lease_expires_at = NULL, failure_reason = $3 \
+             assigned_scanner_id = NULL, lease_expires_at = NULL, failure_reason = $3, cancel_requested = false \
              WHERE task_id = $4 AND assigned_scanner_id = $5 AND task_status = 'running' \
              RETURNING task_status;",
             &[
@@ -249,6 +277,60 @@ pub(crate) async fn scanner_task_failure_handler(
     }
 }
 
+#[post("/api/scanner/task/cancelled")]
+pub(crate) async fn scanner_task_cancelled_handler(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
+    cancelled: web::Json<ScannerTaskCancelled>,
+) -> impl Responder {
+    let Some(token) = bearer_token(&req) else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+    if validate_scanner_credentials(
+        pool.get_ref(),
+        cancelled.scanner_id,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    .is_err()
+    {
+        return HttpResponse::Unauthorized().body("unauthorized");
+    }
+    let connection = match pool.get().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            error_logs(
+                &req,
+                "ScannerTaskCancelledDatabaseError",
+                &error.to_string(),
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let changed = connection
+        .execute(
+            "UPDATE scan_task SET task_status = 'cancelled', task_end_time = $1, \
+             lease_expires_at = NULL, cancel_requested = false, failure_reason = NULL \
+             WHERE task_id = $2 AND assigned_scanner_id = $3 AND task_status = 'running' AND cancel_requested = true;",
+            &[&crate::get_unix_epoch_ms(), &cancelled.task_id.to_string(), &cancelled.scanner_id.to_string()],
+        )
+        .await;
+    match changed {
+        Ok(1) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Ok(_) => HttpResponse::Conflict().body("task cancellation was not requested"),
+        Err(error) => {
+            error_logs(
+                &req,
+                "ScannerTaskCancelledDatabaseError",
+                &error.to_string(),
+            );
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
 #[get("/api/task/{task_id}")]
 async fn get_task(
     req: HttpRequest,
@@ -270,7 +352,7 @@ async fn get_task(
             "SELECT t.id, t.task_id, t.task_target::text[], t.task_port, t.task_initiator, \
              t.task_level, t.task_create_time, t.task_start_time, t.task_end_time, \
              t.task_status, t.assigned_scanner_id, t.lease_expires_at, t.attempt_count, \
-             t.failure_reason, t.remarks, s.name AS scanner_name \
+             t.failure_reason, t.cancel_requested, t.retry_of_task_id, t.remarks, s.name AS scanner_name \
              FROM scan_task t LEFT JOIN scanner_info s ON s.scanner_id = t.assigned_scanner_id \
              WHERE t.task_id = $1 AND ($2 = 1 OR t.user_id = $3) LIMIT 1;",
             &[&task_id, &user.role, &user.id],
@@ -387,6 +469,8 @@ async fn get_task(
             "lease_expires_at": task.get::<_, Option<i64>>("lease_expires_at"),
             "attempt_count": task.get::<_, i32>("attempt_count"),
             "failure_reason": task.get::<_, Option<String>>("failure_reason"),
+            "cancel_requested": task.get::<_, bool>("cancel_requested"),
+            "retry_of_task_id": task.get::<_, Option<String>>("retry_of_task_id"),
             "remarks": task.get::<_, Option<String>>("remarks"),
             "summary": {
                 "ip_count": ip_count,

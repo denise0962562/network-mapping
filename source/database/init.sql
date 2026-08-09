@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	lease_expires_at BIGINT,                                                                  -- 任务租约到期时间（毫秒时间戳）
 	attempt_count INT NOT NULL DEFAULT 0,                                                     -- 任务领取次数
 	failure_reason TEXT,                                                                      -- 最近一次扫描失败原因
+	cancel_requested BOOLEAN NOT NULL DEFAULT false,                                          -- 控制端请求扫描器终止当前任务
+	retry_of_task_id VARCHAR(36),                                                             -- 重试任务所引用的原任务
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -164,12 +166,24 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	tag TEXT                                                                        -- 扫描器的标签
 );
 
+CREATE TABLE IF NOT EXISTS operation_audit (
+	id BIGSERIAL PRIMARY KEY,
+	actor_user_id INT,
+	action TEXT NOT NULL,
+	resource_type TEXT NOT NULL,
+	resource_id TEXT NOT NULL,
+	detail JSONB,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- 兼容已初始化的数据库：CREATE TABLE IF NOT EXISTS 不会补充新字段。
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS assigned_scanner_id VARCHAR(36);
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS lease_expires_at BIGINT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS retry_of_task_id VARCHAR(36);
 UPDATE scan_task SET task_status = CASE
 	WHEN task_end_time IS NOT NULL THEN 'succeeded'
 	WHEN task_start_time IS NOT NULL THEN 'running'
@@ -179,6 +193,7 @@ END WHERE task_status IS NULL OR task_status = 'pending';
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS cpu_model TEXT;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS runtime_state TEXT NOT NULL DEFAULT 'offline';
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
 

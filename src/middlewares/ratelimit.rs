@@ -145,6 +145,16 @@ fn policy_for_path(path: &str) -> Option<RateLimitPolicy> {
             window: Duration::from_secs(60),
             message: "扫描器上报过于频繁，请稍后再试",
         }),
+        "/api/scanner/heartbeat" => Some(RateLimitPolicy {
+            max_requests: 120,
+            window: Duration::from_secs(60),
+            message: "扫描器心跳过于频繁，请稍后再试",
+        }),
+        "/api/scanner/task/fail" | "/api/scanner/task/cancelled" => Some(RateLimitPolicy {
+            max_requests: 30,
+            window: Duration::from_secs(60),
+            message: "扫描器任务状态上报过于频繁，请稍后再试",
+        }),
         "/test/adduser" => Some(RateLimitPolicy {
             max_requests: 5,
             window: Duration::from_secs(60),
@@ -191,10 +201,15 @@ fn check_rate_limit(
 }
 
 fn rate_limit_key(req: &ServiceRequest, path: &str, client: &str) -> String {
-    if path == "/api/scanner/result" {
-        if let Some(token_fingerprint) = bearer_fingerprint(req) {
-            return format!("scanner-result:{}", token_fingerprint);
-        }
+    if matches!(
+        path,
+        "/api/scanner/result"
+            | "/api/scanner/heartbeat"
+            | "/api/scanner/task/fail"
+            | "/api/scanner/task/cancelled"
+    ) && let Some(token_fingerprint) = bearer_fingerprint(req)
+    {
+        return format!("scanner-result:{}", token_fingerprint);
     }
 
     format!("{}:{}:{}", req.method(), path, client)
