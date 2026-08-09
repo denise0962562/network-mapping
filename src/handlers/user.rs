@@ -17,12 +17,17 @@ use crate::handlers::ReceiveLoginInfo;
 use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
 use crate::middlewares::render_500;
-use crate::{AddUserInfo, admin, generate_hash_password, log_out};
+use crate::{AddUserInfo, admin, generate_hash_password, log_out, verify_password};
 use admin::{
     ReceiveAddUserInfo, Unbind2FAH, VerifyTotp, bind_twofa, scanner_register, totp_struct,
     totp_token_verify, unbind_2fa, web_add_scanner,
 };
 
+#[derive(serde::Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
 // BUG 暂时使用 bug 标签用于提示
 /// 该接口为测试阶段接口，用于快速创建账号，在生产环境下必须删除
 #[get("/test/adduser")]
@@ -395,6 +400,164 @@ async fn update_user_info_h(
     }
 }
 
+/// 修改当前登录用户的密码。
+///
+/// 修改成功后会废止该用户的所有既有 Session，以阻止旧登录态继续访问。
+#[post("/api/user/password/update")]
+async fn change_password_h(
+    req: HttpRequest,
+    password_change: web::Json<ChangePasswordRequest>,
+    pool: web::Data<Pool>,
+    pwd_hash_config: web::Data<PasswordHashConfig>,
+    user_base_i: UserBaseI,
+) -> impl Responder {
+    let current_password = password_change.current_password.as_str();
+    let new_password = password_change.new_password.as_str();
+
+    if !matches!(user_base_i.role, 1 | 2) {
+        return HttpResponse::Forbidden().json(json!({
+            "success": false,
+            "message": "当前账户不允许修改密码"
+        }));
+    }
+    if current_password.is_empty() {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": "请输入当前密码"
+        }));
+    }
+    let new_password_length = new_password.chars().count();
+    if !(12..=128).contains(&new_password_length) {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": "新密码长度必须在 12 到 128 个字符之间"
+        }));
+    }
+    if current_password == new_password {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": "新密码不能与当前密码相同"
+        }));
+    }
+
+    let mut client = match pool.get_ref().get().await {
+        Ok(client) => client,
+        Err(error_value) => {
+            error_logs(
+                &req,
+                "ChangePasswordDatabaseError",
+                &error_value.to_string(),
+            );
+            return HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "密码修改服务暂时不可用"
+            }));
+        }
+    };
+    let transaction = match client.transaction().await {
+        Ok(transaction) => transaction,
+        Err(error_value) => {
+            error_logs(
+                &req,
+                "ChangePasswordTransactionError",
+                &error_value.to_string(),
+            );
+            return HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "密码修改服务暂时不可用"
+            }));
+        }
+    };
+    let row = match transaction
+        .query_opt(
+            "SELECT password FROM users WHERE id = $1 AND role IN (1, 2) FOR UPDATE;",
+            &[&user_base_i.id],
+        )
+        .await
+    {
+        Ok(row) => row,
+        Err(error_value) => {
+            error_logs(&req, "ChangePasswordQueryError", &error_value.to_string());
+            return HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "密码修改服务暂时不可用"
+            }));
+        }
+    };
+    let Some(row) = row else {
+        return HttpResponse::NotFound().json(json!({
+            "success": false,
+            "message": "未找到当前用户"
+        }));
+    };
+    let password_hash: String = row.get("password");
+    if !verify_password(current_password, &password_hash) {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": "当前密码不正确"
+        }));
+    }
+
+    let new_password_hash =
+        match generate_hash_password(new_password, pwd_hash_config.get_ref().clone()) {
+            Ok(password_hash) => password_hash,
+            Err(error_value) => {
+                error!(
+                    event = "ChangePasswordHashError",
+                    path = "fn change_password_h",
+                    message = ?error_value
+                );
+                return HttpResponse::InternalServerError().json(json!({
+                    "success": false,
+                    "message": "密码修改服务暂时不可用"
+                }));
+            }
+        };
+    if let Err(error_value) = transaction
+        .execute(
+            "UPDATE users SET password = $1, limit_login = false, limit_at = NULL, \
+             limit_time = NULL, login_error_count = 0, last_error_at = NULL WHERE id = $2;",
+            &[&new_password_hash, &user_base_i.id],
+        )
+        .await
+    {
+        error_logs(&req, "ChangePasswordUpdateError", &error_value.to_string());
+        return HttpResponse::InternalServerError().json(json!({
+            "success": false,
+            "message": "密码修改服务暂时不可用"
+        }));
+    }
+    if let Err(error_value) = transaction
+        .execute(
+            "UPDATE session SET is_enable = false WHERE user_id = $1 AND is_enable = true;",
+            &[&user_base_i.id],
+        )
+        .await
+    {
+        error_logs(&req, "ChangePasswordSessionError", &error_value.to_string());
+        return HttpResponse::InternalServerError().json(json!({
+            "success": false,
+            "message": "密码修改服务暂时不可用"
+        }));
+    }
+    if let Err(error_value) = transaction.commit().await {
+        error_logs(&req, "ChangePasswordCommitError", &error_value.to_string());
+        return HttpResponse::InternalServerError().json(json!({
+            "success": false,
+            "message": "密码修改服务暂时不可用"
+        }));
+    }
+
+    info_logs(
+        &req,
+        "ChangePasswordSuccessful",
+        "用户密码已修改，既有会话已失效",
+    );
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "message": "密码已修改，请重新登录"
+    }))
+}
 /// 添加扫描器
 ///
 /// 主要是 web 端添加用的

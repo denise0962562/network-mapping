@@ -197,6 +197,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(user::bind_twofa_h)
         .service(user::get_user_info_h)
         .service(user::update_user_info_h)
+        .service(user::change_password_h)
         .service(user::totp_config_h)
         .service(user::unbind_2fa_h)
         .service(user::web_add_scanner_h)
