@@ -11,8 +11,211 @@ use crate::{Permission, TEXT_HTML_UTF_8, TemplatesInit};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
 use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
 use deadpool_postgres::Pool;
+use serde::Deserialize;
 use tracing::error;
 use uuid::Uuid;
+
+const TASK_LEASE_MS: i64 = 90_000;
+
+#[derive(Deserialize)]
+pub struct ScannerSystemInfo {
+    os_name: String,
+    os_version: String,
+    cpu_model: String,
+    cpu_cores: u32,
+    ram_total_mb: u64,
+    uptime_seconds: u64,
+}
+
+#[derive(Deserialize)]
+pub struct ScannerHeartbeat {
+    scanner_id: Uuid,
+    state: String,
+    active_task_id: Option<Uuid>,
+    scanner_version: String,
+    system: ScannerSystemInfo,
+}
+
+#[derive(Deserialize)]
+pub struct ScannerTaskFailure {
+    scanner_id: Uuid,
+    task_id: Uuid,
+    error: String,
+    #[serde(default = "default_retryable")]
+    retryable: bool,
+}
+
+fn default_retryable() -> bool {
+    true
+}
+
+fn bearer_token(req: &HttpRequest) -> Option<&str> {
+    req.headers()
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+#[post("/api/scanner/heartbeat")]
+pub(crate) async fn scanner_heartbeat_handler(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
+    heartbeat: web::Json<ScannerHeartbeat>,
+) -> impl Responder {
+    let Some(token) = bearer_token(&req) else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+    if !matches!(heartbeat.state.as_str(), "idle" | "scanning" | "stopping") {
+        return HttpResponse::BadRequest().body("invalid scanner state");
+    }
+    if let Err(error) = validate_scanner_credentials(
+        pool.get_ref(),
+        heartbeat.scanner_id,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
+        return match error {
+            ApplyTaskError::ScannerUnauthorized => {
+                HttpResponse::Unauthorized().body("unauthorized")
+            }
+            _ => HttpResponse::InternalServerError().finish(),
+        };
+    }
+
+    let mut connection = match pool.get().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let transaction = match connection.transaction().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let scanner_id = heartbeat.scanner_id.to_string();
+    let system_version = format!(
+        "{} {}",
+        heartbeat.system.os_name, heartbeat.system.os_version
+    );
+    let cpu_cores = i32::try_from(heartbeat.system.cpu_cores).unwrap_or(i32::MAX);
+    let ram_mb = i32::try_from(heartbeat.system.ram_total_mb).unwrap_or(i32::MAX);
+    let uptime = i32::try_from(heartbeat.system.uptime_seconds).unwrap_or(i32::MAX);
+    let ip_address = req.peer_addr().map(|address| address.ip().to_string());
+    let update = transaction
+        .execute(
+            "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
+             cpus = $4, ram = $5, uptime = $6, runtime_state = $7, last_seen_at = NOW(), \
+             update_time = NOW(), is_run = ($7 <> 'stopping'), \
+             ip_address = COALESCE($8::text::inet, ip_address) WHERE scanner_id = $9;",
+            &[
+                &system_version,
+                &heartbeat.scanner_version,
+                &heartbeat.system.cpu_model,
+                &cpu_cores,
+                &ram_mb,
+                &uptime,
+                &heartbeat.state,
+                &ip_address,
+                &scanner_id,
+            ],
+        )
+        .await;
+    if let Err(error) = update {
+        error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Some(task_id) = heartbeat.active_task_id {
+        let lease_expires_at = crate::get_unix_epoch_ms() + TASK_LEASE_MS;
+        if let Err(error) = transaction
+            .execute(
+                "UPDATE scan_task SET lease_expires_at = $1 WHERE task_id = $2 \
+                 AND assigned_scanner_id = $3 AND task_status = 'running';",
+                &[&lease_expires_at, &task_id.to_string(), &scanner_id],
+            )
+            .await
+        {
+            error_logs(&req, "ScannerLeaseRenewError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
+    if let Err(error) = transaction.commit().await {
+        error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+        return HttpResponse::InternalServerError().finish();
+    }
+    HttpResponse::Ok().json(serde_json::json!({ "success": true }))
+}
+
+#[post("/api/scanner/task/fail")]
+pub(crate) async fn scanner_task_failure_handler(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
+    failure: web::Json<ScannerTaskFailure>,
+) -> impl Responder {
+    let Some(token) = bearer_token(&req) else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+    if validate_scanner_credentials(
+        pool.get_ref(),
+        failure.scanner_id,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    .is_err()
+    {
+        return HttpResponse::Unauthorized().body("unauthorized");
+    }
+    let connection = match pool.get().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            error_logs(&req, "ScannerTaskFailureDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let scanner_id = failure.scanner_id.to_string();
+    let task_id = failure.task_id.to_string();
+    let reason: String = failure.error.chars().take(1000).collect();
+    let force_terminal = !failure.retryable;
+    let changed = connection
+        .query_opt(
+            "UPDATE scan_task SET task_status = CASE WHEN $1 OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
+             task_end_time = CASE WHEN $1 OR attempt_count >= 3 THEN $2 ELSE NULL END, task_start_time = NULL, \
+             assigned_scanner_id = NULL, lease_expires_at = NULL, failure_reason = $3 \
+             WHERE task_id = $4 AND assigned_scanner_id = $5 AND task_status = 'running' \
+             RETURNING task_status;",
+            &[
+                &force_terminal,
+                &crate::get_unix_epoch_ms(),
+                &reason,
+                &task_id,
+                &scanner_id,
+            ],
+        )
+        .await;
+    match changed {
+        Ok(Some(row)) => {
+            let status: String = row.get("task_status");
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "retryable": status == "pending",
+                "status": status,
+            }))
+        }
+        Ok(None) => HttpResponse::Conflict().body("task is not owned by scanner"),
+        Err(error) => {
+            error_logs(&req, "ScannerTaskFailureDatabaseError", &error.to_string());
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
 
 /// TODO 让我想想这个接口是干啥的
 #[get("/api/task/{task_id}")]
@@ -205,6 +408,9 @@ async fn upload_scanner_result_handler(
                 }
                 SaveScannerResultsError::TaskNotFound => {
                     HttpResponse::NotFound().body("task not found")
+                }
+                SaveScannerResultsError::TaskNotOwned => {
+                    HttpResponse::Conflict().body("task is not owned by scanner")
                 }
                 SaveScannerResultsError::Database(_) => {
                     HttpResponse::InternalServerError().body("500")

@@ -92,12 +92,17 @@ pub struct ScannerInfo {
     pub ip_address: Option<String>,
     pub system_version: Option<String>,
     pub scanner_version: Option<String>,
+    pub cpu_model: Option<String>,
     pub cpus: Option<i32>,
     pub ram: Option<i32>,
     pub uptime: Option<i32>,
     pub create_time: Option<DateTime<Utc>>,
     pub register_time: Option<DateTime<Utc>>,
     pub update_time: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub runtime_state: String,
+    pub is_online: bool,
+    pub current_task_id: Option<String>,
     pub is_run: Option<bool>,
     pub is_enable: Option<bool>,
     pub remark: Option<String>,
@@ -1063,7 +1068,13 @@ pub async fn scanner_register(
 const SCANNER_INFO_SELECT: &str = "\
     SELECT s.scanner_id, s.name, u.username AS creator, s.location, \
            host(s.ip_address) AS ip_address, s.system_version, s.scanner_version, \
-           s.cpus, s.ram, s.uptime, s.create_time, s.register_time, s.update_time, \
+           s.cpu_model, s.cpus, s.ram, s.uptime, s.create_time, s.register_time, s.update_time, \
+           s.last_seen_at, s.runtime_state, \
+           (s.runtime_state <> 'stopping' AND s.last_seen_at IS NOT NULL \
+              AND s.last_seen_at >= NOW() - INTERVAL '90 seconds') AS is_online, \
+           (SELECT t.task_id FROM scan_task t WHERE t.assigned_scanner_id = s.scanner_id \
+              AND t.task_status = 'running' AND t.lease_expires_at > (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+              ORDER BY t.task_start_time DESC NULLS LAST LIMIT 1) AS current_task_id, \
            s.is_run, s.is_enable, s.remark, s.tag \
     FROM scanner_info s \
     LEFT JOIN users u ON u.id = s.create_user";
@@ -1077,12 +1088,17 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         ip_address: row.get("ip_address"),
         system_version: row.get("system_version"),
         scanner_version: row.get("scanner_version"),
+        cpu_model: row.get("cpu_model"),
         cpus: row.get("cpus"),
         ram: row.get("ram"),
         uptime: row.get("uptime"),
         create_time: row.get("create_time"),
         register_time: row.get("register_time"),
         update_time: row.get("update_time"),
+        last_seen_at: row.get("last_seen_at"),
+        runtime_state: row.get("runtime_state"),
+        is_online: row.get("is_online"),
+        current_task_id: row.get("current_task_id"),
         is_run: row.get("is_run"),
         is_enable: row.get("is_enable"),
         remark: row.get("remark"),

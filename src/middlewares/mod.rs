@@ -21,7 +21,9 @@ pub mod ratelimit;
 
 const SCANNER_API_PATHS: &[&str] = &[
     "/api/scanner/register",
+    "/api/scanner/heartbeat",
     "/api/scanner/result",
+    "/api/scanner/task/fail",
     "/api/task/apply",
 ];
 
@@ -118,7 +120,9 @@ mod tests {
     #[test]
     fn scanner_api_paths_use_exact_matching() {
         assert!(is_scanner_api_path("/api/scanner/register"));
+        assert!(is_scanner_api_path("/api/scanner/heartbeat"));
         assert!(is_scanner_api_path("/api/scanner/result"));
+        assert!(is_scanner_api_path("/api/scanner/task/fail"));
         assert!(is_scanner_api_path("/api/task/apply"));
         assert!(!is_scanner_api_path("/api/task/apply-extra"));
         assert!(!is_scanner_api_path("/api/task/apply/anything"));

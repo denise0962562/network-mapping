@@ -977,6 +977,7 @@ pub enum SaveScannerResultsError {
     InvalidIp { ip: String, source: AddrParseError },
     ScannerUnauthorized,
     TaskNotFound,
+    TaskNotOwned,
 }
 
 #[derive(Debug)]
@@ -1039,6 +1040,7 @@ impl fmt::Display for SaveScannerResultsError {
             Self::InvalidIp { ip, source } => write!(f, "无效 IP/CIDR: {} ({})", ip, source),
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
             Self::TaskNotFound => write!(f, "任务不存在"),
+            Self::TaskNotOwned => write!(f, "任务不属于当前扫描器或租约已失效"),
         }
     }
 }
@@ -1048,7 +1050,7 @@ impl std::error::Error for SaveScannerResultsError {
         match self {
             Self::Database(e) => Some(e.as_ref()),
             Self::InvalidIp { source, .. } => Some(source),
-            Self::ScannerUnauthorized | Self::TaskNotFound => None,
+            Self::ScannerUnauthorized | Self::TaskNotFound | Self::TaskNotOwned => None,
         }
     }
 }
@@ -1074,10 +1076,11 @@ pub async fn save_scanner_results(
         .map_err(scanner_result_database_error)?;
     let token_hash =
         hash_scanner_token(token, token_pepper).map_err(scanner_result_database_error)?;
+    let scanner_id = upload.scanner_id.to_string();
 
     let scanner = transaction.query_opt(
         "SELECT id, name FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
-        &[&upload.scanner_id.to_string(), &token_hash]
+        &[&scanner_id, &token_hash]
     ).await.map_err(scanner_result_database_error)?;
 
     let scanner_name: String = match scanner {
@@ -1089,14 +1092,23 @@ pub async fn save_scanner_results(
 
     let task_row = transaction
         .query_opt(
-            "SELECT id FROM scan_task WHERE task_id = $1;",
+            "SELECT id, assigned_scanner_id, task_status FROM scan_task WHERE task_id = $1;",
             &[&upload.task_id.to_string()],
         )
         .await
         .map_err(scanner_result_database_error)?;
 
     let task_db_id: i32 = match task_row {
-        Some(row) => row.get("id"),
+        Some(row)
+            if row
+                .get::<_, Option<String>>("assigned_scanner_id")
+                .as_deref()
+                == Some(scanner_id.as_str())
+                && row.get::<_, String>("task_status") == "running" =>
+        {
+            row.get("id")
+        }
+        Some(_) => return Err(SaveScannerResultsError::TaskNotOwned),
         None => return Err(SaveScannerResultsError::TaskNotFound),
     };
 
@@ -1163,6 +1175,15 @@ pub async fn save_scanner_results(
     }
 
     transaction
+        .execute(
+            "UPDATE scan_task SET task_status = 'succeeded', task_end_time = $1, \
+             lease_expires_at = NULL, failure_reason = NULL WHERE id = $2;",
+            &[&get_unix_epoch_ms(), &task_db_id],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+
+    transaction
         .commit()
         .await
         .map_err(scanner_result_database_error)?;
@@ -1186,11 +1207,12 @@ pub async fn apply_task(
         .query_opt(
             "SELECT id, user_id, task_id, task_target::text[], task_port \
          FROM scan_task \
-         WHERE task_start_time IS NULL AND task_end_time IS NULL \
+         WHERE task_status = 'pending' \
+            OR (task_status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < $1)) \
          ORDER BY task_level DESC, task_create_time \
          FOR UPDATE SKIP LOCKED \
          LIMIT 1;",
-            &[],
+            &[&get_unix_epoch_ms()],
         )
         .await
         .map_err(apply_task_database_error)?;
@@ -1205,10 +1227,18 @@ pub async fn apply_task(
     };
 
     let task_pk: i32 = row.get("id");
+    let lease_expires_at = get_unix_epoch_ms() + 90_000;
     transaction
         .execute(
-            "UPDATE scan_task SET task_start_time = COALESCE(task_start_time, $1) WHERE id = $2;",
-            &[&get_unix_epoch_ms(), &task_pk],
+            "UPDATE scan_task SET task_start_time = $1, task_end_time = NULL, \
+             task_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3, \
+             attempt_count = attempt_count + 1, failure_reason = NULL WHERE id = $4;",
+            &[
+                &get_unix_epoch_ms(),
+                &scanner_id.to_string(),
+                &lease_expires_at,
+                &task_pk,
+            ],
         )
         .await
         .map_err(apply_task_database_error)?;

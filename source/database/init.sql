@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	task_level INT NOT NULL CHECK ( task_level >= 0 AND task_level <=4 ) DEFAULT 1,           -- 表示任务的优先级
 	task_start_time BIGINT DEFAULT NULL,                                                      -- 扫描开始时间
 	task_end_time BIGINT DEFAULT NULL,                                                        -- 扫描结束时间
+	task_status TEXT NOT NULL DEFAULT 'pending',                                              -- pending/running/succeeded/failed
+	assigned_scanner_id VARCHAR(36),                                                          -- 当前领取任务的扫描器 UUID
+	lease_expires_at BIGINT,                                                                  -- 任务租约到期时间（毫秒时间戳）
+	attempt_count INT NOT NULL DEFAULT 0,                                                     -- 任务领取次数
+	failure_reason TEXT,                                                                      -- 最近一次扫描失败原因
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -142,18 +147,39 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	location TEXT,                                                                  -- 扫描器的位置描述
 	system_version TEXT,                                                            -- 扫描器所在的系统名称及版本
 	scanner_version TEXT,                                                           -- 扫描器的版本
+	cpu_model TEXT,                                                                 -- 扫描器 CPU 型号
 	cpus INT,                                                                       -- 扫描器 CPU 数量
 	ram INT,                                                                        -- 扫描器 RAM 大小
 	uptime INT,                                                                     -- 扫描器总共运行的时间
 	create_time TIMESTAMPTZ,                                                        -- 扫描器创建的时间
 	register_time TIMESTAMPTZ,                                                      -- 扫描器注册时间
 	update_time TIMESTAMPTZ,                                                        -- 更新时间
+	last_seen_at TIMESTAMPTZ,                                                       -- 最近一次收到心跳的时间
+	runtime_state TEXT NOT NULL DEFAULT 'offline',                                  -- offline/idle/scanning/stopping
 	ip_address INET,                                                                -- 扫描器的IP地址
 	is_run boolean,                                                                 -- 扫描器是否在运行
 	is_enable boolean,                                                              -- 扫描器是否启用
 	remark TEXT,                                                                    -- 扫描器的备注
 	tag TEXT                                                                        -- 扫描器的标签
 );
+
+-- 兼容已初始化的数据库：CREATE TABLE IF NOT EXISTS 不会补充新字段。
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS assigned_scanner_id VARCHAR(36);
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS lease_expires_at BIGINT;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+UPDATE scan_task SET task_status = CASE
+	WHEN task_end_time IS NOT NULL THEN 'succeeded'
+	WHEN task_start_time IS NOT NULL THEN 'running'
+	ELSE 'pending'
+END WHERE task_status IS NULL OR task_status = 'pending';
+
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS cpu_model TEXT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS runtime_state TEXT NOT NULL DEFAULT 'offline';
+CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
+	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
 
 -- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
 CREATE TABLE IF NOT EXISTS ip_list (
