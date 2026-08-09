@@ -19,10 +19,26 @@ use crate::logs::write::{error_logs, info_logs};
 use crate::middlewares::render_500;
 use crate::{AddUserInfo, admin, generate_hash_password, log_out, verify_password};
 use admin::{
-    ReceiveAddUserInfo, Unbind2FAH, VerifyTotp, bind_twofa, scanner_register, totp_struct,
-    totp_token_verify, unbind_2fa, web_add_scanner,
+    ReceiveAddUserInfo, Unbind2FAH, VerifyTotp, bind_twofa, confirm_twofa_binding,
+    scanner_register, totp_struct, totp_token_verify, unbind_2fa, web_add_scanner,
 };
 
+fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Cookie<'static>) {
+    let session_cookie = Cookie::build("session", session.to_owned())
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(cookie::SameSite::Strict)
+        .expires(OffsetDateTime::UNIX_EPOCH)
+        .finish();
+    let csrf_cookie = Cookie::build("csrf_token", csrf_token.to_owned())
+        .path("/")
+        .secure(true)
+        .same_site(cookie::SameSite::Strict)
+        .expires(OffsetDateTime::UNIX_EPOCH)
+        .finish();
+    (session_cookie, csrf_cookie)
+}
 #[derive(serde::Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
@@ -249,12 +265,20 @@ async fn bind_twofa_h(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
     user_base_i: UserBaseI,
+    session: UserSession,
     s_config: web::Data<ServerConfig>,
 ) -> impl Responder {
     let pool_r = pool.get_ref();
 
-    match bind_twofa(user_base_i.username, pool_r, &s_config.encrypt_key).await {
-        Ok(tmp) => return HttpResponse::ImUsed().json(json!({"success": true, "data": tmp})),
+    match bind_twofa(
+        user_base_i.username,
+        &session.session,
+        pool_r,
+        &s_config.encrypt_key,
+    )
+    .await
+    {
+        Ok(tmp) => return HttpResponse::Ok().json(json!({"success": true, "data": tmp})),
         Err(e) => {
             error_logs(&req, "CreateOptauthUrlError", &e.to_string());
             return HttpResponse::InternalServerError().finish();
@@ -275,15 +299,47 @@ async fn verify_totp_h(
     let database_conn = pool.get_ref();
     let username = user_base_i.username;
 
+    if !user_base_i.enable_2fa {
+        return match confirm_twofa_binding(
+            &username,
+            &session.session,
+            &info.token,
+            database_conn,
+            &s_config.encrypt_key,
+        )
+        .await
+        {
+            Ok(true) => {
+                let csrf_token = req
+                    .headers()
+                    .get("X-CSRF-Token")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                let (session_cookie, csrf_cookie) =
+                    expired_auth_cookies(&session.session, csrf_token);
+                HttpResponse::Ok()
+                    .cookie(session_cookie)
+                    .cookie(csrf_cookie)
+                    .json(json!({"success": true, "message": "2FA 绑定成功，请重新登录"}))
+            }
+            Ok(false) => HttpResponse::Unauthorized()
+                .json(json!({"success": false, "message": "验证码无效或绑定已过期"})),
+            Err(e) => {
+                error_logs(&req, "ConfirmTotpBindingError", &e.to_string());
+                HttpResponse::InternalServerError().finish()
+            }
+        };
+    }
+
     let totp = match totp_struct(username, &s_config.encrypt_key, database_conn).await {
         Ok(Some(tmp)) => tmp,
         Ok(None) => {
             info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误");
-            return HttpResponse::NotFound();
+            return HttpResponse::NotFound().finish();
         }
         Err(e) => {
             error_logs(&req, "生成 TOTP 结构体错误", &e.to_string());
-            return HttpResponse::InternalServerError();
+            return HttpResponse::InternalServerError().finish();
         }
     };
 
@@ -291,17 +347,17 @@ async fn verify_totp_h(
         Ok(true) => {
             totp_verify_status_change(&session.session, database_conn)
                 .await
-                .map(|_| HttpResponse::Ok())
-                .unwrap_or(HttpResponse::InternalServerError())
+                .map(|_| HttpResponse::Ok().finish())
+                .unwrap_or(HttpResponse::InternalServerError().finish())
             // HttpResponse::Ok()
         }
         Ok(false) => {
             info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过");
-            HttpResponse::Unauthorized()
+            HttpResponse::Unauthorized().finish()
         }
         Err(e) => {
             error_logs(&req, "TOTPTokenVerifyError", &e.to_string());
-            HttpResponse::InternalServerError()
+            HttpResponse::InternalServerError().finish()
         }
     }
 }
@@ -314,21 +370,36 @@ async fn unbind_2fa_h(
     unbind_info: web::Json<Unbind2FAH>,
     pool: web::Data<deadpool_postgres::Pool>,
     user_base_i: UserBaseI,
+    session: UserSession,
 ) -> impl Responder {
     let pool_c = pool.get_ref();
 
     if user_base_i.role != 1 {
-        return HttpResponse::Forbidden();
+        return HttpResponse::Forbidden().finish();
     };
     match unbind_2fa(&unbind_info.username, pool_c).await {
         Ok(true) => {
             info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功");
-            HttpResponse::Ok()
+            if unbind_info.username == user_base_i.username {
+                let csrf_token = req
+                    .headers()
+                    .get("X-CSRF-Token")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                let (session_cookie, csrf_cookie) =
+                    expired_auth_cookies(&session.session, csrf_token);
+                HttpResponse::Ok()
+                    .cookie(session_cookie)
+                    .cookie(csrf_cookie)
+                    .json(json!({"success": true, "message": "2FA 已解绑，请重新登录"}))
+            } else {
+                HttpResponse::Ok().json(json!({"success": true, "message": "2FA 已解绑"}))
+            }
         }
-        Ok(false) => HttpResponse::NotFound(),
+        Ok(false) => HttpResponse::NotFound().finish(),
         Err(e) => {
             error_logs(&req, "Unbind2FAfaild", &e.to_string());
-            return HttpResponse::InternalServerError();
+            return HttpResponse::InternalServerError().finish();
         }
     }
 }

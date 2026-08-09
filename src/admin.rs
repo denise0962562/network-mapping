@@ -44,7 +44,6 @@ pub struct TotpInfo {
 
 #[derive(Deserialize)]
 pub struct VerifyTotp {
-    pub username: String,
     pub token: String,
 }
 
@@ -482,11 +481,11 @@ pub async fn check_twofa_bind(
 ///
 pub async fn bind_twofa(
     username: String,
+    session: &str,
     pool: &deadpool_postgres::Pool,
     e_key: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let secret32 = Secret::generate_secret();
-
     let totp = TOTP::new(
         Algorithm::SHA1,
         6,
@@ -494,39 +493,130 @@ pub async fn bind_twofa(
         30,
         secret32.to_bytes()?,
         Some("Network Mapping".to_string()),
-        (&username).to_string(),
+        username.clone(),
     )?;
-
     let url = totp.get_url();
     let mut c = pool.get().await?;
     let transaction = c.transaction().await?;
-
-    let t_e_key = openssl::base64::decode_block(e_key)?;
-
-    let (nonce, tag, ciphertext) = encrypt_data(&secret32.to_bytes()?, &t_e_key)?;
-
+    let encryption_key = openssl::base64::decode_block(e_key)?;
+    let (nonce, tag, ciphertext) = encrypt_data(&secret32.to_bytes()?, &encryption_key)?;
     let mut encrypted = Vec::new();
-
     encrypted.extend_from_slice(&nonce);
     encrypted.extend_from_slice(&tag);
     encrypted.extend_from_slice(&ciphertext);
-
-    let enc_se = openssl::base64::encode_block(&encrypted);
-
-    let _r = transaction
+    let encrypted_secret = openssl::base64::encode_block(&encrypted);
+    let expires_at =
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64 + 10 * 60 * 1000;
+    let updated = transaction
         .execute(
-            "UPDATE users SET totp_secret = $1, enable_2fa = true WHERE username = $2;",
-            // 此处的 secret32 是经过 base64 编码后的数据
-            &[&enc_se, &username],
+            "UPDATE session SET pending_totp_secret = $1, pending_totp_expires_at = $2 \
+         WHERE token = $3 AND is_enable = true AND totp_verify_successful = true \
+         AND user_id = (SELECT id FROM users WHERE username = $4 AND enable_2fa = false);",
+            &[&encrypted_secret, &expires_at, &session, &username],
         )
         .await?;
+    if updated != 1 {
+        return Err("当前会话不可用于绑定 2FA，或 2FA 已启用".into());
+    }
     transaction.commit().await?;
-
     Ok(url)
 }
 
-/// 验证 TOTP token
-///
+/// 验证当前会话中的临时 TOTP 密钥，并在成功后正式启用 2FA。
+pub async fn confirm_twofa_binding(
+    username: &str,
+    session: &str,
+    token: &str,
+    pool: &deadpool_postgres::Pool,
+    d_key: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut conn = pool.get().await?;
+    let transaction = conn.transaction().await?;
+    let row = transaction
+        .query_opt(
+            "SELECT u.id, s.pending_totp_secret, s.pending_totp_expires_at \
+         FROM session s JOIN users u ON u.id = s.user_id \
+         WHERE s.token = $1 AND s.is_enable = true AND s.totp_verify_successful = true \
+         AND u.username = $2 AND u.enable_2fa = false FOR UPDATE;",
+            &[&session, &username],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let Some(pending_secret) = row.get::<_, Option<String>>("pending_totp_secret") else {
+        return Ok(false);
+    };
+    let Some(expires_at) = row.get::<_, Option<i64>>("pending_totp_expires_at") else {
+        return Ok(false);
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    if now > expires_at {
+        return Ok(false);
+    }
+
+    let encrypted_secret = openssl::base64::decode_block(&pending_secret)?;
+    let decrypt_key = openssl::base64::decode_block(d_key)?;
+    let secret = decrypt_data(&encrypted_secret, &decrypt_key)?;
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("Network Mapping".to_string()),
+        username.to_string(),
+    )?;
+    if !totp_token_verify(totp, token).await? {
+        return Ok(false);
+    }
+
+    let user_id: i32 = row.get("id");
+    let enabled = transaction.execute(
+        "UPDATE users SET totp_secret = $1, enable_2fa = true WHERE id = $2 AND enable_2fa = false;",
+        &[&pending_secret, &user_id],
+    ).await?;
+    if enabled != 1 {
+        return Err("启用 2FA 影响的用户数量异常".into());
+    }
+    invalidate_user_sessions_in_transaction(&transaction, Some(username)).await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+async fn invalidate_user_sessions_in_transaction(
+    transaction: &tokio_postgres::Transaction<'_>,
+    username: Option<&str>,
+) -> Result<u64, tokio_postgres::Error> {
+    match username {
+        Some(username) => transaction
+            .execute(
+                "UPDATE session SET is_enable = false WHERE is_enable = true AND user_id = (SELECT id FROM users WHERE username = $1);",
+                &[&username],
+            )
+            .await,
+        None => transaction
+            .execute(
+                "UPDATE session SET is_enable = false WHERE is_enable = true;",
+                &[],
+            )
+            .await,
+    }
+}
+
+/// 使指定用户（`Some`）或所有用户（`None`）的有效会话失效。
+pub async fn invalidate_user_sessions(
+    pool: &deadpool_postgres::Pool,
+    username: Option<&str>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut conn = pool.get().await?;
+    let transaction = conn.transaction().await?;
+    let affected = invalidate_user_sessions_in_transaction(&transaction, username).await?;
+    transaction.commit().await?;
+    Ok(affected)
+}
+
+/// 验证 TOTP token///
 ///
 pub async fn totp_token_verify(
     totp: TOTP,
@@ -586,6 +676,7 @@ pub async fn unbind_2fa(
         )
         .await?;
     if r == 1 {
+        invalidate_user_sessions_in_transaction(&db_transaction, Some(username)).await?;
         info!(
             event = "Unbind2FASuccessful",
             path = "fn unbind_2fa",

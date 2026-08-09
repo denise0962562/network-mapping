@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS session (
 	is_enable boolean DEFAULT true
 );
 
+-- 2FA 绑定在验证码确认前仅保存于当前会话，过期后不能被启用。
+ALTER TABLE session ADD COLUMN IF NOT EXISTS pending_totp_secret TEXT;
+ALTER TABLE session ADD COLUMN IF NOT EXISTS pending_totp_expires_at BIGINT;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, is_enable);
 
