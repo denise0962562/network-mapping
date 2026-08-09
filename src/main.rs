@@ -6,7 +6,7 @@ use std::io;
 use tokio::time::{Duration, Instant, interval_at};
 use tracing::error;
 
-use rust_web_test::admin::{check_default_admin_user, check_system_user};
+use rust_web_test::admin::{check_default_admin_user, check_system_user, reset_admin_password};
 use rust_web_test::config::{Clis, SelfChecking};
 use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::maxmind::MaxMindState;
@@ -72,6 +72,20 @@ async fn main() -> io::Result<()> {
     .await
     .expect("创建连接池错误");
     let pool = db_pool.clone();
+    if let Some(username) = args.reset_admin_password.as_deref() {
+        match reset_admin_password(username, &db_pool, config.pwd_hash.clone()).await {
+            Ok(password) => {
+                println!("管理员 {} 的密码已重置。", username);
+                println!("新的随机密码：{}", password);
+                println!("请妥善保存该密码；它不会被写入日志。\n");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("重置管理员密码失败：{}", error);
+                return Err(io::Error::other("重置管理员密码失败"));
+            }
+        }
+    }
 
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
         Ok(_) => println!("初始化数据库成功"),

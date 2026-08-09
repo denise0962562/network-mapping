@@ -248,7 +248,7 @@ fn default_admin_username() -> String {
         .unwrap_or_else(|| DEFAULT_ADMIN_USERNAME.to_string())
 }
 
-fn generate_default_admin_password() -> String {
+fn generate_admin_password() -> String {
     let mut random_bytes = [0u8; DEFAULT_ADMIN_PASSWORD_LEN];
     rand::rand_bytes(&mut random_bytes).unwrap();
 
@@ -261,6 +261,62 @@ fn generate_default_admin_password() -> String {
         .collect()
 }
 
+/// 重置指定管理员的密码，并使该用户的全部既有会话失效。
+///
+/// 仅允许重置 `role = 1` 的管理员账户，避免影响系统账户或普通用户。
+/// 成功时返回仅应在当前终端显示一次的明文随机密码。
+pub async fn reset_admin_password(
+    username: &str,
+    pool: &deadpool_postgres::Pool,
+    pwd_hash_config: PasswordHashConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let password = generate_admin_password();
+    let password_hash = generate_hash_password(&password, pwd_hash_config)
+        .map_err(|error| format!("生成密码哈希失败：{:?}", error))?;
+
+    let mut client = pool.get().await?;
+    let transaction = client.transaction().await?;
+    let admin = transaction
+        .query_opt(
+            "SELECT id FROM users WHERE username = $1 AND role = 1 FOR UPDATE;",
+            &[&username],
+        )
+        .await?;
+
+    let Some(admin) = admin else {
+        return Err(format!("未找到管理员用户：{}", username).into());
+    };
+    let admin_id: i32 = admin.get("id");
+
+    let updated = transaction
+        .execute(
+            "UPDATE users SET password = $1, limit_login = false, limit_at = NULL, \
+             limit_time = NULL, login_error_count = 0, last_error_at = NULL \
+             WHERE id = $2 AND role = 1;",
+            &[&password_hash, &admin_id],
+        )
+        .await?;
+    if updated != 1 {
+        return Err(format!("重置管理员密码影响了 {} 行", updated).into());
+    }
+
+    transaction
+        .execute(
+            "UPDATE session SET is_enable = false WHERE user_id = $1 AND is_enable = true;",
+            &[&admin_id],
+        )
+        .await?;
+    transaction.commit().await?;
+
+    info!(
+        event = "ResetAdminPassword",
+        path = "fn reset_admin_password",
+        username,
+        message = "管理员密码已重置，既有会话已失效"
+    );
+
+    Ok(password)
+}
 /// 创建默认管理员角色。
 ///
 /// 如果默认用户名已被占用，会使用 admin_1、admin_2 等后缀创建用户，避免修改已有账号。
@@ -269,7 +325,7 @@ pub async fn create_default_admin_user(
     pwd_hash_config: PasswordHashConfig,
 ) {
     let username_prefix = default_admin_username();
-    let password = generate_default_admin_password();
+    let password = generate_admin_password();
     let password_hash = generate_hash_password(&password, pwd_hash_config).unwrap();
 
     let mut c = pool.get().await.unwrap();

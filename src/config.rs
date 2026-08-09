@@ -302,4 +302,8 @@ pub struct Clis {
     /// 调试模式，该模式可以输出详细的信息
     #[arg(short, long, default_value = "false")]
     pub debug_model: bool,
+
+    /// 重置指定管理员的密码，并在终端显示新的随机密码后退出
+    #[arg(long, value_name = "USERNAME")]
+    pub reset_admin_password: Option<String>,
 }
