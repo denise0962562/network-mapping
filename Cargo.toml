@@ -36,6 +36,11 @@ totp-rs = { version = "5.7", features = ["gen_secret", "otpauth"]}
 postgres-from-row = "0.5"
 toml_edit = "0.25"
 clap = { version = "4.6", features = ["derive"]}
+maxminddb = "0.28.1"
+
+[features]
+default = []
+rir = []
 
 [profile.dev]
 opt-level = 0

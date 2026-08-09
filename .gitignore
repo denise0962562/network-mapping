@@ -5,3 +5,9 @@ scanner/
 ssl/
 .codegraph/
 test-resource/
+
+source/maxmind/*.mmdb
+
+CLAUDE.md
+
+.codegraph/

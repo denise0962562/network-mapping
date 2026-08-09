@@ -1,7 +1,9 @@
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 
 use actix_web::{
-    Error, dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready}, http::header
+    Error,
+    dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
+    http::header,
 };
 use futures_util::future::LocalBoxFuture;
 
@@ -48,34 +50,34 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-
         let fut = self.service.call(req);
 
         Box::pin(async move {
-
             // 可以在此之前拦截请求
 
             let mut res = fut.await?;
-            
+
             // 在此拦截响应
 
             res.headers_mut().insert(
                 header::CONTENT_SECURITY_POLICY,
-                header::HeaderValue::from_static("default-src \'self\';style-src 'self' 'unsafe-inline';")  // 暂时允许内联css
+                header::HeaderValue::from_static(
+                    "default-src \'self\';style-src 'self' 'unsafe-inline';",
+                ), // 暂时允许内联css
             );
             res.headers_mut().insert(
                 header::X_FRAME_OPTIONS,
-                header::HeaderValue::from_static("DENY")
+                header::HeaderValue::from_static("DENY"),
             );
             res.headers_mut().insert(
                 header::STRICT_TRANSPORT_SECURITY,
-                header::HeaderValue::from_static("max-age=315360000;")
+                header::HeaderValue::from_static("max-age=315360000;"),
             );
             res.headers_mut().insert(
                 header::X_CONTENT_TYPE_OPTIONS,
-                header::HeaderValue::from_static("nosniff")
+                header::HeaderValue::from_static("nosniff"),
             );
-            
+
             // 通过 HTTP 响应标头下发 CSRF Token
             // 允许前端读取 X-CSRF-Token 头
             // res.headers_mut().insert(

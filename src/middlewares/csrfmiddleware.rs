@@ -1,11 +1,20 @@
-use std::{future::{Ready, ready}, sync::Arc};
+use std::{
+    future::{Ready, ready},
+    sync::Arc,
+};
 use tracing::error;
 
-use crate::{TemplatesInit, middlewares::{get_pool_from_app_data, render_500, render_500_simple}};
 use crate::logs::write::warn_logs;
+use crate::{
+    TemplatesInit,
+    middlewares::{get_pool_from_app_data, is_scanner_api_path, render_500, render_500_simple},
+};
 
 use actix_web::{
-    Error, HttpResponse, body::EitherBody, dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready}, web
+    Error, HttpResponse,
+    body::EitherBody,
+    dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
+    web,
 };
 use futures_util::future::LocalBoxFuture;
 
@@ -32,12 +41,14 @@ where
 
     fn new_transform(&self, service: S) -> Self::Future {
         // 用 Arc 包裹 service，使其可以安全地在 async 块中使用
-        ready(Ok(CsrfMiddlewareService { service: Arc::new(service) }))
+        ready(Ok(CsrfMiddlewareService {
+            service: Arc::new(service),
+        }))
     }
 }
 
 pub struct CsrfMiddlewareService<S> {
-    service: Arc<S>,  // Arc 使得 async move 块可以持有其引用
+    service: Arc<S>, // Arc 使得 async move 块可以持有其引用
 }
 
 impl<S, B> Service<ServiceRequest> for CsrfMiddlewareService<S>
@@ -53,20 +64,14 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-
-
         let svc = self.service.clone();
-        let no_ckeck_csrft = vec!["/api/scanner/register"];
         let path = req.path().to_owned();
-
-        let pass = no_ckeck_csrft.iter().any(|p| &path == p);
-        
+        let pass = is_scanner_api_path(&path);
 
         Box::pin(async move {
-
             // 如果路径是扫描器相关直接放行
             if pass {
-                return Ok(svc.call(req).await?.map_into_left_body())
+                return Ok(svc.call(req).await?.map_into_left_body());
             }
 
             // MARK: 对 GET 请求也校验 csrf token
@@ -74,16 +79,14 @@ where
             //     return Ok(svc.call(req).await?.map_into_left_body())
             // }
             if req.method().as_str() == "POST" && &req.path().to_string() == "/api/login" {
-                return Ok(svc.call(req).await?.map_into_left_body())
+                return Ok(svc.call(req).await?.map_into_left_body());
             }
 
             let page = match req.app_data::<web::Data<TemplatesInit>>() {
                 Some(s) => s.get_ref().clone(),
                 None => {
                     let res = render_500_simple(req.request(), "模板加载错误");
-                    return Ok(
-                        req.into_response(res).map_into_right_body()
-                    )
+                    return Ok(req.into_response(res).map_into_right_body());
                 }
             };
 
@@ -96,12 +99,10 @@ where
                         path = "csrfmiddleware -> fn call",
                         message = %e
                     );
-                    return Ok(
-                        req.into_response(resp).map_into_right_body()
-                    )
+                    return Ok(req.into_response(resp).map_into_right_body());
                 }
             };
-            
+
             let client = match p.get().await {
                 Ok(o) => o,
                 Err(e) => {
@@ -111,9 +112,7 @@ where
                         path = "csrfmiddleware -> fn call",
                         message = %e
                     );
-                    return Ok(
-                        req.into_response(resp).map_into_right_body()
-                    )
+                    return Ok(req.into_response(resp).map_into_right_body());
                 }
             };
 
@@ -122,13 +121,15 @@ where
                 None => {
                     warn_logs(req.request(), "CSRFTokenError", "未获取到 CSRF Token");
                     let resp = HttpResponse::Forbidden().body("403");
-                    return Ok(
-                        req.into_response(resp).map_into_right_body()
-                    )
+                    return Ok(req.into_response(resp).map_into_right_body());
                 }
             };
 
-            let tmp_session = req.request().cookie("session").map(|t| t.value().to_string()).unwrap_or(format!(""));
+            let tmp_session = req
+                .request()
+                .cookie("session")
+                .map(|t| t.value().to_string())
+                .unwrap_or(format!(""));
 
             let t = match client.query_opt(
                 "SELECT user_id, id FROM session WHERE is_enable = true AND token = $1 AND csrf_token = $2;",
@@ -152,12 +153,9 @@ where
                 Some(_) => Ok(svc.call(req).await?.map_into_left_body()),
                 None => {
                     let resp = HttpResponse::Forbidden().body("403");
-                    return Ok(
-                        req.into_response(resp).map_into_right_body()
-                    )
+                    return Ok(req.into_response(resp).map_into_right_body());
                 }
             }
-            
         })
     }
 }

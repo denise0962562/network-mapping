@@ -1,0 +1,185 @@
+{
+  "last_reviewed": "2026-08-09",
+  "projects": [
+    {
+      "name": "Actix Web",
+      "package": "actix-web",
+      "version": "4",
+      "license": "MIT OR Apache-2.0",
+      "ecosystem": "backend",
+      "usage": "服务端 HTTP 框架与路由",
+      "homepage": "https://actix.rs/",
+      "repository": "https://github.com/actix/actix-web"
+    },
+    {
+      "name": "Tokio",
+      "package": "tokio",
+      "version": "1",
+      "license": "MIT",
+      "ecosystem": "shared-rust",
+      "usage": "服务端和扫描器异步运行时",
+      "homepage": "https://tokio.rs/",
+      "repository": "https://github.com/tokio-rs/tokio"
+    },
+    {
+      "name": "Serde",
+      "package": "serde",
+      "version": "1.0",
+      "license": "MIT OR Apache-2.0",
+      "ecosystem": "shared-rust",
+      "usage": "服务端和扫描器数据序列化",
+      "homepage": "https://serde.rs/",
+      "repository": "https://github.com/serde-rs/serde"
+    },
+    {
+      "name": "tokio-postgres",
+      "package": "tokio-postgres",
+      "version": "0.7",
+      "license": "MIT OR Apache-2.0",
+      "ecosystem": "backend",
+      "usage": "PostgreSQL 异步客户端",
+      "homepage": "https://docs.rs/tokio-postgres/",
+      "repository": "https://github.com/sfackler/rust-postgres"
+    },
+    {
+      "name": "OpenSSL for Rust",
+      "package": "openssl",
+      "version": "0.10",
+      "license": "Apache-2.0",
+      "ecosystem": "backend",
+      "usage": "HTTPS、加密和安全随机数",
+      "homepage": "https://docs.rs/openssl/",
+      "repository": "https://github.com/sfackler/rust-openssl"
+    },
+    {
+      "name": "Tera",
+      "package": "tera",
+      "version": "1.20",
+      "license": "MIT",
+      "ecosystem": "backend",
+      "usage": "服务端错误页面模板",
+      "homepage": "https://keats.github.io/tera/",
+      "repository": "https://github.com/Keats/tera"
+    },
+    {
+      "name": "Reqwest",
+      "package": "reqwest",
+      "version": "0.12",
+      "license": "MIT OR Apache-2.0",
+      "ecosystem": "scanner",
+      "usage": "扫描器 HTTPS 请求客户端",
+      "homepage": "https://docs.rs/reqwest/",
+      "repository": "https://github.com/seanmonstar/reqwest"
+    },
+    {
+      "name": "clap",
+      "package": "clap",
+      "version": "4.6",
+      "license": "MIT OR Apache-2.0",
+      "ecosystem": "shared-rust",
+      "usage": "服务端和扫描器命令行参数解析",
+      "homepage": "https://docs.rs/clap/",
+      "repository": "https://github.com/clap-rs/clap"
+    },
+    {
+      "name": "tracing",
+      "package": "tracing",
+      "version": "0.1",
+      "license": "MIT",
+      "ecosystem": "shared-rust",
+      "usage": "结构化日志与诊断",
+      "homepage": "https://tokio.rs/tokio/topics/tracing",
+      "repository": "https://github.com/tokio-rs/tracing"
+    },
+    {
+      "name": "Vue",
+      "package": "vue",
+      "version": "^3.5.35",
+      "license": "MIT",
+      "ecosystem": "frontend",
+      "usage": "前端响应式界面框架",
+      "homepage": "https://vuejs.org/",
+      "repository": "https://github.com/vuejs/core"
+    },
+    {
+      "name": "Vue Router",
+      "package": "vue-router",
+      "version": "^5.1.0",
+      "license": "MIT",
+      "ecosystem": "frontend",
+      "usage": "前端页面路由",
+      "homepage": "https://router.vuejs.org/",
+      "repository": "https://github.com/vuejs/router"
+    },
+    {
+      "name": "Axios",
+      "package": "axios",
+      "version": "^1.19.0",
+      "license": "MIT",
+      "ecosystem": "frontend",
+      "usage": "浏览器 HTTP 客户端",
+      "homepage": "https://axios-http.com/",
+      "repository": "https://github.com/axios/axios"
+    },
+    {
+      "name": "Tailwind CSS",
+      "package": "tailwindcss",
+      "version": "^4.3.0",
+      "license": "MIT",
+      "ecosystem": "frontend",
+      "usage": "原子化样式系统",
+      "homepage": "https://tailwindcss.com/",
+      "repository": "https://github.com/tailwindlabs/tailwindcss"
+    },
+    {
+      "name": "daisyUI",
+      "package": "daisyui",
+      "version": "^5.5.20",
+      "license": "MIT",
+      "ecosystem": "frontend",
+      "usage": "Tailwind CSS 组件样式",
+      "homepage": "https://daisyui.com/",
+      "repository": "https://github.com/saadeghi/daisyui"
+    },
+    {
+      "name": "Vite",
+      "package": "vite",
+      "version": "^7.3.6",
+      "license": "MIT",
+      "ecosystem": "frontend",
+      "usage": "前端开发与生产构建",
+      "homepage": "https://vite.dev/",
+      "repository": "https://github.com/vitejs/vite"
+    },
+    {
+      "name": "ApexCharts",
+      "package": "apexcharts",
+      "version": "^5.6.0",
+      "license": "MIT",
+      "ecosystem": "frontend",
+      "usage": "仪表盘数据可视化",
+      "homepage": "https://apexcharts.com/",
+      "repository": "https://github.com/apexcharts/apexcharts.js"
+    },
+    {
+      "name": "Leaflet",
+      "package": "leaflet",
+      "version": "^1.9.4",
+      "license": "BSD-2-Clause",
+      "ecosystem": "frontend",
+      "usage": "地理位置地图展示",
+      "homepage": "https://leafletjs.com/",
+      "repository": "https://github.com/Leaflet/Leaflet"
+    },
+    {
+      "name": "Lucide Vue",
+      "package": "@lucide/vue",
+      "version": "^1.17.0",
+      "license": "ISC",
+      "ecosystem": "frontend",
+      "usage": "界面图标组件",
+      "homepage": "https://lucide.dev/",
+      "repository": "https://github.com/lucide-icons/lucide"
+    }
+  ]
+}

@@ -14,5 +14,5 @@ pub struct ScanTargetGetResponse {
     pub ip: String,
     pub port: String,
     pub rate: u32,
-    pub source_port: u16
+    pub source_port: u16,
 }
