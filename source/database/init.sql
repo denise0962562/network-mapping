@@ -125,13 +125,11 @@ CREATE TABLE IF NOT EXISTS session (
 	csrf_token TEXT NOT NULL,
 	ttl INT DEFAULT 1200, 
 	totp_verify_successful boolean DEFAULT false,
+	pending_totp_secret TEXT,
+	pending_totp_expires_at BIGINT,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
 	is_enable boolean DEFAULT true
 );
-
--- 2FA 绑定在验证码确认前仅保存于当前会话，过期后不能被启用。
-ALTER TABLE session ADD COLUMN IF NOT EXISTS pending_totp_secret TEXT;
-ALTER TABLE session ADD COLUMN IF NOT EXISTS pending_totp_expires_at BIGINT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, is_enable);
@@ -185,7 +183,8 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	is_run boolean,                                                                 -- 扫描器是否在运行
 	is_enable boolean,                                                              -- 扫描器是否启用
 	remark TEXT,                                                                    -- 扫描器的备注
-	tag TEXT                                                                        -- 扫描器的标签
+	tag TEXT,                                                                       -- 扫描器的标签
+	deleted_at TIMESTAMPTZ                                                          -- 软删除时间
 );
 
 CREATE TABLE IF NOT EXISTS operation_audit (
@@ -198,89 +197,15 @@ CREATE TABLE IF NOT EXISTS operation_audit (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 兼容已初始化的数据库：CREATE TABLE IF NOT EXISTS 不会补充新字段。
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_status TEXT NOT NULL DEFAULT 'pending';
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS assigned_scanner_id VARCHAR(36);
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS lease_expires_at BIGINT;
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0;
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS failure_reason TEXT;
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS retry_of_task_id VARCHAR(36);
-ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS dispatch_mode TEXT NOT NULL DEFAULT 'automatic';
-UPDATE scan_task SET task_status = CASE
-	WHEN task_end_time IS NOT NULL THEN 'succeeded'
-	WHEN task_start_time IS NOT NULL THEN 'running'
-	ELSE 'pending'
-END WHERE task_status IS NULL OR task_status = 'pending';
-
-INSERT INTO scan_task_execution (
-	execution_id, task_id, requested_scanner_id, assigned_scanner_id, execution_status,
-	attempt_count, task_start_time, task_end_time, lease_expires_at, failure_reason, cancel_requested
-)
-SELECT task_id, id, assigned_scanner_id, assigned_scanner_id, task_status,
-	attempt_count, task_start_time, task_end_time, lease_expires_at, failure_reason, cancel_requested
-FROM scan_task t
-WHERE NOT EXISTS (SELECT 1 FROM scan_task_execution e WHERE e.task_id = t.id)
-ON CONFLICT (execution_id) DO NOTHING;
-
--- 早期多扫描器迁移会在服务重启时为已有任务重复补一条 execution_id=task_id 的记录。
--- 如果任务已有其他执行记录，则将这条人工补出的记录隐藏，但保留数据供审计。
-UPDATE scan_task_execution e SET
-	execution_status = 'superseded',
-	lease_expires_at = NULL,
-	cancel_requested = false,
-	failure_reason = COALESCE(failure_reason, 'duplicate execution superseded during migration')
-FROM scan_task t
-WHERE e.task_id = t.id AND e.execution_id = t.task_id
-	AND EXISTS (SELECT 1 FROM scan_task_execution other WHERE other.task_id = e.task_id AND other.id <> e.id);
-
--- 额外防御：同一任务不能同时有多条归属于同一扫描器的运行记录。
-WITH duplicate_running AS (
-	SELECT e.id, ROW_NUMBER() OVER (
-		PARTITION BY e.task_id, e.assigned_scanner_id
-		ORDER BY (e.execution_id = t.task_id), e.id
-	) AS duplicate_rank
-	FROM scan_task_execution e
-	JOIN scan_task t ON t.id = e.task_id
-	WHERE e.execution_status = 'running' AND e.assigned_scanner_id IS NOT NULL
-)
-UPDATE scan_task_execution e SET
-	execution_status = 'superseded',
-	task_end_time = COALESCE(task_end_time, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT),
-	lease_expires_at = NULL,
-	cancel_requested = false,
-	failure_reason = COALESCE(failure_reason, 'duplicate running execution superseded during migration')
-FROM duplicate_running d
-WHERE e.id = d.id AND d.duplicate_rank > 1;
-
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS execution_id INT;
-UPDATE ips i SET execution_id = e.id
-FROM scan_task_execution e
-WHERE i.execution_id IS NULL AND e.task_id = i.task_id;
-ALTER TABLE ips ALTER COLUMN execution_id SET NOT NULL;
-ALTER TABLE ips DROP CONSTRAINT IF EXISTS ips_task_id_ip_address_key;
-DROP INDEX IF EXISTS idx_ips_task_address;
+-- 任务调度与结果索引。当前开发环境直接按上述定义创建全新表结构。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_execution_address ON ips (execution_id, ip_address);
-DO $$ BEGIN
-	ALTER TABLE ips ADD CONSTRAINT fk_execution FOREIGN KEY (execution_id)
-		REFERENCES scan_task_execution(id) ON DELETE CASCADE ON UPDATE CASCADE;
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
 	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	ON scan_task_execution (task_id, assigned_scanner_id)
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
-
-ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS cpu_model TEXT;
-ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
-ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS runtime_state TEXT NOT NULL DEFAULT 'offline';
-ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
-
--- 扫描结果必须按执行实例隔离，同一 IP 可以由不同扫描器分别观察。
-ALTER TABLE ips DROP CONSTRAINT IF EXISTS ips_ip_address_key;
 
 -- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
 CREATE TABLE IF NOT EXISTS ip_list (
