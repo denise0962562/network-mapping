@@ -1072,9 +1072,10 @@ const SCANNER_INFO_SELECT: &str = "\
            s.last_seen_at, s.runtime_state, \
            (s.runtime_state <> 'stopping' AND s.last_seen_at IS NOT NULL \
               AND s.last_seen_at >= NOW() - INTERVAL '90 seconds') AS is_online, \
-           (SELECT t.task_id FROM scan_task t WHERE t.assigned_scanner_id = s.scanner_id \
-              AND t.task_status = 'running' AND t.lease_expires_at > (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
-              ORDER BY t.task_start_time DESC NULLS LAST LIMIT 1) AS current_task_id, \
+           (SELECT t.task_id FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+              WHERE e.assigned_scanner_id = s.scanner_id AND e.execution_status = 'running' \
+              AND e.lease_expires_at > (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+              ORDER BY e.task_start_time DESC NULLS LAST LIMIT 1) AS current_task_id, \
            s.is_run, s.is_enable, s.remark, s.tag \
     FROM scanner_info s \
     LEFT JOIN users u ON u.id = s.create_user";
