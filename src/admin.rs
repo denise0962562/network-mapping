@@ -13,6 +13,7 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::{EmailConfig, PasswordHashConfig, SystemConfig};
 use crate::{AddUserInfo, generate_hash_password, generate_scanner_token, hash_scanner_token};
 use crate::{decrypt_data, encrypt_data};
@@ -980,7 +981,8 @@ pub async fn get_user_base_info(
 /// 返回 ScannerRegisterData
 pub async fn web_add_scanner(
     pool: &Pool,
-    user_id: i32,
+    user: &UserBaseI,
+    audit_context: &AuditContext,
     add_data: &AddScanner,
     token_pepper: &str,
 ) -> Result<ScannerRegisterSecret, Box<dyn std::error::Error>> {
@@ -996,9 +998,13 @@ pub async fn web_add_scanner(
         "INSERT INTO scanner_info \
          (name, scanner_id, create_user, registration_token_hash, registration_token_expires_at, location, create_time, remark, tag, is_enable) \
          VALUES ($1, $2, $3, $4, NOW() + INTERVAL '24 hours', $5, NOW(), $6, $7, false);",
-        &[&add_data.name, &scanner_id, &user_id, &registration_token_hash, &add_data.location, &add_data.remark, &add_data.tag]
+        &[&add_data.name, &scanner_id, &user.id, &registration_token_hash, &add_data.location, &add_data.remark, &add_data.tag]
     ).await? {
         1 => {
+            let mut audit_event = AuditEvent::user("scanner", "scanner.create", "success", user)
+                .resource("scanner", scanner_id.clone());
+            audit_event.response_status = Some(200);
+            write_audit(&db_transaction, audit_context, &audit_event).await?;
             db_transaction.commit().await?;
             Ok(ScannerRegisterSecret {
                 scanner_id: scanner_id,
@@ -1016,6 +1022,7 @@ pub async fn scanner_register(
     register_data: &ScannerRegisterData,
     registration_token: &str,
     token_pepper: &str,
+    audit_context: &AuditContext,
 ) -> Result<ScannerRuntimeSecret, Box<dyn std::error::Error>> {
     let mut db_conn = pool.get().await?;
     let db_transaction = db_conn.transaction().await?;
@@ -1057,6 +1064,13 @@ pub async fn scanner_register(
         .await?
     {
         1 => {
+            let mut audit_event = AuditEvent::anonymous("scanner", "scanner.register", "success");
+            audit_event.actor_type = "scanner".to_owned();
+            audit_event.actor_id = Some(register_data.scanner_id.clone());
+            audit_event.resource_type = Some("scanner".to_owned());
+            audit_event.resource_id = Some(register_data.scanner_id.clone());
+            audit_event.response_status = Some(200);
+            write_audit(&db_transaction, audit_context, &audit_event).await?;
             db_transaction.commit().await?;
             Ok(ScannerRuntimeSecret { runtime_token })
         }

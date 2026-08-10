@@ -15,7 +15,9 @@ use crate::login::get_session_from_req;
 use crate::logs::write::info_logs;
 use tracing::{error, info};
 
+use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
 use crate::middlewares::{get_pool_from_app_data, is_scanner_api_path};
+use uuid::Uuid;
 
 /// 用于 session 检查的中间件的 Transform
 pub struct AuthMiddleware;
@@ -62,6 +64,12 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
+        let request_id = req
+            .extensions()
+            .get::<RequestId>()
+            .map(|value| value.0)
+            .unwrap_or_else(Uuid::new_v4);
+        req.extensions_mut().insert(RequestId(request_id));
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = ["/api", "/dashboard", "/logout"];
         let path = req.path().to_owned();
@@ -84,7 +92,7 @@ where
                 .map(|u| u.to_str().unwrap_or("Invalid UTF-8"))
                 .unwrap_or("Unknown or None"),
             path = &req.path(),
-            query = &req.query_string(),
+            request_id = %request_id,
         );
 
         Box::pin(async move {
@@ -96,6 +104,21 @@ where
             let session = match get_session_from_req(req.request(), "session") {
                 Some(se) => se,
                 None => {
+                    if let Ok(pool) = get_pool_from_app_data(&req) {
+                        let mut audit_event = AuditEvent::anonymous(
+                            "authentication",
+                            "auth.session_rejected",
+                            "denied",
+                        );
+                        audit_event.response_status = Some(401);
+                        audit_event.reason_code = Some("missing_session".to_owned());
+                        write_standalone(
+                            pool,
+                            &AuditContext::from_request(req.request()),
+                            &audit_event,
+                        )
+                        .await;
+                    }
                     info_logs(
                         req.request(),
                         "InvalidSession",
@@ -149,6 +172,16 @@ where
                     Ok(svc.call(req).await?.map_into_left_body())
                 }
                 Ok((false, _)) => {
+                    let mut audit_event =
+                        AuditEvent::anonymous("authentication", "auth.session_rejected", "denied");
+                    audit_event.response_status = Some(401);
+                    audit_event.reason_code = Some("invalid_or_expired_session".to_owned());
+                    write_standalone(
+                        g_pool,
+                        &AuditContext::from_request(req.request()),
+                        &audit_event,
+                    )
+                    .await;
                     info_logs(
                         req.request(),
                         "InvalidSession",

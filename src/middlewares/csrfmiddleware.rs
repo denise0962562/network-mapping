@@ -4,6 +4,8 @@ use std::{
 };
 use tracing::error;
 
+use crate::admin::UserBaseI;
+use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::logs::write::warn_logs;
 use crate::{
     TemplatesInit,
@@ -11,7 +13,7 @@ use crate::{
 };
 
 use actix_web::{
-    Error, HttpResponse,
+    Error, HttpMessage, HttpResponse,
     body::EitherBody,
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
     web,
@@ -119,6 +121,26 @@ where
             let tmp_csrf_token_base64 = match req.headers().get("X-CSRF-Token") {
                 Some(t_base64) => t_base64.to_str().unwrap_or(""),
                 None => {
+                    let user = req.extensions().get::<UserBaseI>().cloned();
+                    let mut audit_event = match user.as_ref() {
+                        Some(user) => {
+                            AuditEvent::user("authorization", "auth.csrf_rejected", "denied", user)
+                        }
+                        None => {
+                            AuditEvent::anonymous("authorization", "auth.csrf_rejected", "denied")
+                        }
+                    };
+                    audit_event.response_status = Some(403);
+                    audit_event.reason_code = Some("missing_csrf_token".to_owned());
+                    if let Err(error_value) = write_audit(
+                        &client,
+                        &AuditContext::from_request(req.request()),
+                        &audit_event,
+                    )
+                    .await
+                    {
+                        error!(event = "CsrfAuditError", message = %error_value);
+                    }
                     warn_logs(req.request(), "CSRFTokenError", "未获取到 CSRF Token");
                     let resp = HttpResponse::Forbidden().body("403");
                     return Ok(req.into_response(resp).map_into_right_body());
@@ -152,6 +174,26 @@ where
             match t {
                 Some(_) => Ok(svc.call(req).await?.map_into_left_body()),
                 None => {
+                    let user = req.extensions().get::<UserBaseI>().cloned();
+                    let mut audit_event = match user.as_ref() {
+                        Some(user) => {
+                            AuditEvent::user("authorization", "auth.csrf_rejected", "denied", user)
+                        }
+                        None => {
+                            AuditEvent::anonymous("authorization", "auth.csrf_rejected", "denied")
+                        }
+                    };
+                    audit_event.response_status = Some(403);
+                    audit_event.reason_code = Some("invalid_csrf_token".to_owned());
+                    if let Err(error_value) = write_audit(
+                        &client,
+                        &AuditContext::from_request(req.request()),
+                        &audit_event,
+                    )
+                    .await
+                    {
+                        error!(event = "CsrfAuditError", message = %error_value);
+                    }
                     let resp = HttpResponse::Forbidden().body("403");
                     return Ok(req.into_response(resp).map_into_right_body());
                 }

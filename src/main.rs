@@ -1,4 +1,4 @@
-use actix_web::{App, HttpServer, web};
+use actix_web::{App, HttpMessage, HttpServer, dev::Service, http::header, web};
 use clap::Parser;
 use core::panic;
 use std::io;
@@ -6,6 +6,7 @@ use tokio::time::{Duration, Instant, interval_at};
 use tracing::error;
 
 use rust_web_test::admin::{check_default_admin_user, check_system_user, reset_admin_password};
+use rust_web_test::audit::RequestId;
 use rust_web_test::config::{Clis, SelfChecking};
 use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::maxmind::MaxMindState;
@@ -184,6 +185,26 @@ async fn main() -> io::Result<()> {
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
             .wrap(rate_limiter.clone())
+            .wrap_fn(|req, service| {
+                let request_id = req
+                    .headers()
+                    .get("X-Request-ID")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .unwrap_or_else(uuid::Uuid::new_v4);
+                req.extensions_mut().insert(RequestId(request_id));
+                let response_request_id = header::HeaderValue::from_str(&request_id.to_string())
+                    .expect("UUID is a valid header value");
+                let future = service.call(req);
+                async move {
+                    let mut response = future.await?;
+                    response.headers_mut().insert(
+                        header::HeaderName::from_static("x-request-id"),
+                        response_request_id,
+                    );
+                    Ok(response)
+                }
+            })
             .configure(config::init_routes)
     })
     .bind_openssl((server_host, server_port), tls)?

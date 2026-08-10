@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod audit;
 pub mod config;
 pub mod db;
 pub mod handlers;
@@ -577,6 +578,8 @@ impl<'a> STask<'a> {
         user_id: i32,
         dispatch_mode: &str,
         requested_scanners: &[Option<String>],
+        audit_context: &audit::AuditContext,
+        actor: &admin::UserBaseI,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut p = pool.get().await?;
         let client = p.transaction().await?;
@@ -601,6 +604,16 @@ impl<'a> STask<'a> {
                 &[&Uuid::now_v7().to_string(), &task_db_id, requested_scanner],
             ).await?;
         }
+
+        let mut audit_event =
+            audit::AuditEvent::user("task", "task.create", "success", actor).resource("task", t_id);
+        audit_event.response_status = Some(200);
+        audit_event.metadata = serde_json::json!({
+            "dispatch_mode": dispatch_mode,
+            "scanner_count": requested_scanners.len(),
+            "target_count": self.ip.len()
+        });
+        audit::write(&client, audit_context, &audit_event).await?;
 
         client.commit().await?;
         return Ok(());

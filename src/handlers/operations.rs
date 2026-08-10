@@ -1,4 +1,5 @@
 use crate::admin::UserBaseI;
+use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::SecurityConfig;
 use crate::logs::write::error_logs;
 use crate::{generate_scanner_token, hash_scanner_token};
@@ -13,21 +14,22 @@ fn is_admin(user: &UserBaseI) -> bool {
 }
 
 async fn audit(
-    transaction: &tokio_postgres::Transaction<'_>,
-    user_id: i32,
+    transaction: &deadpool_postgres::Transaction<'_>,
+    req: &HttpRequest,
+    user: &UserBaseI,
     action: &str,
     resource_type: &str,
     resource_id: &str,
     detail: Value,
 ) -> Result<(), tokio_postgres::Error> {
-    transaction
-        .execute(
-            "INSERT INTO operation_audit (actor_user_id, action, resource_type, resource_id, detail) \
-             VALUES ($1, $2, $3, $4, $5);",
-            &[&user_id, &action, &resource_type, &resource_id, &detail],
-        )
-        .await?;
-    Ok(())
+    let mut event =
+        AuditEvent::user("task", action, "success", user).resource(resource_type, resource_id);
+    if resource_type == "scanner" {
+        event.category = "scanner".to_owned();
+    }
+    event.changes = Some(detail);
+    event.response_status = Some(200);
+    write_audit(transaction, &AuditContext::from_request(req), &event).await
 }
 
 #[post("/api/task/{task_id}/cancel")]
@@ -111,7 +113,8 @@ pub(crate) async fn cancel_task(
     let cancel_requested: bool = aggregate.get("cancel_requested");
     if let Err(error) = audit(
         &transaction,
-        user.id,
+        &req,
+        &user,
         "task.cancel",
         "task",
         &id,
@@ -221,7 +224,8 @@ pub(crate) async fn retry_task(
     }
     if let Err(error) = audit(
         &transaction,
-        user.id,
+        &req,
+        &user,
         "task.retry",
         "task",
         &new_id,
@@ -444,7 +448,8 @@ pub(crate) async fn update_scanner(
     }
     if audit(
         &transaction,
-        user.id,
+        &req,
+        &user,
         "scanner.update",
         "scanner",
         &id,
@@ -523,7 +528,8 @@ pub(crate) async fn set_scanner_enabled(
     };
     if audit(
         &transaction,
-        user.id,
+        &req,
+        &user,
         if body.enabled {
             "scanner.enable"
         } else {
@@ -590,7 +596,8 @@ pub(crate) async fn reissue_scanner_token(
         };
     if audit(
         &transaction,
-        user.id,
+        &req,
+        &user,
         "scanner.token.reissue",
         "scanner",
         &id,
@@ -644,7 +651,8 @@ pub(crate) async fn delete_scanner(
     }
     if audit(
         &transaction,
-        user.id,
+        &req,
+        &user,
         "scanner.delete",
         "scanner",
         &id,

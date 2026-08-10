@@ -1,4 +1,5 @@
 use crate::admin::UserBaseI;
+use crate::audit::AuditContext;
 use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, info_logs};
 use crate::maxmind::MaxMindState;
@@ -631,7 +632,7 @@ async fn create_task(
 
     let database_conn = pool.get_ref();
     let user_id = user_base_i.id;
-    let user_name = user_base_i.username;
+    let user_name = user_base_i.username.clone();
 
     let dispatch_mode = create_data.dispatch_mode.trim().to_lowercase();
     let requested_scanners: Vec<Option<String>> = match dispatch_mode.as_str() {
@@ -689,6 +690,8 @@ async fn create_task(
                     user_id,
                     &dispatch_mode,
                     &requested_scanners,
+                    &AuditContext::from_request(&req),
+                    &user_base_i,
                 )
                 .await
             {
