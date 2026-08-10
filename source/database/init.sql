@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	failure_reason TEXT,                                                                      -- 最近一次扫描失败原因
 	cancel_requested BOOLEAN NOT NULL DEFAULT false,                                          -- 控制端请求扫描器终止当前任务
 	retry_of_task_id VARCHAR(36),                                                             -- 重试任务所引用的原任务
+	dispatch_mode TEXT NOT NULL DEFAULT 'automatic',                                          -- automatic/selected/all
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -47,20 +48,41 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	CONSTRAINT uk_task_id UNIQUE (task_id)
 );
 
+CREATE TABLE IF NOT EXISTS scan_task_execution (
+	id SERIAL PRIMARY KEY,
+	execution_id VARCHAR(36) NOT NULL UNIQUE,
+	task_id INT NOT NULL REFERENCES scan_task(id) ON DELETE CASCADE,
+	requested_scanner_id VARCHAR(36),
+	assigned_scanner_id VARCHAR(36),
+	execution_status TEXT NOT NULL DEFAULT 'pending',
+	attempt_count INT NOT NULL DEFAULT 0,
+	task_start_time BIGINT,
+	task_end_time BIGINT,
+	lease_expires_at BIGINT,
+	failure_reason TEXT,
+	cancel_requested BOOLEAN NOT NULL DEFAULT false,
+	CONSTRAINT uk_task_execution_scanner UNIQUE(task_id, requested_scanner_id)
+);
+
 -- 表 ips 用于存储ip数据，并配置了级联更新
 CREATE TABLE IF NOT EXISTS ips ( 
 	task_id INT NOT NULL, 
+	execution_id INT NOT NULL,
 	ip_id SERIAL PRIMARY KEY, 
 	ip_address INET NOT NULL,
 	asn TEXT DEFAULT NULL, 
 	isp TEXT DEFAULT NULL, 
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
 	update_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
-	UNIQUE(task_id, ip_address),
 	CONSTRAINT fk_task
         FOREIGN KEY (task_id)
         REFERENCES scan_task(id)
-        ON UPDATE CASCADE
+	        ON UPDATE CASCADE,
+	CONSTRAINT fk_execution
+		FOREIGN KEY (execution_id)
+		REFERENCES scan_task_execution(id)
+		ON DELETE CASCADE
+		ON UPDATE CASCADE
 );
 
 -- 表 ports 用于存储扫描出的端口，其中ip_id通过外键关联到表ips，并配置了级联更新删除
@@ -184,11 +206,37 @@ ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAUL
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS failure_reason TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS retry_of_task_id VARCHAR(36);
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS dispatch_mode TEXT NOT NULL DEFAULT 'automatic';
 UPDATE scan_task SET task_status = CASE
 	WHEN task_end_time IS NOT NULL THEN 'succeeded'
 	WHEN task_start_time IS NOT NULL THEN 'running'
 	ELSE 'pending'
 END WHERE task_status IS NULL OR task_status = 'pending';
+
+INSERT INTO scan_task_execution (
+	execution_id, task_id, requested_scanner_id, assigned_scanner_id, execution_status,
+	attempt_count, task_start_time, task_end_time, lease_expires_at, failure_reason, cancel_requested
+)
+SELECT task_id, id, assigned_scanner_id, assigned_scanner_id, task_status,
+	attempt_count, task_start_time, task_end_time, lease_expires_at, failure_reason, cancel_requested
+FROM scan_task
+ON CONFLICT (execution_id) DO NOTHING;
+
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS execution_id INT;
+UPDATE ips i SET execution_id = e.id
+FROM scan_task_execution e
+WHERE i.execution_id IS NULL AND e.task_id = i.task_id;
+ALTER TABLE ips ALTER COLUMN execution_id SET NOT NULL;
+ALTER TABLE ips DROP CONSTRAINT IF EXISTS ips_task_id_ip_address_key;
+DROP INDEX IF EXISTS idx_ips_task_address;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_execution_address ON ips (execution_id, ip_address);
+DO $$ BEGIN
+	ALTER TABLE ips ADD CONSTRAINT fk_execution FOREIGN KEY (execution_id)
+		REFERENCES scan_task_execution(id) ON DELETE CASCADE ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
+	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
 
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS cpu_model TEXT;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
@@ -197,9 +245,8 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
 
--- 扫描结果必须按任务隔离，同一 IP 可以出现在多次扫描中。
+-- 扫描结果必须按执行实例隔离，同一 IP 可以由不同扫描器分别观察。
 ALTER TABLE ips DROP CONSTRAINT IF EXISTS ips_ip_address_key;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_task_address ON ips (task_id, ip_address);
 
 -- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
 CREATE TABLE IF NOT EXISTS ip_list (

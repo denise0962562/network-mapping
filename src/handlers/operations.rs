@@ -67,29 +67,48 @@ pub(crate) async fn cancel_task(
         }
     };
     let status: String = row.get("task_status");
-    let next_status = match status.as_str() {
-        "pending" => "cancelled",
-        "running" => "running",
+    match status.as_str() {
+        "pending" | "running" => {}
         _ => {
             return HttpResponse::Conflict()
                 .json(json!({"success": false, "message": "task is already finished"}));
         }
-    };
+    }
     let now = crate::get_unix_epoch_ms();
-    if let Err(error) = transaction
-        .execute(
-            "UPDATE scan_task SET task_status = $1, cancel_requested = true, \
-             task_end_time = CASE WHEN $1 = 'cancelled' THEN $2 ELSE task_end_time END, \
-             assigned_scanner_id = CASE WHEN $1 = 'cancelled' THEN NULL ELSE assigned_scanner_id END, \
-             lease_expires_at = CASE WHEN $1 = 'cancelled' THEN NULL ELSE lease_expires_at END \
-             WHERE task_id = $3;",
-            &[&next_status, &now, &id],
-        )
+    let task_pk: i32 = match transaction
+        .query_one("SELECT id FROM scan_task WHERE task_id = $1", &[&id])
         .await
     {
+        Ok(row) => row.get("id"),
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    if let Err(error) = transaction.execute(
+        "UPDATE scan_task_execution SET execution_status = CASE WHEN execution_status = 'pending' THEN 'cancelled' ELSE execution_status END, \
+         cancel_requested = (execution_status = 'running'), task_end_time = CASE WHEN execution_status = 'pending' THEN $1 ELSE task_end_time END, \
+         lease_expires_at = CASE WHEN execution_status = 'pending' THEN NULL ELSE lease_expires_at END \
+         WHERE task_id = $2 AND execution_status IN ('pending', 'running');", &[&now, &task_pk]).await {
         error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
         return HttpResponse::InternalServerError().finish();
     }
+    if let Err(error) = crate::refresh_task_aggregate(&transaction, task_pk).await {
+        error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+        return HttpResponse::InternalServerError().finish();
+    }
+    let aggregate = match transaction
+        .query_one(
+            "SELECT task_status, cancel_requested FROM scan_task WHERE id = $1;",
+            &[&task_pk],
+        )
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let aggregate_status: String = aggregate.get("task_status");
+    let cancel_requested: bool = aggregate.get("cancel_requested");
     if let Err(error) = audit(
         &transaction,
         user.id,
@@ -107,7 +126,9 @@ pub(crate) async fn cancel_task(
         error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
         return HttpResponse::InternalServerError().finish();
     }
-    HttpResponse::Ok().json(json!({"success": true, "status": next_status, "cancel_requested": next_status == "running"}))
+    HttpResponse::Ok().json(
+        json!({"success": true, "status": aggregate_status, "cancel_requested": cancel_requested}),
+    )
 }
 
 #[post("/api/task/{task_id}/retry")]
@@ -134,7 +155,7 @@ pub(crate) async fn retry_task(
     let source_id = task_id.into_inner().to_string();
     let source = match transaction
         .query_opt(
-            "SELECT user_id, task_target, task_port, task_level, remarks, task_status FROM scan_task \
+            "SELECT id, user_id, task_target, task_port, task_level, remarks, task_status, dispatch_mode FROM scan_task \
              WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) FOR UPDATE;",
             &[&source_id, &user.role, &user.id],
         )
@@ -148,7 +169,10 @@ pub(crate) async fn retry_task(
         }
     };
     let status: String = source.get("task_status");
-    if !matches!(status.as_str(), "failed" | "cancelled" | "succeeded") {
+    if !matches!(
+        status.as_str(),
+        "failed" | "cancelled" | "succeeded" | "partial"
+    ) {
         return HttpResponse::Conflict()
             .json(json!({"success": false, "message": "only finished tasks can be retried"}));
     }
@@ -158,16 +182,41 @@ pub(crate) async fn retry_task(
     let port: String = source.get("task_port");
     let level: i32 = source.get("task_level");
     let remarks: Option<String> = source.get("remarks");
-    if let Err(error) = transaction
-        .execute(
-            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, retry_of_task_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
-            &[&owner_id, &new_id, &user.username, &targets, &port, &level, &remarks, &source_id],
+    let dispatch_mode: String = source.get("dispatch_mode");
+    let source_pk: i32 = source.get("id");
+    let new_task_pk: i32 = match transaction.query_one(
+        "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, retry_of_task_id, dispatch_mode) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;",
+        &[&owner_id, &new_id, &user.username, &targets, &port, &level, &remarks, &source_id, &dispatch_mode]).await {
+        Ok(row) => row.get("id"),
+        Err(error) => { error_logs(&req, "RetryTaskDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+    };
+    let source_executions = match transaction
+        .query(
+            "SELECT requested_scanner_id FROM scan_task_execution WHERE task_id = $1 ORDER BY id;",
+            &[&source_pk],
         )
         .await
     {
-        error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
-        return HttpResponse::InternalServerError().finish();
+        Ok(rows) => rows,
+        Err(error) => {
+            error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    for execution in source_executions {
+        let execution_id = Uuid::now_v7().to_string();
+        let requested_scanner_id: Option<String> = execution.get("requested_scanner_id");
+        if let Err(error) = transaction
+            .execute(
+                "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, $3);",
+                &[&execution_id, &new_task_pk, &requested_scanner_id],
+            )
+            .await
+        {
+            error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
     }
     if let Err(error) = audit(
         &transaction,
@@ -216,8 +265,10 @@ pub(crate) async fn export_task(
     let id = task_id.into_inner().to_string();
     let rows = match connection
         .query(
-            "SELECT host(i.ip_address) AS ip, i.asn, i.isp, p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
-             FROM scan_task t JOIN ips i ON i.task_id = t.id LEFT JOIN ports p ON p.ip_id = i.ip_id \
+            "SELECT e.execution_id, e.assigned_scanner_id, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name, \
+             host(i.ip_address) AS ip, i.asn, i.isp, p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
+             FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id JOIN ips i ON i.execution_id = e.id \
+             LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id LEFT JOIN ports p ON p.ip_id = i.ip_id \
              LEFT JOIN LATERAL (SELECT protocol, service, banner, scan_time FROM scaninfo WHERE port_id = p.port_id ORDER BY scan_time DESC LIMIT 1) latest ON true \
              WHERE t.task_id = $1 AND ($2 = 1 OR t.user_id = $3) ORDER BY i.ip_address, p.port;",
             &[&id, &user.role, &user.id],
@@ -232,16 +283,24 @@ pub(crate) async fn export_task(
     };
     if query.format.as_deref() == Some("json") {
         let data: Vec<Value> = rows.iter().map(|row| json!({
-            "ip": row.get::<_, String>("ip"), "asn": row.get::<_, Option<String>>("asn"),
+            "execution_id": row.get::<_, String>("execution_id"), "scanner_id": row.get::<_, Option<String>>("assigned_scanner_id"),
+            "scanner_name": row.get::<_, Option<String>>("scanner_name"), "ip": row.get::<_, String>("ip"), "asn": row.get::<_, Option<String>>("asn"),
             "isp": row.get::<_, Option<String>>("isp"), "port": row.get::<_, Option<i32>>("port"),
             "protocol": row.get::<_, Option<String>>("protocol"), "service": row.get::<_, Option<String>>("service"),
             "banner": row.get::<_, Option<String>>("banner"), "scan_time": row.get::<_, Option<i64>>("scan_time")
         })).collect();
         return HttpResponse::Ok().json(json!({"task_id": id, "results": data}));
     }
-    let mut csv = String::from("ip,asn,isp,port,protocol,service,banner,scan_time\n");
+    let mut csv = String::from(
+        "execution_id,scanner_id,scanner_name,ip,asn,isp,port,protocol,service,banner,scan_time\n",
+    );
     for row in rows {
         let values = [
+            row.get::<_, String>("execution_id"),
+            row.get::<_, Option<String>>("assigned_scanner_id")
+                .unwrap_or_default(),
+            row.get::<_, Option<String>>("scanner_name")
+                .unwrap_or_default(),
             row.get::<_, String>("ip"),
             row.get::<_, Option<String>>("asn").unwrap_or_default(),
             row.get::<_, Option<String>>("isp").unwrap_or_default(),
@@ -408,9 +467,16 @@ async fn release_scanner_tasks(
     scanner_id: &str,
     reason: &str,
 ) -> Result<u64, tokio_postgres::Error> {
-    transaction.execute(
-        "UPDATE scan_task SET task_status = 'pending', assigned_scanner_id = NULL, lease_expires_at = NULL, task_start_time = NULL, cancel_requested = false, failure_reason = $1 \
-         WHERE assigned_scanner_id = $2 AND task_status = 'running';", &[&reason, &scanner_id]).await
+    let rows = transaction.query(
+        "UPDATE scan_task_execution SET execution_status = 'pending', assigned_scanner_id = NULL, lease_expires_at = NULL, \
+         task_start_time = NULL, cancel_requested = false, failure_reason = $1 \
+         WHERE assigned_scanner_id = $2 AND execution_status = 'running' RETURNING task_id;", &[&reason, &scanner_id]).await?;
+    let task_ids: std::collections::HashSet<i32> =
+        rows.iter().map(|row| row.get("task_id")).collect();
+    for task_id in task_ids {
+        crate::refresh_task_aggregate(transaction, task_id).await?;
+    }
+    Ok(rows.len() as u64)
 }
 
 #[post("/api/scanner/{scanner_id}/enabled")]

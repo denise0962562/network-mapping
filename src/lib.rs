@@ -473,6 +473,14 @@ pub struct CreateTask {
     pub port: String,
     pub level: i8,
     pub remark: Option<String>,
+    #[serde(default = "default_dispatch_mode")]
+    pub dispatch_mode: String,
+    #[serde(default)]
+    pub scanner_ids: Vec<Uuid>,
+}
+
+fn default_dispatch_mode() -> String {
+    "automatic".into()
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
@@ -524,6 +532,8 @@ impl<'a> STask<'a> {
         pool: &deadpool_postgres::Pool,
         level: i32,
         user_id: i32,
+        dispatch_mode: &str,
+        requested_scanners: &[Option<String>],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut p = pool.get().await?;
         let client = p.transaction().await?;
@@ -536,10 +546,18 @@ impl<'a> STask<'a> {
         // 将 ipnet转换为 String
         let tmp_ip: Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
 
-        client.execute(
-            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks) VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7)",
-            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark]
+        let task_row = client.query_one(
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, dispatch_mode) \
+             VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7, $8) RETURNING id;",
+            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark, &dispatch_mode]
         ).await?;
+        let task_db_id: i32 = task_row.get("id");
+        for requested_scanner in requested_scanners {
+            client.execute(
+                "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, $3);",
+                &[&Uuid::now_v7().to_string(), &task_db_id, requested_scanner],
+            ).await?;
+        }
 
         client.commit().await?;
         return Ok(());
@@ -1092,34 +1110,25 @@ pub async fn save_scanner_results(
 
     let task_row = transaction
         .query_opt(
-            "SELECT id, assigned_scanner_id, task_status FROM scan_task WHERE task_id = $1;",
-            &[&upload.task_id.to_string()],
+            "SELECT t.id AS task_id, e.id AS execution_id, e.execution_status \
+             FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id \
+             WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
+             AND e.execution_status IN ('running', 'succeeded') LIMIT 1;",
+            &[&upload.task_id.to_string(), &scanner_id],
         )
         .await
         .map_err(scanner_result_database_error)?;
 
-    let task_db_id: i32 = match task_row {
-        Some(row)
-            if row
-                .get::<_, Option<String>>("assigned_scanner_id")
-                .as_deref()
-                == Some(scanner_id.as_str())
-                && row.get::<_, String>("task_status") == "succeeded" =>
-        {
+    let (task_db_id, execution_db_id): (i32, i32) = match task_row {
+        Some(row) if row.get::<_, String>("execution_status") == "succeeded" => {
             transaction
                 .commit()
                 .await
                 .map_err(scanner_result_database_error)?;
             return Ok(0);
         }
-        Some(row)
-            if row
-                .get::<_, Option<String>>("assigned_scanner_id")
-                .as_deref()
-                == Some(scanner_id.as_str())
-                && row.get::<_, String>("task_status") == "running" =>
-        {
-            row.get("id")
+        Some(row) if row.get::<_, String>("execution_status") == "running" => {
+            (row.get("task_id"), row.get("execution_id"))
         }
         Some(_) => return Err(SaveScannerResultsError::TaskNotOwned),
         None => return Err(SaveScannerResultsError::TaskNotFound),
@@ -1141,14 +1150,20 @@ pub async fn save_scanner_results(
 
         let ip_row = transaction
             .query_one(
-                "INSERT INTO ips (task_id, ip_address, asn, isp) \
-             VALUES ($1, $2::text::inet, $3, $4) \
-             ON CONFLICT (task_id, ip_address) DO UPDATE SET \
+                "INSERT INTO ips (task_id, execution_id, ip_address, asn, isp) \
+             VALUES ($1, $2, $3::text::inet, $4, $5) \
+             ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
                 asn = COALESCE(EXCLUDED.asn, ips.asn), \
                 isp = COALESCE(EXCLUDED.isp, ips.isp), \
                 update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
              RETURNING ip_id;",
-                &[&task_db_id, &ip_text, &intel.asn, &intel.isp],
+                &[
+                    &task_db_id,
+                    &execution_db_id,
+                    &ip_text,
+                    &intel.asn,
+                    &intel.isp,
+                ],
             )
             .await
             .map_err(scanner_result_database_error)?;
@@ -1189,10 +1204,13 @@ pub async fn save_scanner_results(
 
     transaction
         .execute(
-            "UPDATE scan_task SET task_status = 'succeeded', task_end_time = $1, \
-             lease_expires_at = NULL, failure_reason = NULL WHERE id = $2;",
-            &[&get_unix_epoch_ms(), &task_db_id],
+            "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
+             lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false WHERE id = $2;",
+            &[&get_unix_epoch_ms(), &execution_db_id],
         )
+        .await
+        .map_err(scanner_result_database_error)?;
+    refresh_task_aggregate(&transaction, task_db_id)
         .await
         .map_err(scanner_result_database_error)?;
 
@@ -1201,6 +1219,38 @@ pub async fn save_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
     Ok(saved)
+}
+
+pub async fn refresh_task_aggregate(
+    transaction: &tokio_postgres::Transaction<'_>,
+    task_db_id: i32,
+) -> Result<(), tokio_postgres::Error> {
+    transaction.execute(
+        "WITH aggregate AS (SELECT \
+            COUNT(*)::INT AS total, \
+            COUNT(*) FILTER (WHERE execution_status = 'pending')::INT AS pending, \
+            COUNT(*) FILTER (WHERE execution_status = 'running')::INT AS running, \
+            COUNT(*) FILTER (WHERE execution_status = 'succeeded')::INT AS succeeded, \
+            COUNT(*) FILTER (WHERE execution_status = 'failed')::INT AS failed, \
+            COUNT(*) FILTER (WHERE execution_status = 'cancelled')::INT AS cancelled, \
+            MIN(task_start_time) AS started_at, MAX(task_end_time) AS ended_at, \
+            SUM(attempt_count)::INT AS attempts, BOOL_OR(cancel_requested) AS cancelling, \
+            CASE WHEN COUNT(*) = 1 THEN MAX(assigned_scanner_id) ELSE NULL END AS scanner_id, \
+            STRING_AGG(CASE WHEN failure_reason IS NOT NULL THEN \
+                COALESCE(assigned_scanner_id, requested_scanner_id, 'unassigned') || ': ' || failure_reason END, E'\\n') AS failures \
+          FROM scan_task_execution WHERE task_id = $1) \
+         UPDATE scan_task t SET \
+           task_status = CASE WHEN a.running > 0 THEN 'running' WHEN a.pending > 0 THEN 'pending' \
+             WHEN a.succeeded = a.total THEN 'succeeded' WHEN a.failed = a.total THEN 'failed' \
+             WHEN a.cancelled = a.total THEN 'cancelled' ELSE 'partial' END, \
+           task_start_time = a.started_at, \
+           task_end_time = CASE WHEN a.pending = 0 AND a.running = 0 THEN a.ended_at ELSE NULL END, \
+           attempt_count = a.attempts, assigned_scanner_id = a.scanner_id, \
+           lease_expires_at = NULL, failure_reason = a.failures, cancel_requested = a.cancelling \
+         FROM aggregate a WHERE t.id = $1;",
+        &[&task_db_id],
+    ).await?;
+    Ok(())
 }
 
 /// 通过该函数实现扫描器申请任务
@@ -1216,27 +1266,35 @@ pub async fn apply_task(
     let mut p = pool.get().await.map_err(apply_task_database_error)?;
     let transaction = p.transaction().await.map_err(apply_task_database_error)?;
 
-    transaction
-        .execute(
-            "UPDATE scan_task SET task_status = 'cancelled', task_end_time = $1, \
+    let cancelled = transaction
+        .query(
+            "UPDATE scan_task_execution SET execution_status = 'cancelled', task_end_time = $1, \
              lease_expires_at = NULL, cancel_requested = false \
-             WHERE task_status = 'running' AND cancel_requested = true \
-               AND (lease_expires_at IS NULL OR lease_expires_at < $1);",
+             WHERE execution_status = 'running' AND cancel_requested = true \
+               AND (lease_expires_at IS NULL OR lease_expires_at < $1) RETURNING task_id;",
             &[&get_unix_epoch_ms()],
         )
         .await
         .map_err(apply_task_database_error)?;
+    let cancelled_tasks: std::collections::HashSet<i32> =
+        cancelled.iter().map(|row| row.get("task_id")).collect();
+    for task_id in cancelled_tasks {
+        refresh_task_aggregate(&transaction, task_id)
+            .await
+            .map_err(apply_task_database_error)?;
+    }
 
     let row = transaction
         .query_opt(
-            "SELECT id, user_id, task_id, task_target::text[], task_port \
-         FROM scan_task \
-         WHERE task_status = 'pending' \
-            OR (task_status = 'running' AND cancel_requested = false AND (lease_expires_at IS NULL OR lease_expires_at < $1)) \
-         ORDER BY task_level DESC, task_create_time \
-         FOR UPDATE SKIP LOCKED \
+            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port \
+         FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+         WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.cancel_requested = false \
+              AND (e.lease_expires_at IS NULL OR e.lease_expires_at < $1))) \
+           AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
+         ORDER BY t.task_level DESC, t.task_create_time, e.id \
+         FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",
-            &[&get_unix_epoch_ms()],
+            &[&get_unix_epoch_ms(), &scanner_id.to_string()],
         )
         .await
         .map_err(apply_task_database_error)?;
@@ -1250,20 +1308,24 @@ pub async fn apply_task(
         return Err(ApplyTaskError::NoTask);
     };
 
-    let task_pk: i32 = row.get("id");
+    let task_pk: i32 = row.get("task_pk");
+    let execution_pk: i32 = row.get("execution_pk");
     let lease_expires_at = get_unix_epoch_ms() + 90_000;
     transaction
         .execute(
-            "UPDATE scan_task SET task_start_time = $1, task_end_time = NULL, \
-             task_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3, \
+            "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1), task_end_time = NULL, \
+             execution_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3, \
              attempt_count = attempt_count + 1, failure_reason = NULL WHERE id = $4;",
             &[
                 &get_unix_epoch_ms(),
                 &scanner_id.to_string(),
                 &lease_expires_at,
-                &task_pk,
+                &execution_pk,
             ],
         )
+        .await
+        .map_err(apply_task_database_error)?;
+    refresh_task_aggregate(&transaction, task_pk)
         .await
         .map_err(apply_task_database_error)?;
 
@@ -1385,20 +1447,23 @@ pub async fn get_task_item(
     start_id: Option<i32>,
     permissions: Permission,
 ) -> Result<(Vec<TaskItem>, i64, i64, i32), Box<dyn std::error::Error>> {
-    let c = pool.get().await?;
+    let mut c = pool.get().await?;
     let s_count = s_count.clamp(1, 100);
-
-    c.execute(
-        "UPDATE scan_task SET task_status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'pending' END, \
-         assigned_scanner_id = NULL, lease_expires_at = NULL, \
+    let transaction = c.transaction().await?;
+    let expired = transaction.query(
+        "UPDATE scan_task_execution SET execution_status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'pending' END, \
+         assigned_scanner_id = CASE WHEN cancel_requested THEN assigned_scanner_id ELSE NULL END, lease_expires_at = NULL, \
          task_start_time = CASE WHEN cancel_requested THEN task_start_time ELSE NULL END, \
          task_end_time = CASE WHEN cancel_requested THEN (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT ELSE NULL END, \
          cancel_requested = false, failure_reason = CASE WHEN cancel_requested THEN NULL ELSE 'task lease expired' END \
-         WHERE task_status = 'running' AND lease_expires_at IS NOT NULL \
-           AND lease_expires_at < (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT;",
-        &[],
-    )
-    .await?;
+         WHERE execution_status = 'running' AND lease_expires_at IS NOT NULL \
+           AND lease_expires_at < (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT RETURNING task_id;", &[]).await?;
+    let expired_tasks: std::collections::HashSet<i32> =
+        expired.iter().map(|row| row.get("task_id")).collect();
+    for task_id in expired_tasks {
+        refresh_task_aggregate(&transaction, task_id).await?;
+    }
+    transaction.commit().await?;
 
     let row = match permissions {
         Permission::Administrator(_id) => {
