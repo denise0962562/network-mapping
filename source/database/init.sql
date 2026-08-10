@@ -219,8 +219,39 @@ INSERT INTO scan_task_execution (
 )
 SELECT task_id, id, assigned_scanner_id, assigned_scanner_id, task_status,
 	attempt_count, task_start_time, task_end_time, lease_expires_at, failure_reason, cancel_requested
-FROM scan_task
+FROM scan_task t
+WHERE NOT EXISTS (SELECT 1 FROM scan_task_execution e WHERE e.task_id = t.id)
 ON CONFLICT (execution_id) DO NOTHING;
+
+-- 早期多扫描器迁移会在服务重启时为已有任务重复补一条 execution_id=task_id 的记录。
+-- 如果任务已有其他执行记录，则将这条人工补出的记录隐藏，但保留数据供审计。
+UPDATE scan_task_execution e SET
+	execution_status = 'superseded',
+	lease_expires_at = NULL,
+	cancel_requested = false,
+	failure_reason = COALESCE(failure_reason, 'duplicate execution superseded during migration')
+FROM scan_task t
+WHERE e.task_id = t.id AND e.execution_id = t.task_id
+	AND EXISTS (SELECT 1 FROM scan_task_execution other WHERE other.task_id = e.task_id AND other.id <> e.id);
+
+-- 额外防御：同一任务不能同时有多条归属于同一扫描器的运行记录。
+WITH duplicate_running AS (
+	SELECT e.id, ROW_NUMBER() OVER (
+		PARTITION BY e.task_id, e.assigned_scanner_id
+		ORDER BY (e.execution_id = t.task_id), e.id
+	) AS duplicate_rank
+	FROM scan_task_execution e
+	JOIN scan_task t ON t.id = e.task_id
+	WHERE e.execution_status = 'running' AND e.assigned_scanner_id IS NOT NULL
+)
+UPDATE scan_task_execution e SET
+	execution_status = 'superseded',
+	task_end_time = COALESCE(task_end_time, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT),
+	lease_expires_at = NULL,
+	cancel_requested = false,
+	failure_reason = COALESCE(failure_reason, 'duplicate running execution superseded during migration')
+FROM duplicate_running d
+WHERE e.id = d.id AND d.duplicate_rank > 1;
 
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS execution_id INT;
 UPDATE ips i SET execution_id = e.id
@@ -237,6 +268,9 @@ EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
 	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
+	ON scan_task_execution (task_id, assigned_scanner_id)
+	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
 
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS cpu_model TEXT;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;

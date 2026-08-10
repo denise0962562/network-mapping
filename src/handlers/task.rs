@@ -206,7 +206,7 @@ pub(crate) async fn scanner_heartbeat_handler(
             .query_opt(
                 "SELECT t.task_id FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
                  WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
-                 AND e.execution_status = 'running' AND e.cancel_requested = true;",
+                 AND e.execution_status = 'running' AND e.cancel_requested = true LIMIT 1;",
                 &[&task_id.to_string(), &scanner_id],
             )
             .await
@@ -272,7 +272,7 @@ pub(crate) async fn scanner_task_failure_handler(
         }
     };
     let changed = transaction
-        .query_opt(
+        .query(
             "UPDATE scan_task_execution SET execution_status = CASE WHEN $1::boolean OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
              task_end_time = CASE WHEN $1::boolean OR attempt_count >= 3 THEN $2::bigint ELSE NULL::bigint END, task_start_time = NULL, \
              assigned_scanner_id = CASE WHEN $1::boolean OR attempt_count >= 3 THEN assigned_scanner_id ELSE NULL END, \
@@ -289,9 +289,22 @@ pub(crate) async fn scanner_task_failure_handler(
         )
         .await;
     match changed {
-        Ok(Some(row)) => {
-            let status: String = row.get("execution_status");
-            let task_db_id: i32 = row.get("task_id");
+        Ok(rows) if !rows.is_empty() => {
+            let task_db_id: i32 = rows[0].get("task_id");
+            let retryable = rows
+                .iter()
+                .any(|row| row.get::<_, String>("execution_status") == "pending");
+            let status = if retryable { "pending" } else { "failed" };
+            if rows.len() > 1 {
+                error_logs(
+                    &req,
+                    "ScannerTaskDuplicateExecutions",
+                    &format!(
+                        "task_id={task_id} scanner_id={scanner_id} updated_executions={}",
+                        rows.len()
+                    ),
+                );
+            }
             if let Err(error) = crate::refresh_task_aggregate(&transaction, task_db_id).await {
                 error_logs(
                     &req,
@@ -306,11 +319,11 @@ pub(crate) async fn scanner_task_failure_handler(
             }
             HttpResponse::Ok().json(serde_json::json!({
                 "success": true,
-                "retryable": status == "pending",
+                "retryable": retryable,
                 "status": status,
             }))
         }
-        Ok(None) => HttpResponse::Conflict().body("task is not owned by scanner"),
+        Ok(_) => HttpResponse::Conflict().body("task is not owned by scanner"),
         Err(error) => {
             error_logs(
                 &req,
@@ -359,7 +372,7 @@ pub(crate) async fn scanner_task_cancelled_handler(
         Err(_) => return HttpResponse::InternalServerError().finish(),
     };
     let changed = transaction
-        .query_opt(
+        .query(
             "UPDATE scan_task_execution e SET execution_status = 'cancelled', task_end_time = $1, \
              lease_expires_at = NULL, cancel_requested = false, failure_reason = NULL FROM scan_task t \
              WHERE e.task_id = t.id AND t.task_id = $2 AND e.assigned_scanner_id = $3 \
@@ -368,8 +381,8 @@ pub(crate) async fn scanner_task_cancelled_handler(
         )
         .await;
     match changed {
-        Ok(Some(row)) => {
-            if crate::refresh_task_aggregate(&transaction, row.get("task_id"))
+        Ok(rows) if !rows.is_empty() => {
+            if crate::refresh_task_aggregate(&transaction, rows[0].get("task_id"))
                 .await
                 .is_err()
                 || transaction.commit().await.is_err()
@@ -378,7 +391,7 @@ pub(crate) async fn scanner_task_cancelled_handler(
             }
             HttpResponse::Ok().json(serde_json::json!({"success": true}))
         }
-        Ok(None) => HttpResponse::Conflict().body("task cancellation was not requested"),
+        Ok(_) => HttpResponse::Conflict().body("task cancellation was not requested"),
         Err(error) => {
             error_logs(
                 &req,
@@ -441,7 +454,7 @@ async fn get_task(
          FROM scan_task_execution e \
          LEFT JOIN scanner_info s ON s.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
          LEFT JOIN ips i ON i.execution_id = e.id LEFT JOIN ports p ON p.ip_id = i.ip_id \
-         LEFT JOIN scaninfo si ON si.port_id = p.port_id WHERE e.task_id = $1 \
+         LEFT JOIN scaninfo si ON si.port_id = p.port_id WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
          GROUP BY e.id, s.name, s.location ORDER BY e.id;", &[&task_pk]).await {
         Ok(rows) => rows,
         Err(error) => { error_logs(&req, "GetTaskExecutionsError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }

@@ -193,7 +193,8 @@ pub(crate) async fn retry_task(
     };
     let source_executions = match transaction
         .query(
-            "SELECT requested_scanner_id FROM scan_task_execution WHERE task_id = $1 ORDER BY id;",
+            "SELECT requested_scanner_id FROM scan_task_execution WHERE task_id = $1 \
+             AND execution_status <> 'superseded' ORDER BY id;",
             &[&source_pk],
         )
         .await
@@ -270,7 +271,8 @@ pub(crate) async fn export_task(
              FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id JOIN ips i ON i.execution_id = e.id \
              LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id LEFT JOIN ports p ON p.ip_id = i.ip_id \
              LEFT JOIN LATERAL (SELECT protocol, service, banner, scan_time FROM scaninfo WHERE port_id = p.port_id ORDER BY scan_time DESC LIMIT 1) latest ON true \
-             WHERE t.task_id = $1 AND ($2 = 1 OR t.user_id = $3) ORDER BY i.ip_address, p.port;",
+             WHERE t.task_id = $1 AND e.execution_status <> 'superseded' \
+             AND ($2 = 1 OR t.user_id = $3) ORDER BY i.ip_address, p.port;",
             &[&id, &user.role, &user.id],
         )
         .await

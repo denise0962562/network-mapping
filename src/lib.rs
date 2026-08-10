@@ -1238,7 +1238,7 @@ pub async fn refresh_task_aggregate(
             CASE WHEN COUNT(*) = 1 THEN MAX(assigned_scanner_id) ELSE NULL END AS scanner_id, \
             STRING_AGG(CASE WHEN failure_reason IS NOT NULL THEN \
                 COALESCE(assigned_scanner_id, requested_scanner_id, 'unassigned') || ': ' || failure_reason END, E'\\n') AS failures \
-          FROM scan_task_execution WHERE task_id = $1) \
+          FROM scan_task_execution WHERE task_id = $1 AND execution_status <> 'superseded') \
          UPDATE scan_task t SET \
            task_status = CASE WHEN a.running > 0 THEN 'running' WHEN a.pending > 0 THEN 'pending' \
              WHEN a.succeeded = a.total THEN 'succeeded' WHEN a.failed = a.total THEN 'failed' \
