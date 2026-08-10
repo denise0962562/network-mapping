@@ -273,12 +273,12 @@ pub(crate) async fn scanner_task_failure_handler(
     };
     let changed = transaction
         .query_opt(
-            "UPDATE scan_task_execution e SET execution_status = CASE WHEN $1::boolean OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
+            "UPDATE scan_task_execution SET execution_status = CASE WHEN $1::boolean OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
              task_end_time = CASE WHEN $1::boolean OR attempt_count >= 3 THEN $2::bigint ELSE NULL::bigint END, task_start_time = NULL, \
              assigned_scanner_id = CASE WHEN $1::boolean OR attempt_count >= 3 THEN assigned_scanner_id ELSE NULL END, \
              lease_expires_at = NULL, failure_reason = $3, cancel_requested = false \
-             FROM scan_task t WHERE e.task_id = t.id AND t.task_id = $4 AND e.assigned_scanner_id = $5 \
-             AND e.execution_status = 'running' RETURNING e.execution_status, e.task_id;",
+             WHERE task_id = (SELECT id FROM scan_task WHERE task_id = $4) AND assigned_scanner_id = $5 \
+             AND execution_status = 'running' RETURNING execution_status, task_id;",
             &[
                 &force_terminal,
                 &crate::get_unix_epoch_ms(),
