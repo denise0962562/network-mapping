@@ -265,7 +265,8 @@ pub(crate) async fn scanner_task_failure_handler(
         .query_opt(
             "UPDATE scan_task SET task_status = CASE WHEN $1::boolean OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
              task_end_time = CASE WHEN $1::boolean OR attempt_count >= 3 THEN $2::bigint ELSE NULL::bigint END, task_start_time = NULL, \
-             assigned_scanner_id = NULL, lease_expires_at = NULL, failure_reason = $3, cancel_requested = false \
+             assigned_scanner_id = CASE WHEN $1::boolean OR attempt_count >= 3 THEN assigned_scanner_id ELSE NULL END, \
+             lease_expires_at = NULL, failure_reason = $3, cancel_requested = false \
              WHERE task_id = $4 AND assigned_scanner_id = $5 AND task_status = 'running' \
              RETURNING task_status;",
             &[
