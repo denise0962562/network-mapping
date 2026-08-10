@@ -64,6 +64,23 @@ fn bearer_token(req: &HttpRequest) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+fn database_error_diagnostics(error: &tokio_postgres::Error) -> String {
+    let Some(database_error) = error.as_db_error() else {
+        return format!("{error:?}");
+    };
+
+    format!(
+        "sqlstate={} message={} detail={} hint={} table={} column={} constraint={}",
+        database_error.code().code(),
+        database_error.message(),
+        database_error.detail().unwrap_or("-"),
+        database_error.hint().unwrap_or("-"),
+        database_error.table().unwrap_or("-"),
+        database_error.column().unwrap_or("-"),
+        database_error.constraint().unwrap_or("-"),
+    )
+}
+
 #[derive(Deserialize)]
 pub struct TaskDetailQuery {
     page: Option<i64>,
@@ -246,8 +263,8 @@ pub(crate) async fn scanner_task_failure_handler(
     let force_terminal = !failure.retryable;
     let changed = connection
         .query_opt(
-            "UPDATE scan_task SET task_status = CASE WHEN $1 OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
-             task_end_time = CASE WHEN $1 OR attempt_count >= 3 THEN $2 ELSE NULL END, task_start_time = NULL, \
+            "UPDATE scan_task SET task_status = CASE WHEN $1::boolean OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
+             task_end_time = CASE WHEN $1::boolean OR attempt_count >= 3 THEN $2::bigint ELSE NULL::bigint END, task_start_time = NULL, \
              assigned_scanner_id = NULL, lease_expires_at = NULL, failure_reason = $3, cancel_requested = false \
              WHERE task_id = $4 AND assigned_scanner_id = $5 AND task_status = 'running' \
              RETURNING task_status;",
@@ -271,7 +288,11 @@ pub(crate) async fn scanner_task_failure_handler(
         }
         Ok(None) => HttpResponse::Conflict().body("task is not owned by scanner"),
         Err(error) => {
-            error_logs(&req, "ScannerTaskFailureDatabaseError", &error.to_string());
+            error_logs(
+                &req,
+                "ScannerTaskFailureDatabaseError",
+                &database_error_diagnostics(&error),
+            );
             HttpResponse::InternalServerError().finish()
         }
     }
