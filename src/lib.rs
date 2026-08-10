@@ -413,6 +413,58 @@ pub enum TargetPort<'a> {
     I(u16),
 }
 
+/// Parse either a host IP address or an IP network.
+///
+/// `IpNet` requires an explicit prefix length, while scanner results contain
+/// host addresses. Normalize host addresses to their single-host networks so
+/// both upload formats share the same validated representation.
+fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
+    let value = value.trim();
+    if value.contains('/') {
+        value.parse()
+    } else {
+        let prefix = if value.contains(':') { 128 } else { 32 };
+        format!("{value}/{prefix}").parse()
+    }
+}
+
+#[cfg(test)]
+mod parse_ip_or_cidr_tests {
+    use super::parse_ip_or_cidr;
+
+    #[test]
+    fn accepts_plain_ipv4_as_single_host_network() {
+        let parsed = parse_ip_or_cidr("221.233.151.58").unwrap();
+
+        assert_eq!(parsed.to_string(), "221.233.151.58/32");
+    }
+
+    #[test]
+    fn accepts_plain_ipv6_as_single_host_network() {
+        let parsed = parse_ip_or_cidr("2001:db8::1").unwrap();
+
+        assert_eq!(parsed.to_string(), "2001:db8::1/128");
+    }
+
+    #[test]
+    fn accepts_ipv4_and_ipv6_cidr() {
+        assert_eq!(
+            parse_ip_or_cidr("192.0.2.0/24").unwrap().to_string(),
+            "192.0.2.0/24"
+        );
+        assert_eq!(
+            parse_ip_or_cidr("2001:db8::/48").unwrap().to_string(),
+            "2001:db8::/48"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ip() {
+        assert!(parse_ip_or_cidr("not-an-ip").is_err());
+        assert!(parse_ip_or_cidr("192.0.2.1/99").is_err());
+    }
+}
+
 /// 该函数用于解析ip地址，
 /// 可以接收传入字符串IP，会自动解析，然后返回一个向量
 fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
@@ -420,16 +472,7 @@ fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
     match ip {
         TargetIP::S(i_str) => {
             for tmp in i_str.split(",") {
-                let mut t = tmp.to_string();
-                if t.contains("/") {
-                    ()
-                } else if t.contains(":") {
-                    t.push_str("/128");
-                } else {
-                    t.push_str("/32");
-                }
-                let t = (&t).parse::<IpNet>();
-                match t {
+                match parse_ip_or_cidr(tmp) {
                     Ok(o) => n_v.push(o),
                     Err(e) => {
                         error!(event = "PARSING-ERROR", message = e.to_string());
@@ -1137,13 +1180,11 @@ pub async fn save_scanner_results(
     let mut saved = 0usize;
 
     for item in &upload.results {
-        let parsed_ip: IpNet =
-            item.ip
-                .parse()
-                .map_err(|source| SaveScannerResultsError::InvalidIp {
-                    ip: item.ip.clone(),
-                    source,
-                })?;
+        let parsed_ip =
+            parse_ip_or_cidr(&item.ip).map_err(|source| SaveScannerResultsError::InvalidIp {
+                ip: item.ip.clone(),
+                source,
+            })?;
         let ip_addr = parsed_ip.addr();
         let intel = maxmind.lookup(ip_addr);
         let ip_text = parsed_ip.to_string();
