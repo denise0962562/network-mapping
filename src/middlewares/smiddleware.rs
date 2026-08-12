@@ -16,7 +16,7 @@ use crate::logs::write::info_logs;
 use tracing::{error, info};
 
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
-use crate::frontend::is_protected_frontend_path;
+use crate::frontend::{FrontendAssets, is_protected_frontend_path};
 use crate::middlewares::{get_pool_from_app_data, is_scanner_api_path};
 use uuid::Uuid;
 
@@ -88,9 +88,15 @@ where
 
         let frontend_page =
             matches!(req.method().as_str(), "GET" | "HEAD") && is_protected_frontend_path(&path);
+        let frontend_page_available = !frontend_page
+            || req
+                .app_data::<actix_web::web::Data<FrontendAssets>>()
+                .map(|assets| assets.has_page_for_path(&path))
+                .unwrap_or(true);
         let need_check = path != "/api/login"
             && !is_scanner_api_path(&path)
-            && (frontend_page || path_list.iter().any(|prefix| path.starts_with(prefix)));
+            && ((frontend_page && frontend_page_available)
+                || path_list.iter().any(|prefix| path.starts_with(prefix)));
 
         info!(
             event = "received_requests",

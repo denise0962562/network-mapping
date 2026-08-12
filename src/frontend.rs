@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use actix_files::{Files, NamedFile};
 use actix_web::http::{Method, header};
 use actix_web::{HttpRequest, HttpResponse, web};
+use tracing::warn;
 use uuid::{Variant, Version};
 
 const SPA_ROUTES: &[&str] = &[
@@ -28,39 +29,64 @@ pub struct FrontendAssets {
 }
 
 impl FrontendAssets {
-    pub fn new(directory: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
         let directory = directory.into();
         for file_name in REQUIRED_FRONTEND_FILES {
             let path = directory.join(file_name);
             if !path.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("缺少前端构建文件：{}", path.display()),
-                ));
+                warn!(
+                    target: "server::startup",
+                    path = %path.display(),
+                    "缺少前端构建文件，对应页面将返回 404"
+                );
             }
         }
 
         let asset_directory = directory.join("assets");
         if !asset_directory.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("缺少前端资源目录：{}", asset_directory.display()),
-            ));
+            warn!(
+                target: "server::startup",
+                path = %asset_directory.display(),
+                "缺少前端资源目录，静态资源请求将返回 404"
+            );
         }
 
-        Ok(Self { directory })
+        Self { directory }
     }
 
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+
+    pub fn has_page_for_path(&self, path: &str) -> bool {
+        let file_name = if is_spa_path(path) {
+            "index.html"
+        } else if path == "/search.html" {
+            "search.html"
+        } else {
+            return true;
+        };
+
+        self.directory.join(file_name).is_file()
+    }
 }
 
-pub fn assets_service(directory: impl AsRef<Path>) -> Files {
-    Files::new("/assets", directory.as_ref().join("assets"))
-        .use_etag(true)
-        .use_last_modified(true)
-        .prefer_utf8(true)
+pub fn configure_assets(cfg: &mut web::ServiceConfig, directory: impl AsRef<Path>) {
+    let asset_directory = directory.as_ref().join("assets");
+    if asset_directory.is_dir() {
+        cfg.service(
+            Files::new("/assets", asset_directory)
+                .use_etag(true)
+                .use_last_modified(true)
+                .prefer_utf8(true),
+        );
+    } else {
+        cfg.service(
+            web::resource("/assets/{path:.*}")
+                .route(web::get().to(HttpResponse::NotFound))
+                .route(web::head().to(HttpResponse::NotFound)),
+        );
+    }
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -191,7 +217,9 @@ async fn html_response(
         return Ok(HttpResponse::NotAcceptable().finish());
     }
 
-    let file = NamedFile::open_async(assets.directory().join(file_name)).await?;
+    let Some(file) = open_frontend_file(assets.directory().join(file_name)).await? else {
+        return Ok(HttpResponse::NotFound().finish());
+    };
     if req.method() == Method::HEAD {
         return Ok(HttpResponse::Ok()
             .insert_header((header::CONTENT_TYPE, file.content_type().to_string()))
@@ -211,7 +239,9 @@ async fn favicon(
     req: HttpRequest,
     assets: web::Data<FrontendAssets>,
 ) -> actix_web::Result<HttpResponse> {
-    let file = NamedFile::open_async(assets.directory().join("favicon.ico")).await?;
+    let Some(file) = open_frontend_file(assets.directory().join("favicon.ico")).await? else {
+        return Ok(HttpResponse::NotFound().finish());
+    };
     if req.method() == Method::HEAD {
         return Ok(HttpResponse::Ok()
             .insert_header((header::CONTENT_TYPE, file.content_type().to_string()))
@@ -221,10 +251,18 @@ async fn favicon(
     Ok(file.into_response(&req))
 }
 
+async fn open_frontend_file(path: PathBuf) -> actix_web::Result<Option<NamedFile>> {
+    match NamedFile::open_async(path).await {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FrontendAssets, accepts_html, assets_service, configure, is_frontend_resource_path,
+        FrontendAssets, accepts_html, configure, configure_assets, is_frontend_resource_path,
         is_spa_path,
     };
     use actix_web::{App, HttpResponse, http::StatusCode, test as actix_test, web};
@@ -289,12 +327,12 @@ mod tests {
     #[actix_web::test]
     async fn explicit_routes_serve_spa_without_global_fallback() {
         let directory = frontend_fixture();
-        let assets = FrontendAssets::new(&directory).expect("valid frontend fixture");
+        let assets = FrontendAssets::new(&directory);
         let app = actix_test::init_service(
             App::new()
                 .app_data(web::Data::new(assets))
                 .configure(configure)
-                .service(assets_service(&directory))
+                .configure(|cfg| configure_assets(cfg, &directory))
                 .default_service(web::to(|| async { HttpResponse::NotFound().finish() })),
         )
         .await;
@@ -365,7 +403,7 @@ mod tests {
     #[actix_web::test]
     async fn html_entry_rejects_json_only_clients() {
         let directory = frontend_fixture();
-        let assets = FrontendAssets::new(&directory).expect("valid frontend fixture");
+        let assets = FrontendAssets::new(&directory);
         let app = actix_test::init_service(
             App::new()
                 .app_data(web::Data::new(assets))
@@ -382,5 +420,38 @@ mod tests {
             StatusCode::NOT_ACCEPTABLE
         );
         fs::remove_dir_all(directory).expect("remove frontend fixture");
+    }
+
+    #[actix_web::test]
+    async fn missing_frontend_files_do_not_prevent_404_service() {
+        let directory = std::env::temp_dir().join(format!(
+            "network-mapping-missing-frontend-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let assets = FrontendAssets::new(&directory);
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(assets))
+                .configure(configure)
+                .configure(|cfg| configure_assets(cfg, &directory)),
+        )
+        .await;
+
+        let page_request = actix_test::TestRequest::get()
+            .uri("/audit")
+            .insert_header(("Accept", "text/html"))
+            .to_request();
+        assert_eq!(
+            actix_test::call_service(&app, page_request).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let asset_request = actix_test::TestRequest::get()
+            .uri("/assets/app.js")
+            .to_request();
+        assert_eq!(
+            actix_test::call_service(&app, asset_request).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

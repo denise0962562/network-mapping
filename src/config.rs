@@ -183,7 +183,7 @@ pub struct TemplatesConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct FrontendConfig {
-    /// Vite 生产构建目录，必须包含 index.html、login.html、search.html 和 assets/。
+    /// Vite 生产构建目录；文件缺失时对应页面或资源返回 404。
     pub directory: PathBuf,
 }
 

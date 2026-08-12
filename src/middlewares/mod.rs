@@ -118,6 +118,7 @@ mod tests {
     use super::{
         csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, smiddleware::AuthMiddleware,
     };
+    use crate::frontend::{self, FrontendAssets};
     use actix_web::{App, HttpResponse, http::StatusCode, test as actix_test, web};
 
     #[test]
@@ -183,6 +184,30 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("/login")
         );
+    }
+
+    #[actix_web::test]
+    async fn missing_protected_frontend_entry_returns_404_before_authentication() {
+        let directory = std::env::temp_dir().join(format!(
+            "network-mapping-missing-auth-frontend-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(FrontendAssets::new(directory)))
+                .wrap(AuthMiddleware)
+                .configure(frontend::configure),
+        )
+        .await;
+
+        let request = actix_test::TestRequest::get()
+            .uri("/audit")
+            .insert_header(("Accept", "text/html"))
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get("location").is_none());
     }
 
     #[actix_web::test]

@@ -111,7 +111,7 @@ async fn main() -> io::Result<()> {
     let mail_c = config.email_config;
 
     let tls = build_acceptor(&config.tls)?;
-    let frontend_assets = FrontendAssets::new(frontend_directory)?;
+    let frontend_assets = FrontendAssets::new(frontend_directory);
     let frontend_directory = frontend_assets.directory().to_path_buf();
     let frontend_assets = web::Data::new(frontend_assets);
 
@@ -213,7 +213,7 @@ async fn main() -> io::Result<()> {
             })
             .configure(config::init_routes)
             .configure(frontend::configure)
-            .service(frontend::assets_service(&frontend_directory))
+            .configure(|cfg| frontend::configure_assets(cfg, &frontend_directory))
             .default_service(web::to(rust_web_test::handlers::utils::not_found))
     })
     .bind_openssl((server_host, server_port), tls)?
