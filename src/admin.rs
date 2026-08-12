@@ -205,11 +205,10 @@ pub async fn check_system_user(pool: &deadpool_postgres::Pool) {
                 path = "fn check_system_role",
                 message = "没有找到系统用户，正在创建一个新的系统用户"
             );
-            println!("没有找到系统用户，正在创建一个新的系统用户");
             create_system_user(&pool).await;
         }
         1 => {
-            println!("找到系统用户")
+            info!(event = "SystemRoleFound", "系统用户检查通过")
         }
         _ => {
             panic!("找到多个系统用户，请手动清理多余的系统用户!");
@@ -234,7 +233,6 @@ pub async fn create_system_user(pool: &deadpool_postgres::Pool) {
         path = "fn create_system_user",
         message = "创建系统用户成功"
     );
-    println!("创建系统用户成功");
     transaction.commit().await.unwrap();
 }
 
@@ -262,10 +260,9 @@ pub async fn check_default_admin_user(
                 path = "fn check_default_admin_user",
                 message = "没有找到管理员用户，正在创建一个默认管理员用户"
             );
-            println!("没有找到管理员用户，正在创建一个默认管理员用户");
             create_default_admin_user(pool, pwd_hash_config).await;
         }
-        _ => println!("找到管理员用户"),
+        _ => info!(event = "AdminRoleFound", "管理员用户检查通过"),
     }
 }
 
@@ -368,7 +365,7 @@ pub async fn create_default_admin_user(
         .await
         .unwrap();
     if row.get::<_, i64>("count") > 0 {
-        println!("找到管理员用户");
+        info!(event = "AdminRoleFound", "管理员用户已由其他进程创建");
         transaction.commit().await.unwrap();
         return;
     }
@@ -412,8 +409,9 @@ pub async fn create_default_admin_user(
         message = "创建默认管理员用户成功"
     );
 
-    println!("创建默认管理员用户成功，用户名：{}", username);
-    println!("默认管理员随机初始密码：{}，请登录后尽快修改", password);
+    println!(
+        "\n┌─ 初始管理员凭据 ─────────────────────────\n│ 用户名：{username}\n│ 密码：  {password}\n│ 请登录后尽快修改；该密码不会写入日志。\n└──────────────────────────────────────────\n"
+    );
 
     transaction.commit().await.unwrap();
 }

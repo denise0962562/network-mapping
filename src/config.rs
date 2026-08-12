@@ -8,6 +8,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
 };
+use tracing::info;
 
 use crate::handlers::{self, user, utils};
 use crate::{decrypt_data, encrypt_data};
@@ -95,7 +96,7 @@ impl SelfChecking for SecurityConfig {
         if let Err(error) = self.try_check() {
             panic!("{error}");
         }
-        println!("[security] 通过检查");
+        info!(component = "security", "配置检查通过");
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -132,7 +133,7 @@ impl SelfChecking for ServerConfig {
             ),
         }
 
-        println!("[server] 通过检查");
+        info!(component = "server", "配置检查通过");
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -200,7 +201,7 @@ impl SelfChecking for DatabaseConfig {
             panic!("数据库关键字段为空")
         }
 
-        println!("[database] 通过检查");
+        info!(component = "database", "配置检查通过");
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {

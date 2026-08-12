@@ -3,7 +3,7 @@ use clap::Parser;
 use core::panic;
 use std::io;
 use tokio::time::{Duration, Instant, interval_at};
-use tracing::error;
+use tracing::{error, info};
 
 use rust_web_test::admin::{check_default_admin_user, check_system_user, reset_admin_password};
 use rust_web_test::audit::RequestId;
@@ -22,12 +22,24 @@ use rust_web_test::{Systems, TemplatesInit, config, db, insert_system_status};
 async fn main() -> io::Result<()> {
     let args = Clis::parse();
 
-    println!("开始加载配置文件。");
     let config = config::Config::from_file(&args.config);
 
-    println!("配置文件加载完毕。");
+    let log_file_rolling = match config.log.file_rolling {
+        0 => LogRollingMode::Daily,
+        1 => LogRollingMode::Hourly,
+        2 => LogRollingMode::Minutely,
+        _ => LogRollingMode::Never,
+    };
+    let log_debug_mode = args.debug_model;
+    let _guard = logs::init::init(
+        &config.log.directory,
+        &config.log.file_name,
+        &log_file_rolling,
+        &log_debug_mode,
+    );
+    info!(config_path = %args.config, "配置文件已加载");
+    info!("日志系统已启动");
     config.check();
-    println!();
 
     let ser_con = config.server.clone();
     let server = config.server;
@@ -38,13 +50,6 @@ async fn main() -> io::Result<()> {
     let log = config.log;
     let log_file_directory = log.directory;
     let log_file_name = log.file_name;
-    let log_file_rolling = match log.file_rolling {
-        0 => LogRollingMode::Daily,
-        1 => LogRollingMode::Hourly,
-        2 => LogRollingMode::Minutely,
-        _ => LogRollingMode::Never,
-    };
-    let log_debug_mode = args.debug_model;
 
     //模板系统配置
     let template = config.templates;
@@ -53,13 +58,6 @@ async fn main() -> io::Result<()> {
         templates_name: template.templates_name,
     };
 
-    let _guard = logs::init::init(
-        &log_file_directory,
-        &log_file_name,
-        &log_file_rolling,
-        &log_debug_mode,
-    );
-    println!("日志系统已启动");
     let db_config = config.database;
     let database_c = db_config.clone();
     let database_c2 = db_config.clone();
@@ -77,9 +75,9 @@ async fn main() -> io::Result<()> {
     if let Some(username) = args.reset_admin_password.as_deref() {
         match reset_admin_password(username, &db_pool, config.pwd_hash.clone()).await {
             Ok(password) => {
-                println!("管理员 {} 的密码已重置。", username);
-                println!("新的随机密码：{}", password);
-                println!("请妥善保存该密码；它不会被写入日志。\n");
+                println!(
+                    "\n┌─ 管理员密码已重置 ───────────────────────\n│ 用户名：{username}\n│ 新密码：{password}\n│ 请妥善保存；该密码不会写入日志。\n└──────────────────────────────────────────\n"
+                );
                 return Ok(());
             }
             Err(error) => {
@@ -90,11 +88,11 @@ async fn main() -> io::Result<()> {
     }
 
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
-        Ok(_) => println!("初始化数据库成功"),
+        Ok(_) => info!("数据库结构初始化完成"),
         Err(e) => panic!("初始化数据库错误{}", e),
     };
 
-    println!("开始检查系统配置");
+    info!("正在检查系统账户");
 
     check_system_user(&db_pool).await;
 
@@ -117,22 +115,18 @@ async fn main() -> io::Result<()> {
             .map_err(|error| io::Error::other(format!("开源项目清单格式错误: {error}")))?,
     );
 
-    println!("服务已启动");
-    println!("监听 {}:{}", server_host, server_port);
-    println!(
-        "监听地址：{}\n端口：{}\n日志使用的目录：{}\n日志文件名：{}\n日志文件滚动周期模式：{}\n日志系统调试模式：{}",
-        &server_host,
-        &server_port,
-        &log_file_directory,
-        &log_file_name,
-        &log.file_rolling,
-        &log_debug_mode
+    info!(
+        address = %format!("{}:{}", server_host, server_port),
+        log_directory = %log_file_directory,
+        log_file = %log_file_name,
+        log_rolling_mode = log.file_rolling,
+        debug = log_debug_mode,
+        template_directory = %template_info.templates_directory,
+        template_name = %template_info.templates_name,
+        status_interval_seconds = log.status_duration,
+        "服务配置就绪"
     );
-    println!(
-        "模板目录：{}\n模板文件名：{}",
-        template_info.templates_directory, template_info.templates_name
-    );
-    println!("系统信息采集频率：{}", log.status_duration);
+    info!(address = %format!("https://{}:{}", server_host, server_port), "HTTPS 服务开始监听");
 
     // 暂时取消等待
     // 计算下一个 2 分钟整点
