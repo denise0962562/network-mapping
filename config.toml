@@ -24,6 +24,10 @@ status_duration = 5                                      # 系统信息采集频
 templates_directory = "templates/**/*.html"
 templates_name = "error.html"
 
+[frontend]
+# Vite 生产构建目录；相对路径以本配置文件所在目录为基准
+directory = "../network-mapping-vue/dist"
+
 [database]
 host = "127.0.0.1"
 port = 5432

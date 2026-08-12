@@ -50,6 +50,7 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
+        let immutable_asset = req.path().starts_with("/assets/");
         let fut = self.service.call(req);
 
         Box::pin(async move {
@@ -65,6 +66,12 @@ where
                     "default-src \'self\';style-src 'self' 'unsafe-inline';",
                 ), // 暂时允许内联css
             );
+            if immutable_asset && res.status().is_success() {
+                res.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+                );
+            }
             res.headers_mut().insert(
                 header::X_FRAME_OPTIONS,
                 header::HeaderValue::from_static("DENY"),

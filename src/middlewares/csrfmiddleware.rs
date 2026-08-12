@@ -9,6 +9,7 @@ use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::logs::write::warn_logs;
 use crate::{
     TemplatesInit,
+    frontend::is_frontend_resource_path,
     middlewares::{get_pool_from_app_data, is_scanner_api_path, render_500, render_500_simple},
 };
 
@@ -68,10 +69,15 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let svc = self.service.clone();
         let path = req.path().to_owned();
-        let pass = is_scanner_api_path(&path);
+        let csrf_protected_get = matches!(
+            path.as_str(),
+            "/logout" | "/test/adduser" | "/api/totp/bind" | "/api/updaterir"
+        );
+        let safe_method = matches!(req.method().as_str(), "GET" | "HEAD") && !csrf_protected_get;
+        let pass = is_scanner_api_path(&path) || is_frontend_resource_path(&path) || safe_method;
 
         Box::pin(async move {
-            // 如果路径是扫描器相关直接放行
+            // 扫描器接口、前端资源和无副作用的 GET/HEAD 请求无需 CSRF 校验。
             if pass {
                 return Ok(svc.call(req).await?.map_into_left_body());
             }

@@ -2,6 +2,7 @@ pub mod admin;
 pub mod audit;
 pub mod config;
 pub mod db;
+pub mod frontend;
 pub mod handlers;
 pub mod login;
 pub mod logs;

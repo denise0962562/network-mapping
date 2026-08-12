@@ -55,6 +55,22 @@ cargo run -- --verbose
 DEBUG 级别日志时，可组合使用 `--verbose --debug-model`，也可以通过 `RUST_LOG` 指定
 过滤规则。
 
+## 前端页面托管
+
+服务端直接托管 Vue/Vite 的生产构建产物。先在 `network-mapping-vue/` 中执行
+`pnpm build`，再通过配置指定构建目录；相对路径以服务端配置文件所在目录为基准：
+
+```toml
+[frontend]
+directory = "../network-mapping-vue/dist"
+```
+
+服务端只为已声明的 Vue Router 页面路径返回 `index.html`，包括 `/task/{uuid-v7}` 和
+`/scanner/{uuid}` 等动态详情路径。`/login`、`/search.html` 使用各自的独立入口，
+`/assets/*` 只提供实际存在的构建资源。未知路径、错误格式的详情路径、未匹配 API
+和缺失资源均返回真实的 HTTP 404，不会回退到 SPA 页面。未登录访问受保护页面时会
+重定向至 `/login`，API 的未认证响应仍为 401。
+
 ## 扫描器调度
 
 创建任务接口 `POST /api/task/create` 支持 `dispatch_mode`：`automatic` 由下一台可用扫描器领取一次，`selected` 配合 `scanner_ids` 指定一台或多台扫描器，`all` 会为创建时所有已启用扫描器分别创建执行实例。离线的指定扫描器会在重新上线后领取任务。

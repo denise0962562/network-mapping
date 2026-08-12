@@ -8,6 +8,7 @@ use tracing::{error, info};
 use rust_web_test::admin::{check_default_admin_user, check_system_user, reset_admin_password};
 use rust_web_test::audit::RequestId;
 use rust_web_test::config::{Clis, SelfChecking};
+use rust_web_test::frontend::{self, FrontendAssets};
 use rust_web_test::logs::{self, LogRollingMode};
 use rust_web_test::maxmind::MaxMindState;
 use rust_web_test::middlewares::{
@@ -45,6 +46,7 @@ async fn main() -> io::Result<()> {
         "日志系统已启动"
     );
     config.check();
+    let frontend_directory = config.frontend.directory.clone();
 
     let ser_con = config.server.clone();
     let server = config.server;
@@ -109,6 +111,9 @@ async fn main() -> io::Result<()> {
     let mail_c = config.email_config;
 
     let tls = build_acceptor(&config.tls)?;
+    let frontend_assets = FrontendAssets::new(frontend_directory)?;
+    let frontend_directory = frontend_assets.directory().to_path_buf();
+    let frontend_assets = web::Data::new(frontend_assets);
 
     let sys = Systems::new();
     let sys_2 = sys.clone();
@@ -128,6 +133,7 @@ async fn main() -> io::Result<()> {
         debug = log_debug_mode,
         template_directory = %template_info.templates_directory,
         template_name = %template_info.templates_name,
+        frontend_directory = %frontend_directory.display(),
         status_interval_seconds = log.status_duration,
         "服务配置就绪"
     );
@@ -180,6 +186,7 @@ async fn main() -> io::Result<()> {
             .app_data(maxmind_state.clone())
             .app_data(open_source_catalog.clone())
             .app_data(security.clone())
+            .app_data(frontend_assets.clone())
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
@@ -205,6 +212,9 @@ async fn main() -> io::Result<()> {
                 }
             })
             .configure(config::init_routes)
+            .configure(frontend::configure)
+            .service(frontend::assets_service(&frontend_directory))
+            .default_service(web::to(rust_web_test::handlers::utils::not_found))
     })
     .bind_openssl((server_host, server_port), tls)?
     .run()

@@ -29,6 +29,8 @@ pub struct Config {
     pub tls: TlsConfig,
     pub log: LogConfig,
     pub templates: TemplatesConfig,
+    #[serde(default)]
+    pub frontend: FrontendConfig,
     // pub scan_target_generated: ScanTargetConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
@@ -179,6 +181,30 @@ pub struct TemplatesConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct FrontendConfig {
+    /// Vite 生产构建目录，必须包含 index.html、login.html、search.html 和 assets/。
+    pub directory: PathBuf,
+}
+
+impl Default for FrontendConfig {
+    fn default() -> Self {
+        Self {
+            directory: PathBuf::from("../network-mapping-vue/dist"),
+        }
+    }
+}
+
+impl FrontendConfig {
+    fn resolve_relative_to(&mut self, config_path: &Path) {
+        if self.directory.is_relative() {
+            let base_directory = config_path.parent().unwrap_or_else(|| Path::new(""));
+            self.directory = base_directory.join(&self.directory);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub host: String,               //数据库主机地址
     pub port: u16,                  //数据库端口
@@ -238,13 +264,14 @@ impl Config {
         let content = fs::read_to_string(path).expect("无法读取配置文件");
         let mut config: Self = toml::from_str(&content).expect("配置文件格式错误");
         config.tls.resolve_relative_to(path);
+        config.frontend.resolve_relative_to(path);
         config
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Clis, SecurityConfig, SelfChecking, TlsConfig};
+    use super::{Clis, FrontendConfig, SecurityConfig, SelfChecking, TlsConfig};
     use clap::Parser;
     use std::path::{Path, PathBuf};
 
@@ -281,6 +308,20 @@ mod tests {
             PathBuf::from("/run/secrets/cert.pem")
         );
         assert_eq!(tls.private_key_file, PathBuf::from("/run/secrets/key.pem"));
+    }
+
+    #[test]
+    fn frontend_directory_is_resolved_relative_to_config_file() {
+        let mut frontend = FrontendConfig {
+            directory: PathBuf::from("../frontend/dist"),
+        };
+
+        frontend.resolve_relative_to(Path::new("/etc/network-mapping/config.toml"));
+
+        assert_eq!(
+            frontend.directory,
+            PathBuf::from("/etc/network-mapping/../frontend/dist")
+        );
     }
 
     #[test]
@@ -356,8 +397,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::operations::delete_scanner)
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
-        .service(utils::test_mail_server_h)
-        .default_service(web::to(handlers::utils::not_found));
+        .service(utils::test_mail_server_h);
 
     #[cfg(feature = "rir")]
     cfg.service(handlers::utils::update_rir);

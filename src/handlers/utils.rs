@@ -47,7 +47,17 @@ async fn benchmark_route(
     "Benchmark finished, check server logs."
 }
 
-pub async fn not_found(page_template: web::Data<TemplatesInit>) -> impl Responder {
+pub async fn not_found(
+    req: HttpRequest,
+    page_template: web::Data<TemplatesInit>,
+) -> impl Responder {
+    if req.path() == "/api" || req.path().starts_with("/api/") {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "message": "not found"
+        }));
+    }
+
     let error_info = FrontEndErrorInfo {
         status_code: 404,
         error_title: "NotFound",
