@@ -36,9 +36,14 @@ async fn main() -> io::Result<()> {
         &config.log.file_name,
         &log_file_rolling,
         &log_debug_mode,
+        args.terminal_verbose,
     );
-    info!(config_path = %args.config, "配置文件已加载");
-    info!("日志系统已启动");
+    info!(target: "server::startup", config_path = %args.config, "配置文件已加载");
+    info!(
+        target: "server::startup",
+        terminal_mode = if args.terminal_verbose { "详细" } else { "精简" },
+        "日志系统已启动"
+    );
     config.check();
 
     let ser_con = config.server.clone();
@@ -88,11 +93,11 @@ async fn main() -> io::Result<()> {
     }
 
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
-        Ok(_) => info!("数据库结构初始化完成"),
+        Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(e) => panic!("初始化数据库错误{}", e),
     };
 
-    info!("正在检查系统账户");
+    info!(target: "server::startup", "正在检查系统账户");
 
     check_system_user(&db_pool).await;
 
@@ -115,7 +120,7 @@ async fn main() -> io::Result<()> {
             .map_err(|error| io::Error::other(format!("开源项目清单格式错误: {error}")))?,
     );
 
-    info!(
+    info!(target: "server::startup",
         address = %format!("{}:{}", server_host, server_port),
         log_directory = %log_file_directory,
         log_file = %log_file_name,
@@ -126,7 +131,7 @@ async fn main() -> io::Result<()> {
         status_interval_seconds = log.status_duration,
         "服务配置就绪"
     );
-    info!(address = %format!("https://{}:{}", server_host, server_port), "HTTPS 服务开始监听");
+    info!(target: "server::startup", address = %format!("https://{}:{}", server_host, server_port), "HTTPS 服务开始监听");
 
     // 暂时取消等待
     // 计算下一个 2 分钟整点

@@ -208,7 +208,7 @@ pub async fn check_system_user(pool: &deadpool_postgres::Pool) {
             create_system_user(&pool).await;
         }
         1 => {
-            info!(event = "SystemRoleFound", "系统用户检查通过")
+            info!(target: "server::startup", event = "SystemRoleFound", "系统用户检查通过")
         }
         _ => {
             panic!("找到多个系统用户，请手动清理多余的系统用户!");
@@ -228,7 +228,7 @@ pub async fn create_system_user(pool: &deadpool_postgres::Pool) {
         )
         .await
         .unwrap();
-    info!(
+    info!(target: "server::startup",
         event = "CreateSystemUser",
         path = "fn create_system_user",
         message = "创建系统用户成功"
@@ -262,7 +262,7 @@ pub async fn check_default_admin_user(
             );
             create_default_admin_user(pool, pwd_hash_config).await;
         }
-        _ => info!(event = "AdminRoleFound", "管理员用户检查通过"),
+        _ => info!(target: "server::startup", event = "AdminRoleFound", "管理员用户检查通过"),
     }
 }
 
@@ -365,7 +365,7 @@ pub async fn create_default_admin_user(
         .await
         .unwrap();
     if row.get::<_, i64>("count") > 0 {
-        info!(event = "AdminRoleFound", "管理员用户已由其他进程创建");
+        info!(target: "server::startup", event = "AdminRoleFound", "管理员用户已由其他进程创建");
         transaction.commit().await.unwrap();
         return;
     }
@@ -402,7 +402,7 @@ pub async fn create_default_admin_user(
         .await
         .unwrap();
 
-    info!(
+    info!(target: "server::startup",
         event = "CreateDefaultAdminUser",
         path = "fn create_default_admin_user",
         username,

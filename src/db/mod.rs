@@ -40,11 +40,11 @@ pub async fn create_postgresql_pool(
         queue_mode: deadpool::managed::QueueMode::Lifo,
     });
     let pool = db_poll_cfg.create_pool(None, tokio_postgres::NoTls)?;
-    info!("正在检查数据库连接");
+    info!(target: "server::startup", "正在检查数据库连接");
     match pool.get().await {
         Ok(_conn) => {
             // _conn 是一个 deadpool::managed::Object，它会在离开作用域时自动返回池中
-            info!("数据库连接成功，连接池可用");
+            info!(target: "server::startup", "数据库连接成功，连接池可用");
         }
         Err(e) => {
             // 如果连接失败，这里会返回错误

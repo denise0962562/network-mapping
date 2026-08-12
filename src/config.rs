@@ -96,7 +96,7 @@ impl SelfChecking for SecurityConfig {
         if let Err(error) = self.try_check() {
             panic!("{error}");
         }
-        info!(component = "security", "配置检查通过");
+        info!(target: "server::startup", component = "security", "配置检查通过");
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -133,7 +133,7 @@ impl SelfChecking for ServerConfig {
             ),
         }
 
-        info!(component = "server", "配置检查通过");
+        info!(target: "server::startup", component = "server", "配置检查通过");
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -201,7 +201,7 @@ impl SelfChecking for DatabaseConfig {
             panic!("数据库关键字段为空")
         }
 
-        info!(component = "database", "配置检查通过");
+        info!(target: "server::startup", component = "database", "配置检查通过");
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -244,7 +244,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{SecurityConfig, SelfChecking, TlsConfig};
+    use super::{Clis, SecurityConfig, SelfChecking, TlsConfig};
+    use clap::Parser;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -293,6 +294,21 @@ mod tests {
 
         assert!(short.try_check().is_err());
         assert!(valid.try_check().expect("valid pepper"));
+    }
+
+    #[test]
+    fn terminal_logging_is_concise_by_default() {
+        let cli = Clis::try_parse_from(["networkm"]).expect("default CLI should parse");
+
+        assert!(!cli.terminal_verbose);
+    }
+
+    #[test]
+    fn verbose_flag_enables_detailed_terminal_logging() {
+        let cli =
+            Clis::try_parse_from(["networkm", "--verbose"]).expect("verbose CLI flag should parse");
+
+        assert!(cli.terminal_verbose);
     }
 }
 
@@ -442,9 +458,13 @@ pub struct Clis {
     #[arg(long, default_value = "config.toml")]
     pub config: String,
 
-    /// 调试模式，该模式可以输出详细的信息
+    /// 启用 DEBUG 日志级别和源码位置；完整终端日志还需配合 --verbose
     #[arg(short, long, default_value = "false")]
     pub debug_model: bool,
+
+    /// 在终端输出完整日志；默认仅显示启动摘要、警告和错误
+    #[arg(short = 'v', long = "verbose")]
+    pub terminal_verbose: bool,
 
     /// 重置指定管理员的密码，并在终端显示新的随机密码后退出
     #[arg(long, value_name = "USERNAME")]
