@@ -271,7 +271,8 @@ pub(crate) async fn export_task(
     let rows = match connection
         .query(
             "SELECT e.execution_id, e.assigned_scanner_id, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name, \
-             host(i.ip_address) AS ip, i.asn, i.isp, p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
+             host(i.ip_address) AS ip, i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name, \
+             p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
              FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id JOIN ips i ON i.execution_id = e.id \
              LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id LEFT JOIN ports p ON p.ip_id = i.ip_id \
              LEFT JOIN LATERAL (SELECT protocol, service, banner, scan_time FROM scaninfo WHERE port_id = p.port_id ORDER BY scan_time DESC LIMIT 1) latest ON true \
@@ -292,13 +293,15 @@ pub(crate) async fn export_task(
             "execution_id": row.get::<_, String>("execution_id"), "scanner_id": row.get::<_, Option<String>>("assigned_scanner_id"),
             "scanner_name": row.get::<_, Option<String>>("scanner_name"), "ip": row.get::<_, String>("ip"), "asn": row.get::<_, Option<String>>("asn"),
             "isp": row.get::<_, Option<String>>("isp"), "port": row.get::<_, Option<i32>>("port"),
+            "as_org": row.get::<_, Option<String>>("as_org"), "country_code": row.get::<_, Option<String>>("country_code"),
+            "country_name": row.get::<_, Option<String>>("country_name"), "city_name": row.get::<_, Option<String>>("city_name"),
             "protocol": row.get::<_, Option<String>>("protocol"), "service": row.get::<_, Option<String>>("service"),
             "banner": row.get::<_, Option<String>>("banner"), "scan_time": row.get::<_, Option<i64>>("scan_time")
         })).collect();
         return HttpResponse::Ok().json(json!({"task_id": id, "results": data}));
     }
     let mut csv = String::from(
-        "execution_id,scanner_id,scanner_name,ip,asn,isp,port,protocol,service,banner,scan_time\n",
+        "execution_id,scanner_id,scanner_name,ip,asn,as_org,isp,country_code,country_name,city_name,port,protocol,service,banner,scan_time\n",
     );
     for row in rows {
         let values = [
@@ -309,7 +312,14 @@ pub(crate) async fn export_task(
                 .unwrap_or_default(),
             row.get::<_, String>("ip"),
             row.get::<_, Option<String>>("asn").unwrap_or_default(),
+            row.get::<_, Option<String>>("as_org").unwrap_or_default(),
             row.get::<_, Option<String>>("isp").unwrap_or_default(),
+            row.get::<_, Option<String>>("country_code")
+                .unwrap_or_default(),
+            row.get::<_, Option<String>>("country_name")
+                .unwrap_or_default(),
+            row.get::<_, Option<String>>("city_name")
+                .unwrap_or_default(),
             row.get::<_, Option<i32>>("port")
                 .map(|v| v.to_string())
                 .unwrap_or_default(),

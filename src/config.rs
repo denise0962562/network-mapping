@@ -31,6 +31,8 @@ pub struct Config {
     pub templates: TemplatesConfig,
     #[serde(default)]
     pub frontend: FrontendConfig,
+    #[serde(default)]
+    pub maxmind: MaxMindConfig,
     // pub scan_target_generated: ScanTargetConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
@@ -205,6 +207,30 @@ impl FrontendConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct MaxMindConfig {
+    /// GeoLite2 数据库目录；文件缺失时相关 IP 情报字段保持为空。
+    pub directory: PathBuf,
+}
+
+impl Default for MaxMindConfig {
+    fn default() -> Self {
+        Self {
+            directory: PathBuf::from("source/maxmind"),
+        }
+    }
+}
+
+impl MaxMindConfig {
+    fn resolve_relative_to(&mut self, config_path: &Path) {
+        if self.directory.is_relative() {
+            let base_directory = config_path.parent().unwrap_or_else(|| Path::new(""));
+            self.directory = base_directory.join(&self.directory);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub host: String,               //数据库主机地址
     pub port: u16,                  //数据库端口
@@ -265,13 +291,14 @@ impl Config {
         let mut config: Self = toml::from_str(&content).expect("配置文件格式错误");
         config.tls.resolve_relative_to(path);
         config.frontend.resolve_relative_to(path);
+        config.maxmind.resolve_relative_to(path);
         config
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Clis, FrontendConfig, SecurityConfig, SelfChecking, TlsConfig};
+    use super::{Clis, FrontendConfig, MaxMindConfig, SecurityConfig, SelfChecking, TlsConfig};
     use clap::Parser;
     use std::path::{Path, PathBuf};
 
@@ -325,6 +352,20 @@ mod tests {
     }
 
     #[test]
+    fn maxmind_directory_is_resolved_relative_to_config_file() {
+        let mut maxmind = MaxMindConfig {
+            directory: PathBuf::from("geoip"),
+        };
+
+        maxmind.resolve_relative_to(Path::new("/etc/network-mapping/config.toml"));
+
+        assert_eq!(
+            maxmind.directory,
+            PathBuf::from("/etc/network-mapping/geoip")
+        );
+    }
+
+    #[test]
     fn scanner_token_pepper_requires_sufficient_length() {
         let short = SecurityConfig {
             scanner_token_pepper: "too-short".into(),
@@ -342,6 +383,7 @@ mod tests {
         let cli = Clis::try_parse_from(["networkm"]).expect("default CLI should parse");
 
         assert!(!cli.terminal_verbose);
+        assert!(!cli.refresh_ip_intel);
     }
 
     #[test]
@@ -350,6 +392,14 @@ mod tests {
             Clis::try_parse_from(["networkm", "--verbose"]).expect("verbose CLI flag should parse");
 
         assert!(cli.terminal_verbose);
+    }
+
+    #[test]
+    fn refresh_ip_intel_flag_enables_one_off_refresh() {
+        let cli = Clis::try_parse_from(["networkm", "--refresh-ip-intel"])
+            .expect("refresh CLI flag should parse");
+
+        assert!(cli.refresh_ip_intel);
     }
 }
 
@@ -509,4 +559,8 @@ pub struct Clis {
     /// 重置指定管理员的密码，并在终端显示新的随机密码后退出
     #[arg(long, value_name = "USERNAME")]
     pub reset_admin_password: Option<String>,
+
+    /// 使用当前 MaxMind 数据库刷新历史 IP 情报后退出
+    #[arg(long)]
+    pub refresh_ip_intel: bool,
 }

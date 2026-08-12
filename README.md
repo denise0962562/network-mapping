@@ -72,6 +72,23 @@ directory = "../network-mapping-vue/dist"
 重定向至 `/login`，API 的未认证响应仍为 401。前端入口文件或资源目录缺失时，服务端
 启动阶段只输出 warn 警告并继续运行，访问对应页面或资源时返回 404。
 
+## MaxMind IP 情报
+
+将 `GeoLite2-City.mmdb`、`GeoLite2-Country.mmdb` 和 `GeoLite2-ASN.mmdb` 放入配置的
+目录，服务端会在扫描结果入库时保存 ASN、AS 组织、国家和城市信息：
+
+```toml
+[maxmind]
+directory = "source/maxmind"
+```
+
+相对路径以配置文件所在目录为基准。数据库文件缺失时服务仍会启动，相关字段保持为空。
+更新 MMDB 文件后需要重启服务；刷新历史记录可执行：
+
+```sh
+cargo run -- --refresh-ip-intel
+```
+
 ## 扫描器调度
 
 创建任务接口 `POST /api/task/create` 支持 `dispatch_mode`：`automatic` 由下一台可用扫描器领取一次，`selected` 配合 `scanner_ids` 指定一台或多台扫描器，`all` 会为创建时所有已启用扫描器分别创建执行实例。离线的指定扫描器会在重新上线后领取任务。

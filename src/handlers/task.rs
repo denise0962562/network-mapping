@@ -104,6 +104,10 @@ struct TaskResultIp {
     ip: String,
     asn: Option<String>,
     isp: Option<String>,
+    as_org: Option<String>,
+    country_code: Option<String>,
+    country_name: Option<String>,
+    city_name: Option<String>,
     ports: Vec<TaskResultPort>,
 }
 
@@ -512,7 +516,8 @@ async fn get_task(
     };
     let ip_rows = match connection
         .query(
-            "SELECT ip_id, ip_address::text AS ip, asn, isp FROM ips \
+            "SELECT ip_id, ip_address::text AS ip, asn, isp, as_org, \
+             country_code, country_name, city_name FROM ips \
              WHERE execution_id = $1 ORDER BY ip_address LIMIT $2 OFFSET $3;",
             &[&selected_execution_pk, &page_size, &offset],
         )
@@ -566,6 +571,10 @@ async fn get_task(
                 ip: row.get("ip"),
                 asn: row.get("asn"),
                 isp: row.get("isp"),
+                as_org: row.get("as_org"),
+                country_code: row.get("country_code"),
+                country_name: row.get("country_name"),
+                city_name: row.get("city_name"),
                 ports: ports_by_ip.remove(&ip_id).unwrap_or_default(),
             }
         })

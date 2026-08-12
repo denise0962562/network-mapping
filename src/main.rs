@@ -47,6 +47,7 @@ async fn main() -> io::Result<()> {
     );
     config.check();
     let frontend_directory = config.frontend.directory.clone();
+    let maxmind_directory = config.maxmind.directory.clone();
 
     let ser_con = config.server.clone();
     let server = config.server;
@@ -99,6 +100,23 @@ async fn main() -> io::Result<()> {
         Err(e) => panic!("初始化数据库错误{}", e),
     };
 
+    let maxmind_state = MaxMindState::from_directory(&maxmind_directory);
+    if args.refresh_ip_intel {
+        match maxmind_state.refresh_ip_intel(&db_pool).await {
+            Ok(report) => {
+                println!(
+                    "IP 情报刷新完成：扫描 {} 条，更新 {} 条，无匹配 {} 条",
+                    report.scanned, report.updated, report.unmatched
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                error!(event = "RefreshIpIntelError", message = %error);
+                return Err(io::Error::other("刷新历史 IP 情报失败"));
+            }
+        }
+    }
+
     info!(target: "server::startup", "正在检查系统账户");
 
     check_system_user(&db_pool).await;
@@ -117,7 +135,7 @@ async fn main() -> io::Result<()> {
 
     let sys = Systems::new();
     let sys_2 = sys.clone();
-    let maxmind_state = web::Data::new(MaxMindState::from_default_paths());
+    let maxmind_state = web::Data::new(maxmind_state);
     let security = web::Data::new(config.security);
     let rate_limiter = RateLimitMiddleware::default();
     let open_source_catalog = web::Data::new(
@@ -134,6 +152,7 @@ async fn main() -> io::Result<()> {
         template_directory = %template_info.templates_directory,
         template_name = %template_info.templates_name,
         frontend_directory = %frontend_directory.display(),
+        maxmind_directory = %maxmind_directory.display(),
         status_interval_seconds = log.status_duration,
         "服务配置就绪"
     );

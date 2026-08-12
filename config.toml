@@ -28,6 +28,11 @@ templates_name = "error.html"
 # Vite 生产构建目录；相对路径以本配置文件所在目录为基准
 directory = "../network-mapping-vue/dist"
 
+[maxmind]
+# GeoLite2-City.mmdb、GeoLite2-Country.mmdb、GeoLite2-ASN.mmdb 所在目录
+# 相对路径以本配置文件所在目录为基准；缺失时服务继续运行，IP 情报字段保持为空
+directory = "source/maxmind"
+
 [database]
 host = "127.0.0.1"
 port = 5432

@@ -44,6 +44,10 @@ struct SearchItem {
     scan_time: Option<i64>,
     asn: Option<String>,
     isp: Option<String>,
+    as_org: Option<String>,
+    country_code: Option<String>,
+    country_name: Option<String>,
+    city_name: Option<String>,
 }
 
 fn pagination(limit: Option<i64>, offset: Option<i64>) -> Result<(i64, i64), &'static str> {
@@ -101,7 +105,8 @@ async fn search_assets(
     let statement = format!(
         "SELECT latest.*, COUNT(*) OVER() AS total FROM (\
          SELECT DISTINCT ON (i.ip_address, p.port) i.ip_address::TEXT AS ip_address, \
-         p.port, s.protocol, s.service, s.banner, s.scanner_name, s.scan_time, i.asn, i.isp \
+         p.port, s.protocol, s.service, s.banner, s.scanner_name, s.scan_time, \
+         i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name \
          FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id \
          LEFT JOIN scaninfo s ON s.port_id = p.port_id WHERE {where_clause} \
          ORDER BY i.ip_address, p.port NULLS LAST, s.scan_time DESC NULLS LAST\
@@ -121,6 +126,10 @@ async fn search_assets(
             scan_time: row.get("scan_time"),
             asn: row.get("asn"),
             isp: row.get("isp"),
+            as_org: row.get("as_org"),
+            country_code: row.get("country_code"),
+            country_name: row.get("country_name"),
+            city_name: row.get("city_name"),
         })
         .collect();
     Ok(SearchResponse {

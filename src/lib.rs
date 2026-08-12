@@ -1192,6 +1192,7 @@ pub async fn save_scanner_results(
     };
 
     let mut saved = 0usize;
+    let mut ip_intel_cache = HashMap::new();
 
     for item in &upload.results {
         let parsed_ip =
@@ -1200,16 +1201,24 @@ pub async fn save_scanner_results(
                 source,
             })?;
         let ip_addr = parsed_ip.addr();
-        let intel = maxmind.lookup(ip_addr);
+        let intel = ip_intel_cache
+            .entry(ip_addr)
+            .or_insert_with(|| maxmind.lookup(ip_addr))
+            .clone();
         let ip_text = parsed_ip.to_string();
 
         let ip_row = transaction
             .query_one(
-                "INSERT INTO ips (task_id, execution_id, ip_address, asn, isp) \
-             VALUES ($1, $2, $3::text::inet, $4, $5) \
+                "INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
+                 country_code, country_name, city_name) \
+             VALUES ($1, $2, $3::text::inet, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
                 asn = COALESCE(EXCLUDED.asn, ips.asn), \
                 isp = COALESCE(EXCLUDED.isp, ips.isp), \
+                as_org = COALESCE(EXCLUDED.as_org, ips.as_org), \
+                country_code = COALESCE(EXCLUDED.country_code, ips.country_code), \
+                country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
+                city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
                 update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
              RETURNING ip_id;",
                 &[
@@ -1218,6 +1227,10 @@ pub async fn save_scanner_results(
                     &ip_text,
                     &intel.asn,
                     &intel.isp,
+                    &intel.as_org,
+                    &intel.country_code,
+                    &intel.country_name,
+                    &intel.city_name,
                 ],
             )
             .await
