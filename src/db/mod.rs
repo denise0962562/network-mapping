@@ -2,7 +2,7 @@ use crate::path_secure_join;
 use actix_web::web;
 use deadpool_postgres::{ManagerConfig, RecyclingMethod};
 use tokio::fs;
-use tracing::error;
+use tracing::{debug, error, info};
 
 pub struct SqlFile {
     pub root_path: String,
@@ -40,11 +40,11 @@ pub async fn create_postgresql_pool(
         queue_mode: deadpool::managed::QueueMode::Lifo,
     });
     let pool = db_poll_cfg.create_pool(None, tokio_postgres::NoTls)?;
-    println!("正在检查数据库连接...");
+    info!(target: "server::startup", "正在检查数据库连接");
     match pool.get().await {
         Ok(_conn) => {
             // _conn 是一个 deadpool::managed::Object，它会在离开作用域时自动返回池中
-            println!("数据库连接成功，连接池有效！");
+            info!(target: "server::startup", "数据库连接成功，连接池可用");
         }
         Err(e) => {
             // 如果连接失败，这里会返回错误
@@ -93,7 +93,7 @@ pub async fn init_database_table(
         Ok(o) => {
             let mut client = cpool.get().await?;
             let transaction = client.transaction().await?;
-            println!("开启事务");
+            debug!("开始执行数据库初始化事务");
             transaction.batch_execute(&o).await?;
             transaction.commit().await?;
         }

@@ -2,16 +2,14 @@ use actix_web::HttpRequest;
 use lettre::Message;
 use lettre::message::{Mailbox, header::ContentType};
 use openssl::base64;
-use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::UserLoginInfo;
 use crate::config::EmailConfig;
-use crate::{UserLoginInfo, get_conn_ip};
 use crate::{
-    admin::send_email, get_password_and_id_from_database, get_unix_epoch_ms, logs::LoginLog,
-    logs::write::login_logs_to_db, verify_password,
+    admin::send_email, get_password_and_id_from_database, get_unix_epoch_ms, verify_password,
 };
 
 pub struct LoginToken {
@@ -190,7 +188,6 @@ impl LoginToken {
 
 /// 该函数用于处理用户登录，接受一个用户名和密码，如果密码校验成功则返回一个session，失败则传递错误
 pub async fn user_login(
-    req: &HttpRequest,
     username: &str,
     password: &str,
     mail_config: Option<&EmailConfig>,
@@ -200,7 +197,7 @@ pub async fn user_login(
     let start = Instant::now();
 
     // 即使用户名不存在也校验密码，预防时序攻击
-    let (tmp_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(
+    let (_user_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(
         pool, username,
     )
     .await
@@ -229,37 +226,8 @@ pub async fn user_login(
     let get_pwd_h = start.elapsed();
     println!("get_p   : {:>6} ms", get_pwd_h.as_millis());
 
-    let e_ip: IpAddr = match get_conn_ip(&req).parse() {
-        Ok(o) => o,
-        Err(e) => {
-            error!(
-                event = "StringToIpAddrError",
-                path = "fn user_login",
-                message = %e
-            );
-            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) //其中 IPV4 地址 0.0.0.0 表示从 String 转换为 IP 地址失败
-        }
-    };
-
-    let mut loginlogs = LoginLog {
-        event_ip: e_ip,
-        event_useage_userid: tmp_id,
-        is_successful: false,
-    };
-
     // 当用户不存在或者是查找用户错误时使用提供的默认密文校验密码
     if verify_password(password, &pwd_hash) && l_successful {
-        let start = Instant::now();
-
-        loginlogs.is_successful = true;
-        if !login_logs_to_db(pool, loginlogs).await {
-            error!(
-                event = "INSERTDataToDatabaseError",
-                path = "fn user_login",
-                message = "向数据库中插入登录日志数据错误"
-            );
-        };
-        println!("to_db   : {:>6} ms", start.elapsed().as_millis());
         let start = Instant::now();
         let enable_2fa = user_login_info.twofa.map(|_| true).unwrap_or(false);
 
@@ -290,13 +258,6 @@ pub async fn user_login(
         }
         Ok((session.session, csrf_token, enable_2fa))
     } else {
-        if !login_logs_to_db(pool, loginlogs).await {
-            error!(
-                event = "INSERTDataToDatabaseError",
-                path = "fn user_login",
-                message = "向数据库中插入登录日志数据错误"
-            );
-        };
         Err("登录失败".into())
     }
 }

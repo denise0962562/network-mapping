@@ -13,6 +13,7 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::{EmailConfig, PasswordHashConfig, SystemConfig};
 use crate::{AddUserInfo, generate_hash_password, generate_scanner_token, hash_scanner_token};
 use crate::{decrypt_data, encrypt_data};
@@ -204,11 +205,10 @@ pub async fn check_system_user(pool: &deadpool_postgres::Pool) {
                 path = "fn check_system_role",
                 message = "没有找到系统用户，正在创建一个新的系统用户"
             );
-            println!("没有找到系统用户，正在创建一个新的系统用户");
             create_system_user(&pool).await;
         }
         1 => {
-            println!("找到系统用户")
+            info!(target: "server::startup", event = "SystemRoleFound", "系统用户检查通过")
         }
         _ => {
             panic!("找到多个系统用户，请手动清理多余的系统用户!");
@@ -228,12 +228,11 @@ pub async fn create_system_user(pool: &deadpool_postgres::Pool) {
         )
         .await
         .unwrap();
-    info!(
+    info!(target: "server::startup",
         event = "CreateSystemUser",
         path = "fn create_system_user",
         message = "创建系统用户成功"
     );
-    println!("创建系统用户成功");
     transaction.commit().await.unwrap();
 }
 
@@ -261,10 +260,9 @@ pub async fn check_default_admin_user(
                 path = "fn check_default_admin_user",
                 message = "没有找到管理员用户，正在创建一个默认管理员用户"
             );
-            println!("没有找到管理员用户，正在创建一个默认管理员用户");
             create_default_admin_user(pool, pwd_hash_config).await;
         }
-        _ => println!("找到管理员用户"),
+        _ => info!(target: "server::startup", event = "AdminRoleFound", "管理员用户检查通过"),
     }
 }
 
@@ -367,7 +365,7 @@ pub async fn create_default_admin_user(
         .await
         .unwrap();
     if row.get::<_, i64>("count") > 0 {
-        println!("找到管理员用户");
+        info!(target: "server::startup", event = "AdminRoleFound", "管理员用户已由其他进程创建");
         transaction.commit().await.unwrap();
         return;
     }
@@ -404,15 +402,16 @@ pub async fn create_default_admin_user(
         .await
         .unwrap();
 
-    info!(
+    info!(target: "server::startup",
         event = "CreateDefaultAdminUser",
         path = "fn create_default_admin_user",
         username,
         message = "创建默认管理员用户成功"
     );
 
-    println!("创建默认管理员用户成功，用户名：{}", username);
-    println!("默认管理员随机初始密码：{}，请登录后尽快修改", password);
+    println!(
+        "\n┌─ 初始管理员凭据 ─────────────────────────\n│ 用户名：{username}\n│ 密码：  {password}\n│ 请登录后尽快修改；该密码不会写入日志。\n└──────────────────────────────────────────\n"
+    );
 
     transaction.commit().await.unwrap();
 }
@@ -980,7 +979,8 @@ pub async fn get_user_base_info(
 /// 返回 ScannerRegisterData
 pub async fn web_add_scanner(
     pool: &Pool,
-    user_id: i32,
+    user: &UserBaseI,
+    audit_context: &AuditContext,
     add_data: &AddScanner,
     token_pepper: &str,
 ) -> Result<ScannerRegisterSecret, Box<dyn std::error::Error>> {
@@ -996,9 +996,13 @@ pub async fn web_add_scanner(
         "INSERT INTO scanner_info \
          (name, scanner_id, create_user, registration_token_hash, registration_token_expires_at, location, create_time, remark, tag, is_enable) \
          VALUES ($1, $2, $3, $4, NOW() + INTERVAL '24 hours', $5, NOW(), $6, $7, false);",
-        &[&add_data.name, &scanner_id, &user_id, &registration_token_hash, &add_data.location, &add_data.remark, &add_data.tag]
+        &[&add_data.name, &scanner_id, &user.id, &registration_token_hash, &add_data.location, &add_data.remark, &add_data.tag]
     ).await? {
         1 => {
+            let mut audit_event = AuditEvent::user("scanner", "scanner.create", "success", user)
+                .resource("scanner", scanner_id.clone());
+            audit_event.response_status = Some(200);
+            write_audit(&db_transaction, audit_context, &audit_event).await?;
             db_transaction.commit().await?;
             Ok(ScannerRegisterSecret {
                 scanner_id: scanner_id,
@@ -1016,6 +1020,7 @@ pub async fn scanner_register(
     register_data: &ScannerRegisterData,
     registration_token: &str,
     token_pepper: &str,
+    audit_context: &AuditContext,
 ) -> Result<ScannerRuntimeSecret, Box<dyn std::error::Error>> {
     let mut db_conn = pool.get().await?;
     let db_transaction = db_conn.transaction().await?;
@@ -1057,6 +1062,13 @@ pub async fn scanner_register(
         .await?
     {
         1 => {
+            let mut audit_event = AuditEvent::anonymous("scanner", "scanner.register", "success");
+            audit_event.actor_type = "scanner".to_owned();
+            audit_event.actor_id = Some(register_data.scanner_id.clone());
+            audit_event.resource_type = Some("scanner".to_owned());
+            audit_event.resource_id = Some(register_data.scanner_id.clone());
+            audit_event.response_status = Some(200);
+            write_audit(&db_transaction, audit_context, &audit_event).await?;
             db_transaction.commit().await?;
             Ok(ScannerRuntimeSecret { runtime_token })
         }

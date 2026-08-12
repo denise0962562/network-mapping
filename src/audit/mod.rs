@@ -1,0 +1,212 @@
+//! Structured, append-only security audit event support.
+
+use std::net::{IpAddr, SocketAddr};
+
+use actix_web::{HttpMessage, HttpRequest};
+use deadpool_postgres::{GenericClient, Pool};
+use serde_json::{Value, json};
+use tokio_postgres::types::ToSql;
+use tracing::error;
+use uuid::Uuid;
+
+use crate::admin::UserBaseI;
+
+#[derive(Clone, Copy, Debug)]
+pub struct RequestId(pub Uuid);
+
+#[derive(Clone, Debug)]
+pub struct AuditContext {
+    pub request_id: Uuid,
+    pub source_ip: Option<IpAddr>,
+    pub user_agent: Option<String>,
+    pub http_method: String,
+    pub request_path: String,
+}
+
+impl AuditContext {
+    pub fn from_request(req: &HttpRequest) -> Self {
+        let request_id = req
+            .extensions()
+            .get::<RequestId>()
+            .map(|value| value.0)
+            .or_else(|| {
+                req.headers()
+                    .get("X-Request-ID")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| Uuid::parse_str(value).ok())
+            })
+            .unwrap_or_else(Uuid::new_v4);
+
+        let source_ip = req
+            .peer_addr()
+            .map(|address| address.ip())
+            .or_else(|| parse_ip(req.connection_info().realip_remote_addr()?));
+        let user_agent = req
+            .headers()
+            .get("User-Agent")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.chars().take(512).collect());
+
+        Self {
+            request_id,
+            source_ip,
+            user_agent,
+            http_method: req.method().to_string(),
+            request_path: req.path().to_owned(),
+        }
+    }
+}
+
+fn parse_ip(value: &str) -> Option<IpAddr> {
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|value| value.ip()))
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditEvent {
+    pub category: String,
+    pub action: String,
+    pub outcome: String,
+    pub severity: String,
+    pub actor_type: String,
+    pub actor_id: Option<String>,
+    pub actor_name: Option<String>,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub response_status: Option<u16>,
+    pub reason_code: Option<String>,
+    pub changes: Option<Value>,
+    pub metadata: Value,
+}
+
+impl AuditEvent {
+    pub fn user(category: &str, action: &str, outcome: &str, user: &UserBaseI) -> Self {
+        Self {
+            category: category.to_owned(),
+            action: action.to_owned(),
+            outcome: outcome.to_owned(),
+            severity: if outcome == "success" {
+                "info"
+            } else {
+                "warning"
+            }
+            .to_owned(),
+            actor_type: "user".to_owned(),
+            actor_id: Some(user.id.to_string()),
+            actor_name: Some(user.username.clone()),
+            resource_type: None,
+            resource_id: None,
+            response_status: None,
+            reason_code: None,
+            changes: None,
+            metadata: json!({}),
+        }
+    }
+
+    pub fn anonymous(category: &str, action: &str, outcome: &str) -> Self {
+        Self {
+            category: category.to_owned(),
+            action: action.to_owned(),
+            outcome: outcome.to_owned(),
+            severity: "warning".to_owned(),
+            actor_type: "anonymous".to_owned(),
+            actor_id: None,
+            actor_name: None,
+            resource_type: None,
+            resource_id: None,
+            response_status: None,
+            reason_code: None,
+            changes: None,
+            metadata: json!({}),
+        }
+    }
+
+    pub fn resource(mut self, resource_type: &str, resource_id: impl Into<String>) -> Self {
+        self.resource_type = Some(resource_type.to_owned());
+        self.resource_id = Some(resource_id.into());
+        self
+    }
+}
+
+pub async fn write<C>(
+    client: &C,
+    context: &AuditContext,
+    event: &AuditEvent,
+) -> Result<(), tokio_postgres::Error>
+where
+    C: GenericClient + Sync,
+{
+    let response_status = event.response_status.map(|value| value as i16);
+    let params: &[&(dyn ToSql + Sync)] = &[
+        &Uuid::new_v4(),
+        &event.category,
+        &event.action,
+        &event.outcome,
+        &event.severity,
+        &event.actor_type,
+        &event.actor_id,
+        &event.actor_name,
+        &event.resource_type,
+        &event.resource_id,
+        &context.request_id,
+        &context.source_ip,
+        &context.user_agent,
+        &context.http_method,
+        &context.request_path,
+        &response_status,
+        &event.reason_code,
+        &event.changes,
+        &event.metadata,
+    ];
+    client
+        .execute(
+            "INSERT INTO audit_event (event_id, category, action, outcome, severity, actor_type, \
+             actor_id, actor_name, resource_type, resource_id, request_id, source_ip, user_agent, \
+             http_method, request_path, response_status, reason_code, changes, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+             $16::SMALLINT, $17, $18, $19);",
+            params,
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn write_standalone(pool: &Pool, context: &AuditContext, event: &AuditEvent) -> bool {
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(error_value) => {
+            error!(event = "AuditPoolError", request_id = %context.request_id, message = %error_value);
+            return false;
+        }
+    };
+    if let Err(error_value) = write(&client, context, event).await {
+        error!(event = "AuditWriteError", request_id = %context.request_id, message = %error_value);
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ip;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn parses_ip_and_socket_address() {
+        assert_eq!(
+            parse_ip("192.0.2.1"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        assert_eq!(
+            parse_ip("192.0.2.1:443"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        assert_eq!(
+            parse_ip("[2001:db8::1]:443"),
+            Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
+        );
+        assert_eq!(parse_ip("unknown"), None);
+    }
+}

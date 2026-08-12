@@ -32,6 +32,7 @@ async fn login_test() {
         &log_file_name,
         &log_file_rolling,
         &log_debug_mode,
+        false,
     );
     println!("日志系统已启动");
     let db_config = config.database;

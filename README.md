@@ -45,6 +45,16 @@ scanner_token_pepper = "生成的随机值"
 cargo run -- --config /etc/network-mapping/config.toml
 ```
 
+终端日志默认使用精简模式，只显示启动摘要、警告和错误。需要查看完整终端日志时使用：
+
+```sh
+cargo run -- --verbose
+```
+
+`--verbose` 只影响终端输出，不会改变滚动 JSON 日志文件的内容或级别。需要同时查看
+DEBUG 级别日志时，可组合使用 `--verbose --debug-model`，也可以通过 `RUST_LOG` 指定
+过滤规则。
+
 ## 扫描器调度
 
 创建任务接口 `POST /api/task/create` 支持 `dispatch_mode`：`automatic` 由下一台可用扫描器领取一次，`selected` 配合 `scanner_ids` 指定一台或多台扫描器，`all` 会为创建时所有已启用扫描器分别创建执行实例。离线的指定扫描器会在重新上线后领取任务。

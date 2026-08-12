@@ -1,6 +1,7 @@
 pub mod init;
 pub mod write;
 
+use chrono::Local;
 use std::net::IpAddr;
 use std::path::Path;
 use tracing_appender::{rolling as import_log_rolling, rolling::RollingFileAppender};
@@ -41,6 +42,15 @@ impl FormatTime for LogTime {
         // let unix_epoch = get_unix_epoch();
 
         write!(w, "{}", crate::get_unix_epoch_ms())
+    }
+}
+
+pub struct ConsoleTime;
+
+/// 面向终端阅读的本地时间，保留毫秒精度。
+impl FormatTime for ConsoleTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
     }
 }
 

@@ -12,6 +12,7 @@ use crate::admin::{
     AddScanner, GetUserInfoH, ScannerRegisterData, UserBaseI, UserBaseInfo, UserSession,
     check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info,
 };
+use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
 use crate::config::{EmailConfig, PasswordHashConfig, SecurityConfig, ServerConfig};
 use crate::handlers::ReceiveLoginInfo;
 use crate::login::user_login;
@@ -125,9 +126,15 @@ async fn user_login_h(
     let p = pool.get_ref();
     let m_c = mail_config.get_ref().as_ref();
     let (t_session, csrf_token, enable_twofa) =
-        match user_login(&req, &receiveinfo.username, &receiveinfo.password, m_c, p).await {
+        match user_login(&receiveinfo.username, &receiveinfo.password, m_c, p).await {
             Ok(o) => o,
             Err(e) => {
+                let mut audit_event =
+                    AuditEvent::anonymous("authentication", "auth.login", "failure");
+                audit_event.response_status = Some(401);
+                audit_event.reason_code = Some("invalid_credentials".to_owned());
+                audit_event.metadata = json!({"attempted_username": receiveinfo.username});
+                write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
                 let log_event = "LoginFaild";
                 let log_message = &receiveinfo.username;
                 error_logs(&req, log_event, log_message.as_str());
@@ -169,6 +176,21 @@ async fn user_login_h(
     println!("Total   : {:>6} ms", total_es.as_millis());
     println!("Login_f : {:>6} ms", login_function.as_millis());
     println!("=============================================");
+    let mut audit_event = AuditEvent::anonymous(
+        "authentication",
+        if enable_twofa {
+            "auth.password_verify"
+        } else {
+            "auth.login"
+        },
+        "success",
+    );
+    audit_event.actor_type = "user".to_owned();
+    audit_event.actor_name = Some(receiveinfo.username.clone());
+    audit_event.response_status = Some(if enable_twofa { 401 } else { 200 });
+    audit_event.metadata = json!({"totp_required": enable_twofa});
+    write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
+
     match enable_twofa {
         true => {
             // 使用 401 Unauthorized 表示还需要继续验证 TOTP Token
@@ -197,6 +219,7 @@ async fn user_logout(
     pool: web::Data<deadpool_postgres::Pool>,
     page_template: web::Data<TemplatesInit>,
     session: UserSession,
+    user: UserBaseI,
 ) -> impl Responder {
     let tmp_csrf_t = match &req.headers().get("X-CSRF-Token") {
         Some(s) => s.to_str().unwrap_or(""),
@@ -208,6 +231,10 @@ async fn user_logout(
 
     match log_out(&c_s, p).await {
         Ok(_) => {
+            let mut audit_event =
+                AuditEvent::user("authentication", "auth.logout", "success", &user);
+            audit_event.response_status = Some(200);
+            write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
             let cookies = Cookie::build("session", &c_s)
                 .path("/")
                 .http_only(true)
@@ -298,7 +325,7 @@ async fn verify_totp_h(
     s_config: web::Data<ServerConfig>,
 ) -> impl Responder {
     let database_conn = pool.get_ref();
-    let username = user_base_i.username;
+    let username = user_base_i.username.clone();
 
     if !user_base_i.enable_2fa {
         return match confirm_twofa_binding(
@@ -311,6 +338,16 @@ async fn verify_totp_h(
         .await
         {
             Ok(true) => {
+                let mut audit_event =
+                    AuditEvent::user("user_security", "user.totp_bind", "success", &user_base_i)
+                        .resource("user", user_base_i.id.to_string());
+                audit_event.response_status = Some(200);
+                write_standalone(
+                    database_conn,
+                    &AuditContext::from_request(&req),
+                    &audit_event,
+                )
+                .await;
                 let csrf_token = req
                     .headers()
                     .get("X-CSRF-Token")
@@ -323,8 +360,20 @@ async fn verify_totp_h(
                     .cookie(csrf_cookie)
                     .json(json!({"success": true, "message": "2FA 绑定成功，请重新登录"}))
             }
-            Ok(false) => HttpResponse::Unauthorized()
-                .json(json!({"success": false, "message": "验证码无效或绑定已过期"})),
+            Ok(false) => {
+                let mut audit_event =
+                    AuditEvent::user("user_security", "user.totp_bind", "failure", &user_base_i);
+                audit_event.response_status = Some(401);
+                audit_event.reason_code = Some("invalid_totp".to_owned());
+                write_standalone(
+                    database_conn,
+                    &AuditContext::from_request(&req),
+                    &audit_event,
+                )
+                .await;
+                HttpResponse::Unauthorized()
+                    .json(json!({"success": false, "message": "验证码无效或绑定已过期"}))
+            }
             Err(e) => {
                 error_logs(&req, "ConfirmTotpBindingError", &e.to_string());
                 HttpResponse::InternalServerError().finish()
@@ -345,14 +394,43 @@ async fn verify_totp_h(
     };
 
     match totp_token_verify(totp, &info.token).await {
-        Ok(true) => {
-            totp_verify_status_change(&session.session, database_conn)
-                .await
-                .map(|_| HttpResponse::Ok().finish())
-                .unwrap_or(HttpResponse::InternalServerError().finish())
-            // HttpResponse::Ok()
-        }
+        Ok(true) => match totp_verify_status_change(&session.session, database_conn).await {
+            Ok(_) => {
+                let mut audit_event = AuditEvent::user(
+                    "authentication",
+                    "auth.totp_verify",
+                    "success",
+                    &user_base_i,
+                );
+                audit_event.response_status = Some(200);
+                write_standalone(
+                    database_conn,
+                    &AuditContext::from_request(&req),
+                    &audit_event,
+                )
+                .await;
+                HttpResponse::Ok().finish()
+            }
+            Err(error_value) => {
+                error_logs(&req, "TotpSessionUpdateError", &error_value.to_string());
+                HttpResponse::InternalServerError().finish()
+            }
+        },
         Ok(false) => {
+            let mut audit_event = AuditEvent::user(
+                "authentication",
+                "auth.totp_verify",
+                "failure",
+                &user_base_i,
+            );
+            audit_event.response_status = Some(401);
+            audit_event.reason_code = Some("invalid_totp".to_owned());
+            write_standalone(
+                database_conn,
+                &AuditContext::from_request(&req),
+                &audit_event,
+            )
+            .await;
             info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过");
             HttpResponse::Unauthorized().finish()
         }
@@ -380,6 +458,11 @@ async fn unbind_2fa_h(
     };
     match unbind_2fa(&unbind_info.username, pool_c).await {
         Ok(true) => {
+            let mut audit_event =
+                AuditEvent::user("user_security", "user.totp_unbind", "success", &user_base_i)
+                    .resource("user", unbind_info.username.clone());
+            audit_event.response_status = Some(200);
+            write_standalone(pool_c, &AuditContext::from_request(&req), &audit_event).await;
             info_logs(&req, "Unbind2FASuccessful", "解绑 2FA 成功");
             if unbind_info.username == user_base_i.username {
                 let csrf_token = req
@@ -612,6 +695,28 @@ async fn change_password_h(
             "message": "密码修改服务暂时不可用"
         }));
     }
+    let mut audit_event = AuditEvent::user(
+        "user_security",
+        "user.password_change",
+        "success",
+        &user_base_i,
+    )
+    .resource("user", user_base_i.id.to_string());
+    audit_event.response_status = Some(200);
+    audit_event.changes = Some(json!({"sessions_invalidated": true}));
+    if let Err(error_value) = write_audit(
+        &transaction,
+        &AuditContext::from_request(&req),
+        &audit_event,
+    )
+    .await
+    {
+        error_logs(&req, "ChangePasswordAuditError", &error_value.to_string());
+        return HttpResponse::InternalServerError().json(json!({
+            "success": false,
+            "message": "密码修改服务暂时不可用"
+        }));
+    }
     if let Err(error_value) = transaction.commit().await {
         error_logs(&req, "ChangePasswordCommitError", &error_value.to_string());
         return HttpResponse::InternalServerError().json(json!({
@@ -644,7 +749,8 @@ async fn web_add_scanner_h(
     let pool_ref = pool.get_ref();
     let s_id = match web_add_scanner(
         pool_ref,
-        user_base_i.id,
+        &user_base_i,
+        &AuditContext::from_request(&req),
         add_data.deref(),
         &security.scanner_token_pepper,
     )
@@ -728,11 +834,33 @@ async fn scanner_register_h(
         &register_data,
         registration_token,
         &security.scanner_token_pepper,
+        &AuditContext::from_request(&req),
     )
     .await
     {
         Ok(runtime_secret) => HttpResponse::Ok().json(runtime_secret),
         Err(e) => {
+            let mut audit_event = AuditEvent::anonymous("scanner", "scanner.register", "failure");
+            audit_event.actor_type = "scanner".to_owned();
+            audit_event.actor_id = Some(register_data.scanner_id.clone());
+            audit_event.resource_type = Some("scanner".to_owned());
+            audit_event.resource_id = Some(register_data.scanner_id.clone());
+            audit_event.response_status = Some(if e.to_string() == "scanner unauthorized" {
+                401
+            } else {
+                500
+            });
+            audit_event.reason_code = Some(if e.to_string() == "scanner unauthorized" {
+                "invalid_registration_token".to_owned()
+            } else {
+                "registration_error".to_owned()
+            });
+            write_standalone(
+                pool.get_ref(),
+                &AuditContext::from_request(&req),
+                &audit_event,
+            )
+            .await;
             error_logs(&req, "ScannerRegister", &e.to_string());
             if e.to_string() == "scanner unauthorized" {
                 return HttpResponse::Unauthorized().finish();

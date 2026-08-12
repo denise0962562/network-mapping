@@ -197,6 +197,46 @@ CREATE TABLE IF NOT EXISTS operation_audit (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 统一安全审计事件。login_logs 与 operation_audit 暂时保留用于兼容旧数据，
+-- 新代码只写入 audit_event。
+CREATE TABLE IF NOT EXISTS audit_event (
+	id BIGSERIAL PRIMARY KEY,
+	event_id UUID NOT NULL UNIQUE,
+	occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	category TEXT NOT NULL CHECK (category IN (
+		'authentication', 'authorization', 'user_security', 'task', 'scanner',
+		'configuration', 'data_access', 'audit'
+	)),
+	action TEXT NOT NULL,
+	outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied')),
+	severity TEXT NOT NULL DEFAULT 'info' CHECK (severity IN ('info', 'warning', 'critical')),
+	actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'scanner', 'system', 'anonymous')),
+	actor_id TEXT,
+	actor_name TEXT,
+	resource_type TEXT,
+	resource_id TEXT,
+	request_id UUID,
+	source_ip INET,
+	user_agent TEXT,
+	http_method TEXT,
+	request_path TEXT,
+	response_status SMALLINT,
+	reason_code TEXT,
+	changes JSONB,
+	metadata JSONB NOT NULL DEFAULT '{}'::JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_event_time
+	ON audit_event (occurred_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_actor_time
+	ON audit_event (actor_type, actor_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_resource_time
+	ON audit_event (resource_type, resource_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_action_time
+	ON audit_event (action, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_request
+	ON audit_event (request_id) WHERE request_id IS NOT NULL;
+
 -- 任务调度与结果索引。当前开发环境直接按上述定义创建全新表结构。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_execution_address ON ips (execution_id, ip_address);
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
