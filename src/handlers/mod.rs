@@ -1,3 +1,4 @@
+pub mod admin_user;
 pub mod audit;
 pub mod data_saa; //数据统计与分析
 pub mod mail_template;

@@ -793,8 +793,7 @@ mod tests {
 }
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(user::first_add_user)
-        .service(user::user_login_h)
+    cfg.service(user::user_login_h)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
@@ -816,6 +815,11 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::operations::retry_task)
         .service(handlers::operations::export_task)
         .service(handlers::operations::dashboard_overview)
+        .service(handlers::admin_user::list_users)
+        .service(handlers::admin_user::create_user)
+        .service(handlers::admin_user::set_user_enabled)
+        .service(handlers::admin_user::kick_user)
+        .service(handlers::admin_user::delete_user)
         .service(handlers::mail_template::list_mail_templates)
         .service(handlers::mail_template::get_mail_template)
         .service(handlers::mail_template::validate_mail_template)

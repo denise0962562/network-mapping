@@ -100,21 +100,6 @@ pub struct _ProxySetting {
     _headers: String,
 }
 
-pub struct AddUserInfo<'a> {
-    pub username: &'a str,
-    pub password_hash: &'a str,
-    pub role: i32,
-}
-
-impl<'a> AddUserInfo<'a> {
-    fn check(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match self.role {
-            0..=2 => Ok(()),
-            _ => Err("角色值不符合规则".into()),
-        }
-    }
-}
-
 pub struct UserLoginInfo {
     pub username: String,
     pub role: i32,
@@ -780,7 +765,8 @@ pub async fn get_password_and_id_from_database(
 ) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
-        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1",
+        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users \
+         WHERE limit_login = FALSE AND disabled_at IS NULL AND deleted_at IS NULL AND username = $1",
         &[&username]
     ).await? {
         // TODO 需要改进，避免闭包获得所有权

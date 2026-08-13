@@ -21,8 +21,8 @@ use crate::config::{
     SessionSettingsRequest, SessionSettingsResponse, SystemConfig,
     session_ttl_seconds_from_minutes,
 };
-use crate::{AddUserInfo, generate_hash_password, generate_scanner_token, hash_scanner_token};
 use crate::{decrypt_data, encrypt_data};
+use crate::{generate_hash_password, generate_scanner_token, hash_scanner_token};
 
 const DEFAULT_ADMIN_USERNAME: &str = "admin";
 const DEFAULT_ADMIN_USERNAME_ENV: &str = "NM_DEFAULT_ADMIN_USERNAME";
@@ -34,14 +34,6 @@ const NOTIFICATION_SETTING_TYPE: &str = "notification";
 const SMTP_SENDER_KEY: &str = "sender_key";
 const SECURITY_SETTING_TYPE: &str = "security";
 const SESSION_TTL_SETTING_KEY: &str = "session_ttl_seconds";
-
-/// 该结构体用于接收测试使用的创建用户信息
-#[derive(Deserialize)]
-pub struct ReceiveAddUserInfo {
-    pub username: String,
-    pub password: String,
-    pub role: i32,
-}
 
 pub enum UserRole {
     System = 0,
@@ -144,48 +136,6 @@ pub struct ScannerHealthData {
     pub event: String,
 }
 
-///该函数用于添加用户，且需要调用者处理日志。
-pub async fn add_user<'a>(
-    user: AddUserInfo<'a>,
-    pool: &deadpool_postgres::Pool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = user.check()?;
-    let mut client = pool.get().await?;
-    let transaction = client.transaction().await?;
-    let stmt = transaction
-        .prepare("INSERT INTO users (username, password, role) VALUES ($1, $2, $3); ")
-        .await?;
-    let r = transaction
-        .execute(&stmt, &[&user.username, &user.password_hash, &user.role])
-        .await?;
-    if r != 1 {
-        let message = format!("添加用户时所影响的行数不为 1 ({})", r);
-        transaction.rollback().await?;
-        Err(message.into())
-    } else {
-        transaction.commit().await?;
-        Ok(())
-    }
-}
-
-///该函数用于检查用户是否存在
-///
-/// 如果用户存在则返回true
-pub async fn is_user_exist(
-    username: &str,
-    pool: &deadpool_postgres::Pool,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let client = pool.get().await?;
-    let stmt = client
-        .prepare("SELECT username FROM users WHERE username = $1;")
-        .await?;
-    if client.query_opt(&stmt, &[&username]).await?.is_some() {
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
 /// 该函数通过 cookie 获取用户名与其 ID
 ///
 /// FIXME 需要解决 pool 类型错误问题
@@ -194,10 +144,14 @@ pub async fn get_user_id_and_name<'a>(
     pool: &deadpool_postgres::Pool,
 ) -> Result<(i32, i32, String), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
-    let row = client.query_one(
-        "SELECT s.user_id, u.username, u.role FROM session s CROSS JOIN users u WHERE s.token = $1 AND s.is_enable = True AND u.limit_login = False AND s.user_id = u.id;",
-        &[&session]
-    ).await?;
+    let row = client
+        .query_one(
+            "SELECT s.user_id, u.username, u.role FROM session s JOIN users u ON s.user_id = u.id \
+         WHERE s.token = $1 AND s.is_enable = TRUE AND u.limit_login = FALSE \
+         AND u.disabled_at IS NULL AND u.deleted_at IS NULL;",
+            &[&session],
+        )
+        .await?;
 
     Ok((
         row.get::<_, i32>("user_id"),
@@ -1251,22 +1205,14 @@ pub async fn get_user_base_info(
     let conn = pool.get().await?;
 
     let row = conn.query_opt(
-        "SELECT id, username, role, email, limit_login, enable_2fa From users WHERE id = $1 LIMIT 1;",
+        "SELECT id, username, role, email, limit_login, enable_2fa FROM users \
+         WHERE id = $1 AND limit_login = FALSE AND disabled_at IS NULL AND deleted_at IS NULL LIMIT 1;",
         &[&user_id]
     ).await?;
 
-    Ok(row
-        .map(|t| FromRow::try_from_row(&t))
-        // 此处利用 transpose 将 Option<Result<T,E>> 转换为 Result<Option<T>,E>
+    row.map(|value| FromRow::try_from_row(&value))
         .transpose()?
-        .unwrap_or(UserBaseI {
-            id: -1,
-            username: String::new(),
-            role: -1,
-            email: None,
-            limit_login: true,
-            enable_2fa: true,
-        }))
+        .ok_or_else(|| "用户不存在、已锁定、已禁用或已删除".into())
 }
 
 /// web 端添加扫描器

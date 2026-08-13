@@ -16,8 +16,17 @@ CREATE TABLE IF NOT EXISTS users (
 	last_login_at BIGINT,                                                                 -- 表示该用户最后一次登录的时间
 	last_login_ip INET,                                                                   -- 最后一次登录的 IP 地址
 	login_error_count INT,                                                                -- 登录错误的次数
-	last_error_at BIGINT                                                                  -- 最后一次登录出错的时间，以该时间为起点，判断是否将登录错误次数清零
+	last_error_at BIGINT,                                                                 -- 最后一次登录出错的时间，以该时间为起点，判断是否将登录错误次数清零
+	disabled_at TIMESTAMPTZ,                                                              -- 管理员主动禁用时间，与密码错误锁定分离
+	deleted_at TIMESTAMPTZ,                                                               -- 软删除时间，保留任务与审计历史
+	update_at TIMESTAMPTZ
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS update_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_users_management_status
+ON users (role, disabled_at, deleted_at) WHERE role IN (1, 2);
 
 -- 表 scan_task 用于存储扫描任务信息，配置了级联更新和删除
 CREATE TABLE IF NOT EXISTS scan_task( 
@@ -176,6 +185,7 @@ CREATE TABLE IF NOT EXISTS session (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, is_enable);
+CREATE INDEX IF NOT EXISTS idx_session_user_status ON session (user_id, is_enable);
 
 ALTER TABLE session ALTER COLUMN ttl SET DEFAULT 2700;
 

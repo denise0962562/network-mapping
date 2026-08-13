@@ -6,11 +6,12 @@ use std::ops::Deref;
 use std::time::Instant;
 use tracing::error;
 
-use crate::TEXT_HTML_UTF_8;
 use crate::TemplatesInit;
 use crate::admin::{
-    AddScanner, GetUserInfoH, ScannerRegisterData, UserBaseI, UserBaseInfo, UserSession,
-    check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info,
+    AddScanner, GetUserInfoH, ScannerRegisterData, Unbind2FAH, UserBaseI, UserBaseInfo,
+    UserSession, VerifyTotp, bind_twofa, check_twofa_bind, confirm_twofa_binding, get_scanner,
+    get_scanners, get_user_info, scanner_register, totp_struct, totp_token_verify,
+    totp_verify_status_change, unbind_2fa, update_user_info, web_add_scanner,
 };
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
 use crate::config::{PasswordHashConfig, SecurityConfig, ServerConfig};
@@ -19,11 +20,7 @@ use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
 use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
-use crate::{AddUserInfo, admin, generate_hash_password, log_out, verify_password};
-use admin::{
-    ReceiveAddUserInfo, Unbind2FAH, VerifyTotp, bind_twofa, confirm_twofa_binding, get_scanner,
-    get_scanners, scanner_register, totp_struct, totp_token_verify, unbind_2fa, web_add_scanner,
-};
+use crate::{generate_hash_password, log_out, verify_password};
 use uuid::Uuid;
 
 fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Cookie<'static>) {
@@ -73,72 +70,6 @@ struct ChangePasswordRequest {
     current_password: String,
     new_password: String,
 }
-// BUG 暂时使用 bug 标签用于提示
-/// 该接口为测试阶段接口，用于快速创建账号，在生产环境下必须删除
-#[get("/test/adduser")]
-async fn first_add_user(
-    pool: web::Data<deadpool_postgres::Pool>,
-    query_info: web::Query<ReceiveAddUserInfo>,
-    pwd_hash_config: web::Data<PasswordHashConfig>,
-) -> impl Responder {
-    let p = pool.get_ref();
-
-    match admin::is_user_exist(&query_info.username, p).await {
-        Ok(true) => HttpResponse::FailedDependency()
-            .content_type(TEXT_HTML_UTF_8)
-            .body("用户已存在"),
-        Ok(false) => {
-            match generate_hash_password(&query_info.password, pwd_hash_config.get_ref().clone()) {
-                Ok(o) => {
-                    let userinfo = AddUserInfo {
-                        username: &query_info.username,
-                        password_hash: o.as_str(),
-                        role: query_info.role,
-                    };
-                    match admin::add_user(userinfo, p).await {
-                        Ok(_) => {
-                            println!(
-                                "添加用户：{}:{}",
-                                &query_info.username, &query_info.password
-                            );
-                            HttpResponse::Ok()
-                                .content_type(TEXT_HTML_UTF_8)
-                                .body("用户添加成功")
-                        }
-                        Err(e) => {
-                            println!(
-                                "添加用户失败：{}:{}\n错误：{}",
-                                &query_info.username,
-                                &query_info.password,
-                                e.to_string()
-                            );
-                            HttpResponse::InternalServerError()
-                                .content_type(TEXT_HTML_UTF_8)
-                                .body("添加用户失败")
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        event = "GeneratePasswordHashError",
-                        path = "fn first_add_user",
-                        message = %e
-                    );
-                    HttpResponse::InternalServerError().body("500")
-                }
-            }
-        }
-        Err(e) => {
-            error!(
-                event = "CheckUserError",
-                path = "fn first_add_user",
-                message = %e
-            );
-            HttpResponse::InternalServerError().body("500")
-        }
-    }
-}
-
 /// 登录接口
 #[post("/api/login")]
 async fn user_login_h(
