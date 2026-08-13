@@ -299,6 +299,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_event_resource_time
 	ON audit_event (resource_type, resource_id, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_event_action_time
 	ON audit_event (action, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_login_actor_time
+	ON audit_event (actor_id, occurred_at DESC, id DESC)
+	WHERE category = 'authentication' AND action = 'auth.login';
+CREATE INDEX IF NOT EXISTS idx_audit_event_login_username_time
+	ON audit_event ((COALESCE(actor_name, metadata->>'attempted_username')), occurred_at DESC, id DESC)
+	WHERE category = 'authentication' AND action = 'auth.login' AND actor_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_audit_event_request
 	ON audit_event (request_id) WHERE request_id IS NOT NULL;
 

@@ -820,6 +820,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::admin_user::set_user_enabled)
         .service(handlers::admin_user::kick_user)
         .service(handlers::admin_user::delete_user)
+        .service(handlers::login_record::self_login_records)
+        .service(handlers::login_record::admin_login_records)
         .service(handlers::mail_template::list_mail_templates)
         .service(handlers::mail_template::get_mail_template)
         .service(handlers::mail_template::validate_mail_template)

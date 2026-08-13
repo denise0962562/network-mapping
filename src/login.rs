@@ -12,6 +12,14 @@ pub struct LoginToken {
     pub pool: deadpool_postgres::Pool,
 }
 
+pub struct LoginResult {
+    pub session: String,
+    pub csrf_token: String,
+    pub enable_2fa: bool,
+    pub session_ttl_seconds: i32,
+    pub user_id: i32,
+}
+
 pub struct SessionInfo<'a> {
     session: String,
     create_time: i64,
@@ -187,12 +195,12 @@ pub async fn user_login(
     username: &str,
     password: &str,
     pool: &deadpool_postgres::Pool,
-) -> Result<(String, String, bool, i32), Box<dyn std::error::Error>> {
+) -> Result<LoginResult, Box<dyn std::error::Error>> {
     let l_successful: bool;
     let start = Instant::now();
 
     // 即使用户名不存在也校验密码，预防时序攻击
-    let (_user_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(
+    let (user_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(
         pool, username,
     )
     .await
@@ -233,7 +241,13 @@ pub async fn user_login(
             .await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
 
-        Ok((session.session, csrf_token, enable_2fa, session_ttl_seconds))
+        Ok(LoginResult {
+            session: session.session,
+            csrf_token,
+            enable_2fa,
+            session_ttl_seconds,
+            user_id,
+        })
     } else {
         Err("登录失败".into())
     }
