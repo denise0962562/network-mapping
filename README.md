@@ -111,10 +111,12 @@ interval_seconds = 30
 pending_low_watermark = 2
 pending_high_watermark = 5
 priority = 0
-authorized_cidrs = ["10.20.0.0/16"]
+authorized_cidrs = ["198.51.100.0/24"]
+excluded_cidrs = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"]
 ipv4_task_prefix = 24
 ipv6_enabled = false
 ipv6_authorized_cidrs = []
+ipv6_excluded_cidrs = ["fc00::/7", "fe80::/10", "::1/128"]
 ipv6_task_prefix = 120
 ipv6_pending_low_watermark = 1
 ipv6_pending_high_watermark = 2
@@ -124,6 +126,9 @@ repeat_after_seconds = 604800
 
 `enabled` 是兼容已有配置保留的 IPv4 开关，`ipv6_enabled` 单独控制 IPv6。IPv6 默认按
 `/120` 生成，每个任务最多包含 256 个地址；不建议直接把完整 `/64` 作为扫描任务。
+生成候选网段与任一排除 CIDR 相交时会跳过整个任务，因此即使授权范围很大也不会把排除
+地址夹带进扫描任务。排除项默认值在代码层为空，示例配置显式排除了常见私网、回环和
+链路本地范围。
 生成游标存储在数据库中，服务重启后继续；同一目标在冷却期内不会重复生成。管理员可通过
 `GET /api/automatic-target/status` 查看两个地址族各自的队列、游标和可用扫描器数量。
 

@@ -248,9 +248,11 @@ pub struct AutomaticTargetConfig {
     pub pending_high_watermark: u32,
     pub priority: i32,
     pub authorized_cidrs: Vec<String>,
+    pub excluded_cidrs: Vec<String>,
     pub ipv4_task_prefix: u8,
     pub ipv6_enabled: bool,
     pub ipv6_authorized_cidrs: Vec<String>,
+    pub ipv6_excluded_cidrs: Vec<String>,
     pub ipv6_task_prefix: u8,
     pub ipv6_pending_low_watermark: u32,
     pub ipv6_pending_high_watermark: u32,
@@ -268,9 +270,11 @@ impl Default for AutomaticTargetConfig {
             pending_high_watermark: 5,
             priority: 0,
             authorized_cidrs: Vec::new(),
+            excluded_cidrs: Vec::new(),
             ipv4_task_prefix: 24,
             ipv6_enabled: false,
             ipv6_authorized_cidrs: Vec::new(),
+            ipv6_excluded_cidrs: Vec::new(),
             // 避免把完整 /64 直接交给扫描器；默认每个任务最多覆盖 256 个地址。
             ipv6_task_prefix: 120,
             ipv6_pending_low_watermark: 1,
@@ -367,8 +371,36 @@ impl AutomaticTargetConfig {
                 return Err(format!("自动目标授权 CIDR 存在重复或重叠：{network}").into());
             }
         }
+        validate_excluded_cidrs(&self.excluded_cidrs, false)?;
+        validate_excluded_cidrs(&self.ipv6_excluded_cidrs, true)?;
         Ok(())
     }
+}
+
+fn validate_excluded_cidrs(
+    values: &[String],
+    expect_ipv6: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut networks = Vec::with_capacity(values.len());
+    for value in values {
+        let network: ipnet::IpNet = value
+            .parse()
+            .map_err(|error| format!("无效的自动目标排除 CIDR {value}: {error}"))?;
+        if network.addr().is_ipv6() != expect_ipv6 {
+            let family = if expect_ipv6 { "IPv6" } else { "IPv4" };
+            return Err(format!("{family} 自动目标排除范围地址族错误：{value}").into());
+        }
+        networks.push(network);
+    }
+    for (index, network) in networks.iter().enumerate() {
+        if networks[index + 1..]
+            .iter()
+            .any(|other| network.contains(&other.network()) || other.contains(&network.network()))
+        {
+            return Err(format!("自动目标排除 CIDR 存在重复或重叠：{network}").into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_port_list(value: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -600,6 +632,22 @@ mod tests {
         assert!(config.validate().is_ok());
 
         config.ipv6_authorized_cidrs = vec!["10.0.0.0/8".to_owned()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_target_validates_exclusion_families_and_overlap() {
+        let mut config = AutomaticTargetConfig {
+            excluded_cidrs: vec!["10.0.0.0/8".to_owned()],
+            ipv6_excluded_cidrs: vec!["fc00::/7".to_owned()],
+            ..AutomaticTargetConfig::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.excluded_cidrs = vec!["fc00::/7".to_owned()];
+        assert!(config.validate().is_err());
+
+        config.excluded_cidrs = vec!["10.0.0.0/8".to_owned(), "10.1.0.0/16".to_owned()];
         assert!(config.validate().is_err());
     }
 }

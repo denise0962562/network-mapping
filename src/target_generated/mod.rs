@@ -19,6 +19,7 @@ struct FamilyGenerator {
     family: &'static str,
     enabled: bool,
     pools: Vec<IpNet>,
+    excluded: Vec<IpNet>,
     task_prefix: u8,
     low_watermark: u32,
     high_watermark: u32,
@@ -39,6 +40,7 @@ pub struct RefillReport {
     pub pending_after: i64,
     pub generated: usize,
     pub skipped_recent: usize,
+    pub skipped_excluded: usize,
     pub scanner_available: bool,
     pub families: Vec<FamilyRefillReport>,
 }
@@ -50,6 +52,7 @@ pub struct FamilyRefillReport {
     pending_after: i64,
     generated: usize,
     skipped_recent: usize,
+    skipped_excluded: usize,
     scanner_available: bool,
 }
 
@@ -66,6 +69,7 @@ struct FamilyStatus {
     address_family: String,
     enabled: bool,
     authorized_cidrs: Vec<String>,
+    excluded_cidrs: Vec<String>,
     task_prefix: u8,
     pending_low_watermark: u32,
     pending_high_watermark: u32,
@@ -100,11 +104,22 @@ impl AutomaticTargetService {
             .iter()
             .map(|value| value.parse::<Ipv6Net>().map(IpNet::V6))
             .collect::<Result<Vec<_>, _>>()?;
+        let ipv4_excluded = policy
+            .excluded_cidrs
+            .iter()
+            .map(|value| value.parse::<Ipv4Net>().map(IpNet::V4))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ipv6_excluded = policy
+            .ipv6_excluded_cidrs
+            .iter()
+            .map(|value| value.parse::<Ipv6Net>().map(IpNet::V6))
+            .collect::<Result<Vec<_>, _>>()?;
         let generators = vec![
             family_generator(
                 "ipv4",
                 policy.enabled,
                 ipv4_pools,
+                ipv4_excluded,
                 policy.ipv4_task_prefix,
                 policy.pending_low_watermark,
                 policy.pending_high_watermark,
@@ -114,6 +129,7 @@ impl AutomaticTargetService {
                 "ipv6",
                 policy.ipv6_enabled,
                 ipv6_pools,
+                ipv6_excluded,
                 policy.ipv6_task_prefix,
                 policy.ipv6_pending_low_watermark,
                 policy.ipv6_pending_high_watermark,
@@ -142,6 +158,7 @@ impl AutomaticTargetService {
             report.pending_after += family.pending_after;
             report.generated += family.generated;
             report.skipped_recent += family.skipped_recent;
+            report.skipped_excluded += family.skipped_excluded;
             report.scanner_available |= family.scanner_available;
             report.families.push(family);
         }
@@ -215,6 +232,10 @@ impl AutomaticTargetService {
             let target = target_at(generator, position);
             position = (position + 1) % generator.total_subnets;
             attempts += 1;
+            if is_excluded(generator, &target.cidr) {
+                report.skipped_excluded += 1;
+                continue;
+            }
             let recent_exists: bool = transaction
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM scan_task \
@@ -340,6 +361,7 @@ impl AutomaticTargetService {
                 address_family: generator.family.to_owned(),
                 enabled: generator.enabled,
                 authorized_cidrs: generator.pools.iter().map(ToString::to_string).collect(),
+                excluded_cidrs: generator.excluded.iter().map(ToString::to_string).collect(),
                 task_prefix: generator.task_prefix,
                 pending_low_watermark: generator.low_watermark,
                 pending_high_watermark: generator.high_watermark,
@@ -428,6 +450,7 @@ fn family_generator(
     family: &'static str,
     enabled: bool,
     pools: Vec<IpNet>,
+    excluded: Vec<IpNet>,
     task_prefix: u8,
     low_watermark: u32,
     high_watermark: u32,
@@ -442,11 +465,12 @@ fn family_generator(
     } else {
         format!("{STRATEGY}:{family}")
     };
-    let policy_hash = policy_hash(policy, family, &pools, task_prefix);
+    let policy_hash = policy_hash(policy, family, &pools, &excluded, task_prefix);
     FamilyGenerator {
         family,
         enabled,
         pools,
+        excluded,
         task_prefix,
         low_watermark,
         high_watermark,
@@ -501,6 +525,13 @@ fn subnet_count(network: IpNet, task_prefix: u8) -> u64 {
     1_u64 << (task_prefix - network.prefix_len())
 }
 
+fn is_excluded(generator: &FamilyGenerator, cidr: &str) -> bool {
+    let target: IpNet = cidr.parse().expect("generated target is a valid CIDR");
+    generator.excluded.iter().any(|excluded| {
+        target.contains(&excluded.network()) || excluded.contains(&target.network())
+    })
+}
+
 fn ready_scanner_exists_query(family: &str) -> String {
     format!(
         "SELECT EXISTS(SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
@@ -519,13 +550,30 @@ fn policy_hash(
     policy: &AutomaticTargetConfig,
     family: &str,
     pools: &[IpNet],
+    excluded: &[IpNet],
     task_prefix: u8,
 ) -> String {
-    let serialized = if family == "ipv4" {
+    let serialized = if family == "ipv4" && excluded.is_empty() {
         serde_json::to_vec(&json!({
             "strategy": policy.strategy,
             "authorized_cidrs": pools.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "ipv4_task_prefix": task_prefix,
+            "common_ports": policy.common_ports,
+        }))
+    } else if family == "ipv4" {
+        serde_json::to_vec(&json!({
+            "strategy": policy.strategy,
+            "authorized_cidrs": pools.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "excluded_cidrs": excluded.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "ipv4_task_prefix": task_prefix,
+            "common_ports": policy.common_ports,
+        }))
+    } else if excluded.is_empty() {
+        serde_json::to_vec(&json!({
+            "strategy": policy.strategy,
+            "address_family": family,
+            "authorized_cidrs": pools.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "task_prefix": task_prefix,
             "common_ports": policy.common_ports,
         }))
     } else {
@@ -533,6 +581,7 @@ fn policy_hash(
             "strategy": policy.strategy,
             "address_family": family,
             "authorized_cidrs": pools.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "excluded_cidrs": excluded.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "task_prefix": task_prefix,
             "common_ports": policy.common_ports,
         }))
@@ -554,7 +603,7 @@ fn system_audit_context() -> AuditContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutomaticTargetService, target_at};
+    use super::{AutomaticTargetService, is_excluded, target_at};
     use crate::config::AutomaticTargetConfig;
 
     #[test]
@@ -579,5 +628,25 @@ mod tests {
             target_at(&service.generators[1], 1).cidr,
             "2001:db8:0:1::/64"
         );
+    }
+
+    #[test]
+    fn exclusion_intersection_skips_the_entire_generated_subnet() {
+        let service = AutomaticTargetService::new(AutomaticTargetConfig {
+            enabled: true,
+            authorized_cidrs: vec!["10.0.0.0/23".to_owned()],
+            excluded_cidrs: vec!["10.0.0.128/25".to_owned()],
+            ..AutomaticTargetConfig::default()
+        })
+        .unwrap();
+
+        assert!(is_excluded(
+            &service.generators[0],
+            &target_at(&service.generators[0], 0).cidr
+        ));
+        assert!(!is_excluded(
+            &service.generators[0],
+            &target_at(&service.generators[0], 1).cidr
+        ));
     }
 }
