@@ -23,7 +23,7 @@ struct FamilyGenerator {
     task_prefix: u8,
     low_watermark: u32,
     high_watermark: u32,
-    total_subnets: u64,
+    total_subnets: u128,
     state_key: String,
     policy_hash: String,
 }
@@ -56,12 +56,12 @@ pub struct FamilyRefillReport {
     scanner_available: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct GeneratedTarget {
     cidr: String,
     generation_key: String,
     pool: String,
-    position: u64,
+    position: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,8 +76,8 @@ struct FamilyStatus {
     pending_tasks: i64,
     running_tasks: i64,
     ready_scanners: i64,
-    cursor_position: u64,
-    total_subnets: u64,
+    cursor_position: Value,
+    total_subnets: Value,
     last_generated_at: Option<String>,
     last_error: Option<String>,
 }
@@ -189,10 +189,7 @@ impl AutomaticTargetService {
         let stored_policy_hash: String = state.get("policy_hash");
         let cursor: Value = state.get("cursor");
         let mut position = if stored_policy_hash == generator.policy_hash {
-            cursor
-                .get("position")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
+            parse_cursor_position(&cursor)
         } else {
             0
         };
@@ -227,7 +224,7 @@ impl AutomaticTargetService {
         }
 
         let to_generate = i64::from(generator.high_watermark) - pending_before;
-        let mut attempts = 0_u64;
+        let mut attempts = 0_u128;
         while report.generated < to_generate as usize && attempts < generator.total_subnets {
             let target = target_at(generator, position);
             position = (position + 1) % generator.total_subnets;
@@ -259,7 +256,7 @@ impl AutomaticTargetService {
                 "UPDATE automatic_target_state SET cursor = $2, policy_hash = $3, \
                  last_generated_at = CASE WHEN $4::BIGINT > 0 THEN NOW() ELSE last_generated_at END, \
                  last_error = NULL, updated_at = NOW() WHERE strategy = $1;",
-                &[&generator.state_key, &json!({"position": position}), &generator.policy_hash, &(report.generated as i64)],
+                &[&generator.state_key, &json!({"position": position.to_string()}), &generator.policy_hash, &(report.generated as i64)],
             )
             .await?;
         transaction.commit().await?;
@@ -282,7 +279,7 @@ impl AutomaticTargetService {
             "strategy": STRATEGY,
             "address_family": generator.family,
             "pool": target.pool,
-            "position": target.position,
+            "position": target.position.to_string(),
             "policy_hash": generator.policy_hash,
             "queue_depth_before": queue_depth_before,
         });
@@ -351,11 +348,7 @@ impl AutomaticTargetService {
                 .await?;
             let cursor_position = state
                 .as_ref()
-                .and_then(|row| {
-                    row.get::<_, Value>("cursor")
-                        .get("position")
-                        .and_then(Value::as_u64)
-                })
+                .map(|row| parse_cursor_position(&row.get::<_, Value>("cursor")))
                 .unwrap_or_default();
             families.push(FamilyStatus {
                 address_family: generator.family.to_owned(),
@@ -368,8 +361,8 @@ impl AutomaticTargetService {
                 pending_tasks: counts.get("pending"),
                 running_tasks: counts.get("running"),
                 ready_scanners,
-                cursor_position,
-                total_subnets: generator.total_subnets,
+                cursor_position: status_count(generator.family, cursor_position),
+                total_subnets: status_count(generator.family, generator.total_subnets),
                 last_generated_at: state.as_ref().and_then(|row| row.get("last_generated_at")),
                 last_error: state.as_ref().and_then(|row| row.get("last_error")),
             });
@@ -456,10 +449,11 @@ fn family_generator(
     high_watermark: u32,
     policy: &AutomaticTargetConfig,
 ) -> FamilyGenerator {
-    let total_subnets = pools
-        .iter()
-        .map(|network| subnet_count(*network, task_prefix))
-        .sum();
+    let total_subnets = pools.iter().fold(0_u128, |total, network| {
+        total
+            .checked_add(subnet_count(*network, task_prefix))
+            .expect("validated automatic target subnet count")
+    });
     let state_key = if family == "ipv4" {
         STRATEGY.to_owned()
     } else {
@@ -480,23 +474,23 @@ fn family_generator(
     }
 }
 
-fn target_at(generator: &FamilyGenerator, position: u64) -> GeneratedTarget {
+fn target_at(generator: &FamilyGenerator, position: u128) -> GeneratedTarget {
     let mut remaining = position % generator.total_subnets;
     for pool in &generator.pools {
         let count = subnet_count(*pool, generator.task_prefix);
         if remaining < count {
             let subnet = match pool {
                 IpNet::V4(pool) => {
-                    let size = 1_u64 << (32 - generator.task_prefix);
-                    let base = u32::from(pool.network()) as u64 + remaining * size;
+                    let size = 1_u128 << (32 - generator.task_prefix);
+                    let base = u128::from(u32::from(pool.network())) + remaining * size;
                     IpNet::V4(
                         Ipv4Net::new(Ipv4Addr::from(base as u32), generator.task_prefix)
                             .expect("validated IPv4 prefix"),
                     )
                 }
                 IpNet::V6(pool) => {
-                    let base = u128::from(pool.network())
-                        + ((remaining as u128) << (128 - generator.task_prefix));
+                    let base =
+                        u128::from(pool.network()) + (remaining << (128 - generator.task_prefix));
                     IpNet::V6(
                         Ipv6Net::new(Ipv6Addr::from(base), generator.task_prefix)
                             .expect("validated IPv6 prefix"),
@@ -521,8 +515,28 @@ fn target_at(generator: &FamilyGenerator, position: u64) -> GeneratedTarget {
     unreachable!("position is normalized to configured subnet count")
 }
 
-fn subnet_count(network: IpNet, task_prefix: u8) -> u64 {
-    1_u64 << (task_prefix - network.prefix_len())
+fn subnet_count(network: IpNet, task_prefix: u8) -> u128 {
+    1_u128 << (task_prefix - network.prefix_len())
+}
+
+fn parse_cursor_position(cursor: &Value) -> u128 {
+    cursor
+        .get("position")
+        .and_then(|position| {
+            position
+                .as_str()
+                .and_then(|value| value.parse().ok())
+                .or_else(|| position.as_u64().map(u128::from))
+        })
+        .unwrap_or_default()
+}
+
+fn status_count(family: &str, value: u128) -> Value {
+    if family == "ipv4" {
+        json!(u64::try_from(value).expect("IPv4 subnet count fits in u64"))
+    } else {
+        Value::String(value.to_string())
+    }
 }
 
 fn is_excluded(generator: &FamilyGenerator, cidr: &str) -> bool {
@@ -603,8 +617,9 @@ fn system_audit_context() -> AuditContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutomaticTargetService, is_excluded, target_at};
+    use super::{AutomaticTargetService, is_excluded, parse_cursor_position, target_at};
     use crate::config::AutomaticTargetConfig;
+    use serde_json::json;
 
     #[test]
     fn sequential_strategy_walks_ipv4_and_ipv6_subnets() {
@@ -648,5 +663,30 @@ mod tests {
             &service.generators[0],
             &target_at(&service.generators[0], 1).cidr
         ));
+    }
+
+    #[test]
+    fn sequential_strategy_supports_the_full_ipv6_address_space() {
+        let service = AutomaticTargetService::new(AutomaticTargetConfig {
+            ipv6_enabled: true,
+            ipv6_authorized_cidrs: vec!["::/0".to_owned()],
+            ipv6_task_prefix: 120,
+            ..AutomaticTargetConfig::default()
+        })
+        .unwrap();
+        let generator = &service.generators[1];
+
+        assert_eq!(generator.total_subnets, 1_u128 << 120);
+        assert_eq!(target_at(generator, 0).cidr, "::/120");
+        assert_eq!(target_at(generator, 1).cidr, "::100/120");
+    }
+
+    #[test]
+    fn cursor_parser_accepts_legacy_numbers_and_decimal_strings() {
+        assert_eq!(parse_cursor_position(&json!({"position": 42})), 42);
+        assert_eq!(
+            parse_cursor_position(&json!({"position": "1329227995784915872903807060280344576"})),
+            1_u128 << 120
+        );
     }
 }

@@ -341,6 +341,7 @@ impl AutomaticTargetConfig {
             return Err("启用 IPv6 自动目标生成时必须配置 ipv6_authorized_cidrs".into());
         }
         let mut authorized_ipv6 = Vec::with_capacity(self.ipv6_authorized_cidrs.len());
+        let mut ipv6_total_subnets = 0_u128;
         for value in &self.ipv6_authorized_cidrs {
             let network: ipnet::Ipv6Net = value
                 .parse()
@@ -352,9 +353,17 @@ impl AutomaticTargetConfig {
                 )
                 .into());
             }
-            if self.ipv6_task_prefix - network.prefix_len() > 63 {
-                return Err(format!("IPv6 授权范围 {value} 的可生成子网数量过大").into());
-            }
+            let subnet_count = 1_u128
+                .checked_shl(u32::from(self.ipv6_task_prefix - network.prefix_len()))
+                .ok_or_else(|| {
+                    format!(
+                        "IPv6 授权范围 {value} 按 /{} 划分将产生 2^128 个任务网段，超出游标容量",
+                        self.ipv6_task_prefix
+                    )
+                })?;
+            ipv6_total_subnets = ipv6_total_subnets
+                .checked_add(subnet_count)
+                .ok_or("IPv6 授权范围的任务网段总数超出 128 位游标容量")?;
             authorized_ipv6.push(network);
         }
         for (index, network) in authorized_ipv6.iter().enumerate() {
@@ -632,6 +641,30 @@ mod tests {
         assert!(config.validate().is_ok());
 
         config.ipv6_authorized_cidrs = vec!["10.0.0.0/8".to_owned()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_target_accepts_full_ipv6_range_with_bounded_task_subnets() {
+        let config = AutomaticTargetConfig {
+            ipv6_enabled: true,
+            ipv6_authorized_cidrs: vec!["::/0".to_owned()],
+            ipv6_task_prefix: 120,
+            ..AutomaticTargetConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn automatic_target_rejects_an_unrepresentable_ipv6_cursor_space() {
+        let config = AutomaticTargetConfig {
+            ipv6_enabled: true,
+            ipv6_authorized_cidrs: vec!["::/0".to_owned()],
+            ipv6_task_prefix: 128,
+            ..AutomaticTargetConfig::default()
+        };
+
         assert!(config.validate().is_err());
     }
 
