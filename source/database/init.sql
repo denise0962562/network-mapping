@@ -439,3 +439,40 @@ CREATE TABLE IF NOT EXISTS setting (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_item_type_key ON setting (item_type, key);
+
+-- 邮件模板元数据与版本。草稿不会影响正在使用的已发布版本。
+CREATE TABLE IF NOT EXISTS mail_template (
+	template_key TEXT PRIMARY KEY,
+	display_name TEXT NOT NULL,
+	active_version INT,
+	enabled BOOLEAN NOT NULL DEFAULT TRUE,
+	create_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	update_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS mail_template_version (
+	id BIGSERIAL PRIMARY KEY,
+	template_key TEXT NOT NULL REFERENCES mail_template(template_key) ON DELETE CASCADE,
+	version INT NOT NULL,
+	status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived')),
+	subject_template TEXT NOT NULL,
+	html_template TEXT NOT NULL,
+	text_template TEXT NOT NULL,
+	created_by INT REFERENCES users(id) ON DELETE SET NULL,
+	create_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	update_at TIMESTAMPTZ,
+	published_at TIMESTAMPTZ,
+	UNIQUE (template_key, version)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_template_single_draft
+ON mail_template_version (template_key)
+WHERE status = 'draft';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_template_single_published
+ON mail_template_version (template_key)
+WHERE status = 'published';
+
+INSERT INTO mail_template (template_key, display_name)
+VALUES ('login_success', '登录成功')
+ON CONFLICT (template_key) DO UPDATE SET display_name = EXCLUDED.display_name;

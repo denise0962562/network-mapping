@@ -1,16 +1,11 @@
 use actix_web::HttpRequest;
-use lettre::Message;
-use lettre::message::{Mailbox, header::ContentType};
 use openssl::base64;
 use std::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::UserLoginInfo;
-use crate::config::EmailConfig;
-use crate::{
-    admin::send_email, get_password_and_id_from_database, get_unix_epoch_ms, verify_password,
-};
+use crate::{get_password_and_id_from_database, get_unix_epoch_ms, verify_password};
 
 pub struct LoginToken {
     pub pool: deadpool_postgres::Pool,
@@ -190,7 +185,6 @@ impl LoginToken {
 pub async fn user_login(
     username: &str,
     password: &str,
-    mail_config: Option<&EmailConfig>,
     pool: &deadpool_postgres::Pool,
 ) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
     let l_successful: bool;
@@ -237,25 +231,6 @@ pub async fn user_login(
             .await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
 
-        if let Some(m_config) = mail_config {
-            match user_login_info.email_address {
-                Some(mail_address) => {
-                    let mail_message = Message::builder()
-                        .from(Mailbox::new(
-                            Some("Network Mapping".to_string()),
-                            "test@mail.abdc.world".to_string().parse().unwrap(),
-                        ))
-                        .to(Mailbox::new(None, mail_address.parse().unwrap()))
-                        .subject("Test".to_string())
-                        .header(ContentType::TEXT_PLAIN)
-                        .body("登录成功".to_string())
-                        .unwrap();
-
-                    send_email(m_config, mail_message).await;
-                }
-                None => (),
-            };
-        }
         Ok((session.session, csrf_token, enable_2fa))
     } else {
         Err("登录失败".into())

@@ -13,10 +13,11 @@ use crate::admin::{
     check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info,
 };
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
-use crate::config::{EmailConfig, PasswordHashConfig, SecurityConfig, ServerConfig};
+use crate::config::{PasswordHashConfig, SecurityConfig, ServerConfig};
 use crate::handlers::ReceiveLoginInfo;
 use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
+use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
 use crate::{AddUserInfo, admin, generate_hash_password, log_out, verify_password};
 use admin::{
@@ -40,6 +41,32 @@ fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Co
         .expires(OffsetDateTime::UNIX_EPOCH)
         .finish();
     (session_cookie, csrf_cookie)
+}
+
+fn request_source_ip(req: &HttpRequest) -> String {
+    req.connection_info()
+        .realip_remote_addr()
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn queue_login_notification(
+    pool: deadpool_postgres::Pool,
+    encryption_key: String,
+    username: String,
+    source_ip: String,
+) {
+    tokio::spawn(async move {
+        if let Err(error_value) =
+            send_login_notification(&pool, &encryption_key, &username, &source_ip).await
+        {
+            error!(
+                event = "SendLoginNotificationError",
+                username,
+                message = %error_value
+            );
+        }
+    });
 }
 #[derive(serde::Deserialize)]
 struct ChangePasswordRequest {
@@ -117,16 +144,15 @@ async fn first_add_user(
 async fn user_login_h(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
-    mail_config: web::Data<Option<EmailConfig>>,
+    server_config: web::Data<ServerConfig>,
     receiveinfo: web::Json<ReceiveLoginInfo>,
 ) -> impl Responder {
     println!("================= Benchmark =================");
     let total_start = Instant::now(); // 总的开始时间
     let start = Instant::now(); // 登录函数开始时间
     let p = pool.get_ref();
-    let m_c = mail_config.get_ref().as_ref();
     let (t_session, csrf_token, enable_twofa) =
-        match user_login(&receiveinfo.username, &receiveinfo.password, m_c, p).await {
+        match user_login(&receiveinfo.username, &receiveinfo.password, p).await {
             Ok(o) => o,
             Err(e) => {
                 let mut audit_event =
@@ -190,6 +216,15 @@ async fn user_login_h(
     audit_event.response_status = Some(if enable_twofa { 401 } else { 200 });
     audit_event.metadata = json!({"totp_required": enable_twofa});
     write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
+
+    if !enable_twofa {
+        queue_login_notification(
+            p.clone(),
+            server_config.encrypt_key.clone(),
+            receiveinfo.username.clone(),
+            request_source_ip(&req),
+        );
+    }
 
     match enable_twofa {
         true => {
@@ -409,6 +444,12 @@ async fn verify_totp_h(
                     &audit_event,
                 )
                 .await;
+                queue_login_notification(
+                    database_conn.clone(),
+                    s_config.encrypt_key.clone(),
+                    user_base_i.username.clone(),
+                    request_source_ip(&req),
+                );
                 HttpResponse::Ok().finish()
             }
             Err(error_value) => {
