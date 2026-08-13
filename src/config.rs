@@ -517,6 +517,7 @@ impl Default for NotificationPreferences {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailSettingsRequest {
+    /// 仅用于 SMTP 连通性测试和邮件模板测试，不作为真实通知的收件人。
     pub recipient: String,
     pub smtp_host: String,
     pub smtp_port: u16,
@@ -530,6 +531,7 @@ pub struct MailSettingsRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailSettingsResponse {
+    /// 仅用于 SMTP 连通性测试和邮件模板测试，不作为真实通知的收件人。
     pub recipient: String,
     pub smtp_host: String,
     pub smtp_port: u16,

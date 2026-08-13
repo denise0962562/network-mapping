@@ -51,12 +51,13 @@ fn request_source_ip(req: &HttpRequest) -> String {
 fn queue_login_notification(
     pool: deadpool_postgres::Pool,
     encryption_key: String,
+    user_id: i32,
     username: String,
     source_ip: String,
 ) {
     tokio::spawn(async move {
         if let Err(error_value) =
-            send_login_notification(&pool, &encryption_key, &username, &source_ip).await
+            send_login_notification(&pool, &encryption_key, user_id, &username, &source_ip).await
         {
             error!(
                 event = "SendLoginNotificationError",
@@ -174,6 +175,7 @@ async fn user_login_h(
         queue_login_notification(
             p.clone(),
             server_config.encrypt_key.clone(),
+            login_result.user_id,
             receiveinfo.username.clone(),
             request_source_ip(&req),
         );
@@ -426,6 +428,7 @@ async fn verify_totp_h(
                 queue_login_notification(
                     database_conn.clone(),
                     s_config.encrypt_key.clone(),
+                    user_base_i.id,
                     user_base_i.username.clone(),
                     request_source_ip(&req),
                 );

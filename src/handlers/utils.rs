@@ -101,14 +101,14 @@ async fn get_config_h(
 }
 
 fn validate_mail_settings(
-    recipient: &str,
+    test_recipient: &str,
     smtp_host: &str,
     smtp_port: u16,
     sender: &str,
     sender_key: &str,
 ) -> Result<(), &'static str> {
-    if recipient.trim().parse::<Mailbox>().is_err() {
-        return Err("收件人邮箱格式不正确");
+    if test_recipient.trim().parse::<Mailbox>().is_err() {
+        return Err("测试收件人邮箱格式不正确");
     }
     let smtp_host = smtp_host.trim();
     if smtp_host.is_empty()
@@ -409,7 +409,7 @@ async fn save_mail_settings_h(
     .resource("setting", "smtp");
     audit_event.response_status = Some(200);
     audit_event.changes = Some(json!({
-        "recipient": &saved_settings.recipient,
+        "test_recipient": &saved_settings.recipient,
         "smtp_host": &saved_settings.smtp_host,
         "smtp_port": saved_settings.smtp_port,
         "sender": &saved_settings.sender,
@@ -518,7 +518,7 @@ async fn test_mail_server_h(
             Err(_) => {
                 return HttpResponse::BadRequest().json(json!({
                     "success": false,
-                    "message": "收件人邮箱格式不正确"
+                    "message": "测试收件人邮箱格式不正确"
                 }));
             }
         })

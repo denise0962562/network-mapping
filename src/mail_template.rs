@@ -636,6 +636,7 @@ pub async fn send_template_test(
 pub async fn send_login_notification(
     pool: &Pool,
     encryption_key: &str,
+    user_id: i32,
     username: &str,
     source_ip: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -643,16 +644,43 @@ pub async fn send_login_notification(
     if !settings.notification_prefs.login_notify_enabled {
         return Ok(false);
     }
-    if settings.recipient.trim().is_empty() {
-        return Err("尚未配置登录通知收件人".into());
-    }
+    let Some(recipient) = get_user_notification_recipient(pool, user_id).await? else {
+        return Ok(false);
+    };
     let Some(source) = get_published_source(pool, LOGIN_SUCCESS_TEMPLATE_KEY).await? else {
         return Ok(false);
     };
     let context = login_context(username, source_ip)?;
     let rendered = render_template(LOGIN_SUCCESS_TEMPLATE_KEY, &source, &context)?;
-    send_rendered_mail(pool, encryption_key, &settings.recipient, rendered).await?;
+    send_rendered_mail(pool, encryption_key, &recipient, rendered).await?;
     Ok(true)
+}
+
+/// 获取真实通知的用户收件地址。系统级测试收件人不得在此处作为回退值。
+pub(crate) async fn get_user_notification_recipient(
+    pool: &Pool,
+    user_id: i32,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let conn = pool.get().await?;
+    let user_email = conn
+        .query_opt(
+            "SELECT email FROM users WHERE id = $1 AND role IN (1, 2) \
+             AND disabled_at IS NULL AND deleted_at IS NULL LIMIT 1;",
+            &[&user_id],
+        )
+        .await?
+        .and_then(|row| row.get::<_, Option<String>>("email"));
+    Ok(normalize_user_notification_recipient(user_email.as_deref())?.map(str::to_owned))
+}
+
+fn normalize_user_notification_recipient(
+    email: Option<&str>,
+) -> Result<Option<&str>, Box<dyn std::error::Error>> {
+    let Some(email) = email.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    email.parse::<Mailbox>()?;
+    Ok(Some(email))
 }
 
 pub fn validation_error_message(error: &dyn std::error::Error) -> String {
@@ -676,7 +704,8 @@ pub fn audit_source_metadata(source: &MailTemplateSource) -> Value {
 mod tests {
     use super::{
         LOGIN_SUCCESS_TEMPLATE_KEY, MailTemplateSource, default_source, login_context,
-        render_template, sanitize_email_html, template_definition, validate_template,
+        normalize_user_notification_recipient, render_template, sanitize_email_html,
+        template_definition, validate_template,
     };
 
     #[test]
@@ -722,5 +751,19 @@ mod tests {
         assert!(sanitized.contains("safe"));
         assert!(!sanitized.contains("onclick"));
         assert!(!sanitized.contains("script"));
+    }
+
+    #[test]
+    fn user_notification_recipient_uses_only_valid_profile_email() {
+        assert_eq!(normalize_user_notification_recipient(None).unwrap(), None);
+        assert_eq!(
+            normalize_user_notification_recipient(Some("  ")).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_user_notification_recipient(Some(" alice@example.com ")).unwrap(),
+            Some("alice@example.com")
+        );
+        assert!(normalize_user_notification_recipient(Some("not-an-email")).is_err());
     }
 }
