@@ -5,7 +5,7 @@ use crate::logs::write::{error_logs, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
-    TaskItemJson, apply_task, get_task_item, validate_scanner_credentials,
+    TaskItemJson, apply_task, build_scan_plan, get_task_item, validate_scanner_credentials,
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
@@ -502,7 +502,7 @@ async fn get_task(
              t.task_level, t.task_create_time, t.task_start_time, t.task_end_time, \
              t.task_status, t.lease_expires_at, t.attempt_count, t.failure_reason, t.cancel_requested, \
              t.retry_of_task_id, t.remarks, t.dispatch_mode, t.task_source, \
-             t.generation_strategy, t.generation_metadata, t.address_family \
+             t.generation_strategy, t.generation_metadata, t.address_family, t.scan_profile, t.scan_plan \
              FROM scan_task t \
              WHERE t.task_id = $1 AND ($2 = 1 OR t.user_id = $3) LIMIT 1;",
             &[&task_id, &user.role, &user.id],
@@ -670,6 +670,8 @@ async fn get_task(
             "generation_strategy": task.get::<_, Option<String>>("generation_strategy"),
             "generation_metadata": task.get::<_, Option<Value>>("generation_metadata"),
             "address_family": task.get::<_, String>("address_family"),
+            "scan_profile": task.get::<_, String>("scan_profile"),
+            "scan_plan": task.get::<_, Value>("scan_plan"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
             "executions": executions,
             "scanner_id": selected_execution.get::<_, Option<String>>("assigned_scanner_id"),
@@ -740,6 +742,14 @@ async fn create_task(
                 .json(serde_json::json!({"success": false, "message": message}));
         }
     };
+    let scan_profile = create_data.scan_profile.trim().to_lowercase();
+    let scan_plan = match build_scan_plan(&scan_profile) {
+        Ok(plan) => plan,
+        Err(message) => {
+            return HttpResponse::BadRequest()
+                .json(serde_json::json!({"success": false, "message": message}));
+        }
+    };
     let capability_filter = if address_family == "ipv6" {
         "supports_ipv6 AND ipv6_ready"
     } else {
@@ -797,6 +807,8 @@ async fn create_task(
             user_id,
             &dispatch_mode,
             &requested_scanners,
+            &scan_profile,
+            &scan_plan,
             &AuditContext::from_request(&req),
             &user_base_i,
         )

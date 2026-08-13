@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	generation_key TEXT,
 	generation_metadata JSONB,
 	address_family TEXT NOT NULL DEFAULT 'ipv4' CHECK (address_family IN ('ipv4', 'ipv6')),
+	scan_profile TEXT NOT NULL DEFAULT 'legacy',
+	scan_plan JSONB NOT NULL DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb,
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -68,6 +70,9 @@ ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_strategy TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_key TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_metadata JSONB;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS address_family TEXT NOT NULL DEFAULT 'ipv4';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_profile TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_plan JSONB NOT NULL
+    DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb;
 UPDATE scan_task SET address_family = 'ipv6'
 WHERE cardinality(task_target) > 0
   AND NOT EXISTS (SELECT 1 FROM unnest(task_target) AS target WHERE family(target) <> 6);
@@ -78,6 +83,15 @@ BEGIN
     ) THEN
         ALTER TABLE scan_task ADD CONSTRAINT scan_task_address_family_check
             CHECK (address_family IN ('ipv4', 'ipv6'));
+    END IF;
+END $$;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_profile_check'
+    ) THEN
+        ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
+            CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory'));
     END IF;
 END $$;
 

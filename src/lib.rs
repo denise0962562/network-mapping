@@ -418,7 +418,7 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
 
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
-    use super::{STask, TargetIP, parse_ip_or_cidr};
+    use super::{STask, TargetIP, build_scan_plan, parse_ip_or_cidr};
 
     #[test]
     fn accepts_plain_ipv4_as_single_host_network() {
@@ -463,6 +463,17 @@ mod parse_ip_or_cidr_tests {
 
         let mixed = STask::new(TargetIP::S("192.0.2.1,2001:db8::1"), "test", None, None).unwrap();
         assert!(mixed.address_family().is_err());
+    }
+
+    #[test]
+    fn scan_profiles_expand_to_allowlisted_plans() {
+        let ports = build_scan_plan("port_only").unwrap();
+        assert_eq!(ports["version"], 1);
+        assert_eq!(ports["stages"].as_array().unwrap().len(), 1);
+
+        let inventory = build_scan_plan("service_inventory").unwrap();
+        assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
+        assert!(build_scan_plan("arbitrary_command").is_err());
     }
 }
 
@@ -521,10 +532,38 @@ pub struct CreateTask {
     pub dispatch_mode: String,
     #[serde(default)]
     pub scanner_ids: Vec<Uuid>,
+    #[serde(default = "default_scan_profile")]
+    pub scan_profile: String,
 }
 
 fn default_dispatch_mode() -> String {
     "automatic".into()
+}
+
+fn default_scan_profile() -> String {
+    "legacy".into()
+}
+
+pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
+    let stages = match profile {
+        "legacy" => serde_json::json!([
+            {"type": "port_discovery", "required": true},
+            {"type": "service_detection", "required": false}
+        ]),
+        "port_only" => serde_json::json!([
+            {"type": "port_discovery", "required": true}
+        ]),
+        "service_inventory" => serde_json::json!([
+            {"type": "port_discovery", "required": true},
+            {"type": "service_detection", "required": true}
+        ]),
+        _ => return Err("unsupported scan profile"),
+    };
+    Ok(serde_json::json!({
+        "version": 1,
+        "profile": profile,
+        "stages": stages,
+    }))
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
@@ -591,6 +630,8 @@ impl<'a> STask<'a> {
         user_id: i32,
         dispatch_mode: &str,
         requested_scanners: &[Option<String>],
+        scan_profile: &str,
+        scan_plan: &Value,
         audit_context: &audit::AuditContext,
         actor: &admin::UserBaseI,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -607,9 +648,9 @@ impl<'a> STask<'a> {
         let address_family = self.address_family()?;
 
         let task_row = client.query_one(
-            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, dispatch_mode, address_family) \
-             VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7, $8, $9) RETURNING id;",
-            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark, &dispatch_mode, &address_family]
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, dispatch_mode, address_family, scan_profile, scan_plan) \
+             VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7, $8, $9, $10, $11) RETURNING id;",
+            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark, &dispatch_mode, &address_family, &scan_profile, &scan_plan]
         ).await?;
         let task_db_id: i32 = task_row.get("id");
         for requested_scanner in requested_scanners {
@@ -626,6 +667,7 @@ impl<'a> STask<'a> {
             "dispatch_mode": dispatch_mode,
             "scanner_count": requested_scanners.len(),
             "target_count": self.ip.len()
+            ,"scan_profile": scan_profile
         });
         audit::write(&client, audit_context, &audit_event).await?;
 
@@ -1042,6 +1084,7 @@ pub struct ApplyTask {
     pub task_target: Vec<String>,
     pub task_port: String,
     pub address_family: String,
+    pub scan_plan: Value,
 }
 
 #[derive(Deserialize)]
@@ -1369,7 +1412,7 @@ pub async fn apply_task(
 
     let row = transaction
         .query_opt(
-            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port, t.address_family \
+            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port, t.address_family, t.scan_plan \
          FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
          JOIN scanner_info s ON s.scanner_id = $2 \
          WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.cancel_requested = false \
@@ -1423,6 +1466,7 @@ pub async fn apply_task(
         task_target: row.get("task_target"),
         task_port: row.get("task_port"),
         address_family: row.get("address_family"),
+        scan_plan: row.get("scan_plan"),
     };
 
     transaction
@@ -1509,6 +1553,8 @@ pub struct TaskItem {
     pub remarks: Option<String>,
     pub task_source: String,
     pub address_family: String,
+    pub scan_profile: String,
+    pub scan_plan: Value,
 }
 
 /// 表示 Json 格式的任务列表
@@ -1610,6 +1656,8 @@ pub async fn get_task_item(
             remarks: r.get::<_, Option<String>>("remarks"),
             task_source: r.get::<_, String>("task_source"),
             address_family: r.get::<_, String>("address_family"),
+            scan_profile: r.get::<_, String>("scan_profile"),
+            scan_plan: r.get::<_, Value>("scan_plan"),
         };
         task_item_r.push(titem);
         count += 1;
