@@ -33,7 +33,8 @@ pub struct Config {
     pub frontend: FrontendConfig,
     #[serde(default)]
     pub maxmind: MaxMindConfig,
-    // pub scan_target_generated: ScanTargetConfig,
+    #[serde(default)]
+    pub automatic_target: AutomaticTargetConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -64,6 +65,9 @@ impl SelfChecking for Config {
         let _ = &self.server.check();
         let _ = &self.database.check();
         let _ = &self.security.check();
+        if let Err(error) = self.automatic_target.validate() {
+            panic!("{error}");
+        }
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -77,7 +81,9 @@ impl SelfChecking for Config {
             Ok(false) => return Ok(false),
             Err(e) => return Err(e),
         }
-        self.security.try_check()
+        self.security.try_check()?;
+        self.automatic_target.validate()?;
+        Ok(true)
     }
 }
 
@@ -230,6 +236,118 @@ impl MaxMindConfig {
     }
 }
 
+pub const DEFAULT_COMMON_SCAN_PORTS: &str = "21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5432,5900,6379,8080,8443,9200,11211,27017";
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AutomaticTargetConfig {
+    pub enabled: bool,
+    pub strategy: String,
+    pub interval_seconds: u64,
+    pub pending_low_watermark: u32,
+    pub pending_high_watermark: u32,
+    pub priority: i32,
+    pub authorized_cidrs: Vec<String>,
+    pub ipv4_task_prefix: u8,
+    pub common_ports: String,
+    pub repeat_after_seconds: u64,
+}
+
+impl Default for AutomaticTargetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: "sequential_subnet".to_owned(),
+            interval_seconds: 30,
+            pending_low_watermark: 2,
+            pending_high_watermark: 5,
+            priority: 0,
+            authorized_cidrs: Vec::new(),
+            ipv4_task_prefix: 24,
+            common_ports: DEFAULT_COMMON_SCAN_PORTS.to_owned(),
+            repeat_after_seconds: 7 * 24 * 60 * 60,
+        }
+    }
+}
+
+impl AutomaticTargetConfig {
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.strategy != "sequential_subnet" {
+            return Err(format!("不支持的自动目标生成策略：{}", self.strategy).into());
+        }
+        if self.interval_seconds < 5 {
+            return Err("automatic_target.interval_seconds 不能小于 5".into());
+        }
+        if self.pending_low_watermark > self.pending_high_watermark
+            || self.pending_high_watermark == 0
+            || self.pending_high_watermark > 100
+        {
+            return Err(
+                "automatic_target 队列水位必须满足 0 <= low <= high <= 100 且 high > 0".into(),
+            );
+        }
+        if !(0..=4).contains(&self.priority) {
+            return Err("automatic_target.priority 必须在 0 到 4 之间".into());
+        }
+        if self.ipv4_task_prefix > 32 {
+            return Err("automatic_target.ipv4_task_prefix 不能大于 32".into());
+        }
+        validate_port_list(&self.common_ports)?;
+        if self.enabled && self.authorized_cidrs.is_empty() {
+            return Err("启用自动目标生成时必须配置 authorized_cidrs".into());
+        }
+        let mut authorized_networks = Vec::with_capacity(self.authorized_cidrs.len());
+        for value in &self.authorized_cidrs {
+            let network: ipnet::IpNet = value
+                .parse()
+                .map_err(|error| format!("无效的自动目标授权 CIDR {value}: {error}"))?;
+            let ipnet::IpNet::V4(network) = network else {
+                return Err(format!("自动目标生成第一版仅支持 IPv4：{value}").into());
+            };
+            if network.prefix_len() > self.ipv4_task_prefix {
+                return Err(format!(
+                    "授权范围 {value} 小于配置的 /{} 任务网段",
+                    self.ipv4_task_prefix
+                )
+                .into());
+            }
+            authorized_networks.push(network);
+        }
+        for (index, network) in authorized_networks.iter().enumerate() {
+            if authorized_networks[index + 1..].iter().any(|other| {
+                network.contains(&other.network()) || other.contains(&network.network())
+            }) {
+                return Err(format!("自动目标授权 CIDR 存在重复或重叠：{network}").into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_port_list(value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.is_empty() {
+        return Err("automatic_target.common_ports 不能为空".into());
+    }
+    for segment in value.split(',') {
+        let mut bounds = segment.split('-');
+        let start = bounds
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("无效的自动扫描端口：{segment}"))?;
+        let end = bounds
+            .next()
+            .map(|value| value.parse::<u16>())
+            .transpose()
+            .map_err(|_| format!("无效的自动扫描端口：{segment}"))?
+            .unwrap_or(start);
+        if bounds.next().is_some() || end == 0 || start > end {
+            return Err(format!("无效的自动扫描端口：{segment}").into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub host: String,               //数据库主机地址
@@ -298,7 +416,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Clis, FrontendConfig, MaxMindConfig, SecurityConfig, SelfChecking, TlsConfig};
+    use super::{
+        AutomaticTargetConfig, Clis, FrontendConfig, MaxMindConfig, SecurityConfig, SelfChecking,
+        TlsConfig,
+    };
     use clap::Parser;
     use std::path::{Path, PathBuf};
 
@@ -401,12 +522,29 @@ mod tests {
 
         assert!(cli.refresh_ip_intel);
     }
+
+    #[test]
+    fn automatic_target_requires_authorized_ipv4_ranges_when_enabled() {
+        let mut config = AutomaticTargetConfig {
+            enabled: true,
+            ..AutomaticTargetConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.authorized_cidrs = vec!["10.20.0.0/16".to_owned()];
+        assert!(config.validate().is_ok());
+
+        config.authorized_cidrs = vec!["2001:db8::/32".to_owned()];
+        assert!(config.validate().is_err());
+
+        config.authorized_cidrs = vec!["10.20.0.0/16".to_owned(), "10.20.1.0/24".to_owned()];
+        assert!(config.validate().is_err());
+    }
 }
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(user::first_add_user)
         .service(user::user_login_h)
-        .service(handlers::utils::get_scan_target)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
@@ -415,6 +553,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::search::search_port)
         .service(handlers::search::search_service)
         .service(handlers::search::search_banner)
+        .service(crate::target_generated::automatic_target_status)
         .service(handlers::task::create_task)
         .service(handlers::task::apply_task_handler) //更换了 apply_task_handler 和 get_task的注册顺序
         .service(handlers::task::scanner_heartbeat_handler)

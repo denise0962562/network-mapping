@@ -429,7 +429,8 @@ async fn get_task(
             "SELECT t.id, t.task_id, t.task_target::text[], t.task_port, t.task_initiator, \
              t.task_level, t.task_create_time, t.task_start_time, t.task_end_time, \
              t.task_status, t.lease_expires_at, t.attempt_count, t.failure_reason, t.cancel_requested, \
-             t.retry_of_task_id, t.remarks, t.dispatch_mode \
+             t.retry_of_task_id, t.remarks, t.dispatch_mode, t.task_source, \
+             t.generation_strategy, t.generation_metadata \
              FROM scan_task t \
              WHERE t.task_id = $1 AND ($2 = 1 OR t.user_id = $3) LIMIT 1;",
             &[&task_id, &user.role, &user.id],
@@ -593,6 +594,9 @@ async fn get_task(
             "task_end_time": selected_execution.get::<_, Option<i64>>("task_end_time"),
             "task_status": task.get::<_, String>("task_status"),
             "dispatch_mode": task.get::<_, String>("dispatch_mode"),
+            "task_source": task.get::<_, String>("task_source"),
+            "generation_strategy": task.get::<_, Option<String>>("generation_strategy"),
+            "generation_metadata": task.get::<_, Option<Value>>("generation_metadata"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
             "executions": executions,
             "scanner_id": selected_execution.get::<_, Option<String>>("assigned_scanner_id"),

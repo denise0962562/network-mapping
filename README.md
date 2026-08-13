@@ -95,6 +95,30 @@ cargo run -- --refresh-ip-intel
 
 任务详情接口 `GET /api/task/{task_id}` 返回 `executions`，并可通过 `execution_id` 查询参数选择某个执行实例的分页结果。同一个逻辑任务下，各扫描器的状态、失败原因和扫描结果相互独立；导出的 CSV/JSON 也包含执行实例和扫描器标识。
 
+## 自动目标生成
+
+服务端可以从明确授权的 IPv4 CIDR 中顺序生成扫描任务，并使用现有任务队列自动分配给
+任意已启用扫描器。默认关闭；启用前必须配置授权范围：
+
+```toml
+[automatic_target]
+enabled = true
+strategy = "sequential_subnet"
+interval_seconds = 30
+pending_low_watermark = 2
+pending_high_watermark = 5
+priority = 0
+authorized_cidrs = ["10.20.0.0/16"]
+ipv4_task_prefix = 24
+common_ports = "21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5432,5900,6379,8080,8443,9200,11211,27017"
+repeat_after_seconds = 604800
+```
+
+待领取的自动任务低于低水位时，服务端补充至高水位。生成游标存储在数据库中，服务重启
+后继续；同一目标在冷却期内不会重复生成。管理员可通过
+`GET /api/automatic-target/status` 查看当前策略、队列水位和生成状态。第一版仅支持 IPv4，
+不会随机生成或扫描配置范围之外的公网目标。
+
 ## 开源项目清单
 
 `GET /api/open-source/projects` 返回编译进服务端的主要直接依赖清单。升级 `Cargo.toml`、扫描器依赖或前端 `package.json` 后，应同步复核 `source/open_source_projects.json` 中的版本、许可证和上游链接。

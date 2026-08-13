@@ -1488,6 +1488,7 @@ pub struct TaskItem {
     pub start_at: Option<i64>,
     pub end_at: Option<i64>,
     pub remarks: Option<String>,
+    pub task_source: String,
 }
 
 /// 表示 Json 格式的任务列表
@@ -1587,6 +1588,7 @@ pub async fn get_task_item(
             start_at: r.get::<_, Option<i64>>("task_start_time"),
             end_at: r.get::<_, Option<i64>>("task_end_time"),
             remarks: r.get::<_, Option<String>>("remarks"),
+            task_source: r.get::<_, String>("task_source"),
         };
         task_item_r.push(titem);
         count += 1;

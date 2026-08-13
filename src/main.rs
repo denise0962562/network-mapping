@@ -16,6 +16,7 @@ use rust_web_test::middlewares::{
     smiddleware::AuthMiddleware,
 };
 use rust_web_test::open_source::OpenSourceCatalog;
+use rust_web_test::target_generated::{AutomaticTargetService, run_generator};
 use rust_web_test::tls::build_acceptor;
 use rust_web_test::{Systems, TemplatesInit, config, db, insert_system_status};
 
@@ -48,6 +49,8 @@ async fn main() -> io::Result<()> {
     config.check();
     let frontend_directory = config.frontend.directory.clone();
     let maxmind_directory = config.maxmind.directory.clone();
+    let automatic_target_service = AutomaticTargetService::new(config.automatic_target.clone())
+        .map_err(|error| io::Error::other(format!("自动目标生成配置错误：{error}")))?;
 
     let ser_con = config.server.clone();
     let server = config.server;
@@ -121,6 +124,11 @@ async fn main() -> io::Result<()> {
 
     check_system_user(&db_pool).await;
 
+    tokio::spawn(run_generator(
+        automatic_target_service.clone(),
+        db_pool.clone(),
+    ));
+
     // 定义密码加密相关配置文件
     let pwd_h = config.pwd_hash;
 
@@ -136,6 +144,7 @@ async fn main() -> io::Result<()> {
     let sys = Systems::new();
     let sys_2 = sys.clone();
     let maxmind_state = web::Data::new(maxmind_state);
+    let automatic_target_service = web::Data::new(automatic_target_service);
     let security = web::Data::new(config.security);
     let rate_limiter = RateLimitMiddleware::default();
     let open_source_catalog = web::Data::new(
@@ -153,6 +162,7 @@ async fn main() -> io::Result<()> {
         template_name = %template_info.templates_name,
         frontend_directory = %frontend_directory.display(),
         maxmind_directory = %maxmind_directory.display(),
+        automatic_target_enabled = automatic_target_service.enabled(),
         status_interval_seconds = log.status_duration,
         "服务配置就绪"
     );
@@ -203,6 +213,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(mail_c.clone()))
             .app_data(web::Data::new(ser_con.clone()))
             .app_data(maxmind_state.clone())
+            .app_data(automatic_target_service.clone())
             .app_data(open_source_catalog.clone())
             .app_data(security.clone())
             .app_data(frontend_assets.clone())
