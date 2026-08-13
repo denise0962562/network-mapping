@@ -265,6 +265,9 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv4 INET;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv6 INET;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_status_reason JSONB;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_capabilities_updated_at TIMESTAMPTZ;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities JSONB NOT NULL
+    DEFAULT '{"plan_versions":[],"profiles":["legacy"],"stages":["port_discovery"]}'::jsonb;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities_updated_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,

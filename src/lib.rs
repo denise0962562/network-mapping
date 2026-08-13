@@ -1420,6 +1420,7 @@ pub async fn apply_task(
            AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
              OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
+           AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
          ORDER BY t.task_level DESC, t.task_create_time, e.id \
          FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",

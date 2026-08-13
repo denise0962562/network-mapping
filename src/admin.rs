@@ -119,6 +119,8 @@ pub struct ScannerInfo {
     pub public_ipv6: Option<String>,
     pub network_status_reason: Option<serde_json::Value>,
     pub network_capabilities_updated_at: Option<DateTime<Utc>>,
+    pub scan_capabilities: serde_json::Value,
+    pub scan_capabilities_updated_at: Option<DateTime<Utc>>,
 }
 
 pub enum ScannerEvent {
@@ -1332,7 +1334,7 @@ const SCANNER_INFO_SELECT: &str = "\
            s.is_run, s.is_enable, s.remark, s.tag, s.supports_ipv4, s.supports_ipv6, \
            s.ipv4_ready, s.ipv6_ready, host(s.public_ipv4) AS public_ipv4, \
            host(s.public_ipv6) AS public_ipv6, s.network_status_reason, \
-           s.network_capabilities_updated_at \
+           s.network_capabilities_updated_at, s.scan_capabilities, s.scan_capabilities_updated_at \
     FROM scanner_info s \
     LEFT JOIN users u ON u.id = s.create_user";
 
@@ -1368,6 +1370,8 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         public_ipv6: row.get("public_ipv6"),
         network_status_reason: row.get("network_status_reason"),
         network_capabilities_updated_at: row.get("network_capabilities_updated_at"),
+        scan_capabilities: row.get("scan_capabilities"),
+        scan_capabilities_updated_at: row.get("scan_capabilities_updated_at"),
     }
 }
 
