@@ -5,12 +5,14 @@ use tracing::error;
 
 use crate::TEXT_HTML_UTF_8;
 use crate::admin::{
-    UserBaseI, get_config_from_database, get_mail_sender_key_from_database,
-    get_mail_settings_from_database, try_send_email, write_mail_settings_to_database,
+    UserBaseI, UserSession, get_config_from_database, get_mail_sender_key_from_database,
+    get_mail_settings_from_database, get_session_settings_from_database, try_send_email,
+    write_mail_settings_to_database, write_session_settings_to_database,
 };
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::config::{
     DatabaseConfig, EmailConfig, GetConfig, MailSettingsRequest, MailTestRequest, ServerConfig,
+    SessionSettingsRequest, session_ttl_seconds_from_minutes,
 };
 use crate::{FrontEndErrorInfo, TemplatesInit, front_end_error_page, logs::write::info_logs};
 
@@ -195,6 +197,113 @@ async fn get_mail_settings_h(
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
                 "message": "邮件配置暂时无法读取"
+            }))
+        }
+    }
+}
+
+#[get("/api/config/security/session")]
+async fn get_session_settings_h(
+    pool: web::Data<deadpool_postgres::Pool>,
+    user_base_i: UserBaseI,
+) -> impl Responder {
+    if user_base_i.role != 1 {
+        return HttpResponse::Forbidden().json(json!({
+            "success": false,
+            "message": "仅管理员可以读取会话策略"
+        }));
+    }
+    match get_session_settings_from_database(pool.get_ref()).await {
+        Ok(settings) => HttpResponse::Ok().json(json!({
+            "success": true,
+            "data": settings
+        })),
+        Err(error_value) => {
+            error!(
+                event = "GetSessionSettingsError",
+                path = "fn get_session_settings_h",
+                message = %error_value
+            );
+            HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "会话策略暂时无法读取"
+            }))
+        }
+    }
+}
+
+#[post("/api/config/security/session")]
+async fn save_session_settings_h(
+    req: HttpRequest,
+    settings: web::Json<SessionSettingsRequest>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    user_base_i: UserBaseI,
+    user_session: UserSession,
+) -> impl Responder {
+    if user_base_i.role != 1 {
+        let mut audit_event = AuditEvent::user(
+            "configuration",
+            "configuration.session_policy_update",
+            "failure",
+            &user_base_i,
+        );
+        audit_event.response_status = Some(403);
+        audit_event.reason_code = Some("insufficient_role".to_owned());
+        write_standalone(
+            pool.get_ref(),
+            &AuditContext::from_request(&req),
+            &audit_event,
+        )
+        .await;
+        return HttpResponse::Forbidden().json(json!({
+            "success": false,
+            "message": "仅管理员可以修改会话策略"
+        }));
+    }
+    if let Err(message) = session_ttl_seconds_from_minutes(settings.session_ttl_minutes) {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": message
+        }));
+    }
+
+    match write_session_settings_to_database(pool.get_ref(), &settings, &user_session.session).await
+    {
+        Ok(saved_settings) => {
+            let mut audit_event = AuditEvent::user(
+                "configuration",
+                "configuration.session_policy_update",
+                "success",
+                &user_base_i,
+            )
+            .resource("setting", "security.session_ttl_seconds");
+            audit_event.response_status = Some(200);
+            audit_event.changes = Some(json!({
+                "session_ttl_minutes": saved_settings.session_ttl_minutes,
+                "invalidate_other_sessions": settings.invalidate_other_sessions,
+                "invalidated_session_count": saved_settings.invalidated_session_count
+            }));
+            write_standalone(
+                pool.get_ref(),
+                &AuditContext::from_request(&req),
+                &audit_event,
+            )
+            .await;
+            HttpResponse::Ok().json(json!({
+                "success": true,
+                "message": "会话策略已保存",
+                "data": saved_settings
+            }))
+        }
+        Err(error_value) => {
+            error!(
+                event = "SaveSessionSettingsError",
+                path = "fn save_session_settings_h",
+                message = %error_value
+            );
+            HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "会话策略保存失败"
             }))
         }
     }

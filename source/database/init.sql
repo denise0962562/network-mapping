@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS session (
 	id SERIAL PRIMARY KEY,
 	token TEXT NOT NULL,
 	csrf_token TEXT NOT NULL,
-	ttl INT DEFAULT 1200, 
+	ttl INT DEFAULT 2700,
 	totp_verify_successful boolean DEFAULT false,
 	pending_totp_secret TEXT,
 	pending_totp_expires_at BIGINT,
@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS session (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, is_enable);
+
+ALTER TABLE session ALTER COLUMN ttl SET DEFAULT 2700;
 
 
 -- 表 system_status 用于存储系统状态数据
@@ -439,6 +441,10 @@ CREATE TABLE IF NOT EXISTS setting (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_item_type_key ON setting (item_type, key);
+
+INSERT INTO setting (item_type, key, value)
+VALUES ('security', 'session_ttl_seconds', '2700')
+ON CONFLICT (item_type, key) DO NOTHING;
 
 -- 邮件模板元数据与版本。草稿不会影响正在使用的已发布版本。
 CREATE TABLE IF NOT EXISTS mail_template (

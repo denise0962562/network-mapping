@@ -16,8 +16,10 @@ use uuid::Uuid;
 
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::{
-    EmailConfig, MailSettingsRequest, MailSettingsResponse, NotificationPreferences,
-    PasswordHashConfig, SystemConfig,
+    DEFAULT_SESSION_TTL_SECONDS, EmailConfig, MAX_SESSION_TTL_MINUTES, MIN_SESSION_TTL_MINUTES,
+    MailSettingsRequest, MailSettingsResponse, NotificationPreferences, PasswordHashConfig,
+    SessionSettingsRequest, SessionSettingsResponse, SystemConfig,
+    session_ttl_seconds_from_minutes,
 };
 use crate::{AddUserInfo, generate_hash_password, generate_scanner_token, hash_scanner_token};
 use crate::{decrypt_data, encrypt_data};
@@ -30,6 +32,8 @@ const DEFAULT_ADMIN_PASSWORD_CHARS: &[u8] =
 const SMTP_SETTING_TYPE: &str = "smtp";
 const NOTIFICATION_SETTING_TYPE: &str = "notification";
 const SMTP_SENDER_KEY: &str = "sender_key";
+const SECURITY_SETTING_TYPE: &str = "security";
+const SESSION_TTL_SETTING_KEY: &str = "session_ttl_seconds";
 
 /// 该结构体用于接收测试使用的创建用户信息
 #[derive(Deserialize)]
@@ -950,6 +954,71 @@ pub async fn write_config_to_database(
 
         _ => Err("插入数据异常".into()),
     }
+}
+
+/// 读取用于新登录会话的绝对有效期。缺失或损坏的设置回退到 45 分钟。
+pub async fn get_session_ttl_seconds_from_database(
+    pool: &deadpool_postgres::Pool,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let conn = pool.get().await?;
+    let row = conn
+        .query_opt(
+            "SELECT value FROM setting WHERE item_type = $1 AND key = $2 LIMIT 1;",
+            &[&SECURITY_SETTING_TYPE, &SESSION_TTL_SETTING_KEY],
+        )
+        .await?;
+    let minimum_seconds = MIN_SESSION_TTL_MINUTES * 60;
+    let maximum_seconds = MAX_SESSION_TTL_MINUTES * 60;
+    Ok(row
+        .and_then(|row| row.get::<_, String>("value").parse::<i32>().ok())
+        .filter(|seconds| {
+            seconds % 60 == 0 && (minimum_seconds..=maximum_seconds).contains(seconds)
+        })
+        .unwrap_or(DEFAULT_SESSION_TTL_SECONDS))
+}
+
+pub async fn get_session_settings_from_database(
+    pool: &deadpool_postgres::Pool,
+) -> Result<SessionSettingsResponse, Box<dyn std::error::Error>> {
+    Ok(SessionSettingsResponse::new(
+        get_session_ttl_seconds_from_database(pool).await?,
+        0,
+    ))
+}
+
+/// 原子保存会话策略，并按管理员选择注销除当前会话外的其他活动会话。
+pub async fn write_session_settings_to_database(
+    pool: &deadpool_postgres::Pool,
+    settings: &SessionSettingsRequest,
+    current_session: &str,
+) -> Result<SessionSettingsResponse, Box<dyn std::error::Error>> {
+    let ttl_seconds = session_ttl_seconds_from_minutes(settings.session_ttl_minutes)?;
+    let value = ttl_seconds.to_string();
+    let mut conn = pool.get().await?;
+    let transaction = conn.transaction().await?;
+    transaction
+        .execute(
+            "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \
+             ON CONFLICT (item_type, key) DO UPDATE SET value = EXCLUDED.value, update_at = NOW();",
+            &[&SECURITY_SETTING_TYPE, &SESSION_TTL_SETTING_KEY, &value],
+        )
+        .await?;
+    let invalidated_session_count = if settings.invalidate_other_sessions {
+        transaction
+            .execute(
+                "UPDATE session SET is_enable = false \
+                 WHERE is_enable = true AND token <> $1;",
+                &[&current_session],
+            )
+            .await?
+    } else {
+        0
+    };
+    transaction.commit().await?;
+    Ok(SessionSettingsResponse::new(
+        ttl_seconds,
+        invalidated_session_count,
+    ))
 }
 
 /// 读取设置页需要的邮件与通知配置。

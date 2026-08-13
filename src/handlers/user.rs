@@ -151,7 +151,7 @@ async fn user_login_h(
     let total_start = Instant::now(); // 总的开始时间
     let start = Instant::now(); // 登录函数开始时间
     let p = pool.get_ref();
-    let (t_session, csrf_token, enable_twofa) =
+    let (t_session, csrf_token, enable_twofa, session_ttl_seconds) =
         match user_login(&receiveinfo.username, &receiveinfo.password, p).await {
             Ok(o) => o,
             Err(e) => {
@@ -186,13 +186,17 @@ async fn user_login_h(
         .path("/")
         .http_only(true)
         .secure(true)
-        .max_age(cookie::time::Duration::seconds(2700))
+        .max_age(cookie::time::Duration::seconds(i64::from(
+            session_ttl_seconds,
+        )))
         .same_site(cookie::SameSite::Strict)
         .finish();
     let cookie_csrf_token = Cookie::build("csrf_token", &csrf_token)
         .path("/")
         .secure(true)
-        .max_age(cookie::time::Duration::seconds(2700))
+        .max_age(cookie::time::Duration::seconds(i64::from(
+            session_ttl_seconds,
+        )))
         .same_site(cookie::SameSite::Strict)
         .finish();
 

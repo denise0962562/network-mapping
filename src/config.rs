@@ -538,6 +538,45 @@ pub struct MailSettingsResponse {
     pub notification_prefs: NotificationPreferences,
 }
 
+pub const DEFAULT_SESSION_TTL_SECONDS: i32 = 45 * 60;
+pub const MIN_SESSION_TTL_MINUTES: i32 = 5;
+pub const MAX_SESSION_TTL_MINUTES: i32 = 24 * 60;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSettingsRequest {
+    pub session_ttl_minutes: i32,
+    #[serde(default)]
+    pub invalidate_other_sessions: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSettingsResponse {
+    pub session_ttl_minutes: i32,
+    pub minimum_minutes: i32,
+    pub maximum_minutes: i32,
+    pub invalidated_session_count: u64,
+}
+
+impl SessionSettingsResponse {
+    pub fn new(session_ttl_seconds: i32, invalidated_session_count: u64) -> Self {
+        Self {
+            session_ttl_minutes: session_ttl_seconds / 60,
+            minimum_minutes: MIN_SESSION_TTL_MINUTES,
+            maximum_minutes: MAX_SESSION_TTL_MINUTES,
+            invalidated_session_count,
+        }
+    }
+}
+
+pub fn session_ttl_seconds_from_minutes(minutes: i32) -> Result<i32, &'static str> {
+    if !(MIN_SESSION_TTL_MINUTES..=MAX_SESSION_TTL_MINUTES).contains(&minutes) {
+        return Err("会话有效期必须在 5 分钟到 24 小时之间");
+    }
+    minutes.checked_mul(60).ok_or("会话有效期超出允许范围")
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailTestRequest {
@@ -565,10 +604,19 @@ impl Config {
 mod tests {
     use super::{
         AutomaticTargetConfig, Clis, FrontendConfig, MaxMindConfig, SecurityConfig, SelfChecking,
-        TlsConfig,
+        TlsConfig, session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn session_ttl_minutes_are_converted_and_bounded() {
+        assert_eq!(session_ttl_seconds_from_minutes(45), Ok(2700));
+        assert_eq!(session_ttl_seconds_from_minutes(5), Ok(300));
+        assert_eq!(session_ttl_seconds_from_minutes(1440), Ok(86_400));
+        assert!(session_ttl_seconds_from_minutes(4).is_err());
+        assert!(session_ttl_seconds_from_minutes(1441).is_err());
+    }
 
     #[test]
     fn tls_paths_are_resolved_relative_to_config_file() {
@@ -799,6 +847,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(utils::get_config_h)
         .service(utils::get_mail_settings_h)
         .service(utils::save_mail_settings_h)
+        .service(utils::get_session_settings_h)
+        .service(utils::save_session_settings_h)
         .service(utils::test_mail_server_h);
 
     #[cfg(feature = "rir")]

@@ -5,6 +5,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::UserLoginInfo;
+use crate::admin::get_session_ttl_seconds_from_database;
 use crate::{get_password_and_id_from_database, get_unix_epoch_ms, verify_password};
 
 pub struct LoginToken {
@@ -186,7 +187,7 @@ pub async fn user_login(
     username: &str,
     password: &str,
     pool: &deadpool_postgres::Pool,
-) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
+) -> Result<(String, String, bool, i32), Box<dyn std::error::Error>> {
     let l_successful: bool;
     let start = Instant::now();
 
@@ -225,13 +226,14 @@ pub async fn user_login(
         let start = Instant::now();
         let enable_2fa = user_login_info.twofa.map(|_| true).unwrap_or(false);
 
+        let session_ttl_seconds = get_session_ttl_seconds_from_database(pool).await?;
         let login_token = LoginToken { pool: pool.clone() };
         let (session, csrf_token) = login_token
-            .create_session(2700, username, enable_2fa)
+            .create_session(session_ttl_seconds, username, enable_2fa)
             .await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
 
-        Ok((session.session, csrf_token, enable_2fa))
+        Ok((session.session, csrf_token, enable_2fa, session_ttl_seconds))
     } else {
         Err("登录失败".into())
     }
