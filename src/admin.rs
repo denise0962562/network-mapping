@@ -108,6 +108,14 @@ pub struct ScannerInfo {
     pub is_enable: Option<bool>,
     pub remark: Option<String>,
     pub tag: Option<String>,
+    pub supports_ipv4: bool,
+    pub supports_ipv6: bool,
+    pub ipv4_ready: bool,
+    pub ipv6_ready: bool,
+    pub public_ipv4: Option<String>,
+    pub public_ipv6: Option<String>,
+    pub network_status_reason: Option<serde_json::Value>,
+    pub network_capabilities_updated_at: Option<DateTime<Utc>>,
 }
 
 pub enum ScannerEvent {
@@ -1088,7 +1096,10 @@ const SCANNER_INFO_SELECT: &str = "\
               WHERE e.assigned_scanner_id = s.scanner_id AND e.execution_status = 'running' \
               AND e.lease_expires_at > (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
               ORDER BY e.task_start_time DESC NULLS LAST LIMIT 1) AS current_task_id, \
-           s.is_run, s.is_enable, s.remark, s.tag \
+           s.is_run, s.is_enable, s.remark, s.tag, s.supports_ipv4, s.supports_ipv6, \
+           s.ipv4_ready, s.ipv6_ready, host(s.public_ipv4) AS public_ipv4, \
+           host(s.public_ipv6) AS public_ipv6, s.network_status_reason, \
+           s.network_capabilities_updated_at \
     FROM scanner_info s \
     LEFT JOIN users u ON u.id = s.create_user";
 
@@ -1116,6 +1127,14 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         is_enable: row.get("is_enable"),
         remark: row.get("remark"),
         tag: row.get("tag"),
+        supports_ipv4: row.get("supports_ipv4"),
+        supports_ipv6: row.get("supports_ipv6"),
+        ipv4_ready: row.get("ipv4_ready"),
+        ipv6_ready: row.get("ipv6_ready"),
+        public_ipv4: row.get("public_ipv4"),
+        public_ipv6: row.get("public_ipv6"),
+        network_status_reason: row.get("network_status_reason"),
+        network_capabilities_updated_at: row.get("network_capabilities_updated_at"),
     }
 }
 

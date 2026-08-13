@@ -24,6 +24,39 @@ status_duration = 5                                      # 系统信息采集频
 templates_directory = "templates/**/*.html"
 templates_name = "error.html"
 
+[frontend]
+# Vite 生产构建目录；相对路径以本配置文件所在目录为基准
+directory = "../network-mapping-vue/dist"
+
+[maxmind]
+# GeoLite2-City.mmdb、GeoLite2-Country.mmdb、GeoLite2-ASN.mmdb 所在目录
+# 相对路径以本配置文件所在目录为基准；缺失时服务继续运行，IP 情报字段保持为空
+directory = "source/maxmind"
+
+[automatic_target]
+# 仅从明确授权的 IPv4/IPv6 范围生成任务；两种地址族分别控制和补充队列
+# IPv4 自动目标生成开关
+enabled = false
+strategy = "sequential_subnet"
+interval_seconds = 30
+pending_low_watermark = 2
+pending_high_watermark = 5
+priority = 0
+authorized_cidrs = []
+# 显式排除的 IPv4 范围；候选任务与任一范围相交时跳过整个任务。
+excluded_cidrs = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"]
+ipv4_task_prefix = 24
+# IPv6 默认关闭；启用后按独立队列水位生成，并且只在 IPv6 扫描器在线时补充。
+ipv6_enabled = false
+ipv6_authorized_cidrs = []
+ipv6_excluded_cidrs = ["fc00::/7", "fe80::/10", "::1/128"]
+# 默认 /120，每个任务 256 个地址；不建议直接扫描完整 /64。
+ipv6_task_prefix = 120
+ipv6_pending_low_watermark = 1
+ipv6_pending_high_watermark = 2
+common_ports = "21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5432,5900,6379,8080,8443,9200,11211,27017"
+repeat_after_seconds = 604800
+
 [database]
 host = "127.0.0.1"
 port = 5432

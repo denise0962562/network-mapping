@@ -1,11 +1,10 @@
-use actix_web::{HttpRequest, HttpResponse, Responder, dev::ConnectionInfo, get, post, web};
+use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
 use lettre::{Message, message::Mailbox, message::header::ContentType};
 use tracing::error;
 
 use crate::TEXT_HTML_UTF_8;
 use crate::admin::{UserBaseI, get_config_from_database, get_user_info, send_email};
 use crate::config::{DatabaseConfig, EmailConfig, GetConfig};
-use crate::target_generated::{ScanTargetGetResponse, targetgenerated::random_generate_target};
 use crate::{FrontEndErrorInfo, TemplatesInit, front_end_error_page, logs::write::info_logs};
 
 #[cfg(feature = "rir")]
@@ -13,28 +12,6 @@ use crate::rir::get_rir_data;
 
 //基准测试
 use crate::{Systems, benchmark};
-
-#[get("/scanner/target")]
-async fn get_scan_target(
-    _req: HttpRequest,
-    _conn_info: ConnectionInfo,
-    // get_target: web::Query<ScanTargetGet>,
-    // target_generated: web::Data<ScanTargetConfig>
-) -> web::Json<ScanTargetGetResponse> {
-    // let mut rng = rand::rng();
-
-    // println!("扫描器ID: {}, a = {}", get_target.scanner_id, get_target.test);
-    // let port_list = vec![80, 5000];
-    // web::Json(
-    //     ScanTargetGetResponse{
-    //         mode: format!("SCAN"),
-    //         ip: format!("{}.{}.{}.1", rng.random_range(1..=255), rng.random_range(0..=255), rng.random_range(0..=255)),
-    //         port: rust_web_test::target_generated::port_type::Vertor(port_list),
-    //         rate: 1000
-    //     }
-    // )
-    random_generate_target()
-}
 
 ///获取系统信息基准测试
 #[get("/benchmark")]
@@ -47,7 +24,17 @@ async fn benchmark_route(
     "Benchmark finished, check server logs."
 }
 
-pub async fn not_found(page_template: web::Data<TemplatesInit>) -> impl Responder {
+pub async fn not_found(
+    req: HttpRequest,
+    page_template: web::Data<TemplatesInit>,
+) -> impl Responder {
+    if req.path() == "/api" || req.path().starts_with("/api/") {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "success": false,
+            "message": "not found"
+        }));
+    }
+
     let error_info = FrontEndErrorInfo {
         status_code: 404,
         error_title: "NotFound",

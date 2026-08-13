@@ -115,7 +115,10 @@ impl FromRequest for UserSession {
 #[cfg(test)]
 mod tests {
     use super::is_scanner_api_path;
-    use super::{csrfmiddleware::CsrfMiddleware, smiddleware::AuthMiddleware};
+    use super::{
+        csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, smiddleware::AuthMiddleware,
+    };
+    use crate::frontend::{self, FrontendAssets};
     use actix_web::{App, HttpResponse, http::StatusCode, test as actix_test, web};
 
     #[test]
@@ -159,5 +162,75 @@ mod tests {
             .to_request();
         let similar_response = actix_test::call_service(&app, similar_request).await;
         assert_eq!(similar_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn protected_frontend_navigation_redirects_to_login() {
+        let app = actix_test::init_service(
+            App::new()
+                .wrap(AuthMiddleware)
+                .route("/audit", web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+
+        let request = actix_test::TestRequest::get().uri("/audit").to_request();
+        let response = actix_test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/login")
+        );
+    }
+
+    #[actix_web::test]
+    async fn missing_protected_frontend_entry_returns_404_before_authentication() {
+        let directory = std::env::temp_dir().join(format!(
+            "network-mapping-missing-auth-frontend-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(FrontendAssets::new(directory)))
+                .wrap(AuthMiddleware)
+                .configure(frontend::configure),
+        )
+        .await;
+
+        let request = actix_test::TestRequest::get()
+            .uri("/audit")
+            .insert_header(("Accept", "text/html"))
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get("location").is_none());
+    }
+
+    #[actix_web::test]
+    async fn successful_hashed_assets_receive_immutable_cache_headers() {
+        let app = actix_test::init_service(
+            App::new()
+                .wrap(SHeaderM)
+                .route("/assets/app-hash.js", web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+
+        let request = actix_test::TestRequest::get()
+            .uri("/assets/app-hash.js")
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable")
+        );
     }
 }

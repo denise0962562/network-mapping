@@ -2,6 +2,7 @@ pub mod admin;
 pub mod audit;
 pub mod config;
 pub mod db;
+pub mod frontend;
 pub mod handlers;
 pub mod login;
 pub mod logs;
@@ -431,7 +432,7 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
 
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
-    use super::parse_ip_or_cidr;
+    use super::{STask, TargetIP, parse_ip_or_cidr};
 
     #[test]
     fn accepts_plain_ipv4_as_single_host_network() {
@@ -463,6 +464,19 @@ mod parse_ip_or_cidr_tests {
     fn rejects_invalid_ip() {
         assert!(parse_ip_or_cidr("not-an-ip").is_err());
         assert!(parse_ip_or_cidr("192.0.2.1/99").is_err());
+    }
+
+    #[test]
+    fn tasks_must_use_one_address_family() {
+        let ipv4 =
+            STask::new(TargetIP::S("192.0.2.1,198.51.100.0/24"), "test", None, None).unwrap();
+        assert_eq!(ipv4.address_family(), Ok("ipv4"));
+
+        let ipv6 = STask::new(TargetIP::S("2001:db8::1"), "test", None, None).unwrap();
+        assert_eq!(ipv6.address_family(), Ok("ipv6"));
+
+        let mixed = STask::new(TargetIP::S("192.0.2.1,2001:db8::1"), "test", None, None).unwrap();
+        assert!(mixed.address_family().is_err());
     }
 }
 
@@ -539,6 +553,19 @@ pub struct STask<'a> {
     pub remark: Option<&'a str>,
 }
 
+impl STask<'_> {
+    pub fn address_family(&self) -> Result<&'static str, &'static str> {
+        let has_ipv4 = self.ip.iter().any(|target| matches!(target, IpNet::V4(_)));
+        let has_ipv6 = self.ip.iter().any(|target| matches!(target, IpNet::V6(_)));
+        match (has_ipv4, has_ipv6) {
+            (true, false) => Ok("ipv4"),
+            (false, true) => Ok("ipv6"),
+            (true, true) => Err("同一扫描任务不能混合 IPv4 和 IPv6 目标"),
+            (false, false) => Err("扫描目标不能为空"),
+        }
+    }
+}
+
 impl<'a> STask<'a> {
     pub fn new(
         ip: TargetIP,
@@ -591,11 +618,12 @@ impl<'a> STask<'a> {
 
         // 将 ipnet转换为 String
         let tmp_ip: Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
+        let address_family = self.address_family()?;
 
         let task_row = client.query_one(
-            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, dispatch_mode) \
-             VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7, $8) RETURNING id;",
-            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark, &dispatch_mode]
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, dispatch_mode, address_family) \
+             VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7, $8, $9) RETURNING id;",
+            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark, &dispatch_mode, &address_family]
         ).await?;
         let task_db_id: i32 = task_row.get("id");
         for requested_scanner in requested_scanners {
@@ -1026,6 +1054,7 @@ pub struct ApplyTask {
     pub task_id: Uuid,
     pub task_target: Vec<String>,
     pub task_port: String,
+    pub address_family: String,
 }
 
 #[derive(Deserialize)]
@@ -1191,6 +1220,7 @@ pub async fn save_scanner_results(
     };
 
     let mut saved = 0usize;
+    let mut ip_intel_cache = HashMap::new();
 
     for item in &upload.results {
         let parsed_ip =
@@ -1199,16 +1229,24 @@ pub async fn save_scanner_results(
                 source,
             })?;
         let ip_addr = parsed_ip.addr();
-        let intel = maxmind.lookup(ip_addr);
+        let intel = ip_intel_cache
+            .entry(ip_addr)
+            .or_insert_with(|| maxmind.lookup(ip_addr))
+            .clone();
         let ip_text = parsed_ip.to_string();
 
         let ip_row = transaction
             .query_one(
-                "INSERT INTO ips (task_id, execution_id, ip_address, asn, isp) \
-             VALUES ($1, $2, $3::text::inet, $4, $5) \
+                "INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
+                 country_code, country_name, city_name) \
+             VALUES ($1, $2, $3::text::inet, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
                 asn = COALESCE(EXCLUDED.asn, ips.asn), \
                 isp = COALESCE(EXCLUDED.isp, ips.isp), \
+                as_org = COALESCE(EXCLUDED.as_org, ips.as_org), \
+                country_code = COALESCE(EXCLUDED.country_code, ips.country_code), \
+                country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
+                city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
                 update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
              RETURNING ip_id;",
                 &[
@@ -1217,6 +1255,10 @@ pub async fn save_scanner_results(
                     &ip_text,
                     &intel.asn,
                     &intel.isp,
+                    &intel.as_org,
+                    &intel.country_code,
+                    &intel.country_name,
+                    &intel.city_name,
                 ],
             )
             .await
@@ -1340,11 +1382,14 @@ pub async fn apply_task(
 
     let row = transaction
         .query_opt(
-            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port \
+            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port, t.address_family \
          FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+         JOIN scanner_info s ON s.scanner_id = $2 \
          WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.cancel_requested = false \
               AND (e.lease_expires_at IS NULL OR e.lease_expires_at < $1))) \
            AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
+           AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
+             OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
          ORDER BY t.task_level DESC, t.task_create_time, e.id \
          FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",
@@ -1390,6 +1435,7 @@ pub async fn apply_task(
         task_id,
         task_target: row.get("task_target"),
         task_port: row.get("task_port"),
+        address_family: row.get("address_family"),
     };
 
     transaction
@@ -1474,6 +1520,8 @@ pub struct TaskItem {
     pub start_at: Option<i64>,
     pub end_at: Option<i64>,
     pub remarks: Option<String>,
+    pub task_source: String,
+    pub address_family: String,
 }
 
 /// 表示 Json 格式的任务列表
@@ -1573,6 +1621,8 @@ pub async fn get_task_item(
             start_at: r.get::<_, Option<i64>>("task_start_time"),
             end_at: r.get::<_, Option<i64>>("task_end_time"),
             remarks: r.get::<_, Option<String>>("remarks"),
+            task_source: r.get::<_, String>("task_source"),
+            address_family: r.get::<_, String>("address_family"),
         };
         task_item_r.push(titem);
         count += 1;

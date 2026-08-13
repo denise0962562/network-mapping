@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	cancel_requested BOOLEAN NOT NULL DEFAULT false,                                          -- 控制端请求扫描器终止当前任务
 	retry_of_task_id VARCHAR(36),                                                             -- 重试任务所引用的原任务
 	dispatch_mode TEXT NOT NULL DEFAULT 'automatic',                                          -- automatic/selected/all
+	task_source TEXT NOT NULL DEFAULT 'manual',                                               -- manual/automatic
+	generation_strategy TEXT,
+	generation_key TEXT,
+	generation_metadata JSONB,
+	address_family TEXT NOT NULL DEFAULT 'ipv4' CHECK (address_family IN ('ipv4', 'ipv6')),
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -47,6 +52,25 @@ CREATE TABLE IF NOT EXISTS scan_task(
 		ON UPDATE CASCADE,
 	CONSTRAINT uk_task_id UNIQUE (task_id)
 );
+
+-- 兼容已有数据库中的任务表。
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_strategy TEXT;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_key TEXT;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_metadata JSONB;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS address_family TEXT NOT NULL DEFAULT 'ipv4';
+UPDATE scan_task SET address_family = 'ipv6'
+WHERE cardinality(task_target) > 0
+  AND NOT EXISTS (SELECT 1 FROM unnest(task_target) AS target WHERE family(target) <> 6);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_address_family_check'
+    ) THEN
+        ALTER TABLE scan_task ADD CONSTRAINT scan_task_address_family_check
+            CHECK (address_family IN ('ipv4', 'ipv6'));
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS scan_task_execution (
 	id SERIAL PRIMARY KEY,
@@ -64,14 +88,27 @@ CREATE TABLE IF NOT EXISTS scan_task_execution (
 	CONSTRAINT uk_task_execution_scanner UNIQUE(task_id, requested_scanner_id)
 );
 
+CREATE TABLE IF NOT EXISTS automatic_target_state (
+	strategy TEXT PRIMARY KEY,
+	cursor JSONB NOT NULL DEFAULT '{"position": 0}'::JSONB,
+	policy_hash TEXT NOT NULL,
+	last_generated_at TIMESTAMPTZ,
+	last_error TEXT,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- 表 ips 用于存储ip数据，并配置了级联更新
 CREATE TABLE IF NOT EXISTS ips ( 
 	task_id INT NOT NULL, 
 	execution_id INT NOT NULL,
 	ip_id SERIAL PRIMARY KEY, 
 	ip_address INET NOT NULL,
-	asn TEXT DEFAULT NULL, 
-	isp TEXT DEFAULT NULL, 
+	asn TEXT DEFAULT NULL,
+	isp TEXT DEFAULT NULL,
+	as_org TEXT DEFAULT NULL,
+	country_code VARCHAR(2) DEFAULT NULL,
+	country_name TEXT DEFAULT NULL,
+	city_name TEXT DEFAULT NULL,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
 	update_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
 	CONSTRAINT fk_task
@@ -84,6 +121,12 @@ CREATE TABLE IF NOT EXISTS ips (
 		ON DELETE CASCADE
 		ON UPDATE CASCADE
 );
+
+-- 兼容已有数据库；CREATE TABLE IF NOT EXISTS 不会为现有表补充列。
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS as_org TEXT DEFAULT NULL;
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) DEFAULT NULL;
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_name TEXT DEFAULT NULL;
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS city_name TEXT DEFAULT NULL;
 
 -- 表 ports 用于存储扫描出的端口，其中ip_id通过外键关联到表ips，并配置了级联更新删除
 CREATE TABLE IF NOT EXISTS ports ( 
@@ -187,6 +230,16 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	deleted_at TIMESTAMPTZ                                                          -- 软删除时间
 );
 
+-- 旧版扫描器没有网络能力心跳，安全地按仅支持 IPv4 处理。
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS supports_ipv4 BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS supports_ipv6 BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS ipv4_ready BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS ipv6_ready BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv4 INET;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv6 INET;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_status_reason JSONB;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_capabilities_updated_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,
 	actor_user_id INT,
@@ -246,6 +299,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
+CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_queue
+	ON scan_task (task_status, task_create_time) WHERE task_source = 'automatic';
+CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_family_queue
+	ON scan_task (address_family, task_status, task_create_time) WHERE task_source = 'automatic';
+CREATE INDEX IF NOT EXISTS idx_scan_task_generation_key
+	ON scan_task (generation_key, task_create_time DESC) WHERE generation_key IS NOT NULL;
 
 -- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
 CREATE TABLE IF NOT EXISTS ip_list (

@@ -1,13 +1,14 @@
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use maxminddb::{Reader, geoip2};
 use serde::Serialize;
 use tracing::{error, warn};
 
-const DEFAULT_CITY_DB: &str = "source/maxmind/GeoLite2-City.mmdb";
-const DEFAULT_COUNTRY_DB: &str = "source/maxmind/GeoLite2-Country.mmdb";
-const DEFAULT_ASN_DB: &str = "source/maxmind/GeoLite2-ASN.mmdb";
+const CITY_DB: &str = "GeoLite2-City.mmdb";
+const COUNTRY_DB: &str = "GeoLite2-Country.mmdb";
+const ASN_DB: &str = "GeoLite2-ASN.mmdb";
+const REFRESH_BATCH_SIZE: i64 = 500;
 
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct IpIntel {
@@ -29,12 +30,20 @@ pub struct MaxMindState {
     asn: Option<Reader<Vec<u8>>>,
 }
 
+#[derive(Debug, Default)]
+pub struct RefreshIpIntelReport {
+    pub scanned: usize,
+    pub updated: usize,
+    pub unmatched: usize,
+}
+
 impl MaxMindState {
-    pub fn from_default_paths() -> Self {
+    pub fn from_directory(directory: impl AsRef<Path>) -> Self {
+        let directory = directory.as_ref();
         Self {
-            city: open_database(DEFAULT_CITY_DB),
-            country: open_database(DEFAULT_COUNTRY_DB),
-            asn: open_database(DEFAULT_ASN_DB),
+            city: open_database(directory.join(CITY_DB)),
+            country: open_database(directory.join(COUNTRY_DB)),
+            asn: open_database(directory.join(ASN_DB)),
         }
     }
 
@@ -60,11 +69,15 @@ impl MaxMindState {
             }
         }
 
-        if intel.country_code.is_none() {
+        if intel.country_code.is_none() || intel.country_name.is_none() {
             if let Some(reader) = &self.country {
                 if let Some(country) = lookup_country(reader, ip) {
-                    intel.country_code = country.country.iso_code.map(str::to_string);
-                    intel.country_name = country.country.names.english.map(str::to_string);
+                    if intel.country_code.is_none() {
+                        intel.country_code = country.country.iso_code.map(str::to_string);
+                    }
+                    if intel.country_name.is_none() {
+                        intel.country_name = country.country.names.english.map(str::to_string);
+                    }
                 }
             }
         }
@@ -75,10 +88,90 @@ impl MaxMindState {
 
         intel
     }
+
+    pub async fn refresh_ip_intel(
+        &self,
+        pool: &deadpool_postgres::Pool,
+    ) -> Result<RefreshIpIntelReport, Box<dyn std::error::Error + Send + Sync>> {
+        if self.city.is_none() && self.country.is_none() && self.asn.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "没有可用的 MaxMind 数据库",
+            )
+            .into());
+        }
+
+        let mut client = pool.get().await?;
+        let mut report = RefreshIpIntelReport::default();
+        let mut last_ip_id = 0_i32;
+
+        loop {
+            let rows = client
+                .query(
+                    "SELECT ip_id, host(ip_address) AS ip FROM ips \
+                     WHERE ip_id > $1 ORDER BY ip_id LIMIT $2;",
+                    &[&last_ip_id, &REFRESH_BATCH_SIZE],
+                )
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let transaction = client.transaction().await?;
+            for row in rows {
+                let ip_id: i32 = row.get("ip_id");
+                let ip: std::net::IpAddr = row.get::<_, String>("ip").parse()?;
+                let intel = self.lookup(ip);
+                report.scanned += 1;
+                last_ip_id = ip_id;
+
+                if !intel.has_persisted_data() {
+                    report.unmatched += 1;
+                    continue;
+                }
+
+                transaction
+                    .execute(
+                        "UPDATE ips SET \
+                         asn = COALESCE($2, asn), isp = COALESCE($3, isp), \
+                         as_org = COALESCE($4, as_org), \
+                         country_code = COALESCE($5, country_code), \
+                         country_name = COALESCE($6, country_name), \
+                         city_name = COALESCE($7, city_name), \
+                         update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+                         WHERE ip_id = $1;",
+                        &[
+                            &ip_id,
+                            &intel.asn,
+                            &intel.isp,
+                            &intel.as_org,
+                            &intel.country_code,
+                            &intel.country_name,
+                            &intel.city_name,
+                        ],
+                    )
+                    .await?;
+                report.updated += 1;
+            }
+            transaction.commit().await?;
+        }
+
+        Ok(report)
+    }
 }
 
-fn open_database(path: impl AsRef<Path>) -> Option<Reader<Vec<u8>>> {
-    let path_ref = path.as_ref();
+impl IpIntel {
+    fn has_persisted_data(&self) -> bool {
+        self.asn.is_some()
+            || self.as_org.is_some()
+            || self.country_code.is_some()
+            || self.country_name.is_some()
+            || self.city_name.is_some()
+    }
+}
+
+fn open_database(path: PathBuf) -> Option<Reader<Vec<u8>>> {
+    let path_ref = path.as_path();
     match Reader::open_readfile(path_ref) {
         Ok(reader) => Some(reader),
         Err(e) => {
@@ -122,5 +215,25 @@ fn lookup_country(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<geoip2::Countr
             error!(event = "MaxMindDecodeCountryError", ip = %ip, message = %e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IpIntel;
+
+    #[test]
+    fn persisted_data_detection_ignores_unused_geo_fields() {
+        let only_time_zone = IpIntel {
+            time_zone: Some("Asia/Shanghai".to_owned()),
+            ..IpIntel::default()
+        };
+        let with_country = IpIntel {
+            country_code: Some("CN".to_owned()),
+            ..IpIntel::default()
+        };
+
+        assert!(!only_time_zone.has_persisted_data());
+        assert!(with_country.has_persisted_data());
     }
 }

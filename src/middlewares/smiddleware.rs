@@ -3,7 +3,7 @@ use actix_web::{
     body::EitherBody, // 可以参见 https://docs.rs/actix-web/latest/actix_web/body/enum.EitherBody.html
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
 };
-use actix_web::{HttpMessage, HttpResponse};
+use actix_web::{HttpMessage, HttpResponse, http::header};
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use crate::logs::write::info_logs;
 use tracing::{error, info};
 
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
+use crate::frontend::{FrontendAssets, is_protected_frontend_path};
 use crate::middlewares::{get_pool_from_app_data, is_scanner_api_path};
 use uuid::Uuid;
 
@@ -51,6 +52,16 @@ pub struct AuthMiddlewareService<S> {
     service: Arc<S>,
 }
 
+fn unauthorized_response(frontend_page: bool) -> HttpResponse {
+    if frontend_page {
+        HttpResponse::Found()
+            .insert_header((header::LOCATION, "/login"))
+            .finish()
+    } else {
+        HttpResponse::Unauthorized().body("401")
+    }
+}
+
 impl<S, B> Service<ServiceRequest> for AuthMiddlewareService<S>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
@@ -75,9 +86,17 @@ where
         let path = req.path().to_owned();
         let svc = self.service.clone();
 
+        let frontend_page =
+            matches!(req.method().as_str(), "GET" | "HEAD") && is_protected_frontend_path(&path);
+        let frontend_page_available = !frontend_page
+            || req
+                .app_data::<actix_web::web::Data<FrontendAssets>>()
+                .map(|assets| assets.has_page_for_path(&path))
+                .unwrap_or(true);
         let need_check = path != "/api/login"
             && !is_scanner_api_path(&path)
-            && path_list.iter().any(|prefix| path.starts_with(prefix));
+            && ((frontend_page && frontend_page_available)
+                || path_list.iter().any(|prefix| path.starts_with(prefix)));
 
         info!(
             event = "received_requests",
@@ -124,7 +143,7 @@ where
                         "InvalidSession",
                         "未能从请求中获取到 Session",
                     );
-                    let resp = HttpResponse::Unauthorized().body("401");
+                    let resp = unauthorized_response(frontend_page);
                     return Ok(req.into_response(resp).map_into_right_body());
                 }
             };
@@ -187,7 +206,7 @@ where
                         "InvalidSession",
                         "数据库中未找到符合条件的 Session",
                     );
-                    let resp = HttpResponse::Unauthorized().body("401");
+                    let resp = unauthorized_response(frontend_page);
                     Ok(req.into_response(resp).map_into_right_body())
                 }
                 Err(e) => {
