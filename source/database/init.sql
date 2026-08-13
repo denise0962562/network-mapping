@@ -436,4 +436,6 @@ CREATE TABLE IF NOT EXISTS setting (
 	value TEXT,
 	create_at TIMESTAMPTZ DEFAULT NOW(),
 	update_at TIMESTAMPTZ
-)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_item_type_key ON setting (item_type, key);

@@ -490,6 +490,65 @@ pub struct EmailConfig {
     pub account_password: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationPreferences {
+    pub login_notify_enabled: bool,
+    pub notify_on_stuck: bool,
+    pub notify_on_complete: bool,
+    pub report_daily: bool,
+    pub report_weekly: bool,
+    pub report_monthly: bool,
+}
+
+impl Default for NotificationPreferences {
+    fn default() -> Self {
+        Self {
+            login_notify_enabled: true,
+            notify_on_stuck: true,
+            notify_on_complete: true,
+            report_daily: false,
+            report_weekly: true,
+            report_monthly: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSettingsRequest {
+    pub recipient: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub sender: String,
+    #[serde(default)]
+    pub sender_key: String,
+    #[serde(default)]
+    pub notification_prefs: NotificationPreferences,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSettingsResponse {
+    pub recipient: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub sender: String,
+    pub sender_key_configured: bool,
+    pub notification_prefs: NotificationPreferences,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailTestRequest {
+    pub recipient: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub sender: String,
+    #[serde(default)]
+    pub sender_key: String,
+}
+
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
         let path = path.as_ref();
@@ -729,6 +788,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::operations::delete_scanner)
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
+        .service(utils::get_mail_settings_h)
+        .service(utils::save_mail_settings_h)
         .service(utils::test_mail_server_h);
 
     #[cfg(feature = "rir")]
