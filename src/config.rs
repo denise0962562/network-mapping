@@ -249,6 +249,11 @@ pub struct AutomaticTargetConfig {
     pub priority: i32,
     pub authorized_cidrs: Vec<String>,
     pub ipv4_task_prefix: u8,
+    pub ipv6_enabled: bool,
+    pub ipv6_authorized_cidrs: Vec<String>,
+    pub ipv6_task_prefix: u8,
+    pub ipv6_pending_low_watermark: u32,
+    pub ipv6_pending_high_watermark: u32,
     pub common_ports: String,
     pub repeat_after_seconds: u64,
 }
@@ -264,6 +269,12 @@ impl Default for AutomaticTargetConfig {
             priority: 0,
             authorized_cidrs: Vec::new(),
             ipv4_task_prefix: 24,
+            ipv6_enabled: false,
+            ipv6_authorized_cidrs: Vec::new(),
+            // 避免把完整 /64 直接交给扫描器；默认每个任务最多覆盖 256 个地址。
+            ipv6_task_prefix: 120,
+            ipv6_pending_low_watermark: 1,
+            ipv6_pending_high_watermark: 2,
             common_ports: DEFAULT_COMMON_SCAN_PORTS.to_owned(),
             repeat_after_seconds: 7 * 24 * 60 * 60,
         }
@@ -292,6 +303,15 @@ impl AutomaticTargetConfig {
         if self.ipv4_task_prefix > 32 {
             return Err("automatic_target.ipv4_task_prefix 不能大于 32".into());
         }
+        if self.ipv6_task_prefix > 128 {
+            return Err("automatic_target.ipv6_task_prefix 不能大于 128".into());
+        }
+        if self.ipv6_pending_low_watermark > self.ipv6_pending_high_watermark
+            || self.ipv6_pending_high_watermark == 0
+            || self.ipv6_pending_high_watermark > 100
+        {
+            return Err("IPv6 自动目标队列水位必须满足 0 <= low <= high <= 100 且 high > 0".into());
+        }
         validate_port_list(&self.common_ports)?;
         if self.enabled && self.authorized_cidrs.is_empty() {
             return Err("启用自动目标生成时必须配置 authorized_cidrs".into());
@@ -302,7 +322,7 @@ impl AutomaticTargetConfig {
                 .parse()
                 .map_err(|error| format!("无效的自动目标授权 CIDR {value}: {error}"))?;
             let ipnet::IpNet::V4(network) = network else {
-                return Err(format!("自动目标生成第一版仅支持 IPv4：{value}").into());
+                return Err(format!("IPv4 自动目标授权范围包含 IPv6：{value}").into());
             };
             if network.prefix_len() > self.ipv4_task_prefix {
                 return Err(format!(
@@ -312,6 +332,33 @@ impl AutomaticTargetConfig {
                 .into());
             }
             authorized_networks.push(network);
+        }
+        if self.ipv6_enabled && self.ipv6_authorized_cidrs.is_empty() {
+            return Err("启用 IPv6 自动目标生成时必须配置 ipv6_authorized_cidrs".into());
+        }
+        let mut authorized_ipv6 = Vec::with_capacity(self.ipv6_authorized_cidrs.len());
+        for value in &self.ipv6_authorized_cidrs {
+            let network: ipnet::Ipv6Net = value
+                .parse()
+                .map_err(|error| format!("无效的 IPv6 自动目标授权 CIDR {value}: {error}"))?;
+            if network.prefix_len() > self.ipv6_task_prefix {
+                return Err(format!(
+                    "IPv6 授权范围 {value} 小于配置的 /{} 任务网段",
+                    self.ipv6_task_prefix
+                )
+                .into());
+            }
+            if self.ipv6_task_prefix - network.prefix_len() > 63 {
+                return Err(format!("IPv6 授权范围 {value} 的可生成子网数量过大").into());
+            }
+            authorized_ipv6.push(network);
+        }
+        for (index, network) in authorized_ipv6.iter().enumerate() {
+            if authorized_ipv6[index + 1..].iter().any(|other| {
+                network.contains(&other.network()) || other.contains(&network.network())
+            }) {
+                return Err(format!("IPv6 自动目标授权 CIDR 存在重复或重叠：{network}").into());
+            }
         }
         for (index, network) in authorized_networks.iter().enumerate() {
             if authorized_networks[index + 1..].iter().any(|other| {
@@ -538,6 +585,21 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.authorized_cidrs = vec!["10.20.0.0/16".to_owned(), "10.20.1.0/24".to_owned()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_target_validates_ipv6_ranges_independently() {
+        let mut config = AutomaticTargetConfig {
+            ipv6_enabled: true,
+            ..AutomaticTargetConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.ipv6_authorized_cidrs = vec!["2001:db8::/64".to_owned()];
+        assert!(config.validate().is_ok());
+
+        config.ipv6_authorized_cidrs = vec!["10.0.0.0/8".to_owned()];
         assert!(config.validate().is_err());
     }
 }

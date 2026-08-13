@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	generation_strategy TEXT,
 	generation_key TEXT,
 	generation_metadata JSONB,
+	address_family TEXT NOT NULL DEFAULT 'ipv4' CHECK (address_family IN ('ipv4', 'ipv6')),
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -57,6 +58,19 @@ ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_source TEXT NOT NULL DEFAULT
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_strategy TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_key TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_metadata JSONB;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS address_family TEXT NOT NULL DEFAULT 'ipv4';
+UPDATE scan_task SET address_family = 'ipv6'
+WHERE cardinality(task_target) > 0
+  AND NOT EXISTS (SELECT 1 FROM unnest(task_target) AS target WHERE family(target) <> 6);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_address_family_check'
+    ) THEN
+        ALTER TABLE scan_task ADD CONSTRAINT scan_task_address_family_check
+            CHECK (address_family IN ('ipv4', 'ipv6'));
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS scan_task_execution (
 	id SERIAL PRIMARY KEY,
@@ -216,6 +230,16 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	deleted_at TIMESTAMPTZ                                                          -- 软删除时间
 );
 
+-- 旧版扫描器没有网络能力心跳，安全地按仅支持 IPv4 处理。
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS supports_ipv4 BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS supports_ipv6 BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS ipv4_ready BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS ipv6_ready BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv4 INET;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv6 INET;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_status_reason JSONB;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_capabilities_updated_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,
 	actor_user_id INT,
@@ -277,6 +301,8 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
 CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_queue
 	ON scan_task (task_status, task_create_time) WHERE task_source = 'automatic';
+CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_family_queue
+	ON scan_task (address_family, task_status, task_create_time) WHERE task_source = 'automatic';
 CREATE INDEX IF NOT EXISTS idx_scan_task_generation_key
 	ON scan_task (generation_key, task_create_time DESC) WHERE generation_key IS NOT NULL;
 

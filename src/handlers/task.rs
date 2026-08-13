@@ -3,18 +3,18 @@ use crate::audit::AuditContext;
 use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, info_logs};
 use crate::maxmind::MaxMindState;
-use crate::middlewares::render_500;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
     TaskItemJson, apply_task, get_task_item, validate_scanner_credentials,
 };
-use crate::{Permission, TEXT_HTML_UTF_8, TemplatesInit};
+use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
 use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use tracing::error;
 use uuid::Uuid;
 
@@ -37,6 +37,36 @@ pub struct ScannerHeartbeat {
     active_task_id: Option<Uuid>,
     scanner_version: String,
     system: ScannerSystemInfo,
+    #[serde(default)]
+    network_capabilities: ScannerNetworkCapabilities,
+}
+
+#[derive(Deserialize)]
+pub struct ScannerNetworkCapabilities {
+    ipv4: ScannerNetworkFamily,
+    ipv6: ScannerNetworkFamily,
+}
+
+impl Default for ScannerNetworkCapabilities {
+    fn default() -> Self {
+        Self {
+            ipv4: ScannerNetworkFamily {
+                supported: true,
+                ready: true,
+                public_ip: None,
+                reason: Some("legacy_scanner".to_owned()),
+            },
+            ipv6: ScannerNetworkFamily::default(),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub struct ScannerNetworkFamily {
+    supported: bool,
+    ready: bool,
+    public_ip: Option<String>,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +86,19 @@ pub struct ScannerTaskCancelled {
 
 fn default_retryable() -> bool {
     true
+}
+
+fn validate_public_ip(value: Option<&str>, expect_ipv6: bool) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let address: IpAddr = value
+        .parse()
+        .map_err(|_| "network capability contains an invalid public IP".to_owned())?;
+    if address.is_ipv6() != expect_ipv6 {
+        return Err("network capability public IP has the wrong address family".to_owned());
+    }
+    Ok(Some(address.to_string()))
 }
 
 fn bearer_token(req: &HttpRequest) -> Option<&str> {
@@ -169,12 +212,34 @@ pub(crate) async fn scanner_heartbeat_handler(
     let ram_mb = i32::try_from(heartbeat.system.ram_total_mb).unwrap_or(i32::MAX);
     let uptime = i32::try_from(heartbeat.system.uptime_seconds).unwrap_or(i32::MAX);
     let ip_address = req.peer_addr().map(|address| address.ip().to_string());
+    let public_ipv4 = match validate_public_ip(
+        heartbeat.network_capabilities.ipv4.public_ip.as_deref(),
+        false,
+    ) {
+        Ok(value) => value,
+        Err(message) => return HttpResponse::BadRequest().body(message),
+    };
+    let public_ipv6 = match validate_public_ip(
+        heartbeat.network_capabilities.ipv6.public_ip.as_deref(),
+        true,
+    ) {
+        Ok(value) => value,
+        Err(message) => return HttpResponse::BadRequest().body(message),
+    };
+    let network_status_reason = serde_json::json!({
+        "ipv4": heartbeat.network_capabilities.ipv4.reason,
+        "ipv6": heartbeat.network_capabilities.ipv6.reason,
+    });
     let update = transaction
         .execute(
             "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
              cpus = $4, ram = $5, uptime = $6, runtime_state = $7, last_seen_at = NOW(), \
              update_time = NOW(), is_run = ($7 <> 'stopping'), \
-             ip_address = COALESCE($8::text::inet, ip_address) WHERE scanner_id = $9;",
+             ip_address = COALESCE($8::text::inet, ip_address), supports_ipv4 = $9, \
+             supports_ipv6 = $10, ipv4_ready = $11, ipv6_ready = $12, \
+             public_ipv4 = $13::text::inet, public_ipv6 = $14::text::inet, \
+             network_status_reason = $15, network_capabilities_updated_at = NOW() \
+             WHERE scanner_id = $16;",
             &[
                 &system_version,
                 &heartbeat.scanner_version,
@@ -184,6 +249,13 @@ pub(crate) async fn scanner_heartbeat_handler(
                 &uptime,
                 &heartbeat.state,
                 &ip_address,
+                &heartbeat.network_capabilities.ipv4.supported,
+                &heartbeat.network_capabilities.ipv6.supported,
+                &heartbeat.network_capabilities.ipv4.ready,
+                &heartbeat.network_capabilities.ipv6.ready,
+                &public_ipv4.as_deref(),
+                &public_ipv6.as_deref(),
+                &network_status_reason,
                 &scanner_id,
             ],
         )
@@ -430,7 +502,7 @@ async fn get_task(
              t.task_level, t.task_create_time, t.task_start_time, t.task_end_time, \
              t.task_status, t.lease_expires_at, t.attempt_count, t.failure_reason, t.cancel_requested, \
              t.retry_of_task_id, t.remarks, t.dispatch_mode, t.task_source, \
-             t.generation_strategy, t.generation_metadata \
+             t.generation_strategy, t.generation_metadata, t.address_family \
              FROM scan_task t \
              WHERE t.task_id = $1 AND ($2 = 1 OR t.user_id = $3) LIMIT 1;",
             &[&task_id, &user.role, &user.id],
@@ -597,6 +669,7 @@ async fn get_task(
             "task_source": task.get::<_, String>("task_source"),
             "generation_strategy": task.get::<_, Option<String>>("generation_strategy"),
             "generation_metadata": task.get::<_, Option<Value>>("generation_metadata"),
+            "address_family": task.get::<_, String>("address_family"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
             "executions": executions,
             "scanner_id": selected_execution.get::<_, Option<String>>("assigned_scanner_id"),
@@ -628,7 +701,6 @@ async fn create_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
     create_data: web::Json<CreateTask>,
-    page_template: web::Data<TemplatesInit>,
     user_base_i: UserBaseI,
 ) -> impl Responder {
     match create_data.level {
@@ -647,6 +719,33 @@ async fn create_task(
     let user_id = user_base_i.id;
     let user_name = user_base_i.username.clone();
 
+    let task_info = match STask::new(
+        TargetIP::S(&create_data.ip),
+        &user_name,
+        Some(&create_data.port),
+        create_data.remark.as_deref(),
+    ) {
+        Ok(task) => task,
+        Err(error_value) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "message": error_value.to_string()
+            }));
+        }
+    };
+    let address_family = match task_info.address_family() {
+        Ok(family) => family,
+        Err(message) => {
+            return HttpResponse::BadRequest()
+                .json(serde_json::json!({"success": false, "message": message}));
+        }
+    };
+    let capability_filter = if address_family == "ipv6" {
+        "supports_ipv6 AND ipv6_ready"
+    } else {
+        "supports_ipv4 AND ipv4_ready"
+    };
+
     let dispatch_mode = create_data.dispatch_mode.trim().to_lowercase();
     let requested_scanners: Vec<Option<String>> = match dispatch_mode.as_str() {
         "automatic" if create_data.scanner_ids.is_empty() => vec![None],
@@ -657,15 +756,16 @@ async fn create_task(
                 Err(_) => return HttpResponse::InternalServerError().finish(),
             };
             let values: Vec<String> = ids.into_iter().collect();
-            let rows = match connection.query(
-                "SELECT scanner_id FROM scanner_info WHERE scanner_id = ANY($1::text[]) AND is_enable = true AND deleted_at IS NULL;",
-                &[&values],
-            ).await {
+            let query = format!(
+                "SELECT scanner_id FROM scanner_info WHERE scanner_id = ANY($1::text[]) \
+                 AND is_enable = true AND deleted_at IS NULL AND {capability_filter};"
+            );
+            let rows = match connection.query(&query, &[&values]).await {
                 Ok(rows) => rows,
                 Err(error) => { error_logs(&req, "ResolveTaskScannersError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
             };
             if rows.len() != values.len() {
-                return HttpResponse::BadRequest().json(serde_json::json!({"success": false, "message": "selected scanner does not exist or is disabled"}));
+                return HttpResponse::BadRequest().json(serde_json::json!({"success": false, "message": format!("selected scanner is unavailable or does not support {address_family}")}));
             }
             rows.into_iter().map(|row| Some(row.get("scanner_id"))).collect()
         }
@@ -674,50 +774,40 @@ async fn create_task(
                 Ok(value) => value,
                 Err(_) => return HttpResponse::InternalServerError().finish(),
             };
-            let rows = match connection.query(
-                "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL ORDER BY scanner_id;", &[]).await {
+            let query = format!(
+                "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
+                 AND {capability_filter} ORDER BY scanner_id;"
+            );
+            let rows = match connection.query(&query, &[]).await {
                 Ok(rows) => rows,
                 Err(error) => { error_logs(&req, "ResolveTaskScannersError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
             };
             if rows.is_empty() {
-                return HttpResponse::Conflict().json(serde_json::json!({"success": false, "message": "no enabled scanner is available"}));
+                return HttpResponse::Conflict().json(serde_json::json!({"success": false, "message": format!("no {address_family} scanner is currently available")}));
             }
             rows.into_iter().map(|row| Some(row.get("scanner_id"))).collect()
         }
         _ => return HttpResponse::BadRequest().json(serde_json::json!({"success": false, "message": "invalid dispatch mode or scanner selection"})),
     };
 
-    let task_info = STask::new(
-        TargetIP::S(&create_data.ip),
-        &user_name,
-        Some(&create_data.port),
-        create_data.remark.as_deref(),
-    );
-
-    match task_info {
-        Ok(o) => {
-            if let Err(e) = o
-                .add(
-                    database_conn,
-                    create_data.level as i32,
-                    user_id,
-                    &dispatch_mode,
-                    &requested_scanners,
-                    &AuditContext::from_request(&req),
-                    &user_base_i,
-                )
-                .await
-            {
-                error_logs(&req, "AddTaskError", e.to_string().as_str());
-                return HttpResponse::InternalServerError().body("500");
-            }
-            return HttpResponse::Ok()
-                .content_type(TEXT_HTML_UTF_8)
-                .body("创建成功");
-        }
+    match task_info
+        .add(
+            database_conn,
+            create_data.level as i32,
+            user_id,
+            &dispatch_mode,
+            &requested_scanners,
+            &AuditContext::from_request(&req),
+            &user_base_i,
+        )
+        .await
+    {
+        Ok(()) => HttpResponse::Ok()
+            .content_type(TEXT_HTML_UTF_8)
+            .body("创建成功"),
         Err(e) => {
-            error_logs(&req, "STASK-ERROR", &e.to_string());
-            return render_500(&req, &page_template, &e.to_string());
+            error_logs(&req, "AddTaskError", e.to_string().as_str());
+            HttpResponse::InternalServerError().body("500")
         }
     }
 }
@@ -892,12 +982,22 @@ async fn get_all_task_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::task_result_pagination;
+    use super::{task_result_pagination, validate_public_ip};
 
     #[test]
     fn task_result_pagination_uses_safe_bounds() {
         assert_eq!(task_result_pagination(None, None), (1, 20, 0));
         assert_eq!(task_result_pagination(Some(-5), Some(0)), (1, 1, 0));
         assert_eq!(task_result_pagination(Some(3), Some(500)), (3, 100, 200));
+    }
+
+    #[test]
+    fn public_probe_addresses_must_match_the_reported_family() {
+        assert_eq!(
+            validate_public_ip(Some("203.0.113.10"), false).unwrap(),
+            Some("203.0.113.10".to_owned())
+        );
+        assert!(validate_public_ip(Some("2001:db8::1"), false).is_err());
+        assert!(validate_public_ip(Some("not-an-ip"), true).is_err());
     }
 }

@@ -158,7 +158,7 @@ pub(crate) async fn retry_task(
     let source_id = task_id.into_inner().to_string();
     let source = match transaction
         .query_opt(
-            "SELECT id, user_id, task_target, task_port, task_level, remarks, task_status, dispatch_mode FROM scan_task \
+            "SELECT id, user_id, task_target, task_port, task_level, remarks, task_status, dispatch_mode, address_family FROM scan_task \
              WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) FOR UPDATE;",
             &[&source_id, &user.role, &user.id],
         )
@@ -187,10 +187,11 @@ pub(crate) async fn retry_task(
     let remarks: Option<String> = source.get("remarks");
     let dispatch_mode: String = source.get("dispatch_mode");
     let source_pk: i32 = source.get("id");
+    let address_family: String = source.get("address_family");
     let new_task_pk: i32 = match transaction.query_one(
-        "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, retry_of_task_id, dispatch_mode) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id;",
-        &[&owner_id, &new_id, &user.username, &targets, &port, &level, &remarks, &source_id, &dispatch_mode]).await {
+        "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, retry_of_task_id, dispatch_mode, address_family) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id;",
+        &[&owner_id, &new_id, &user.username, &targets, &port, &level, &remarks, &source_id, &dispatch_mode, &address_family]).await {
         Ok(row) => row.get("id"),
         Err(error) => { error_logs(&req, "RetryTaskDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
     };
