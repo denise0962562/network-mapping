@@ -93,6 +93,11 @@ cargo run -- --refresh-ip-intel
 
 创建任务接口 `POST /api/task/create` 支持 `dispatch_mode`：`automatic` 由下一台可用扫描器领取一次，`selected` 配合 `scanner_ids` 指定一台或多台扫描器，`all` 会为创建时所有已启用扫描器分别创建执行实例。离线的指定扫描器会在重新上线后领取任务。
 
+接口还支持 `scan_profile`：`legacy` 保持旧节点行为，`port_only` 只发现开放端口，
+`service_inventory` 继续执行服务识别。非 legacy 任务会根据心跳中的扫描能力选择节点。
+任务计划、能力字段、类型化观察结果和幂等分批上传参见
+[扫描计划与结果协议](docs/SCAN_PIPELINE.md)。
+
 任务会根据目标自动标记为 `ipv4` 或 `ipv6`。同一任务不能混合两种地址族；服务端只允许对应协议当前就绪的扫描器领取任务。旧版扫描器未上报网络能力时按仅支持 IPv4 兼容。
 
 任务详情接口 `GET /api/task/{task_id}` 返回 `executions`，并可通过 `execution_id` 查询参数选择某个执行实例的分页结果。同一个逻辑任务下，各扫描器的状态、失败原因和扫描结果相互独立；导出的 CSV/JSON 也包含执行实例和扫描器标识。

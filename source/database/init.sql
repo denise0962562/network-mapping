@@ -183,6 +183,39 @@ CREATE TABLE IF NOT EXISTS scaninfo (
 		ON UPDATE CASCADE 
 );
 
+-- Versioned, idempotent scanner uploads. A retry with the same execution/upload/batch
+-- identity is acknowledged without inserting observations again.
+CREATE TABLE IF NOT EXISTS scan_result_batch (
+	id BIGSERIAL PRIMARY KEY,
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	upload_id VARCHAR(36) NOT NULL,
+	batch_index INT NOT NULL CHECK (batch_index >= 0),
+	is_final BOOLEAN NOT NULL,
+	observation_count INT NOT NULL CHECK (observation_count >= 0),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE(execution_id, upload_id, batch_index)
+);
+
+CREATE TABLE IF NOT EXISTS scan_observation (
+	id BIGSERIAL PRIMARY KEY,
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	batch_id BIGINT NOT NULL REFERENCES scan_result_batch(id) ON DELETE CASCADE,
+	observation_key TEXT NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('port', 'service')),
+	ip_address INET NOT NULL,
+	port INT NOT NULL CHECK (port >= 0 AND port <= 65535),
+	protocol TEXT NOT NULL,
+	service TEXT,
+	banner TEXT,
+	source TEXT NOT NULL,
+	data JSONB,
+	observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE(execution_id, observation_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
+	ON scan_observation(execution_id, kind);
+
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (
 	user_id INT NOT NULL,

@@ -418,7 +418,9 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
 
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
-    use super::{STask, TargetIP, build_scan_plan, parse_ip_or_cidr};
+    use super::{
+        STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan, parse_ip_or_cidr,
+    };
 
     #[test]
     fn accepts_plain_ipv4_as_single_host_network() {
@@ -474,6 +476,40 @@ mod parse_ip_or_cidr_tests {
         let inventory = build_scan_plan("service_inventory").unwrap();
         assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
         assert!(build_scan_plan("arbitrary_command").is_err());
+    }
+
+    #[test]
+    fn result_protocol_accepts_legacy_and_typed_payloads() {
+        let legacy: ScannerResultUpload = serde_json::from_value(serde_json::json!({
+            "scanner_id": "019c0000-0000-7000-8000-000000000001",
+            "task_id": "019c0000-0000-7000-8000-000000000002",
+            "results": []
+        }))
+        .unwrap();
+        assert_eq!(legacy.protocol_version, 1);
+
+        let typed: ScannerResultUpload = serde_json::from_value(serde_json::json!({
+            "protocol_version": 2,
+            "scanner_id": "019c0000-0000-7000-8000-000000000001",
+            "task_id": "019c0000-0000-7000-8000-000000000002",
+            "upload_id": "019c0000-0000-7000-8000-000000000003",
+            "batch_index": 0,
+            "is_final": true,
+            "observations": [{
+                "kind": "port",
+                "ip": "192.0.2.1",
+                "port": 443,
+                "protocol": "tcp",
+                "state": "open",
+                "source": "masscan"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(typed.protocol_version, 2);
+        assert!(matches!(
+            typed.observations[0],
+            ScannerObservation::Port { .. }
+        ));
     }
 }
 
@@ -1089,12 +1125,45 @@ pub struct ApplyTask {
 
 #[derive(Deserialize)]
 pub struct ScannerResultUpload {
+    #[serde(default = "default_result_protocol_version")]
+    pub protocol_version: u16,
     pub scanner_id: Uuid,
     pub task_id: Uuid,
+    pub upload_id: Option<Uuid>,
+    pub batch_index: Option<u32>,
+    pub is_final: Option<bool>,
+    #[serde(default)]
+    pub observations: Vec<ScannerObservation>,
+    #[serde(default)]
     pub results: Vec<ScannerResultItem>,
 }
 
+fn default_result_protocol_version() -> u16 {
+    1
+}
+
 #[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScannerObservation {
+    Port {
+        ip: String,
+        port: u16,
+        protocol: String,
+        state: String,
+        source: String,
+    },
+    Service {
+        ip: String,
+        port: u16,
+        protocol: String,
+        service: Option<String>,
+        banner: Option<String>,
+        source: String,
+        data: Option<Value>,
+    },
+}
+
+#[derive(Clone, Deserialize)]
 pub struct ScannerResultItem {
     pub ip: String,
     pub port: u16,
@@ -1111,6 +1180,7 @@ pub enum SaveScannerResultsError {
     ScannerUnauthorized,
     TaskNotFound,
     TaskNotOwned,
+    InvalidUpload(String),
 }
 
 #[derive(Debug)]
@@ -1174,6 +1244,7 @@ impl fmt::Display for SaveScannerResultsError {
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
             Self::TaskNotFound => write!(f, "任务不存在"),
             Self::TaskNotOwned => write!(f, "任务不属于当前扫描器或租约已失效"),
+            Self::InvalidUpload(message) => write!(f, "无效扫描结果上传: {message}"),
         }
     }
 }
@@ -1183,7 +1254,10 @@ impl std::error::Error for SaveScannerResultsError {
         match self {
             Self::Database(e) => Some(e.as_ref()),
             Self::InvalidIp { source, .. } => Some(source),
-            Self::ScannerUnauthorized | Self::TaskNotFound | Self::TaskNotOwned => None,
+            Self::ScannerUnauthorized
+            | Self::TaskNotFound
+            | Self::TaskNotOwned
+            | Self::InvalidUpload(_) => None,
         }
     }
 }
@@ -1202,6 +1276,80 @@ pub async fn save_scanner_results(
     token: &str,
     token_pepper: &str,
 ) -> Result<usize, SaveScannerResultsError> {
+    let is_v2 = upload.protocol_version == 2;
+    if upload.protocol_version != 1 && !is_v2 {
+        return Err(SaveScannerResultsError::InvalidUpload(format!(
+            "unsupported protocol_version {}",
+            upload.protocol_version
+        )));
+    }
+    if is_v2
+        && (upload.upload_id.is_none()
+            || upload.batch_index.is_none()
+            || upload.is_final.is_none()
+            || !upload.results.is_empty()
+            || upload.observations.len() > 500)
+    {
+        return Err(SaveScannerResultsError::InvalidUpload(
+            "version 2 requires upload_id, batch_index and is_final, accepts only observations, and limits each batch to 500 observations".into(),
+        ));
+    }
+    if !is_v2 && !upload.observations.is_empty() {
+        return Err(SaveScannerResultsError::InvalidUpload(
+            "typed observations require protocol_version 2".into(),
+        ));
+    }
+
+    let normalized_results: Vec<ScannerResultItem> = if is_v2 {
+        upload
+            .observations
+            .iter()
+            .map(|observation| match observation {
+                ScannerObservation::Port {
+                    ip,
+                    port,
+                    protocol,
+                    state,
+                    source,
+                } => ScannerResultItem {
+                    ip: ip.clone(),
+                    port: *port,
+                    protocol: Some(protocol.clone()),
+                    service: None,
+                    banner: None,
+                    other: Some(serde_json::json!({
+                        "observation_kind": "port",
+                        "state": state,
+                        "source": source,
+                    })),
+                },
+                ScannerObservation::Service {
+                    ip,
+                    port,
+                    protocol,
+                    service,
+                    banner,
+                    source,
+                    data,
+                } => ScannerResultItem {
+                    ip: ip.clone(),
+                    port: *port,
+                    protocol: Some(protocol.clone()),
+                    service: service.clone(),
+                    banner: banner.clone(),
+                    other: Some(serde_json::json!({
+                        "observation_kind": "service",
+                        "source": source,
+                        "data": data,
+                    })),
+                },
+            })
+            .collect()
+    } else {
+        upload.results.clone()
+    };
+    let mut mirror_results = vec![true; normalized_results.len()];
+
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()
@@ -1249,10 +1397,143 @@ pub async fn save_scanner_results(
         None => return Err(SaveScannerResultsError::TaskNotFound),
     };
 
+    let batch_db_id = if is_v2 {
+        let upload_id = upload.upload_id.expect("validated above").to_string();
+        let batch_index =
+            i32::try_from(upload.batch_index.expect("validated above")).map_err(|_| {
+                SaveScannerResultsError::InvalidUpload("batch_index is too large".into())
+            })?;
+        let observation_count = i32::try_from(upload.observations.len()).expect("bounded above");
+        let row = transaction
+            .query_opt(
+                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (execution_id, upload_id, batch_index) \
+                 DO NOTHING RETURNING id;",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &upload.is_final.expect("validated above"),
+                    &observation_count,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let Some(row) = row else {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        };
+        Some(row.get::<_, i64>("id"))
+    } else {
+        None
+    };
+
+    if let Some(batch_db_id) = batch_db_id {
+        for (observation_index, observation) in upload.observations.iter().enumerate() {
+            let (kind, ip, port, protocol, service, banner, source, data) = match observation {
+                ScannerObservation::Port {
+                    ip,
+                    port,
+                    protocol,
+                    state,
+                    source,
+                } => (
+                    "port",
+                    ip,
+                    *port,
+                    protocol,
+                    None,
+                    None,
+                    source,
+                    Some(serde_json::json!({"state": state})),
+                ),
+                ScannerObservation::Service {
+                    ip,
+                    port,
+                    protocol,
+                    service,
+                    banner,
+                    source,
+                    data,
+                } => (
+                    "service",
+                    ip,
+                    *port,
+                    protocol,
+                    service.as_deref(),
+                    banner.as_deref(),
+                    source,
+                    data.clone(),
+                ),
+            };
+            if protocol.is_empty()
+                || protocol.len() > 16
+                || source.is_empty()
+                || source.len() > 64
+                || service.is_some_and(|value| value.len() > 128)
+                || banner.is_some_and(|value| value.len() > 4096)
+                || (kind == "port"
+                    && data.as_ref().and_then(|value| value["state"].as_str()) != Some("open"))
+                || data
+                    .as_ref()
+                    .is_some_and(|value| value.to_string().len() > 1_048_576)
+            {
+                return Err(SaveScannerResultsError::InvalidUpload(
+                    "observation fields exceed allowed values or sizes".into(),
+                ));
+            }
+            let parsed_ip = parse_ip_or_cidr(ip).map_err(|source_error| {
+                SaveScannerResultsError::InvalidIp {
+                    ip: ip.clone(),
+                    source: source_error,
+                }
+            })?;
+            let canonical_ip = parsed_ip.to_string();
+            let observation_key = serde_json::to_string(&serde_json::json!([
+                kind,
+                canonical_ip,
+                port,
+                protocol,
+                service,
+                source
+            ]))
+            .map_err(scanner_result_database_error)?;
+            let port_i32 = i32::from(port);
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, ip_address, port, protocol, service, banner, source, data) \
+                     VALUES ($1, $2, $3, $4, $5::text::inet, $6, $7, $8, $9, $10, $11) \
+                     ON CONFLICT (execution_id, observation_key) DO NOTHING;",
+                    &[
+                        &execution_db_id,
+                        &batch_db_id,
+                        &observation_key,
+                        &kind,
+                        &canonical_ip,
+                        &port_i32,
+                        &protocol,
+                        &service,
+                        &banner,
+                        &source,
+                        &data,
+                    ],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
+            mirror_results[observation_index] = inserted == 1;
+        }
+    }
+
     let mut saved = 0usize;
     let mut ip_intel_cache = HashMap::new();
 
-    for item in &upload.results {
+    for (item, should_mirror) in normalized_results.iter().zip(mirror_results) {
+        if !should_mirror {
+            continue;
+        }
         let parsed_ip =
             parse_ip_or_cidr(&item.ip).map_err(|source| SaveScannerResultsError::InvalidIp {
                 ip: item.ip.clone(),
@@ -1328,17 +1609,19 @@ pub async fn save_scanner_results(
         saved += 1;
     }
 
-    transaction
-        .execute(
-            "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
-             lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false WHERE id = $2;",
-            &[&get_unix_epoch_ms(), &execution_db_id],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
-    refresh_task_aggregate(&transaction, task_db_id)
-        .await
-        .map_err(scanner_result_database_error)?;
+    if !is_v2 || upload.is_final == Some(true) {
+        transaction
+            .execute(
+                "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
+                 lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false WHERE id = $2;",
+                &[&get_unix_epoch_ms(), &execution_db_id],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        refresh_task_aggregate(&transaction, task_db_id)
+            .await
+            .map_err(scanner_result_database_error)?;
+    }
 
     transaction
         .commit()

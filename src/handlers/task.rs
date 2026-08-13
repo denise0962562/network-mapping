@@ -974,6 +974,9 @@ async fn upload_scanner_result_handler(
                 SaveScannerResultsError::InvalidIp { .. } => {
                     HttpResponse::BadRequest().body("invalid ip")
                 }
+                SaveScannerResultsError::InvalidUpload(message) => {
+                    HttpResponse::BadRequest().body(message)
+                }
                 SaveScannerResultsError::ScannerUnauthorized => {
                     HttpResponse::Unauthorized().body("unauthorized")
                 }
