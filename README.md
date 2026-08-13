@@ -93,12 +93,15 @@ cargo run -- --refresh-ip-intel
 
 创建任务接口 `POST /api/task/create` 支持 `dispatch_mode`：`automatic` 由下一台可用扫描器领取一次，`selected` 配合 `scanner_ids` 指定一台或多台扫描器，`all` 会为创建时所有已启用扫描器分别创建执行实例。离线的指定扫描器会在重新上线后领取任务。
 
+任务会根据目标自动标记为 `ipv4` 或 `ipv6`。同一任务不能混合两种地址族；服务端只允许对应协议当前就绪的扫描器领取任务。旧版扫描器未上报网络能力时按仅支持 IPv4 兼容。
+
 任务详情接口 `GET /api/task/{task_id}` 返回 `executions`，并可通过 `execution_id` 查询参数选择某个执行实例的分页结果。同一个逻辑任务下，各扫描器的状态、失败原因和扫描结果相互独立；导出的 CSV/JSON 也包含执行实例和扫描器标识。
 
 ## 自动目标生成
 
-服务端可以从明确授权的 IPv4 CIDR 中顺序生成扫描任务，并使用现有任务队列自动分配给
-任意已启用扫描器。默认关闭；启用前必须配置授权范围：
+服务端可以从明确授权的 IPv4/IPv6 CIDR 中顺序生成扫描任务。两个地址族使用独立的
+队列水位和生成游标，并且只有存在对应协议在线扫描器时才补充任务。默认只配置 IPv4，
+IPv6 自动生成保持关闭：
 
 ```toml
 [automatic_target]
@@ -110,14 +113,22 @@ pending_high_watermark = 5
 priority = 0
 authorized_cidrs = ["10.20.0.0/16"]
 ipv4_task_prefix = 24
+ipv6_enabled = false
+ipv6_authorized_cidrs = []
+ipv6_task_prefix = 120
+ipv6_pending_low_watermark = 1
+ipv6_pending_high_watermark = 2
 common_ports = "21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5432,5900,6379,8080,8443,9200,11211,27017"
 repeat_after_seconds = 604800
 ```
 
-待领取的自动任务低于低水位时，服务端补充至高水位。生成游标存储在数据库中，服务重启
-后继续；同一目标在冷却期内不会重复生成。管理员可通过
-`GET /api/automatic-target/status` 查看当前策略、队列水位和生成状态。第一版仅支持 IPv4，
-不会随机生成或扫描配置范围之外的公网目标。
+`enabled` 是兼容已有配置保留的 IPv4 开关，`ipv6_enabled` 单独控制 IPv6。IPv6 默认按
+`/120` 生成，每个任务最多包含 256 个地址；不建议直接把完整 `/64` 作为扫描任务。
+生成游标存储在数据库中，服务重启后继续；同一目标在冷却期内不会重复生成。管理员可通过
+`GET /api/automatic-target/status` 查看两个地址族各自的队列、游标和可用扫描器数量。
+
+完整的心跳载荷、数据库字段、调度规则、升级兼容和故障排查参见
+[双栈扫描与自动目标文档](docs/DUAL_STACK_SCANNING.md)。
 
 ## 开源项目清单
 
