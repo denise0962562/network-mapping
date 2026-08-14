@@ -13,6 +13,7 @@ use crate::config::AutomaticTargetConfig;
 
 const STRATEGY: &str = "sequential_subnet";
 const SYSTEM_REQUEST_PATH: &str = "system://automatic-target-generator";
+const MANDATORY_IPV4_EXCLUSIONS: &[&str] = &["0.0.0.0/8"];
 
 #[derive(Clone, Debug)]
 struct FamilyGenerator {
@@ -104,11 +105,21 @@ impl AutomaticTargetService {
             .iter()
             .map(|value| value.parse::<Ipv6Net>().map(IpNet::V6))
             .collect::<Result<Vec<_>, _>>()?;
-        let ipv4_excluded = policy
+        let mut ipv4_excluded = policy
             .excluded_cidrs
             .iter()
             .map(|value| value.parse::<Ipv4Net>().map(IpNet::V4))
             .collect::<Result<Vec<_>, _>>()?;
+        for value in MANDATORY_IPV4_EXCLUSIONS {
+            let network = IpNet::V4(
+                value
+                    .parse::<Ipv4Net>()
+                    .expect("mandatory IPv4 exclusion is a valid CIDR"),
+            );
+            if !ipv4_excluded.contains(&network) {
+                ipv4_excluded.push(network);
+            }
+        }
         let ipv6_excluded = policy
             .ipv6_excluded_cidrs
             .iter()
@@ -663,6 +674,23 @@ mod tests {
             &service.generators[0],
             &target_at(&service.generators[0], 1).cidr
         ));
+    }
+
+    #[test]
+    fn zero_network_is_always_excluded() {
+        let service = AutomaticTargetService::new(AutomaticTargetConfig {
+            enabled: true,
+            authorized_cidrs: vec!["0.0.0.0/7".to_owned()],
+            excluded_cidrs: Vec::new(),
+            ..AutomaticTargetConfig::default()
+        })
+        .unwrap();
+        let generator = &service.generators[0];
+
+        assert_eq!(target_at(generator, 17).cidr, "0.0.17.0/24");
+        assert!(is_excluded(generator, &target_at(generator, 17).cidr));
+        assert_eq!(target_at(generator, 65_536).cidr, "1.0.0.0/24");
+        assert!(!is_excluded(generator, &target_at(generator, 65_536).cidr));
     }
 
     #[test]
