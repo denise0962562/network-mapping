@@ -236,6 +236,14 @@ impl SystemCPU {
     }
 }
 
+fn usage_percentage(used: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+
+    (used as f64 / total as f64 * 100.0) as f32
+}
+
 impl SystemRAM {
     pub fn new(sys: Arc<Mutex<sysinfo::System>>) -> Self {
         let mut sys = sys.lock().unwrap();
@@ -245,13 +253,28 @@ impl SystemRAM {
         let total_s = sys.total_swap();
         let used_s = sys.used_swap();
         Self {
-            ram_usage: (used_m / total_m) as f32 * 100.0,
+            ram_usage: usage_percentage(used_m, total_m),
             total_ram: total_m,
             used_ram: used_m,
             total_swap: total_s,
             use_swap: used_s,
-            swap_usage: (used_s / total_s) as f32 * 100.0,
+            swap_usage: usage_percentage(used_s, total_s),
         }
+    }
+}
+
+#[cfg(test)]
+mod system_ram_tests {
+    use super::usage_percentage;
+
+    #[test]
+    fn zero_total_has_zero_usage() {
+        assert_eq!(usage_percentage(128, 0), 0.0);
+    }
+
+    #[test]
+    fn usage_preserves_fractional_values() {
+        assert_eq!(usage_percentage(1, 4), 25.0);
     }
 }
 
