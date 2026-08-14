@@ -16,8 +16,17 @@ CREATE TABLE IF NOT EXISTS users (
 	last_login_at BIGINT,                                                                 -- 表示该用户最后一次登录的时间
 	last_login_ip INET,                                                                   -- 最后一次登录的 IP 地址
 	login_error_count INT,                                                                -- 登录错误的次数
-	last_error_at BIGINT                                                                  -- 最后一次登录出错的时间，以该时间为起点，判断是否将登录错误次数清零
+	last_error_at BIGINT,                                                                 -- 最后一次登录出错的时间，以该时间为起点，判断是否将登录错误次数清零
+	disabled_at TIMESTAMPTZ,                                                              -- 管理员主动禁用时间，与密码错误锁定分离
+	deleted_at TIMESTAMPTZ,                                                               -- 软删除时间，保留任务与审计历史
+	update_at TIMESTAMPTZ
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS update_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_users_management_status
+ON users (role, disabled_at, deleted_at) WHERE role IN (1, 2);
 
 -- 表 scan_task 用于存储扫描任务信息，配置了级联更新和删除
 CREATE TABLE IF NOT EXISTS scan_task( 
@@ -44,6 +53,8 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	generation_key TEXT,
 	generation_metadata JSONB,
 	address_family TEXT NOT NULL DEFAULT 'ipv4' CHECK (address_family IN ('ipv4', 'ipv6')),
+	scan_profile TEXT NOT NULL DEFAULT 'legacy',
+	scan_plan JSONB NOT NULL DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb,
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -59,6 +70,9 @@ ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_strategy TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_key TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_metadata JSONB;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS address_family TEXT NOT NULL DEFAULT 'ipv4';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_profile TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_plan JSONB NOT NULL
+    DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb;
 UPDATE scan_task SET address_family = 'ipv6'
 WHERE cardinality(task_target) > 0
   AND NOT EXISTS (SELECT 1 FROM unnest(task_target) AS target WHERE family(target) <> 6);
@@ -69,6 +83,15 @@ BEGIN
     ) THEN
         ALTER TABLE scan_task ADD CONSTRAINT scan_task_address_family_check
             CHECK (address_family IN ('ipv4', 'ipv6'));
+    END IF;
+END $$;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_profile_check'
+    ) THEN
+        ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
+            CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory'));
     END IF;
 END $$;
 
@@ -160,13 +183,46 @@ CREATE TABLE IF NOT EXISTS scaninfo (
 		ON UPDATE CASCADE 
 );
 
+-- Versioned, idempotent scanner uploads. A retry with the same execution/upload/batch
+-- identity is acknowledged without inserting observations again.
+CREATE TABLE IF NOT EXISTS scan_result_batch (
+	id BIGSERIAL PRIMARY KEY,
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	upload_id VARCHAR(36) NOT NULL,
+	batch_index INT NOT NULL CHECK (batch_index >= 0),
+	is_final BOOLEAN NOT NULL,
+	observation_count INT NOT NULL CHECK (observation_count >= 0),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE(execution_id, upload_id, batch_index)
+);
+
+CREATE TABLE IF NOT EXISTS scan_observation (
+	id BIGSERIAL PRIMARY KEY,
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	batch_id BIGINT NOT NULL REFERENCES scan_result_batch(id) ON DELETE CASCADE,
+	observation_key TEXT NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('port', 'service')),
+	ip_address INET NOT NULL,
+	port INT NOT NULL CHECK (port >= 0 AND port <= 65535),
+	protocol TEXT NOT NULL,
+	service TEXT,
+	banner TEXT,
+	source TEXT NOT NULL,
+	data JSONB,
+	observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE(execution_id, observation_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
+	ON scan_observation(execution_id, kind);
+
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (
 	user_id INT NOT NULL,
 	id SERIAL PRIMARY KEY,
 	token TEXT NOT NULL,
 	csrf_token TEXT NOT NULL,
-	ttl INT DEFAULT 1200, 
+	ttl INT DEFAULT 2700,
 	totp_verify_successful boolean DEFAULT false,
 	pending_totp_secret TEXT,
 	pending_totp_expires_at BIGINT,
@@ -176,6 +232,9 @@ CREATE TABLE IF NOT EXISTS session (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, is_enable);
+CREATE INDEX IF NOT EXISTS idx_session_user_status ON session (user_id, is_enable);
+
+ALTER TABLE session ALTER COLUMN ttl SET DEFAULT 2700;
 
 
 -- 表 system_status 用于存储系统状态数据
@@ -239,6 +298,9 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv4 INET;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS public_ipv6 INET;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_status_reason JSONB;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_capabilities_updated_at TIMESTAMPTZ;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities JSONB NOT NULL
+    DEFAULT '{"plan_versions":[],"profiles":["legacy"],"stages":["port_discovery"]}'::jsonb;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities_updated_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,
@@ -287,6 +349,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_event_resource_time
 	ON audit_event (resource_type, resource_id, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_event_action_time
 	ON audit_event (action, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_event_login_actor_time
+	ON audit_event (actor_id, occurred_at DESC, id DESC)
+	WHERE category = 'authentication' AND action = 'auth.login';
+CREATE INDEX IF NOT EXISTS idx_audit_event_login_username_time
+	ON audit_event ((COALESCE(actor_name, metadata->>'attempted_username')), occurred_at DESC, id DESC)
+	WHERE category = 'authentication' AND action = 'auth.login' AND actor_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_audit_event_request
 	ON audit_event (request_id) WHERE request_id IS NOT NULL;
 
@@ -436,4 +504,47 @@ CREATE TABLE IF NOT EXISTS setting (
 	value TEXT,
 	create_at TIMESTAMPTZ DEFAULT NOW(),
 	update_at TIMESTAMPTZ
-)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_item_type_key ON setting (item_type, key);
+
+INSERT INTO setting (item_type, key, value)
+VALUES ('security', 'session_ttl_seconds', '2700')
+ON CONFLICT (item_type, key) DO NOTHING;
+
+-- 邮件模板元数据与版本。草稿不会影响正在使用的已发布版本。
+CREATE TABLE IF NOT EXISTS mail_template (
+	template_key TEXT PRIMARY KEY,
+	display_name TEXT NOT NULL,
+	active_version INT,
+	enabled BOOLEAN NOT NULL DEFAULT TRUE,
+	create_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	update_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS mail_template_version (
+	id BIGSERIAL PRIMARY KEY,
+	template_key TEXT NOT NULL REFERENCES mail_template(template_key) ON DELETE CASCADE,
+	version INT NOT NULL,
+	status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived')),
+	subject_template TEXT NOT NULL,
+	html_template TEXT NOT NULL,
+	text_template TEXT NOT NULL,
+	created_by INT REFERENCES users(id) ON DELETE SET NULL,
+	create_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	update_at TIMESTAMPTZ,
+	published_at TIMESTAMPTZ,
+	UNIQUE (template_key, version)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_template_single_draft
+ON mail_template_version (template_key)
+WHERE status = 'draft';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_template_single_published
+ON mail_template_version (template_key)
+WHERE status = 'published';
+
+INSERT INTO mail_template (template_key, display_name)
+VALUES ('login_success', '登录成功')
+ON CONFLICT (template_key) DO UPDATE SET display_name = EXCLUDED.display_name;

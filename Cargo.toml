@@ -37,6 +37,8 @@ postgres-from-row = "0.5"
 toml_edit = "0.25"
 clap = { version = "4.6", features = ["derive"]}
 maxminddb = "0.28.1"
+ammonia = "4.1.4"
+css-inline = "0.21.1"
 
 [features]
 default = []

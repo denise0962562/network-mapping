@@ -1,5 +1,8 @@
+pub mod admin_user;
 pub mod audit;
 pub mod data_saa; //数据统计与分析
+pub mod login_record;
+pub mod mail_template;
 pub mod open_source;
 pub mod operations;
 pub mod search;

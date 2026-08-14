@@ -6,6 +6,7 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use openssl::rand;
 use postgres_from_row::FromRow;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::Row;
@@ -14,23 +15,25 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
-use crate::config::{EmailConfig, PasswordHashConfig, SystemConfig};
-use crate::{AddUserInfo, generate_hash_password, generate_scanner_token, hash_scanner_token};
+use crate::config::{
+    DEFAULT_SESSION_TTL_SECONDS, EmailConfig, MAX_SESSION_TTL_MINUTES, MIN_SESSION_TTL_MINUTES,
+    MailSettingsRequest, MailSettingsResponse, NotificationPreferences, PasswordHashConfig,
+    SessionSettingsRequest, SessionSettingsResponse, SystemConfig,
+    session_ttl_seconds_from_minutes,
+};
 use crate::{decrypt_data, encrypt_data};
+use crate::{generate_hash_password, generate_scanner_token, hash_scanner_token};
 
 const DEFAULT_ADMIN_USERNAME: &str = "admin";
 const DEFAULT_ADMIN_USERNAME_ENV: &str = "NM_DEFAULT_ADMIN_USERNAME";
 const DEFAULT_ADMIN_PASSWORD_LEN: usize = 18;
 const DEFAULT_ADMIN_PASSWORD_CHARS: &[u8] =
     b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
-
-/// 该结构体用于接收测试使用的创建用户信息
-#[derive(Deserialize)]
-pub struct ReceiveAddUserInfo {
-    pub username: String,
-    pub password: String,
-    pub role: i32,
-}
+const SMTP_SETTING_TYPE: &str = "smtp";
+const NOTIFICATION_SETTING_TYPE: &str = "notification";
+const SMTP_SENDER_KEY: &str = "sender_key";
+const SECURITY_SETTING_TYPE: &str = "security";
+const SESSION_TTL_SETTING_KEY: &str = "session_ttl_seconds";
 
 pub enum UserRole {
     System = 0,
@@ -116,6 +119,8 @@ pub struct ScannerInfo {
     pub public_ipv6: Option<String>,
     pub network_status_reason: Option<serde_json::Value>,
     pub network_capabilities_updated_at: Option<DateTime<Utc>>,
+    pub scan_capabilities: serde_json::Value,
+    pub scan_capabilities_updated_at: Option<DateTime<Utc>>,
 }
 
 pub enum ScannerEvent {
@@ -133,48 +138,6 @@ pub struct ScannerHealthData {
     pub event: String,
 }
 
-///该函数用于添加用户，且需要调用者处理日志。
-pub async fn add_user<'a>(
-    user: AddUserInfo<'a>,
-    pool: &deadpool_postgres::Pool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = user.check()?;
-    let mut client = pool.get().await?;
-    let transaction = client.transaction().await?;
-    let stmt = transaction
-        .prepare("INSERT INTO users (username, password, role) VALUES ($1, $2, $3); ")
-        .await?;
-    let r = transaction
-        .execute(&stmt, &[&user.username, &user.password_hash, &user.role])
-        .await?;
-    if r != 1 {
-        let message = format!("添加用户时所影响的行数不为 1 ({})", r);
-        transaction.rollback().await?;
-        Err(message.into())
-    } else {
-        transaction.commit().await?;
-        Ok(())
-    }
-}
-
-///该函数用于检查用户是否存在
-///
-/// 如果用户存在则返回true
-pub async fn is_user_exist(
-    username: &str,
-    pool: &deadpool_postgres::Pool,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let client = pool.get().await?;
-    let stmt = client
-        .prepare("SELECT username FROM users WHERE username = $1;")
-        .await?;
-    if client.query_opt(&stmt, &[&username]).await?.is_some() {
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
 /// 该函数通过 cookie 获取用户名与其 ID
 ///
 /// FIXME 需要解决 pool 类型错误问题
@@ -183,10 +146,14 @@ pub async fn get_user_id_and_name<'a>(
     pool: &deadpool_postgres::Pool,
 ) -> Result<(i32, i32, String), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
-    let row = client.query_one(
-        "SELECT s.user_id, u.username, u.role FROM session s CROSS JOIN users u WHERE s.token = $1 AND s.is_enable = True AND u.limit_login = False AND s.user_id = u.id;",
-        &[&session]
-    ).await?;
+    let row = client
+        .query_one(
+            "SELECT s.user_id, u.username, u.role FROM session s JOIN users u ON s.user_id = u.id \
+         WHERE s.token = $1 AND s.is_enable = TRUE AND u.limit_login = FALSE \
+         AND u.disabled_at IS NULL AND u.deleted_at IS NULL;",
+            &[&session],
+        )
+        .await?;
 
     Ok((
         row.get::<_, i32>("user_id"),
@@ -427,34 +394,40 @@ pub async fn create_default_admin_user(
 /// 发送邮件
 ///
 pub async fn send_email(emailconf: &EmailConfig, mail: Message) {
+    if let Err(e) = try_send_email(emailconf, 465, mail).await {
+        warn!(
+            event = "SendEmailError",
+            path = "fn send_email",
+            message = format!("Could not send email: {e:?}")
+        );
+        println!("Could not send email: {e:?}")
+    }
+}
+
+/// 发送邮件并将连接或发送错误返回给调用方。
+pub async fn try_send_email(
+    emailconf: &EmailConfig,
+    port: u16,
+    mail: Message,
+) -> Result<(), Box<dyn std::error::Error>> {
     let creds = Credentials::new(
         emailconf.account_username.to_string(),
         emailconf.account_password.to_string(),
     );
 
-    // 使用465端口，且强制加密
+    // relay 使用 SMTPS，并允许设置页指定服务器端口。
     let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&emailconf.host)
-        .unwrap()
+        .map_err(|error_value| std::io::Error::other(format!("邮件服务器配置无效: {error_value}")))?
+        .port(port)
         .credentials(creds)
         .build();
-    match mailer.send(mail).await {
-        Ok(_) => {
-            info!(
-                event = "SendEmailSuccessfully",
-                path = "fn send_email",
-                message = "Email sent successfully!"
-            );
-            println!("Email sent successfully!")
-        }
-        Err(e) => {
-            warn!(
-                event = "SendEmailError",
-                path = "fn send_email",
-                message = format!("Could not send email: {e:?}")
-            );
-            println!("Could not send email: {e:?}")
-        }
-    }
+    mailer.send(mail).await?;
+    info!(
+        event = "SendEmailSuccessfully",
+        path = "fn try_send_email",
+        message = "Email sent successfully!"
+    );
+    Ok(())
 }
 
 // 创建 TOTP 结构体
@@ -924,7 +897,8 @@ pub async fn write_config_to_database(
 
     match transaction
         .execute(
-            "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3);",
+            "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \
+             ON CONFLICT (item_type, key) DO UPDATE SET value = EXCLUDED.value, update_at = NOW();",
             &[&sys_conf.item_type, &sys_conf.key, &sys_conf.value],
         )
         .await?
@@ -935,6 +909,275 @@ pub async fn write_config_to_database(
         }
 
         _ => Err("插入数据异常".into()),
+    }
+}
+
+/// 读取用于新登录会话的绝对有效期。缺失或损坏的设置回退到 45 分钟。
+pub async fn get_session_ttl_seconds_from_database(
+    pool: &deadpool_postgres::Pool,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let conn = pool.get().await?;
+    let row = conn
+        .query_opt(
+            "SELECT value FROM setting WHERE item_type = $1 AND key = $2 LIMIT 1;",
+            &[&SECURITY_SETTING_TYPE, &SESSION_TTL_SETTING_KEY],
+        )
+        .await?;
+    let minimum_seconds = MIN_SESSION_TTL_MINUTES * 60;
+    let maximum_seconds = MAX_SESSION_TTL_MINUTES * 60;
+    Ok(row
+        .and_then(|row| row.get::<_, String>("value").parse::<i32>().ok())
+        .filter(|seconds| {
+            seconds % 60 == 0 && (minimum_seconds..=maximum_seconds).contains(seconds)
+        })
+        .unwrap_or(DEFAULT_SESSION_TTL_SECONDS))
+}
+
+pub async fn get_session_settings_from_database(
+    pool: &deadpool_postgres::Pool,
+) -> Result<SessionSettingsResponse, Box<dyn std::error::Error>> {
+    Ok(SessionSettingsResponse::new(
+        get_session_ttl_seconds_from_database(pool).await?,
+        0,
+    ))
+}
+
+/// 原子保存会话策略，并按管理员选择注销除当前会话外的其他活动会话。
+pub async fn write_session_settings_to_database(
+    pool: &deadpool_postgres::Pool,
+    settings: &SessionSettingsRequest,
+    current_session: &str,
+) -> Result<SessionSettingsResponse, Box<dyn std::error::Error>> {
+    let ttl_seconds = session_ttl_seconds_from_minutes(settings.session_ttl_minutes)?;
+    let value = ttl_seconds.to_string();
+    let mut conn = pool.get().await?;
+    let transaction = conn.transaction().await?;
+    transaction
+        .execute(
+            "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \
+             ON CONFLICT (item_type, key) DO UPDATE SET value = EXCLUDED.value, update_at = NOW();",
+            &[&SECURITY_SETTING_TYPE, &SESSION_TTL_SETTING_KEY, &value],
+        )
+        .await?;
+    let invalidated_session_count = if settings.invalidate_other_sessions {
+        transaction
+            .execute(
+                "UPDATE session SET is_enable = false \
+                 WHERE is_enable = true AND token <> $1;",
+                &[&current_session],
+            )
+            .await?
+    } else {
+        0
+    };
+    transaction.commit().await?;
+    Ok(SessionSettingsResponse::new(
+        ttl_seconds,
+        invalidated_session_count,
+    ))
+}
+
+/// 读取设置页需要的邮件与通知配置。
+///
+/// 邮箱密钥只返回是否已配置，绝不通过接口回传密文或明文。
+pub async fn get_mail_settings_from_database(
+    pool: &deadpool_postgres::Pool,
+) -> Result<MailSettingsResponse, Box<dyn std::error::Error>> {
+    let conn = pool.get().await?;
+    let rows = conn
+        .query(
+            "SELECT item_type, key, value FROM setting WHERE item_type IN ($1, $2);",
+            &[&SMTP_SETTING_TYPE, &NOTIFICATION_SETTING_TYPE],
+        )
+        .await?;
+    let values = rows
+        .iter()
+        .map(|row| {
+            (
+                (
+                    row.get::<_, String>("item_type"),
+                    row.get::<_, String>("key"),
+                ),
+                row.get::<_, String>("value"),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let smtp_value = |key: &str| {
+        values
+            .get(&(SMTP_SETTING_TYPE.to_owned(), key.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let notification_value = |key: &str, default: bool| {
+        values
+            .get(&(NOTIFICATION_SETTING_TYPE.to_owned(), key.to_owned()))
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(default)
+    };
+    let defaults = NotificationPreferences::default();
+
+    Ok(MailSettingsResponse {
+        recipient: smtp_value("recipient"),
+        smtp_host: smtp_value("host"),
+        smtp_port: smtp_value("port").parse::<u16>().unwrap_or(465),
+        sender: smtp_value("sender"),
+        sender_key_configured: !smtp_value(SMTP_SENDER_KEY).is_empty(),
+        notification_prefs: NotificationPreferences {
+            login_notify_enabled: notification_value(
+                "login_notify_enabled",
+                defaults.login_notify_enabled,
+            ),
+            notify_on_stuck: notification_value("notify_on_stuck", defaults.notify_on_stuck),
+            notify_on_complete: notification_value(
+                "notify_on_complete",
+                defaults.notify_on_complete,
+            ),
+            report_daily: notification_value("report_daily", defaults.report_daily),
+            report_weekly: notification_value("report_weekly", defaults.report_weekly),
+            report_monthly: notification_value("report_monthly", defaults.report_monthly),
+        },
+    })
+}
+
+fn encrypt_setting_secret(
+    plaintext: &str,
+    encoded_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let encryption_key = openssl::base64::decode_block(encoded_key)?;
+    let (nonce, tag, ciphertext) = encrypt_data(plaintext.as_bytes(), &encryption_key)?;
+    let mut encrypted = Vec::with_capacity(nonce.len() + tag.len() + ciphertext.len());
+    encrypted.extend_from_slice(&nonce);
+    encrypted.extend_from_slice(&tag);
+    encrypted.extend_from_slice(&ciphertext);
+    Ok(openssl::base64::encode_block(&encrypted))
+}
+
+fn decrypt_setting_secret(
+    encrypted_value: &str,
+    encoded_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let encrypted = openssl::base64::decode_block(encrypted_value)?;
+    if encrypted.len() < 28 {
+        return Err("邮件密钥密文格式错误".into());
+    }
+    let decryption_key = openssl::base64::decode_block(encoded_key)?;
+    let plaintext = decrypt_data(&encrypted, &decryption_key)?;
+    Ok(String::from_utf8(plaintext)?)
+}
+
+/// 读取并解密已保存的发件邮箱密钥，供邮件测试使用。
+pub async fn get_mail_sender_key_from_database(
+    pool: &deadpool_postgres::Pool,
+    encoded_key: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let conn = pool.get().await?;
+    let row = conn
+        .query_opt(
+            "SELECT value FROM setting WHERE item_type = $1 AND key = $2 LIMIT 1;",
+            &[&SMTP_SETTING_TYPE, &SMTP_SENDER_KEY],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let encrypted_value = row.get::<_, String>("value");
+    if encrypted_value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decrypt_setting_secret(&encrypted_value, encoded_key)?))
+}
+
+/// 原子写入设置页中的邮件配置和通知偏好。
+pub async fn write_mail_settings_to_database(
+    pool: &deadpool_postgres::Pool,
+    settings: &MailSettingsRequest,
+    encoded_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = pool.get().await?;
+    let transaction = conn.transaction().await?;
+    let smtp_values = [
+        ("recipient", settings.recipient.trim().to_owned()),
+        ("host", settings.smtp_host.trim().to_owned()),
+        ("port", settings.smtp_port.to_string()),
+        ("sender", settings.sender.trim().to_owned()),
+    ];
+    let notification_values = [
+        (
+            "login_notify_enabled",
+            settings.notification_prefs.login_notify_enabled.to_string(),
+        ),
+        (
+            "notify_on_stuck",
+            settings.notification_prefs.notify_on_stuck.to_string(),
+        ),
+        (
+            "notify_on_complete",
+            settings.notification_prefs.notify_on_complete.to_string(),
+        ),
+        (
+            "report_daily",
+            settings.notification_prefs.report_daily.to_string(),
+        ),
+        (
+            "report_weekly",
+            settings.notification_prefs.report_weekly.to_string(),
+        ),
+        (
+            "report_monthly",
+            settings.notification_prefs.report_monthly.to_string(),
+        ),
+    ];
+    const UPSERT_SETTING: &str = "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \
+         ON CONFLICT (item_type, key) DO UPDATE SET value = EXCLUDED.value, update_at = NOW();";
+
+    for (key, value) in smtp_values {
+        transaction
+            .execute(UPSERT_SETTING, &[&SMTP_SETTING_TYPE, &key, &value])
+            .await?;
+    }
+    if !settings.sender_key.is_empty() {
+        let encrypted_sender_key = encrypt_setting_secret(&settings.sender_key, encoded_key)?;
+        transaction
+            .execute(
+                UPSERT_SETTING,
+                &[&SMTP_SETTING_TYPE, &SMTP_SENDER_KEY, &encrypted_sender_key],
+            )
+            .await?;
+    }
+    for (key, value) in notification_values {
+        transaction
+            .execute(UPSERT_SETTING, &[&NOTIFICATION_SETTING_TYPE, &key, &value])
+            .await?;
+    }
+
+    transaction.commit().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod mail_setting_tests {
+    use super::{decrypt_setting_secret, encrypt_setting_secret};
+
+    #[test]
+    fn mail_sender_key_encryption_round_trips() {
+        let encoded_key = openssl::base64::encode_block(&[7_u8; 32]);
+        let plaintext = "smtp-app-password-测试";
+
+        let encrypted = encrypt_setting_secret(plaintext, &encoded_key).unwrap();
+        assert_ne!(encrypted, plaintext);
+        assert_eq!(
+            decrypt_setting_secret(&encrypted, &encoded_key).unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn malformed_mail_sender_key_ciphertext_is_rejected() {
+        let encoded_key = openssl::base64::encode_block(&[7_u8; 32]);
+        let malformed = openssl::base64::encode_block(&[1_u8; 12]);
+
+        assert!(decrypt_setting_secret(&malformed, &encoded_key).is_err());
     }
 }
 
@@ -964,22 +1207,14 @@ pub async fn get_user_base_info(
     let conn = pool.get().await?;
 
     let row = conn.query_opt(
-        "SELECT id, username, role, email, limit_login, enable_2fa From users WHERE id = $1 LIMIT 1;",
+        "SELECT id, username, role, email, limit_login, enable_2fa FROM users \
+         WHERE id = $1 AND limit_login = FALSE AND disabled_at IS NULL AND deleted_at IS NULL LIMIT 1;",
         &[&user_id]
     ).await?;
 
-    Ok(row
-        .map(|t| FromRow::try_from_row(&t))
-        // 此处利用 transpose 将 Option<Result<T,E>> 转换为 Result<Option<T>,E>
+    row.map(|value| FromRow::try_from_row(&value))
         .transpose()?
-        .unwrap_or(UserBaseI {
-            id: -1,
-            username: String::new(),
-            role: -1,
-            email: None,
-            limit_login: true,
-            enable_2fa: true,
-        }))
+        .ok_or_else(|| "用户不存在、已锁定、已禁用或已删除".into())
 }
 
 /// web 端添加扫描器
@@ -1099,7 +1334,7 @@ const SCANNER_INFO_SELECT: &str = "\
            s.is_run, s.is_enable, s.remark, s.tag, s.supports_ipv4, s.supports_ipv6, \
            s.ipv4_ready, s.ipv6_ready, host(s.public_ipv4) AS public_ipv4, \
            host(s.public_ipv6) AS public_ipv6, s.network_status_reason, \
-           s.network_capabilities_updated_at \
+           s.network_capabilities_updated_at, s.scan_capabilities, s.scan_capabilities_updated_at \
     FROM scanner_info s \
     LEFT JOIN users u ON u.id = s.create_user";
 
@@ -1135,6 +1370,8 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         public_ipv6: row.get("public_ipv6"),
         network_status_reason: row.get("network_status_reason"),
         network_capabilities_updated_at: row.get("network_capabilities_updated_at"),
+        scan_capabilities: row.get("scan_capabilities"),
+        scan_capabilities_updated_at: row.get("scan_capabilities_updated_at"),
     }
 }
 

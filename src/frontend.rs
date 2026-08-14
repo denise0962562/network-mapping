@@ -13,10 +13,12 @@ const SPA_ROUTES: &[&str] = &[
     "/task",
     "/scanner",
     "/analysis",
+    "/admin/users",
     "/audit",
     "/open-source",
     "/testpage",
     "/setting",
+    "/setting/mail-templates",
     "/user/info",
     "/user/security",
 ];

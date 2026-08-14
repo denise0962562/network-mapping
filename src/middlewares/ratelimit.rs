@@ -155,11 +155,6 @@ fn policy_for_path(path: &str) -> Option<RateLimitPolicy> {
             window: Duration::from_secs(60),
             message: "扫描器任务状态上报过于频繁，请稍后再试",
         }),
-        "/test/adduser" => Some(RateLimitPolicy {
-            max_requests: 5,
-            window: Duration::from_secs(60),
-            message: "请求过于频繁，请稍后再试",
-        }),
         _ => None,
     }
 }

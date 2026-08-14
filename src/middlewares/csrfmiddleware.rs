@@ -71,7 +71,7 @@ where
         let path = req.path().to_owned();
         let csrf_protected_get = matches!(
             path.as_str(),
-            "/logout" | "/test/adduser" | "/api/totp/bind" | "/api/updaterir"
+            "/logout" | "/api/totp/bind" | "/api/updaterir"
         );
         let safe_method = matches!(req.method().as_str(), "GET" | "HEAD") && !csrf_protected_get;
         let pass = is_scanner_api_path(&path) || is_frontend_resource_path(&path) || safe_method;

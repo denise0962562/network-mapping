@@ -6,6 +6,7 @@ pub mod frontend;
 pub mod handlers;
 pub mod login;
 pub mod logs;
+pub mod mail_template;
 pub mod maxmind;
 pub mod target_generated;
 pub mod tls;
@@ -97,21 +98,6 @@ struct FrontEndErrorInfo<'a> {
 pub struct _ProxySetting {
     _status: bool,
     _headers: String,
-}
-
-pub struct AddUserInfo<'a> {
-    pub username: &'a str,
-    pub password_hash: &'a str,
-    pub role: i32,
-}
-
-impl<'a> AddUserInfo<'a> {
-    fn check(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match self.role {
-            0..=2 => Ok(()),
-            _ => Err("角色值不符合规则".into()),
-        }
-    }
 }
 
 pub struct UserLoginInfo {
@@ -432,7 +418,9 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
 
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
-    use super::{STask, TargetIP, parse_ip_or_cidr};
+    use super::{
+        STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan, parse_ip_or_cidr,
+    };
 
     #[test]
     fn accepts_plain_ipv4_as_single_host_network() {
@@ -477,6 +465,51 @@ mod parse_ip_or_cidr_tests {
 
         let mixed = STask::new(TargetIP::S("192.0.2.1,2001:db8::1"), "test", None, None).unwrap();
         assert!(mixed.address_family().is_err());
+    }
+
+    #[test]
+    fn scan_profiles_expand_to_allowlisted_plans() {
+        let ports = build_scan_plan("port_only").unwrap();
+        assert_eq!(ports["version"], 1);
+        assert_eq!(ports["stages"].as_array().unwrap().len(), 1);
+
+        let inventory = build_scan_plan("service_inventory").unwrap();
+        assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
+        assert!(build_scan_plan("arbitrary_command").is_err());
+    }
+
+    #[test]
+    fn result_protocol_accepts_legacy_and_typed_payloads() {
+        let legacy: ScannerResultUpload = serde_json::from_value(serde_json::json!({
+            "scanner_id": "019c0000-0000-7000-8000-000000000001",
+            "task_id": "019c0000-0000-7000-8000-000000000002",
+            "results": []
+        }))
+        .unwrap();
+        assert_eq!(legacy.protocol_version, 1);
+
+        let typed: ScannerResultUpload = serde_json::from_value(serde_json::json!({
+            "protocol_version": 2,
+            "scanner_id": "019c0000-0000-7000-8000-000000000001",
+            "task_id": "019c0000-0000-7000-8000-000000000002",
+            "upload_id": "019c0000-0000-7000-8000-000000000003",
+            "batch_index": 0,
+            "is_final": true,
+            "observations": [{
+                "kind": "port",
+                "ip": "192.0.2.1",
+                "port": 443,
+                "protocol": "tcp",
+                "state": "open",
+                "source": "masscan"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(typed.protocol_version, 2);
+        assert!(matches!(
+            typed.observations[0],
+            ScannerObservation::Port { .. }
+        ));
     }
 }
 
@@ -535,10 +568,38 @@ pub struct CreateTask {
     pub dispatch_mode: String,
     #[serde(default)]
     pub scanner_ids: Vec<Uuid>,
+    #[serde(default = "default_scan_profile")]
+    pub scan_profile: String,
 }
 
 fn default_dispatch_mode() -> String {
     "automatic".into()
+}
+
+fn default_scan_profile() -> String {
+    "legacy".into()
+}
+
+pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
+    let stages = match profile {
+        "legacy" => serde_json::json!([
+            {"type": "port_discovery", "required": true},
+            {"type": "service_detection", "required": false}
+        ]),
+        "port_only" => serde_json::json!([
+            {"type": "port_discovery", "required": true}
+        ]),
+        "service_inventory" => serde_json::json!([
+            {"type": "port_discovery", "required": true},
+            {"type": "service_detection", "required": true}
+        ]),
+        _ => return Err("unsupported scan profile"),
+    };
+    Ok(serde_json::json!({
+        "version": 1,
+        "profile": profile,
+        "stages": stages,
+    }))
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
@@ -605,6 +666,8 @@ impl<'a> STask<'a> {
         user_id: i32,
         dispatch_mode: &str,
         requested_scanners: &[Option<String>],
+        scan_profile: &str,
+        scan_plan: &Value,
         audit_context: &audit::AuditContext,
         actor: &admin::UserBaseI,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -621,9 +684,9 @@ impl<'a> STask<'a> {
         let address_family = self.address_family()?;
 
         let task_row = client.query_one(
-            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, dispatch_mode, address_family) \
-             VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7, $8, $9) RETURNING id;",
-            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark, &dispatch_mode, &address_family]
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, dispatch_mode, address_family, scan_profile, scan_plan) \
+             VALUES ($1, $2, $3, ARRAY(SELECT inet(unnest($4::text[]))), $5, $6, $7, $8, $9, $10, $11) RETURNING id;",
+            &[&user_id, &t_id, &self.task_initiator, &tmp_ip, &self.port, &level, &self.remark, &dispatch_mode, &address_family, &scan_profile, &scan_plan]
         ).await?;
         let task_db_id: i32 = task_row.get("id");
         for requested_scanner in requested_scanners {
@@ -640,6 +703,7 @@ impl<'a> STask<'a> {
             "dispatch_mode": dispatch_mode,
             "scanner_count": requested_scanners.len(),
             "target_count": self.ip.len()
+            ,"scan_profile": scan_profile
         });
         audit::write(&client, audit_context, &audit_event).await?;
 
@@ -779,7 +843,8 @@ pub async fn get_password_and_id_from_database(
 ) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
-        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users WHERE limit_login = False AND username = $1",
+        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users \
+         WHERE limit_login = FALSE AND disabled_at IS NULL AND deleted_at IS NULL AND username = $1",
         &[&username]
     ).await? {
         // TODO 需要改进，避免闭包获得所有权
@@ -1055,16 +1120,50 @@ pub struct ApplyTask {
     pub task_target: Vec<String>,
     pub task_port: String,
     pub address_family: String,
+    pub scan_plan: Value,
 }
 
 #[derive(Deserialize)]
 pub struct ScannerResultUpload {
+    #[serde(default = "default_result_protocol_version")]
+    pub protocol_version: u16,
     pub scanner_id: Uuid,
     pub task_id: Uuid,
+    pub upload_id: Option<Uuid>,
+    pub batch_index: Option<u32>,
+    pub is_final: Option<bool>,
+    #[serde(default)]
+    pub observations: Vec<ScannerObservation>,
+    #[serde(default)]
     pub results: Vec<ScannerResultItem>,
 }
 
+fn default_result_protocol_version() -> u16 {
+    1
+}
+
 #[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScannerObservation {
+    Port {
+        ip: String,
+        port: u16,
+        protocol: String,
+        state: String,
+        source: String,
+    },
+    Service {
+        ip: String,
+        port: u16,
+        protocol: String,
+        service: Option<String>,
+        banner: Option<String>,
+        source: String,
+        data: Option<Value>,
+    },
+}
+
+#[derive(Clone, Deserialize)]
 pub struct ScannerResultItem {
     pub ip: String,
     pub port: u16,
@@ -1081,6 +1180,7 @@ pub enum SaveScannerResultsError {
     ScannerUnauthorized,
     TaskNotFound,
     TaskNotOwned,
+    InvalidUpload(String),
 }
 
 #[derive(Debug)]
@@ -1144,6 +1244,7 @@ impl fmt::Display for SaveScannerResultsError {
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
             Self::TaskNotFound => write!(f, "任务不存在"),
             Self::TaskNotOwned => write!(f, "任务不属于当前扫描器或租约已失效"),
+            Self::InvalidUpload(message) => write!(f, "无效扫描结果上传: {message}"),
         }
     }
 }
@@ -1153,7 +1254,10 @@ impl std::error::Error for SaveScannerResultsError {
         match self {
             Self::Database(e) => Some(e.as_ref()),
             Self::InvalidIp { source, .. } => Some(source),
-            Self::ScannerUnauthorized | Self::TaskNotFound | Self::TaskNotOwned => None,
+            Self::ScannerUnauthorized
+            | Self::TaskNotFound
+            | Self::TaskNotOwned
+            | Self::InvalidUpload(_) => None,
         }
     }
 }
@@ -1172,6 +1276,80 @@ pub async fn save_scanner_results(
     token: &str,
     token_pepper: &str,
 ) -> Result<usize, SaveScannerResultsError> {
+    let is_v2 = upload.protocol_version == 2;
+    if upload.protocol_version != 1 && !is_v2 {
+        return Err(SaveScannerResultsError::InvalidUpload(format!(
+            "unsupported protocol_version {}",
+            upload.protocol_version
+        )));
+    }
+    if is_v2
+        && (upload.upload_id.is_none()
+            || upload.batch_index.is_none()
+            || upload.is_final.is_none()
+            || !upload.results.is_empty()
+            || upload.observations.len() > 500)
+    {
+        return Err(SaveScannerResultsError::InvalidUpload(
+            "version 2 requires upload_id, batch_index and is_final, accepts only observations, and limits each batch to 500 observations".into(),
+        ));
+    }
+    if !is_v2 && !upload.observations.is_empty() {
+        return Err(SaveScannerResultsError::InvalidUpload(
+            "typed observations require protocol_version 2".into(),
+        ));
+    }
+
+    let normalized_results: Vec<ScannerResultItem> = if is_v2 {
+        upload
+            .observations
+            .iter()
+            .map(|observation| match observation {
+                ScannerObservation::Port {
+                    ip,
+                    port,
+                    protocol,
+                    state,
+                    source,
+                } => ScannerResultItem {
+                    ip: ip.clone(),
+                    port: *port,
+                    protocol: Some(protocol.clone()),
+                    service: None,
+                    banner: None,
+                    other: Some(serde_json::json!({
+                        "observation_kind": "port",
+                        "state": state,
+                        "source": source,
+                    })),
+                },
+                ScannerObservation::Service {
+                    ip,
+                    port,
+                    protocol,
+                    service,
+                    banner,
+                    source,
+                    data,
+                } => ScannerResultItem {
+                    ip: ip.clone(),
+                    port: *port,
+                    protocol: Some(protocol.clone()),
+                    service: service.clone(),
+                    banner: banner.clone(),
+                    other: Some(serde_json::json!({
+                        "observation_kind": "service",
+                        "source": source,
+                        "data": data,
+                    })),
+                },
+            })
+            .collect()
+    } else {
+        upload.results.clone()
+    };
+    let mut mirror_results = vec![true; normalized_results.len()];
+
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()
@@ -1219,10 +1397,143 @@ pub async fn save_scanner_results(
         None => return Err(SaveScannerResultsError::TaskNotFound),
     };
 
+    let batch_db_id = if is_v2 {
+        let upload_id = upload.upload_id.expect("validated above").to_string();
+        let batch_index =
+            i32::try_from(upload.batch_index.expect("validated above")).map_err(|_| {
+                SaveScannerResultsError::InvalidUpload("batch_index is too large".into())
+            })?;
+        let observation_count = i32::try_from(upload.observations.len()).expect("bounded above");
+        let row = transaction
+            .query_opt(
+                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (execution_id, upload_id, batch_index) \
+                 DO NOTHING RETURNING id;",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &upload.is_final.expect("validated above"),
+                    &observation_count,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let Some(row) = row else {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        };
+        Some(row.get::<_, i64>("id"))
+    } else {
+        None
+    };
+
+    if let Some(batch_db_id) = batch_db_id {
+        for (observation_index, observation) in upload.observations.iter().enumerate() {
+            let (kind, ip, port, protocol, service, banner, source, data) = match observation {
+                ScannerObservation::Port {
+                    ip,
+                    port,
+                    protocol,
+                    state,
+                    source,
+                } => (
+                    "port",
+                    ip,
+                    *port,
+                    protocol,
+                    None,
+                    None,
+                    source,
+                    Some(serde_json::json!({"state": state})),
+                ),
+                ScannerObservation::Service {
+                    ip,
+                    port,
+                    protocol,
+                    service,
+                    banner,
+                    source,
+                    data,
+                } => (
+                    "service",
+                    ip,
+                    *port,
+                    protocol,
+                    service.as_deref(),
+                    banner.as_deref(),
+                    source,
+                    data.clone(),
+                ),
+            };
+            if protocol.is_empty()
+                || protocol.len() > 16
+                || source.is_empty()
+                || source.len() > 64
+                || service.is_some_and(|value| value.len() > 128)
+                || banner.is_some_and(|value| value.len() > 4096)
+                || (kind == "port"
+                    && data.as_ref().and_then(|value| value["state"].as_str()) != Some("open"))
+                || data
+                    .as_ref()
+                    .is_some_and(|value| value.to_string().len() > 1_048_576)
+            {
+                return Err(SaveScannerResultsError::InvalidUpload(
+                    "observation fields exceed allowed values or sizes".into(),
+                ));
+            }
+            let parsed_ip = parse_ip_or_cidr(ip).map_err(|source_error| {
+                SaveScannerResultsError::InvalidIp {
+                    ip: ip.clone(),
+                    source: source_error,
+                }
+            })?;
+            let canonical_ip = parsed_ip.to_string();
+            let observation_key = serde_json::to_string(&serde_json::json!([
+                kind,
+                canonical_ip,
+                port,
+                protocol,
+                service,
+                source
+            ]))
+            .map_err(scanner_result_database_error)?;
+            let port_i32 = i32::from(port);
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, ip_address, port, protocol, service, banner, source, data) \
+                     VALUES ($1, $2, $3, $4, $5::text::inet, $6, $7, $8, $9, $10, $11) \
+                     ON CONFLICT (execution_id, observation_key) DO NOTHING;",
+                    &[
+                        &execution_db_id,
+                        &batch_db_id,
+                        &observation_key,
+                        &kind,
+                        &canonical_ip,
+                        &port_i32,
+                        &protocol,
+                        &service,
+                        &banner,
+                        &source,
+                        &data,
+                    ],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
+            mirror_results[observation_index] = inserted == 1;
+        }
+    }
+
     let mut saved = 0usize;
     let mut ip_intel_cache = HashMap::new();
 
-    for item in &upload.results {
+    for (item, should_mirror) in normalized_results.iter().zip(mirror_results) {
+        if !should_mirror {
+            continue;
+        }
         let parsed_ip =
             parse_ip_or_cidr(&item.ip).map_err(|source| SaveScannerResultsError::InvalidIp {
                 ip: item.ip.clone(),
@@ -1298,17 +1609,19 @@ pub async fn save_scanner_results(
         saved += 1;
     }
 
-    transaction
-        .execute(
-            "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
-             lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false WHERE id = $2;",
-            &[&get_unix_epoch_ms(), &execution_db_id],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
-    refresh_task_aggregate(&transaction, task_db_id)
-        .await
-        .map_err(scanner_result_database_error)?;
+    if !is_v2 || upload.is_final == Some(true) {
+        transaction
+            .execute(
+                "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
+                 lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false WHERE id = $2;",
+                &[&get_unix_epoch_ms(), &execution_db_id],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        refresh_task_aggregate(&transaction, task_db_id)
+            .await
+            .map_err(scanner_result_database_error)?;
+    }
 
     transaction
         .commit()
@@ -1382,7 +1695,7 @@ pub async fn apply_task(
 
     let row = transaction
         .query_opt(
-            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port, t.address_family \
+            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port, t.address_family, t.scan_plan \
          FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
          JOIN scanner_info s ON s.scanner_id = $2 \
          WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.cancel_requested = false \
@@ -1390,6 +1703,7 @@ pub async fn apply_task(
            AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
              OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
+           AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
          ORDER BY t.task_level DESC, t.task_create_time, e.id \
          FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",
@@ -1436,6 +1750,7 @@ pub async fn apply_task(
         task_target: row.get("task_target"),
         task_port: row.get("task_port"),
         address_family: row.get("address_family"),
+        scan_plan: row.get("scan_plan"),
     };
 
     transaction
@@ -1522,6 +1837,8 @@ pub struct TaskItem {
     pub remarks: Option<String>,
     pub task_source: String,
     pub address_family: String,
+    pub scan_profile: String,
+    pub scan_plan: Value,
 }
 
 /// 表示 Json 格式的任务列表
@@ -1623,6 +1940,8 @@ pub async fn get_task_item(
             remarks: r.get::<_, Option<String>>("remarks"),
             task_source: r.get::<_, String>("task_source"),
             address_family: r.get::<_, String>("address_family"),
+            scan_profile: r.get::<_, String>("scan_profile"),
+            scan_plan: r.get::<_, Value>("scan_plan"),
         };
         task_item_r.push(titem);
         count += 1;

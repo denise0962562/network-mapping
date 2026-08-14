@@ -490,6 +490,106 @@ pub struct EmailConfig {
     pub account_password: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationPreferences {
+    pub login_notify_enabled: bool,
+    pub notify_on_stuck: bool,
+    pub notify_on_complete: bool,
+    pub report_daily: bool,
+    pub report_weekly: bool,
+    pub report_monthly: bool,
+}
+
+impl Default for NotificationPreferences {
+    fn default() -> Self {
+        Self {
+            login_notify_enabled: true,
+            notify_on_stuck: true,
+            notify_on_complete: true,
+            report_daily: false,
+            report_weekly: true,
+            report_monthly: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSettingsRequest {
+    /// 仅用于 SMTP 连通性测试和邮件模板测试，不作为真实通知的收件人。
+    pub recipient: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub sender: String,
+    #[serde(default)]
+    pub sender_key: String,
+    #[serde(default)]
+    pub notification_prefs: NotificationPreferences,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSettingsResponse {
+    /// 仅用于 SMTP 连通性测试和邮件模板测试，不作为真实通知的收件人。
+    pub recipient: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub sender: String,
+    pub sender_key_configured: bool,
+    pub notification_prefs: NotificationPreferences,
+}
+
+pub const DEFAULT_SESSION_TTL_SECONDS: i32 = 45 * 60;
+pub const MIN_SESSION_TTL_MINUTES: i32 = 5;
+pub const MAX_SESSION_TTL_MINUTES: i32 = 24 * 60;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSettingsRequest {
+    pub session_ttl_minutes: i32,
+    #[serde(default)]
+    pub invalidate_other_sessions: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSettingsResponse {
+    pub session_ttl_minutes: i32,
+    pub minimum_minutes: i32,
+    pub maximum_minutes: i32,
+    pub invalidated_session_count: u64,
+}
+
+impl SessionSettingsResponse {
+    pub fn new(session_ttl_seconds: i32, invalidated_session_count: u64) -> Self {
+        Self {
+            session_ttl_minutes: session_ttl_seconds / 60,
+            minimum_minutes: MIN_SESSION_TTL_MINUTES,
+            maximum_minutes: MAX_SESSION_TTL_MINUTES,
+            invalidated_session_count,
+        }
+    }
+}
+
+pub fn session_ttl_seconds_from_minutes(minutes: i32) -> Result<i32, &'static str> {
+    if !(MIN_SESSION_TTL_MINUTES..=MAX_SESSION_TTL_MINUTES).contains(&minutes) {
+        return Err("会话有效期必须在 5 分钟到 24 小时之间");
+    }
+    minutes.checked_mul(60).ok_or("会话有效期超出允许范围")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailTestRequest {
+    pub recipient: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub sender: String,
+    #[serde(default)]
+    pub sender_key: String,
+}
+
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Self {
         let path = path.as_ref();
@@ -506,10 +606,19 @@ impl Config {
 mod tests {
     use super::{
         AutomaticTargetConfig, Clis, FrontendConfig, MaxMindConfig, SecurityConfig, SelfChecking,
-        TlsConfig,
+        TlsConfig, session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn session_ttl_minutes_are_converted_and_bounded() {
+        assert_eq!(session_ttl_seconds_from_minutes(45), Ok(2700));
+        assert_eq!(session_ttl_seconds_from_minutes(5), Ok(300));
+        assert_eq!(session_ttl_seconds_from_minutes(1440), Ok(86_400));
+        assert!(session_ttl_seconds_from_minutes(4).is_err());
+        assert!(session_ttl_seconds_from_minutes(1441).is_err());
+    }
 
     #[test]
     fn tls_paths_are_resolved_relative_to_config_file() {
@@ -686,8 +795,7 @@ mod tests {
 }
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(user::first_add_user)
-        .service(user::user_login_h)
+    cfg.service(user::user_login_h)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
@@ -709,6 +817,22 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::operations::retry_task)
         .service(handlers::operations::export_task)
         .service(handlers::operations::dashboard_overview)
+        .service(handlers::admin_user::list_users)
+        .service(handlers::admin_user::create_user)
+        .service(handlers::admin_user::set_user_enabled)
+        .service(handlers::admin_user::kick_user)
+        .service(handlers::admin_user::delete_user)
+        .service(handlers::login_record::self_login_records)
+        .service(handlers::login_record::admin_login_records)
+        .service(handlers::mail_template::list_mail_templates)
+        .service(handlers::mail_template::get_mail_template)
+        .service(handlers::mail_template::validate_mail_template)
+        .service(handlers::mail_template::preview_mail_template)
+        .service(handlers::mail_template::save_mail_template_draft)
+        .service(handlers::mail_template::publish_mail_template)
+        .service(handlers::mail_template::get_mail_template_versions)
+        .service(handlers::mail_template::restore_mail_template_version)
+        .service(handlers::mail_template::test_mail_template)
         .service(handlers::audit::list_audit_events)
         .service(handlers::audit::export_audit_events)
         .service(handlers::audit::get_audit_event)
@@ -729,6 +853,10 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::operations::delete_scanner)
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
+        .service(utils::get_mail_settings_h)
+        .service(utils::save_mail_settings_h)
+        .service(utils::get_session_settings_h)
+        .service(utils::save_session_settings_h)
         .service(utils::test_mail_server_h);
 
     #[cfg(feature = "rir")]

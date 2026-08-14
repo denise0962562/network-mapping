@@ -6,23 +6,22 @@ use std::ops::Deref;
 use std::time::Instant;
 use tracing::error;
 
-use crate::TEXT_HTML_UTF_8;
 use crate::TemplatesInit;
 use crate::admin::{
-    AddScanner, GetUserInfoH, ScannerRegisterData, UserBaseI, UserBaseInfo, UserSession,
-    check_twofa_bind, get_user_info, totp_verify_status_change, update_user_info,
+    AddScanner, GetUserInfoH, ScannerRegisterData, Unbind2FAH, UserBaseI, UserBaseInfo,
+    UserSession, VerifyTotp, bind_twofa, check_twofa_bind, confirm_twofa_binding, get_scanner,
+    get_scanners, get_user_info, scanner_register, totp_struct, totp_token_verify,
+    totp_verify_status_change, unbind_2fa, update_user_info, web_add_scanner,
 };
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
-use crate::config::{EmailConfig, PasswordHashConfig, SecurityConfig, ServerConfig};
+use crate::config::{PasswordHashConfig, SecurityConfig, ServerConfig};
 use crate::handlers::ReceiveLoginInfo;
+use crate::handlers::login_record::{login_failure_event, record_completed_login};
 use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
+use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
-use crate::{AddUserInfo, admin, generate_hash_password, log_out, verify_password};
-use admin::{
-    ReceiveAddUserInfo, Unbind2FAH, VerifyTotp, bind_twofa, confirm_twofa_binding, get_scanner,
-    get_scanners, scanner_register, totp_struct, totp_token_verify, unbind_2fa, web_add_scanner,
-};
+use crate::{generate_hash_password, log_out, verify_password};
 use uuid::Uuid;
 
 fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Cookie<'static>) {
@@ -41,132 +40,128 @@ fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Co
         .finish();
     (session_cookie, csrf_cookie)
 }
+
+fn request_source_ip(req: &HttpRequest) -> String {
+    req.connection_info()
+        .realip_remote_addr()
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn queue_login_notification(
+    pool: deadpool_postgres::Pool,
+    encryption_key: String,
+    user_id: i32,
+    username: String,
+    source_ip: String,
+) {
+    tokio::spawn(async move {
+        if let Err(error_value) =
+            send_login_notification(&pool, &encryption_key, user_id, &username, &source_ip).await
+        {
+            error!(
+                event = "SendLoginNotificationError",
+                username,
+                message = %error_value
+            );
+        }
+    });
+}
 #[derive(serde::Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
     new_password: String,
 }
-// BUG 暂时使用 bug 标签用于提示
-/// 该接口为测试阶段接口，用于快速创建账号，在生产环境下必须删除
-#[get("/test/adduser")]
-async fn first_add_user(
-    pool: web::Data<deadpool_postgres::Pool>,
-    query_info: web::Query<ReceiveAddUserInfo>,
-    pwd_hash_config: web::Data<PasswordHashConfig>,
-) -> impl Responder {
-    let p = pool.get_ref();
-
-    match admin::is_user_exist(&query_info.username, p).await {
-        Ok(true) => HttpResponse::FailedDependency()
-            .content_type(TEXT_HTML_UTF_8)
-            .body("用户已存在"),
-        Ok(false) => {
-            match generate_hash_password(&query_info.password, pwd_hash_config.get_ref().clone()) {
-                Ok(o) => {
-                    let userinfo = AddUserInfo {
-                        username: &query_info.username,
-                        password_hash: o.as_str(),
-                        role: query_info.role,
-                    };
-                    match admin::add_user(userinfo, p).await {
-                        Ok(_) => {
-                            println!(
-                                "添加用户：{}:{}",
-                                &query_info.username, &query_info.password
-                            );
-                            HttpResponse::Ok()
-                                .content_type(TEXT_HTML_UTF_8)
-                                .body("用户添加成功")
-                        }
-                        Err(e) => {
-                            println!(
-                                "添加用户失败：{}:{}\n错误：{}",
-                                &query_info.username,
-                                &query_info.password,
-                                e.to_string()
-                            );
-                            HttpResponse::InternalServerError()
-                                .content_type(TEXT_HTML_UTF_8)
-                                .body("添加用户失败")
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        event = "GeneratePasswordHashError",
-                        path = "fn first_add_user",
-                        message = %e
-                    );
-                    HttpResponse::InternalServerError().body("500")
-                }
-            }
-        }
-        Err(e) => {
-            error!(
-                event = "CheckUserError",
-                path = "fn first_add_user",
-                message = %e
-            );
-            HttpResponse::InternalServerError().body("500")
-        }
-    }
-}
-
 /// 登录接口
 #[post("/api/login")]
 async fn user_login_h(
     req: HttpRequest,
     pool: web::Data<deadpool_postgres::Pool>,
-    mail_config: web::Data<Option<EmailConfig>>,
+    server_config: web::Data<ServerConfig>,
     receiveinfo: web::Json<ReceiveLoginInfo>,
 ) -> impl Responder {
     println!("================= Benchmark =================");
     let total_start = Instant::now(); // 总的开始时间
     let start = Instant::now(); // 登录函数开始时间
     let p = pool.get_ref();
-    let m_c = mail_config.get_ref().as_ref();
-    let (t_session, csrf_token, enable_twofa) =
-        match user_login(&receiveinfo.username, &receiveinfo.password, m_c, p).await {
-            Ok(o) => o,
-            Err(e) => {
-                let mut audit_event =
-                    AuditEvent::anonymous("authentication", "auth.login", "failure");
-                audit_event.response_status = Some(401);
-                audit_event.reason_code = Some("invalid_credentials".to_owned());
-                audit_event.metadata = json!({"attempted_username": receiveinfo.username});
-                write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
-                let log_event = "LoginFaild";
-                let log_message = &receiveinfo.username;
-                error_logs(&req, log_event, log_message.as_str());
-                error!(
-                    event = "UserLoginError",
-                    path = "fn user_login_h",
-                    message = %e
-                );
-                let body = json!({
-                    "success": false,
-                    "message": "登录失败"
-                });
-                let total_es = total_start.elapsed();
-                let login_function = start.elapsed();
-                println!("Total   : {:>6} ms", total_es.as_millis());
-                println!("Login_f : {:>6} ms", login_function.as_millis());
-                println!("=============================================");
-                return HttpResponse::Unauthorized().json(body);
-            }
-        };
+    let login_result = match user_login(&receiveinfo.username, &receiveinfo.password, p).await {
+        Ok(value) => value,
+        Err(e) => {
+            let audit_event = login_failure_event(
+                None,
+                &receiveinfo.username,
+                "invalid_credentials",
+                "password",
+            );
+            write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
+            let log_event = "LoginFaild";
+            let log_message = &receiveinfo.username;
+            error_logs(&req, log_event, log_message.as_str());
+            error!(
+                event = "UserLoginError",
+                path = "fn user_login_h",
+                message = %e
+            );
+            let body = json!({
+                "success": false,
+                "message": "登录失败"
+            });
+            let total_es = total_start.elapsed();
+            let login_function = start.elapsed();
+            println!("Total   : {:>6} ms", total_es.as_millis());
+            println!("Login_f : {:>6} ms", login_function.as_millis());
+            println!("=============================================");
+            return HttpResponse::Unauthorized().json(body);
+        }
+    };
+    let t_session = login_result.session;
+    let csrf_token = login_result.csrf_token;
+    let enable_twofa = login_result.enable_2fa;
+    let session_ttl_seconds = login_result.session_ttl_seconds;
+    let login_context = AuditContext::from_request(&req);
+
+    if enable_twofa {
+        let mut audit_event =
+            AuditEvent::anonymous("authentication", "auth.password_verify", "success");
+        audit_event.severity = "info".to_owned();
+        audit_event.actor_type = "user".to_owned();
+        audit_event.actor_id = Some(login_result.user_id.to_string());
+        audit_event.actor_name = Some(receiveinfo.username.clone());
+        audit_event.response_status = Some(401);
+        audit_event.metadata = json!({"totp_required": true});
+        write_standalone(p, &login_context, &audit_event).await;
+    } else if let Err(error_value) = record_completed_login(
+        p,
+        &login_context,
+        login_result.user_id,
+        &receiveinfo.username,
+        "password",
+    )
+    .await
+    {
+        error!(event = "RecordCompletedLoginError", message = %error_value);
+        if let Err(logout_error) = log_out(&t_session, p).await {
+            error!(event = "RollbackLoginSessionError", message = %logout_error);
+        }
+        return HttpResponse::InternalServerError()
+            .json(json!({"success": false, "message": "登录状态保存失败，请重试"}));
+    }
 
     let cookies = Cookie::build("session", &t_session)
         .path("/")
         .http_only(true)
         .secure(true)
-        .max_age(cookie::time::Duration::seconds(2700))
+        .max_age(cookie::time::Duration::seconds(i64::from(
+            session_ttl_seconds,
+        )))
         .same_site(cookie::SameSite::Strict)
         .finish();
     let cookie_csrf_token = Cookie::build("csrf_token", &csrf_token)
         .path("/")
         .secure(true)
-        .max_age(cookie::time::Duration::seconds(2700))
+        .max_age(cookie::time::Duration::seconds(i64::from(
+            session_ttl_seconds,
+        )))
         .same_site(cookie::SameSite::Strict)
         .finish();
 
@@ -176,20 +171,15 @@ async fn user_login_h(
     println!("Total   : {:>6} ms", total_es.as_millis());
     println!("Login_f : {:>6} ms", login_function.as_millis());
     println!("=============================================");
-    let mut audit_event = AuditEvent::anonymous(
-        "authentication",
-        if enable_twofa {
-            "auth.password_verify"
-        } else {
-            "auth.login"
-        },
-        "success",
-    );
-    audit_event.actor_type = "user".to_owned();
-    audit_event.actor_name = Some(receiveinfo.username.clone());
-    audit_event.response_status = Some(if enable_twofa { 401 } else { 200 });
-    audit_event.metadata = json!({"totp_required": enable_twofa});
-    write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
+    if !enable_twofa {
+        queue_login_notification(
+            p.clone(),
+            server_config.encrypt_key.clone(),
+            login_result.user_id,
+            receiveinfo.username.clone(),
+            request_source_ip(&req),
+        );
+    }
 
     match enable_twofa {
         true => {
@@ -409,6 +399,39 @@ async fn verify_totp_h(
                     &audit_event,
                 )
                 .await;
+                if let Err(error_value) = record_completed_login(
+                    database_conn,
+                    &AuditContext::from_request(&req),
+                    user_base_i.id,
+                    &user_base_i.username,
+                    "password_totp",
+                )
+                .await
+                {
+                    error_logs(
+                        &req,
+                        "RecordCompletedTotpLoginError",
+                        &error_value.to_string(),
+                    );
+                    if let Err(logout_error) = log_out(&session.session, database_conn).await {
+                        error_logs(
+                            &req,
+                            "RollbackTotpLoginSessionError",
+                            &logout_error.to_string(),
+                        );
+                    }
+                    return HttpResponse::InternalServerError().json(json!({
+                        "success": false,
+                        "message": "登录状态保存失败，请重新登录"
+                    }));
+                }
+                queue_login_notification(
+                    database_conn.clone(),
+                    s_config.encrypt_key.clone(),
+                    user_base_i.id,
+                    user_base_i.username.clone(),
+                    request_source_ip(&req),
+                );
                 HttpResponse::Ok().finish()
             }
             Err(error_value) => {
@@ -429,6 +452,18 @@ async fn verify_totp_h(
                 database_conn,
                 &AuditContext::from_request(&req),
                 &audit_event,
+            )
+            .await;
+            let login_event = login_failure_event(
+                Some(&user_base_i),
+                &user_base_i.username,
+                "invalid_totp",
+                "password_totp",
+            );
+            write_standalone(
+                database_conn,
+                &AuditContext::from_request(&req),
+                &login_event,
             )
             .await;
             info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过");

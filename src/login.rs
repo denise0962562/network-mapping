@@ -1,19 +1,23 @@
 use actix_web::HttpRequest;
-use lettre::Message;
-use lettre::message::{Mailbox, header::ContentType};
 use openssl::base64;
 use std::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::UserLoginInfo;
-use crate::config::EmailConfig;
-use crate::{
-    admin::send_email, get_password_and_id_from_database, get_unix_epoch_ms, verify_password,
-};
+use crate::admin::get_session_ttl_seconds_from_database;
+use crate::{get_password_and_id_from_database, get_unix_epoch_ms, verify_password};
 
 pub struct LoginToken {
     pub pool: deadpool_postgres::Pool,
+}
+
+pub struct LoginResult {
+    pub session: String,
+    pub csrf_token: String,
+    pub enable_2fa: bool,
+    pub session_ttl_seconds: i32,
+    pub user_id: i32,
 }
 
 pub struct SessionInfo<'a> {
@@ -190,14 +194,13 @@ impl LoginToken {
 pub async fn user_login(
     username: &str,
     password: &str,
-    mail_config: Option<&EmailConfig>,
     pool: &deadpool_postgres::Pool,
-) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
+) -> Result<LoginResult, Box<dyn std::error::Error>> {
     let l_successful: bool;
     let start = Instant::now();
 
     // 即使用户名不存在也校验密码，预防时序攻击
-    let (_user_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(
+    let (user_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(
         pool, username,
     )
     .await
@@ -231,32 +234,20 @@ pub async fn user_login(
         let start = Instant::now();
         let enable_2fa = user_login_info.twofa.map(|_| true).unwrap_or(false);
 
+        let session_ttl_seconds = get_session_ttl_seconds_from_database(pool).await?;
         let login_token = LoginToken { pool: pool.clone() };
         let (session, csrf_token) = login_token
-            .create_session(2700, username, enable_2fa)
+            .create_session(session_ttl_seconds, username, enable_2fa)
             .await?;
         println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
 
-        if let Some(m_config) = mail_config {
-            match user_login_info.email_address {
-                Some(mail_address) => {
-                    let mail_message = Message::builder()
-                        .from(Mailbox::new(
-                            Some("Network Mapping".to_string()),
-                            "test@mail.abdc.world".to_string().parse().unwrap(),
-                        ))
-                        .to(Mailbox::new(None, mail_address.parse().unwrap()))
-                        .subject("Test".to_string())
-                        .header(ContentType::TEXT_PLAIN)
-                        .body("登录成功".to_string())
-                        .unwrap();
-
-                    send_email(m_config, mail_message).await;
-                }
-                None => (),
-            };
-        }
-        Ok((session.session, csrf_token, enable_2fa))
+        Ok(LoginResult {
+            session: session.session,
+            csrf_token,
+            enable_2fa,
+            session_ttl_seconds,
+            user_id,
+        })
     } else {
         Err("登录失败".into())
     }
