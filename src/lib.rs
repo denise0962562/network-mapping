@@ -331,7 +331,7 @@ impl SystemNetwork {
 }
 
 impl DbResource {
-    pub async fn new(pool: &deadpool_postgres::Pool, sql_file_path: &str) -> Self {
+    pub async fn new(pool: &deadpool_postgres::Pool, sql_file_path: &str, db_name: &str) -> Self {
         let client = pool.get().await;
         // let mut db_h: HashMap<String, String> = HashMap::new();
 
@@ -343,8 +343,6 @@ impl DbResource {
         match client {
             Ok(o) => {
                 //返回值的单位均为字节
-
-                let db_library_size_sql = "SELECT pg_database_size('nmapping') AS db_size;";
 
                 let db_table_size_sql =
                     get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
@@ -362,7 +360,7 @@ impl DbResource {
                 };
 
                 Self {
-                    db_library_size: get_db_library_size_byte(&o, db_library_size_sql, &[]).await,
+                    db_library_size: get_db_library_size_byte(&o, db_name).await,
                     db_table_size: get_db_table_size_byte(&o, &sql, &[&table]).await,
                     db_conn: get_db_conn(&o, db_conn_sql, &[]).await,
                 }
@@ -400,13 +398,13 @@ impl Default for DbTableSizeInfo {
 }
 
 impl SystemResource {
-    pub async fn new(sys: Systems, pool: &deadpool_postgres::Pool, _db_name: String) -> Self {
+    pub async fn new(sys: Systems, pool: &deadpool_postgres::Pool, db_name: &str) -> Self {
         Self {
             server_run_time: get_server_uptime() as i64,
             cpu: SystemCPU::new(sys.sys.clone()),
             ram: SystemRAM::new(sys.sys.clone()),
             disk: SystemDisk::new(sys.disk.clone()),
-            db_postgresql: DbResource::new(pool, "source/database/").await,
+            db_postgresql: DbResource::new(pool, "source/database/", db_name).await,
             network: SystemNetwork::new(sys.network.clone()),
             create_at: None,
         }
@@ -781,10 +779,10 @@ async fn get_db_table_size_byte(
 ///获取数据库的大小，单位为字节
 async fn get_db_library_size_byte(
     pool: &deadpool::managed::Object<deadpool_postgres::Manager>,
-    sql: &str,
-    params: &[&(dyn ToSql + Sync)],
+    db_name: &str,
 ) -> String {
-    if let Ok(result) = pool.query_opt(sql, params).await {
+    let sql = "SELECT pg_database_size($1::text::name) AS db_size;";
+    if let Ok(result) = pool.query_opt(sql, &[&db_name]).await {
         if let Some(row) = result {
             let r: i64 = row.get("db_size");
             r.to_string()
@@ -999,7 +997,7 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
 pub async fn benchmark(
     sys: web::Data<Systems>,
     pool: web::Data<&deadpool_postgres::Pool>,
-    _db_name: String,
+    db_name: String,
 ) {
     let total_start = Instant::now();
     let pool = pool.get_ref();
@@ -1021,7 +1019,7 @@ pub async fn benchmark(
 
     // DB
     let start = Instant::now();
-    let db = DbResource::new(pool, "source/database/").await;
+    let db = DbResource::new(pool, "source/database/", &db_name).await;
     let db_elapsed = start.elapsed();
 
     //Network
@@ -1066,7 +1064,7 @@ pub async fn insert_system_status(
     sys: Systems,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = pool.get().await?;
-    let s = SystemResource::new(sys, pool, db_name).await;
+    let s = SystemResource::new(sys, pool, &db_name).await;
     let transaction = client.transaction().await?;
     let sql = get_sql_from_file("source/database/", "insert_system_status.sql").await?;
     let statement = transaction.prepare(&sql).await?;
