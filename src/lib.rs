@@ -1876,6 +1876,7 @@ pub struct TaskItemJson {
 pub struct ReceiveTaskItemQueryInfo {
     pub start: Option<i32>,
     pub count: Option<i64>,
+    pub include_system: Option<bool>,
 }
 
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
@@ -1885,6 +1886,7 @@ pub async fn get_task_item(
     pool: &deadpool_postgres::Pool,
     s_count: i64,
     start_id: Option<i32>,
+    include_system: bool,
     permissions: Permission,
 ) -> Result<(Vec<TaskItem>, i64, i64, i32), Box<dyn std::error::Error>> {
     let mut c = pool.get().await?;
@@ -1909,27 +1911,37 @@ pub async fn get_task_item(
         Permission::Administrator(_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE id <= $1 ORDER BY id DESC LIMIT $2;",
-                    &[&st, &s_count]
-                ).await?
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE id <= $1 AND ($2::boolean OR task_source <> 'automatic') \
+                     ORDER BY id DESC LIMIT $3;",
+                    &[&st, &include_system, &s_count],
+                )
+                .await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task ORDER BY id DESC LIMIT $1;",
-                    &[&s_count]
-                ).await?
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE $1::boolean OR task_source <> 'automatic' ORDER BY id DESC LIMIT $2;",
+                    &[&include_system, &s_count],
+                )
+                .await?
             }
         }
         Permission::Users(u_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 AND id <= $2 ORDER BY id DESC LIMIT $3;",
-                    &[&u_id, &st, &s_count]
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE user_id = $1 AND id <= $2 AND ($3::boolean OR task_source <> 'automatic') \
+                     ORDER BY id DESC LIMIT $4;",
+                    &[&u_id, &st, &include_system, &s_count]
                 ).await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;",
-                    &[&u_id, &s_count]
-                ).await?
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE user_id = $1 AND ($2::boolean OR task_source <> 'automatic') \
+                     ORDER BY id DESC LIMIT $3;",
+                    &[&u_id, &include_system, &s_count],
+                )
+                .await?
             }
         }
     };

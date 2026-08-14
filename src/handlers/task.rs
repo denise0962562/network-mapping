@@ -1022,18 +1022,25 @@ async fn get_all_task_handler(
         }
     };
 
-    let (tmp_result, total_count, item_count, start_index) =
-        match get_task_item(p, query_info.count.unwrap_or(5), query_info.start, permi).await {
-            Ok(o) => o,
-            Err(e) => {
-                error!(
-                    event = "GetTaskError",
-                    path = "fn get_all_task_handler",
-                    message = %e
-                );
-                return HttpResponse::InternalServerError().body("500");
-            }
-        };
+    let (tmp_result, total_count, item_count, start_index) = match get_task_item(
+        p,
+        query_info.count.unwrap_or(5),
+        query_info.start,
+        query_info.include_system.unwrap_or(false),
+        permi,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            error!(
+                event = "GetTaskError",
+                path = "fn get_all_task_handler",
+                message = %e
+            );
+            return HttpResponse::InternalServerError().body("500");
+        }
+    };
 
     let tmp_json = TaskItemJson {
         total_c: total_count,
@@ -1048,6 +1055,20 @@ async fn get_all_task_handler(
 #[cfg(test)]
 mod tests {
     use super::{ScannerScanCapabilities, task_result_pagination, validate_public_ip};
+    use crate::ReceiveTaskItemQueryInfo;
+    use actix_web::web;
+
+    #[test]
+    fn task_list_query_excludes_system_tasks_by_default() {
+        let default_query =
+            web::Query::<ReceiveTaskItemQueryInfo>::from_query("").expect("empty query is valid");
+        assert!(!default_query.include_system.unwrap_or(false));
+
+        let include_query =
+            web::Query::<ReceiveTaskItemQueryInfo>::from_query("include_system=true&count=10")
+                .expect("include_system query is valid");
+        assert_eq!(include_query.include_system, Some(true));
+    }
 
     #[test]
     fn task_result_pagination_uses_safe_bounds() {
