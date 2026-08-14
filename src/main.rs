@@ -5,20 +5,20 @@ use std::io;
 use tokio::time::{Duration, Instant, interval_at};
 use tracing::{error, info};
 
-use rust_web_test::admin::{check_default_admin_user, check_system_user, reset_admin_password};
-use rust_web_test::audit::RequestId;
-use rust_web_test::config::{Clis, SelfChecking};
-use rust_web_test::frontend::{self, FrontendAssets};
-use rust_web_test::logs::{self, LogRollingMode};
-use rust_web_test::maxmind::MaxMindState;
-use rust_web_test::middlewares::{
+use network_mapping_server::admin::{check_default_admin_user, check_system_user, reset_admin_password};
+use network_mapping_server::audit::RequestId;
+use network_mapping_server::config::{Clis, SelfChecking};
+use network_mapping_server::frontend::{self, FrontendAssets};
+use network_mapping_server::logs::{self, LogRollingMode};
+use network_mapping_server::maxmind::MaxMindState;
+use network_mapping_server::middlewares::{
     csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, ratelimit::RateLimitMiddleware,
     smiddleware::AuthMiddleware,
 };
-use rust_web_test::open_source::OpenSourceCatalog;
-use rust_web_test::target_generated::{AutomaticTargetService, run_generator};
-use rust_web_test::tls::build_acceptor;
-use rust_web_test::{Systems, TemplatesInit, config, db, insert_system_status};
+use network_mapping_server::open_source::OpenSourceCatalog;
+use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
+use network_mapping_server::tls::build_acceptor;
+use network_mapping_server::{Systems, TemplatesInit, config, db, insert_system_status};
 
 #[actix_web::main]
 async fn main() -> io::Result<()> {
@@ -244,7 +244,7 @@ async fn main() -> io::Result<()> {
             .configure(config::init_routes)
             .configure(frontend::configure)
             .configure(|cfg| frontend::configure_assets(cfg, &frontend_directory))
-            .default_service(web::to(rust_web_test::handlers::utils::not_found))
+            .default_service(web::to(network_mapping_server::handlers::utils::not_found))
     })
     .bind_openssl((server_host, server_port), tls)?
     .run()

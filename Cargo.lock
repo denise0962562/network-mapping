@@ -2057,6 +2057,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "network_mapping_server"
+version = "0.1.1"
+dependencies = [
+ "actix-files",
+ "actix-session",
+ "actix-web",
+ "ammonia",
+ "argon2",
+ "chrono",
+ "cidr",
+ "clap",
+ "css-inline",
+ "deadpool",
+ "deadpool-postgres",
+ "futures",
+ "futures-util",
+ "ipnet",
+ "lettre",
+ "maxminddb",
+ "openssl",
+ "password-hash",
+ "postgres-from-row",
+ "postgres-types",
+ "rand 0.9.4",
+ "regex",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tera",
+ "tokio",
+ "tokio-postgres",
+ "toml",
+ "toml_edit",
+ "totp-rs",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2813,47 +2854,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rust_web_test"
-version = "0.1.0"
-dependencies = [
- "actix-files",
- "actix-session",
- "actix-web",
- "ammonia",
- "argon2",
- "chrono",
- "cidr",
- "clap",
- "css-inline",
- "deadpool",
- "deadpool-postgres",
- "futures",
- "futures-util",
- "ipnet",
- "lettre",
- "maxminddb",
- "openssl",
- "password-hash",
- "postgres-from-row",
- "postgres-types",
- "rand 0.9.4",
- "regex",
- "serde",
- "serde_json",
- "sysinfo",
- "tera",
- "tokio",
- "tokio-postgres",
- "toml",
- "toml_edit",
- "totp-rs",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
