@@ -1,0 +1,15 @@
+[Unit]
+Description=Network Mapping Server
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=someuser
+WorkingDirectory=/path/to/app
+ExecStart=./network_mapping_server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
