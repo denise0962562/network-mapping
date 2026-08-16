@@ -281,7 +281,8 @@ mod system_ram_tests {
 
 impl SystemDisk {
     pub fn new(disk: Arc<Mutex<sysinfo::Disks>>) -> Self {
-        let disk = disk.lock().unwrap();
+        let mut disk = disk.lock().unwrap();
+        disk.refresh(true);
         let mut disk_total: u64 = 0;
         let mut disk_total_usage: u64 = 0;
         let mut d_h: HashMap<String, Vec<u64>> = HashMap::new();

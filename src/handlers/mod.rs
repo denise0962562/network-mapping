@@ -6,6 +6,7 @@ pub mod mail_template;
 pub mod open_source;
 pub mod operations;
 pub mod search;
+pub mod system_resources;
 pub mod task;
 pub mod user;
 pub mod utils;

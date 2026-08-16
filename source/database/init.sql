@@ -257,6 +257,9 @@ CREATE TABLE IF NOT EXISTS system_status (
 	network JSONB DEFAULT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_system_status_create_time
+	ON system_status(create_time);
+
 -- 表 login_logs 用于存储用户登录日志，包括登陆成功和失败 
 CREATE TABLE IF NOT EXISTS login_logs (
 	id SERIAL PRIMARY KEY,
