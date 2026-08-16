@@ -36,7 +36,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -123,7 +123,7 @@ pub struct TemplatesInit {
 #[derive(Serialize, Deserialize)]
 pub struct DbResource {
     pub db_library_size: String,
-    pub db_table_size: HashMap<String, DbTableSizeInfo>,
+    pub db_table_size: BTreeMap<String, DbTableSizeInfo>,
     pub db_conn: String,
 }
 
@@ -166,7 +166,7 @@ pub struct SystemNetInfo {
 
 #[derive(Serialize, Deserialize)]
 pub struct SystemNetwork {
-    pub net: HashMap<String, SystemNetInfo>,
+    pub net: BTreeMap<String, SystemNetInfo>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -314,7 +314,7 @@ impl SystemNetwork {
     pub fn new(net: Arc<Mutex<sysinfo::Networks>>) -> Self {
         let net = net.lock().unwrap();
         // net.refresh(true);
-        let n_h: HashMap<String, SystemNetInfo> = net
+        let n_h: BTreeMap<String, SystemNetInfo> = net
             .list()
             .iter()
             .map(|(net_name, net_data)| {
@@ -349,9 +349,6 @@ impl DbResource {
                 let db_table_size_sql =
                     get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
                 let db_conn_sql = "SELECT COUNT(*) AS db_conn FROM pg_stat_activity;";
-                //获取数据库大小(Byte)
-                let table = vec!["ips", "ports", "scaninfo"];
-
                 let sql = match db_table_size_sql {
                     Ok(sql) => sql,
                     Err(e) => {
@@ -363,7 +360,7 @@ impl DbResource {
 
                 Self {
                     db_library_size: get_db_library_size_byte(&o, db_name).await,
-                    db_table_size: get_db_table_size_byte(&o, &sql, &[&table]).await,
+                    db_table_size: get_db_table_size_byte(&o, &sql, &[]).await,
                     db_conn: get_db_conn(&o, db_conn_sql, &[]).await,
                 }
             }
@@ -380,7 +377,7 @@ impl DbResource {
 impl Default for DbResource {
     fn default() -> Self {
         let tmp = vec![("error".to_string(), DbTableSizeInfo::default())];
-        let h: HashMap<String, DbTableSizeInfo> = tmp.into_iter().collect();
+        let h: BTreeMap<String, DbTableSizeInfo> = tmp.into_iter().collect();
         Self {
             db_library_size: "none".to_string(),
             db_table_size: h,
@@ -741,7 +738,7 @@ async fn get_db_table_size_byte(
     // db_h: &mut HashMap<String, DbTableSizeInfo>,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
-) -> HashMap<String, DbTableSizeInfo> {
+) -> BTreeMap<String, DbTableSizeInfo> {
     let result = pool.query(sql, params).await;
     match result {
         Ok(rows) => {

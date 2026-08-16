@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::admin::UserBaseI;
 use crate::logs::write::error_logs;
@@ -60,6 +61,43 @@ FROM bucket_range b
 LEFT JOIN aggregated a USING (bucket_start)
 ORDER BY b.bucket_start;
 "#;
+const DATABASE_HISTORY_SQL: &str = r#"
+WITH bucket_range AS (
+    SELECT generate_series(
+        ($1::BIGINT / $3::BIGINT) * $3::BIGINT,
+        (($2::BIGINT - 1) / $3::BIGINT) * $3::BIGINT,
+        $3
+    )::BIGINT AS bucket_start
+), ranked AS (
+    SELECT (create_time / $3::BIGINT) * $3::BIGINT AS bucket_start,
+        CASE WHEN db_postgresql->>'db_library_size' ~ '^[0-9]+$'
+             THEN (db_postgresql->>'db_library_size')::BIGINT END AS database_size,
+        CASE WHEN db_postgresql->>'db_conn' ~ '^[0-9]+$'
+             THEN (db_postgresql->>'db_conn')::BIGINT END AS connection_count,
+        CASE WHEN jsonb_typeof(db_postgresql->'db_table_size') = 'object'
+             THEN db_postgresql->'db_table_size'
+             ELSE '{}'::JSONB END AS tables,
+        COUNT(*) OVER (
+            PARTITION BY (create_time / $3::BIGINT) * $3::BIGINT
+        )::BIGINT AS sample_count,
+        ROW_NUMBER() OVER (
+            PARTITION BY (create_time / $3::BIGINT) * $3::BIGINT
+            ORDER BY create_time DESC, id DESC
+        ) AS sample_rank
+    FROM system_status
+    WHERE create_time >= $1 AND create_time < $2
+)
+SELECT b.bucket_start,
+       COALESCE(r.sample_count, 0)::BIGINT AS sample_count,
+       r.database_size,
+       r.connection_count,
+       COALESCE(r.tables, '{}'::JSONB) AS tables
+FROM bucket_range b
+LEFT JOIN ranked r
+       ON r.bucket_start = b.bucket_start
+      AND r.sample_rank = 1
+ORDER BY b.bucket_start;
+"#;
 
 #[derive(Deserialize)]
 pub(crate) struct ResourceHistoryQuery {
@@ -78,6 +116,7 @@ enum Granularity {
     ThirtyMinutes,
     OneHour,
     TwoHours,
+    SixHours,
 }
 
 impl Granularity {
@@ -91,7 +130,8 @@ impl Granularity {
             "30m" => Ok(Self::ThirtyMinutes),
             "1h" => Ok(Self::OneHour),
             "2h" => Ok(Self::TwoHours),
-            _ => Err("granularity must be auto, 10s, 30s, 1m, 5m, 15m, 30m, 1h or 2h"),
+            "6h" => Ok(Self::SixHours),
+            _ => Err("granularity must be auto, 10s, 30s, 1m, 5m, 15m, 30m, 1h, 2h or 6h"),
         }
     }
 
@@ -111,6 +151,20 @@ impl Granularity {
         }
     }
 
+    fn auto_for_database(duration: Duration) -> Self {
+        if duration <= Duration::hours(1) {
+            Self::OneMinute
+        } else if duration <= Duration::hours(6) {
+            Self::FiveMinutes
+        } else if duration <= Duration::hours(24) {
+            Self::FifteenMinutes
+        } else if duration <= Duration::days(7) {
+            Self::OneHour
+        } else {
+            Self::SixHours
+        }
+    }
+
     fn seconds(self) -> i64 {
         match self {
             Self::TenSeconds => 10,
@@ -121,6 +175,7 @@ impl Granularity {
             Self::ThirtyMinutes => 1_800,
             Self::OneHour => 3_600,
             Self::TwoHours => 7_200,
+            Self::SixHours => 21_600,
         }
     }
 
@@ -134,6 +189,7 @@ impl Granularity {
             Self::ThirtyMinutes => "30m",
             Self::OneHour => "1h",
             Self::TwoHours => "2h",
+            Self::SixHours => "6h",
         }
     }
 }
@@ -178,7 +234,39 @@ struct ResourceHistoryResponse {
     meta: ResourceHistoryMeta,
 }
 
-fn normalize_query(query: &ResourceHistoryQuery) -> Result<NormalizedHistoryQuery, &'static str> {
+#[derive(Serialize)]
+struct DatabaseTableSize {
+    total: i64,
+    data: i64,
+    index: i64,
+}
+
+#[derive(Serialize)]
+struct DatabaseHistoryPoint {
+    timestamp_ms: i64,
+    sample_count: i64,
+    database_size: Option<i64>,
+    connection_count: Option<i64>,
+    tables: BTreeMap<String, DatabaseTableSize>,
+}
+
+#[derive(Serialize)]
+struct DatabaseHistoryData {
+    table_names: Vec<String>,
+    points: Vec<DatabaseHistoryPoint>,
+}
+
+#[derive(Serialize)]
+struct DatabaseHistoryResponse {
+    success: bool,
+    data: DatabaseHistoryData,
+    meta: ResourceHistoryMeta,
+}
+
+fn normalize_query_with(
+    query: &ResourceHistoryQuery,
+    automatic_granularity: fn(Duration) -> Granularity,
+) -> Result<NormalizedHistoryQuery, &'static str> {
     let end_at = query.end_at.unwrap_or_else(Utc::now);
     let start_at = query
         .start_at
@@ -193,7 +281,7 @@ fn normalize_query(query: &ResourceHistoryQuery) -> Result<NormalizedHistoryQuer
     }
 
     let granularity = match query.granularity.as_deref().unwrap_or("auto") {
-        "auto" => Granularity::auto_for(duration),
+        "auto" => automatic_granularity(duration),
         value => Granularity::parse(value)?,
     };
     let duration_seconds = duration.num_seconds();
@@ -207,6 +295,16 @@ fn normalize_query(query: &ResourceHistoryQuery) -> Result<NormalizedHistoryQuer
         end_at,
         granularity,
     })
+}
+
+fn normalize_query(query: &ResourceHistoryQuery) -> Result<NormalizedHistoryQuery, &'static str> {
+    normalize_query_with(query, Granularity::auto_for)
+}
+
+fn normalize_database_query(
+    query: &ResourceHistoryQuery,
+) -> Result<NormalizedHistoryQuery, &'static str> {
+    normalize_query_with(query, Granularity::auto_for_database)
 }
 
 fn rounded(value: Option<f64>) -> Option<f64> {
@@ -232,6 +330,23 @@ fn database_error_diagnostics(error: &tokio_postgres::Error) -> String {
         database_error.column().unwrap_or("-"),
         database_error.constraint().unwrap_or("-"),
     )
+}
+
+fn table_sizes_from_json(value: serde_json::Value) -> BTreeMap<String, DatabaseTableSize> {
+    let Some(tables) = value.as_object() else {
+        return BTreeMap::new();
+    };
+
+    tables
+        .iter()
+        .filter_map(|(name, metrics)| {
+            let total = metrics.get("total")?.as_i64()?;
+            let data = metrics.get("data")?.as_i64()?;
+            let index = metrics.get("index")?.as_i64()?;
+            (total >= 0 && data >= 0 && index >= 0)
+                .then(|| (name.clone(), DatabaseTableSize { total, data, index }))
+        })
+        .collect()
 }
 
 #[get("/api/data/system-resource-history")]
@@ -307,12 +422,91 @@ pub(crate) async fn get_system_resource_history(
     })
 }
 
+#[get("/api/data/database-size-history")]
+pub(crate) async fn get_database_size_history(
+    req: HttpRequest,
+    query: web::Query<ResourceHistoryQuery>,
+    pool: web::Data<Pool>,
+    _user: UserBaseI,
+) -> impl Responder {
+    let normalized = match normalize_database_query(&query) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
+    let client = match pool.get().await {
+        Ok(value) => value,
+        Err(error_value) => {
+            error_logs(
+                &req,
+                "DatabaseSizeHistoryPoolError",
+                &error_value.to_string(),
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    let start_seconds = normalized.start_at.timestamp();
+    let end_seconds = normalized.end_at.timestamp();
+    let bucket_seconds = normalized.granularity.seconds();
+    let rows = match client
+        .query(
+            DATABASE_HISTORY_SQL,
+            &[&start_seconds, &end_seconds, &bucket_seconds],
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error_value) => {
+            error_logs(
+                &req,
+                "DatabaseSizeHistoryQueryError",
+                &database_error_diagnostics(&error_value),
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    let mut table_names = BTreeSet::new();
+    let points: Vec<DatabaseHistoryPoint> = rows
+        .into_iter()
+        .map(|row| {
+            let tables = table_sizes_from_json(row.get("tables"));
+            table_names.extend(tables.keys().cloned());
+            DatabaseHistoryPoint {
+                timestamp_ms: row.get::<_, i64>("bucket_start") * 1_000,
+                sample_count: row.get("sample_count"),
+                database_size: row.get("database_size"),
+                connection_count: row.get("connection_count"),
+                tables,
+            }
+        })
+        .collect();
+    let point_count = points.len();
+
+    HttpResponse::Ok().json(DatabaseHistoryResponse {
+        success: true,
+        data: DatabaseHistoryData {
+            table_names: table_names.into_iter().collect(),
+            points,
+        },
+        meta: ResourceHistoryMeta {
+            start_at: normalized.start_at,
+            end_at: normalized.end_at,
+            granularity: normalized.granularity.label(),
+            granularity_seconds: bucket_seconds,
+            timezone: RESOURCE_TIMEZONE,
+            point_count,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        Granularity, RESOURCE_HISTORY_SQL, ResourceHistoryQuery, normalize_query, rounded,
+        DATABASE_HISTORY_SQL, Granularity, RESOURCE_HISTORY_SQL, ResourceHistoryQuery,
+        normalize_database_query, normalize_query, rounded, table_sizes_from_json,
     };
 
     fn query(duration: Duration, granularity: &str) -> ResourceHistoryQuery {
@@ -365,6 +559,22 @@ mod tests {
     }
 
     #[test]
+    fn database_granularity_uses_slower_buckets() {
+        assert_eq!(
+            normalize_database_query(&query(Duration::minutes(30), "auto"))
+                .unwrap()
+                .granularity,
+            Granularity::OneMinute
+        );
+        assert_eq!(
+            normalize_database_query(&query(Duration::days(30), "auto"))
+                .unwrap()
+                .granularity,
+            Granularity::SixHours
+        );
+    }
+
+    #[test]
     fn rejects_oversized_ranges_and_point_counts() {
         assert!(normalize_query(&query(Duration::days(31), "auto")).is_err());
         assert!(normalize_query(&query(Duration::days(7), "1m")).is_err());
@@ -391,5 +601,20 @@ mod tests {
         assert!(RESOURCE_HISTORY_SQL.contains("FROM bucket_range"));
         assert!(!RESOURCE_HISTORY_SQL.contains("usageFROM"));
         assert!(!RESOURCE_HISTORY_SQL.contains("maxFROM"));
+        assert!(DATABASE_HISTORY_SQL.contains("FROM system_status"));
+    }
+
+    #[test]
+    fn table_sizes_are_sorted_and_invalid_entries_are_ignored() {
+        let tables = table_sizes_from_json(serde_json::json!({
+            "z_table": {"total": 30, "data": 20, "index": 10},
+            "a_table": {"total": 15, "data": 10, "index": 5},
+            "error": {"total": -1, "data": -1, "index": -1}
+        }));
+        assert_eq!(
+            tables.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a_table", "z_table"]
+        );
+        assert_eq!(tables["a_table"].total, 15);
     }
 }
