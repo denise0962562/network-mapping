@@ -313,21 +313,14 @@ impl AutomaticTargetService {
                 &[&Uuid::now_v7().to_string(), &task_pk],
             )
             .await?;
-        let mut event = AuditEvent::anonymous("task", "task.auto_generate", "success")
-            .resource("task", task_id);
-        event.actor_type = "system".to_owned();
-        event.actor_id = Some(system_user_id.to_string());
-        event.actor_name = Some("system".to_owned());
-        event.severity = "info".to_owned();
-        event.response_status = Some(200);
-        event.metadata = json!({
-            "strategy": STRATEGY,
-            "address_family": generator.family,
-            "target": target.cidr,
-            "ports": self.policy.common_ports,
-            "policy_hash": generator.policy_hash,
-            "queue_depth_before": queue_depth_before,
-        });
+        let event = generated_target_audit_event(
+            system_user_id,
+            task_id,
+            generator,
+            target,
+            &self.policy.common_ports,
+            queue_depth_before,
+        );
         write_audit(transaction, &system_audit_context(), &event).await
     }
 
@@ -626,9 +619,38 @@ fn system_audit_context() -> AuditContext {
     }
 }
 
+fn generated_target_audit_event(
+    system_user_id: i32,
+    task_id: String,
+    generator: &FamilyGenerator,
+    target: &GeneratedTarget,
+    common_ports: &str,
+    queue_depth_before: i64,
+) -> AuditEvent {
+    let mut event = AuditEvent::anonymous("automatic_target", "task.auto_generate", "success")
+        .resource("task", task_id);
+    event.actor_type = "system".to_owned();
+    event.actor_id = Some(system_user_id.to_string());
+    event.actor_name = Some("system".to_owned());
+    event.severity = "info".to_owned();
+    event.response_status = Some(200);
+    event.metadata = json!({
+        "strategy": STRATEGY,
+        "address_family": generator.family,
+        "target": target.cidr,
+        "ports": common_ports,
+        "policy_hash": generator.policy_hash,
+        "queue_depth_before": queue_depth_before,
+    });
+    event
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AutomaticTargetService, is_excluded, parse_cursor_position, target_at};
+    use super::{
+        AutomaticTargetService, generated_target_audit_event, is_excluded, parse_cursor_position,
+        target_at,
+    };
     use crate::config::AutomaticTargetConfig;
     use serde_json::json;
 
@@ -716,5 +738,33 @@ mod tests {
             parse_cursor_position(&json!({"position": "1329227995784915872903807060280344576"})),
             1_u128 << 120
         );
+    }
+
+    #[test]
+    fn generated_targets_have_a_dedicated_audit_category() {
+        let service = AutomaticTargetService::new(AutomaticTargetConfig {
+            enabled: true,
+            authorized_cidrs: vec!["10.0.0.0/24".to_owned()],
+            ..AutomaticTargetConfig::default()
+        })
+        .unwrap();
+        let generator = &service.generators[0];
+        let target = target_at(generator, 0);
+
+        let event = generated_target_audit_event(
+            1,
+            "0198-test-task".to_owned(),
+            generator,
+            &target,
+            "80,443",
+            3,
+        );
+
+        assert_eq!(event.category, "automatic_target");
+        assert_eq!(event.action, "task.auto_generate");
+        assert_eq!(event.actor_type, "system");
+        assert_eq!(event.resource_type.as_deref(), Some("task"));
+        assert_eq!(event.resource_id.as_deref(), Some("0198-test-task"));
+        assert_eq!(event.metadata["target"], "10.0.0.0/24");
     }
 }

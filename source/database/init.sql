@@ -216,6 +216,14 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
 	ON scan_observation(execution_id, kind);
 
+-- 数据分析查询按观察时间筛选，并通过端口、任务和执行记录进行权限过滤。
+CREATE INDEX IF NOT EXISTS idx_ips_create_time_task
+	ON ips(create_time, task_id);
+CREATE INDEX IF NOT EXISTS idx_scaninfo_scan_time_port
+	ON scaninfo(scan_time, port_id);
+CREATE INDEX IF NOT EXISTS idx_scaninfo_port
+	ON scaninfo(port_id);
+
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (
 	user_id INT NOT NULL,
@@ -248,6 +256,9 @@ CREATE TABLE IF NOT EXISTS system_status (
 	db_postgresql JSONB DEFAULT NULL,
 	network JSONB DEFAULT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_system_status_create_time
+	ON system_status(create_time);
 
 -- 表 login_logs 用于存储用户登录日志，包括登陆成功和失败 
 CREATE TABLE IF NOT EXISTS login_logs (
@@ -318,9 +329,9 @@ CREATE TABLE IF NOT EXISTS audit_event (
 	id BIGSERIAL PRIMARY KEY,
 	event_id UUID NOT NULL UNIQUE,
 	occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	category TEXT NOT NULL CHECK (category IN (
+	category TEXT NOT NULL CONSTRAINT audit_event_category_check CHECK (category IN (
 		'authentication', 'authorization', 'user_security', 'task', 'scanner',
-		'configuration', 'data_access', 'audit'
+		'automatic_target', 'configuration', 'data_access', 'audit'
 	)),
 	action TEXT NOT NULL,
 	outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied')),
@@ -340,6 +351,32 @@ CREATE TABLE IF NOT EXISTS audit_event (
 	changes JSONB,
 	metadata JSONB NOT NULL DEFAULT '{}'::JSONB
 );
+
+-- 兼容尚未包含系统生成目标分类的已有审计表。
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'audit_event'::regclass
+          AND conname = 'audit_event_category_check'
+          AND POSITION('automatic_target' IN pg_get_constraintdef(oid)) = 0
+    ) THEN
+        ALTER TABLE audit_event DROP CONSTRAINT audit_event_category_check;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'audit_event'::regclass
+          AND conname = 'audit_event_category_check'
+    ) THEN
+        ALTER TABLE audit_event ADD CONSTRAINT audit_event_category_check CHECK (category IN (
+            'authentication', 'authorization', 'user_security', 'task', 'scanner',
+            'automatic_target', 'configuration', 'data_access', 'audit'
+        ));
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_audit_event_time
 	ON audit_event (occurred_at DESC, id DESC);

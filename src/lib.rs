@@ -36,7 +36,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -63,6 +63,7 @@ pub const IMAGE_PNG: &str = "image/png";
 pub const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 pub const APPLICATION_JSON: &str = "application/json";
 pub const _SYSTEM_TIME_ZONE: &str = "Asia/Shanghai";
+pub const TASK_LEASE_MS: i64 = 90_000;
 
 pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
     let mut token_buffer = [0u8; 36];
@@ -122,7 +123,7 @@ pub struct TemplatesInit {
 #[derive(Serialize, Deserialize)]
 pub struct DbResource {
     pub db_library_size: String,
-    pub db_table_size: HashMap<String, DbTableSizeInfo>,
+    pub db_table_size: BTreeMap<String, DbTableSizeInfo>,
     pub db_conn: String,
 }
 
@@ -165,7 +166,7 @@ pub struct SystemNetInfo {
 
 #[derive(Serialize, Deserialize)]
 pub struct SystemNetwork {
-    pub net: HashMap<String, SystemNetInfo>,
+    pub net: BTreeMap<String, SystemNetInfo>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -200,6 +201,20 @@ pub struct Systems {
     pub network: Arc<Mutex<sysinfo::Networks>>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct SystemDetails {
+    pub host_name: Option<String>,
+    pub os_name: Option<String>,
+    pub os_version: Option<String>,
+    pub kernel_version: Option<String>,
+    pub architecture: String,
+    pub cpu_model: Option<String>,
+    pub cpu_vendor: Option<String>,
+    pub cpu_frequency_mhz: Option<u64>,
+    pub physical_core_count: Option<usize>,
+    pub logical_cpu_count: usize,
+}
+
 impl Systems {
     pub fn new() -> Self {
         Self {
@@ -213,6 +228,33 @@ impl Systems {
 impl Default for Systems {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SystemDetails {
+    pub fn new(systems: &Systems) -> Self {
+        let sys = systems
+            .sys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_cpu = sys.cpus().first();
+
+        Self {
+            host_name: sysinfo::System::host_name(),
+            os_name: sysinfo::System::name(),
+            os_version: sysinfo::System::long_os_version(),
+            kernel_version: sysinfo::System::kernel_version(),
+            architecture: sysinfo::System::cpu_arch(),
+            cpu_model: first_cpu
+                .map(|cpu| cpu.brand().trim().to_string())
+                .filter(|value| !value.is_empty()),
+            cpu_vendor: first_cpu
+                .map(|cpu| cpu.vendor_id().trim().to_string())
+                .filter(|value| !value.is_empty()),
+            cpu_frequency_mhz: first_cpu.map(sysinfo::Cpu::frequency),
+            physical_core_count: sysinfo::System::physical_core_count(),
+            logical_cpu_count: sys.cpus().len(),
+        }
     }
 }
 
@@ -280,7 +322,8 @@ mod system_ram_tests {
 
 impl SystemDisk {
     pub fn new(disk: Arc<Mutex<sysinfo::Disks>>) -> Self {
-        let disk = disk.lock().unwrap();
+        let mut disk = disk.lock().unwrap();
+        disk.refresh(true);
         let mut disk_total: u64 = 0;
         let mut disk_total_usage: u64 = 0;
         let mut d_h: HashMap<String, Vec<u64>> = HashMap::new();
@@ -310,17 +353,19 @@ impl SystemDisk {
 
 impl SystemNetwork {
     pub fn new(net: Arc<Mutex<sysinfo::Networks>>) -> Self {
-        let net = net.lock().unwrap();
-        // net.refresh(true);
-        let n_h: HashMap<String, SystemNetInfo> = net
+        let mut net = net.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        net.refresh(true);
+        // The dashboard displays counters accumulated since system boot. The
+        // received/transmitted methods only contain the latest refresh delta.
+        let n_h: BTreeMap<String, SystemNetInfo> = net
             .list()
             .iter()
             .map(|(net_name, net_data)| {
                 (
                     net_name.to_string(),
                     SystemNetInfo {
-                        send: net_data.transmitted().to_string(),
-                        receive: net_data.received().to_string(),
+                        send: net_data.total_transmitted().to_string(),
+                        receive: net_data.total_received().to_string(),
                     },
                 )
             })
@@ -347,9 +392,6 @@ impl DbResource {
                 let db_table_size_sql =
                     get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
                 let db_conn_sql = "SELECT COUNT(*) AS db_conn FROM pg_stat_activity;";
-                //获取数据库大小(Byte)
-                let table = vec!["ips", "ports", "scaninfo"];
-
                 let sql = match db_table_size_sql {
                     Ok(sql) => sql,
                     Err(e) => {
@@ -361,7 +403,7 @@ impl DbResource {
 
                 Self {
                     db_library_size: get_db_library_size_byte(&o, db_name).await,
-                    db_table_size: get_db_table_size_byte(&o, &sql, &[&table]).await,
+                    db_table_size: get_db_table_size_byte(&o, &sql, &[]).await,
                     db_conn: get_db_conn(&o, db_conn_sql, &[]).await,
                 }
             }
@@ -378,7 +420,7 @@ impl DbResource {
 impl Default for DbResource {
     fn default() -> Self {
         let tmp = vec![("error".to_string(), DbTableSizeInfo::default())];
-        let h: HashMap<String, DbTableSizeInfo> = tmp.into_iter().collect();
+        let h: BTreeMap<String, DbTableSizeInfo> = tmp.into_iter().collect();
         Self {
             db_library_size: "none".to_string(),
             db_table_size: h,
@@ -739,7 +781,7 @@ async fn get_db_table_size_byte(
     // db_h: &mut HashMap<String, DbTableSizeInfo>,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
-) -> HashMap<String, DbTableSizeInfo> {
+) -> BTreeMap<String, DbTableSizeInfo> {
     let result = pool.query(sql, params).await;
     match result {
         Ok(rows) => {
@@ -1142,6 +1184,8 @@ pub struct ApplyTask {
     pub task_port: String,
     pub address_family: String,
     pub scan_plan: Value,
+    pub lease_expires_at_ms: i64,
+    pub lease_ttl_ms: i64,
 }
 
 #[derive(Deserialize)]
@@ -1772,6 +1816,8 @@ pub async fn apply_task(
         task_port: row.get("task_port"),
         address_family: row.get("address_family"),
         scan_plan: row.get("scan_plan"),
+        lease_expires_at_ms: lease_expires_at,
+        lease_ttl_ms: TASK_LEASE_MS,
     };
 
     transaction
@@ -1876,6 +1922,7 @@ pub struct TaskItemJson {
 pub struct ReceiveTaskItemQueryInfo {
     pub start: Option<i32>,
     pub count: Option<i64>,
+    pub include_system: Option<bool>,
 }
 
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
@@ -1885,6 +1932,7 @@ pub async fn get_task_item(
     pool: &deadpool_postgres::Pool,
     s_count: i64,
     start_id: Option<i32>,
+    include_system: bool,
     permissions: Permission,
 ) -> Result<(Vec<TaskItem>, i64, i64, i32), Box<dyn std::error::Error>> {
     let mut c = pool.get().await?;
@@ -1909,27 +1957,37 @@ pub async fn get_task_item(
         Permission::Administrator(_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE id <= $1 ORDER BY id DESC LIMIT $2;",
-                    &[&st, &s_count]
-                ).await?
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE id <= $1 AND ($2::boolean OR task_source <> 'automatic') \
+                     ORDER BY id DESC LIMIT $3;",
+                    &[&st, &include_system, &s_count],
+                )
+                .await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task ORDER BY id DESC LIMIT $1;",
-                    &[&s_count]
-                ).await?
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE $1::boolean OR task_source <> 'automatic' ORDER BY id DESC LIMIT $2;",
+                    &[&include_system, &s_count],
+                )
+                .await?
             }
         }
         Permission::Users(u_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 AND id <= $2 ORDER BY id DESC LIMIT $3;",
-                    &[&u_id, &st, &s_count]
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE user_id = $1 AND id <= $2 AND ($3::boolean OR task_source <> 'automatic') \
+                     ORDER BY id DESC LIMIT $4;",
+                    &[&u_id, &st, &include_system, &s_count]
                 ).await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task WHERE user_id = $1 ORDER BY id DESC LIMIT $2;",
-                    &[&u_id, &s_count]
-                ).await?
+                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                     WHERE user_id = $1 AND ($2::boolean OR task_source <> 'automatic') \
+                     ORDER BY id DESC LIMIT $3;",
+                    &[&u_id, &include_system, &s_count],
+                )
+                .await?
             }
         }
     };
@@ -1982,6 +2040,7 @@ pub struct ReceiveSystemStatusInfo {
 pub struct SystemStatusJson {
     pub total_c: i32,
     pub status_item: Vec<SystemResource>,
+    pub system_info: SystemDetails,
 }
 
 /// 获取系统状态信息

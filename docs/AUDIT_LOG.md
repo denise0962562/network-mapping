@@ -5,8 +5,10 @@
 
 ## 事件范围
 
-当前版本记录登录成功与失败、退出登录、密码修改、任务创建/取消/重试、扫描器配置
-变更，以及审计日志的查询与导出。心跳、健康检查和普通页面读取不会产生审计事件。
+当前版本记录登录成功与失败、退出登录、密码修改、任务创建/取消/重试、系统目标生成、
+扫描器配置变更，以及审计日志的查询与导出。系统自动生成目标使用
+`automatic_target` 分类和 `task.auto_generate` 动作。心跳、健康检查和普通页面读取不会
+产生审计事件。
 
 所有 HTTP 响应包含 `X-Request-ID`。客户端提供合法 UUID 时会沿用该值，否则服务器
 生成新 UUID。运行日志和审计事件可以通过该字段关联。
@@ -22,7 +24,8 @@
   `actor_id`、`resource_type`、`resource_id`、`keyword`、`start`、`end`、`page` 和
   `page_size`。
 - `GET /api/audit/events/{event_id}`：读取单个事件。
-- `GET /api/audit/export`：按相同筛选条件导出 CSV，单次最多 10000 条。
+- `GET /api/audit/export`：按相同筛选条件导出 CSV，包含详情接口返回的全部事件字段，
+  单次最多 10000 条。`changes` 和 `metadata` 以 JSON 字符串写入各自的 CSV 单元格。
 
 `start` 和 `end` 使用 RFC 3339 时间，例如 `2026-08-10T09:00:00+08:00`。
 

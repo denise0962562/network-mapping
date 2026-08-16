@@ -18,7 +18,27 @@ use std::net::IpAddr;
 use tracing::error;
 use uuid::Uuid;
 
-const TASK_LEASE_MS: i64 = 90_000;
+#[derive(Serialize)]
+struct ScannerHeartbeatLease {
+    task_id: Uuid,
+    status: &'static str,
+    expires_at_ms: Option<i64>,
+    ttl_ms: i64,
+}
+
+#[derive(Serialize)]
+struct ScannerHeartbeatCommand {
+    #[serde(rename = "type")]
+    command_type: &'static str,
+    task_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct ScannerHeartbeatResponse {
+    success: bool,
+    lease: Option<ScannerHeartbeatLease>,
+    command: Option<ScannerHeartbeatCommand>,
+}
 
 #[derive(Deserialize)]
 pub struct ScannerSystemInfo {
@@ -312,49 +332,69 @@ pub(crate) async fn scanner_heartbeat_handler(
         error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
         return HttpResponse::InternalServerError().finish();
     }
+    let mut lease = None;
     let mut cancel_task_id = None;
     if let Some(task_id) = heartbeat.active_task_id {
-        let lease_expires_at = crate::get_unix_epoch_ms() + TASK_LEASE_MS;
-        if let Err(error) = transaction
-            .execute(
+        let lease_expires_at = crate::get_unix_epoch_ms() + crate::TASK_LEASE_MS;
+        let renewed = match transaction
+            .query_opt(
                 "UPDATE scan_task_execution e SET lease_expires_at = $1 FROM scan_task t \
                  WHERE e.task_id = t.id AND t.task_id = $2 AND e.assigned_scanner_id = $3 \
-                 AND e.execution_status = 'running';",
+                 AND e.execution_status = 'running' RETURNING e.lease_expires_at;",
                 &[&lease_expires_at, &task_id.to_string(), &scanner_id],
             )
             .await
         {
-            error_logs(&req, "ScannerLeaseRenewError", &error.to_string());
-            return HttpResponse::InternalServerError().finish();
-        }
-        match transaction
-            .query_opt(
-                "SELECT t.task_id FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
-                 WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
-                 AND e.execution_status = 'running' AND e.cancel_requested = true LIMIT 1;",
-                &[&task_id.to_string(), &scanner_id],
-            )
-            .await
-        {
-            Ok(Some(_)) => cancel_task_id = Some(task_id),
-            Ok(None) => {}
             Err(error) => {
-                error_logs(&req, "ScannerCancelCommandError", &error.to_string());
+                error_logs(&req, "ScannerLeaseRenewError", &error.to_string());
                 return HttpResponse::InternalServerError().finish();
             }
+            Ok(row) => row,
+        };
+        if renewed.is_some() {
+            lease = Some(ScannerHeartbeatLease {
+                task_id,
+                status: "renewed",
+                expires_at_ms: Some(lease_expires_at),
+                ttl_ms: crate::TASK_LEASE_MS,
+            });
+            match transaction
+                .query_opt(
+                    "SELECT t.task_id FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+                     WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
+                     AND e.execution_status = 'running' AND e.cancel_requested = true LIMIT 1;",
+                    &[&task_id.to_string(), &scanner_id],
+                )
+                .await
+            {
+                Ok(Some(_)) => cancel_task_id = Some(task_id),
+                Ok(None) => {}
+                Err(error) => {
+                    error_logs(&req, "ScannerCancelCommandError", &error.to_string());
+                    return HttpResponse::InternalServerError().finish();
+                }
+            }
+        } else {
+            lease = Some(ScannerHeartbeatLease {
+                task_id,
+                status: "lost",
+                expires_at_ms: None,
+                ttl_ms: crate::TASK_LEASE_MS,
+            });
         }
     }
     if let Err(error) = transaction.commit().await {
         error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
         return HttpResponse::InternalServerError().finish();
     }
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "command": cancel_task_id.map(|task_id| serde_json::json!({
-            "type": "cancel_task",
-            "task_id": task_id,
-        }))
-    }))
+    HttpResponse::Ok().json(ScannerHeartbeatResponse {
+        success: true,
+        lease,
+        command: cancel_task_id.map(|task_id| ScannerHeartbeatCommand {
+            command_type: "cancel_task",
+            task_id,
+        }),
+    })
 }
 
 #[post("/api/scanner/task/fail")]
@@ -1022,18 +1062,25 @@ async fn get_all_task_handler(
         }
     };
 
-    let (tmp_result, total_count, item_count, start_index) =
-        match get_task_item(p, query_info.count.unwrap_or(5), query_info.start, permi).await {
-            Ok(o) => o,
-            Err(e) => {
-                error!(
-                    event = "GetTaskError",
-                    path = "fn get_all_task_handler",
-                    message = %e
-                );
-                return HttpResponse::InternalServerError().body("500");
-            }
-        };
+    let (tmp_result, total_count, item_count, start_index) = match get_task_item(
+        p,
+        query_info.count.unwrap_or(5),
+        query_info.start,
+        query_info.include_system.unwrap_or(false),
+        permi,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            error!(
+                event = "GetTaskError",
+                path = "fn get_all_task_handler",
+                message = %e
+            );
+            return HttpResponse::InternalServerError().body("500");
+        }
+    };
 
     let tmp_json = TaskItemJson {
         total_c: total_count,
@@ -1047,7 +1094,24 @@ async fn get_all_task_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{ScannerScanCapabilities, task_result_pagination, validate_public_ip};
+    use super::{
+        ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerScanCapabilities,
+        task_result_pagination, validate_public_ip,
+    };
+    use crate::ReceiveTaskItemQueryInfo;
+    use actix_web::web;
+
+    #[test]
+    fn task_list_query_excludes_system_tasks_by_default() {
+        let default_query =
+            web::Query::<ReceiveTaskItemQueryInfo>::from_query("").expect("empty query is valid");
+        assert!(!default_query.include_system.unwrap_or(false));
+
+        let include_query =
+            web::Query::<ReceiveTaskItemQueryInfo>::from_query("include_system=true&count=10")
+                .expect("include_system query is valid");
+        assert_eq!(include_query.include_system, Some(true));
+    }
 
     #[test]
     fn task_result_pagination_uses_safe_bounds() {
@@ -1081,5 +1145,26 @@ mod tests {
             stages: vec!["port_discovery".into()],
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn heartbeat_reports_lost_task_lease_explicitly() {
+        let task_id = uuid::Uuid::now_v7();
+        let body = serde_json::to_value(ScannerHeartbeatResponse {
+            success: true,
+            lease: Some(ScannerHeartbeatLease {
+                task_id,
+                status: "lost",
+                expires_at_ms: None,
+                ttl_ms: crate::TASK_LEASE_MS,
+            }),
+            command: None,
+        })
+        .unwrap();
+
+        assert_eq!(body["lease"]["task_id"], task_id.to_string());
+        assert_eq!(body["lease"]["status"], "lost");
+        assert!(body["lease"]["expires_at_ms"].is_null());
+        assert_eq!(body["lease"]["ttl_ms"], crate::TASK_LEASE_MS);
     }
 }
