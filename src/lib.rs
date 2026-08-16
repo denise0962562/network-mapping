@@ -63,6 +63,7 @@ pub const IMAGE_PNG: &str = "image/png";
 pub const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 pub const APPLICATION_JSON: &str = "application/json";
 pub const _SYSTEM_TIME_ZONE: &str = "Asia/Shanghai";
+pub const TASK_LEASE_MS: i64 = 90_000;
 
 pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
     let mut token_buffer = [0u8; 36];
@@ -1142,6 +1143,8 @@ pub struct ApplyTask {
     pub task_port: String,
     pub address_family: String,
     pub scan_plan: Value,
+    pub lease_expires_at_ms: i64,
+    pub lease_ttl_ms: i64,
 }
 
 #[derive(Deserialize)]
@@ -1772,6 +1775,8 @@ pub async fn apply_task(
         task_port: row.get("task_port"),
         address_family: row.get("address_family"),
         scan_plan: row.get("scan_plan"),
+        lease_expires_at_ms: lease_expires_at,
+        lease_ttl_ms: TASK_LEASE_MS,
     };
 
     transaction
