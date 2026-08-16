@@ -797,6 +797,8 @@ mod tests {
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(user::user_login_h)
         .service(handlers::data_saa::get_system_data_handler)
+        .service(handlers::data_saa::get_analysis_distribution)
+        .service(handlers::data_saa::get_analysis_discovery_heatmap)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
         .service(handlers::search::search_ip)

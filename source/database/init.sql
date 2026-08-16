@@ -216,6 +216,14 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
 	ON scan_observation(execution_id, kind);
 
+-- 数据分析查询按观察时间筛选，并通过端口、任务和执行记录进行权限过滤。
+CREATE INDEX IF NOT EXISTS idx_ips_create_time_task
+	ON ips(create_time, task_id);
+CREATE INDEX IF NOT EXISTS idx_scaninfo_scan_time_port
+	ON scaninfo(scan_time, port_id);
+CREATE INDEX IF NOT EXISTS idx_scaninfo_port
+	ON scaninfo(port_id);
+
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (
 	user_id INT NOT NULL,
