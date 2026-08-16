@@ -215,6 +215,8 @@ fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+const AUDIT_EXPORT_HEADER: &str = "event_id,occurred_at,category,action,outcome,severity,actor_type,actor_id,actor_name,resource_type,resource_id,request_id,source_ip,user_agent,http_method,request_path,response_status,reason_code,changes,metadata\n";
+
 #[get("/api/audit/export")]
 pub(crate) async fn export_audit_events(
     req: HttpRequest,
@@ -244,8 +246,9 @@ pub(crate) async fn export_audit_events(
         &query.keyword,
     ];
     let sql = format!(
-        "SELECT event_id, occurred_at, category, action, outcome, actor_type, actor_id, actor_name, \
-         resource_type, resource_id, request_id, source_ip::TEXT AS source_ip, reason_code \
+        "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
+         actor_name, resource_type, resource_id, request_id, source_ip::TEXT AS source_ip, \
+         user_agent, http_method, request_path, response_status, reason_code, changes, metadata \
          FROM audit_event {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT 10000"
     );
     let rows = match client.query(&sql, params).await {
@@ -255,9 +258,7 @@ pub(crate) async fn export_audit_events(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let mut csv = String::from(
-        "event_id,occurred_at,category,action,outcome,actor_type,actor_id,actor_name,resource_type,resource_id,request_id,source_ip,reason_code\n",
-    );
+    let mut csv = String::from(AUDIT_EXPORT_HEADER);
     for row in &rows {
         let values = [
             row.get::<_, Uuid>("event_id").to_string(),
@@ -265,6 +266,7 @@ pub(crate) async fn export_audit_events(
             row.get::<_, String>("category"),
             row.get::<_, String>("action"),
             row.get::<_, String>("outcome"),
+            row.get::<_, String>("severity"),
             row.get::<_, String>("actor_type"),
             row.get::<_, Option<String>>("actor_id").unwrap_or_default(),
             row.get::<_, Option<String>>("actor_name")
@@ -278,8 +280,21 @@ pub(crate) async fn export_audit_events(
                 .unwrap_or_default(),
             row.get::<_, Option<String>>("source_ip")
                 .unwrap_or_default(),
+            row.get::<_, Option<String>>("user_agent")
+                .unwrap_or_default(),
+            row.get::<_, Option<String>>("http_method")
+                .unwrap_or_default(),
+            row.get::<_, Option<String>>("request_path")
+                .unwrap_or_default(),
+            row.get::<_, Option<i16>>("response_status")
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
             row.get::<_, Option<String>>("reason_code")
                 .unwrap_or_default(),
+            row.get::<_, Option<Value>>("changes")
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.get::<_, Value>("metadata").to_string(),
         ];
         csv.push_str(
             &values
@@ -309,7 +324,7 @@ pub(crate) async fn export_audit_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{csv_cell, pagination};
+    use super::{AUDIT_EXPORT_HEADER, csv_cell, pagination};
 
     #[test]
     fn pagination_bounds_are_stable() {
@@ -320,5 +335,37 @@ mod tests {
     #[test]
     fn csv_cells_escape_quotes() {
         assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn audit_export_contains_every_detail_field() {
+        assert_eq!(
+            AUDIT_EXPORT_HEADER
+                .trim_end()
+                .split(',')
+                .collect::<Vec<_>>(),
+            vec![
+                "event_id",
+                "occurred_at",
+                "category",
+                "action",
+                "outcome",
+                "severity",
+                "actor_type",
+                "actor_id",
+                "actor_name",
+                "resource_type",
+                "resource_id",
+                "request_id",
+                "source_ip",
+                "user_agent",
+                "http_method",
+                "request_path",
+                "response_status",
+                "reason_code",
+                "changes",
+                "metadata",
+            ]
+        );
     }
 }

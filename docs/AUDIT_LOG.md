@@ -24,7 +24,8 @@
   `actor_id`、`resource_type`、`resource_id`、`keyword`、`start`、`end`、`page` 和
   `page_size`。
 - `GET /api/audit/events/{event_id}`：读取单个事件。
-- `GET /api/audit/export`：按相同筛选条件导出 CSV，单次最多 10000 条。
+- `GET /api/audit/export`：按相同筛选条件导出 CSV，包含详情接口返回的全部事件字段，
+  单次最多 10000 条。`changes` 和 `metadata` 以 JSON 字符串写入各自的 CSV 单元格。
 
 `start` 和 `end` 使用 RFC 3339 时间，例如 `2026-08-10T09:00:00+08:00`。
 
