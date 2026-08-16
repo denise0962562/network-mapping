@@ -40,10 +40,13 @@ WITH bucket_range AS (
     SELECT (create_time / $3::BIGINT) * $3::BIGINT AS bucket_start,
         COUNT(*)::BIGINT AS sample_count,
         AVG(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_avg,
+        MIN(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_min,
         MAX(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_max,
         AVG(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_avg,
+        MIN(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_min,
         MAX(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_max,
         AVG(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_avg,
+        MIN(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_min,
         MAX(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_max
     FROM normalized
     GROUP BY bucket_start
@@ -51,10 +54,13 @@ WITH bucket_range AS (
 SELECT b.bucket_start,
        COALESCE(a.sample_count, 0)::BIGINT AS sample_count,
        a.cpu_avg,
+       a.cpu_min,
        a.cpu_max,
        a.ram_avg,
+       a.ram_min,
        a.ram_max,
        a.disk_avg,
+       a.disk_min,
        a.disk_max
 FROM bucket_range b
 LEFT JOIN aggregated a USING (bucket_start)
@@ -137,10 +143,13 @@ struct ResourceHistoryPoint {
     timestamp_ms: i64,
     sample_count: i64,
     cpu_avg: Option<f64>,
+    cpu_min: Option<f64>,
     cpu_max: Option<f64>,
     ram_avg: Option<f64>,
+    ram_min: Option<f64>,
     ram_max: Option<f64>,
     disk_avg: Option<f64>,
+    disk_min: Option<f64>,
     disk_max: Option<f64>,
 }
 
@@ -272,10 +281,13 @@ pub(crate) async fn get_system_resource_history(
             timestamp_ms: row.get::<_, i64>("bucket_start") * 1_000,
             sample_count: row.get("sample_count"),
             cpu_avg: rounded(row.get("cpu_avg")),
+            cpu_min: rounded(row.get("cpu_min")),
             cpu_max: rounded(row.get("cpu_max")),
             ram_avg: rounded(row.get("ram_avg")),
+            ram_min: rounded(row.get("ram_min")),
             ram_max: rounded(row.get("ram_max")),
             disk_avg: rounded(row.get("disk_avg")),
+            disk_min: rounded(row.get("disk_min")),
             disk_max: rounded(row.get("disk_max")),
         })
         .collect();
