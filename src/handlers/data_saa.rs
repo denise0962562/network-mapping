@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::ReceiveSystemStatusInfo;
 use crate::admin::UserBaseI;
 use crate::logs::write::error_logs;
-use crate::{SystemStatusJson, get_system_status_info};
+use crate::{SystemDetails, SystemStatusJson, Systems, get_system_status_info};
 
 const ANALYSIS_TIMEZONE: &str = "Asia/Shanghai";
 const DEFAULT_RANGE_WEEKS: i64 = 12;
@@ -161,6 +161,7 @@ async fn get_system_data_handler(
     _req: HttpRequest,
     query_info: web::Query<ReceiveSystemStatusInfo>,
     pool: web::Data<Pool>,
+    systems: web::Data<Systems>,
 ) -> impl Responder {
     let p = pool.get_ref();
 
@@ -186,6 +187,7 @@ async fn get_system_data_handler(
     let t_json = SystemStatusJson {
         total_c: c,
         status_item: t,
+        system_info: SystemDetails::new(systems.get_ref()),
     };
 
     HttpResponse::Ok().json(t_json)

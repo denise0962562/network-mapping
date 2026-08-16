@@ -201,6 +201,20 @@ pub struct Systems {
     pub network: Arc<Mutex<sysinfo::Networks>>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct SystemDetails {
+    pub host_name: Option<String>,
+    pub os_name: Option<String>,
+    pub os_version: Option<String>,
+    pub kernel_version: Option<String>,
+    pub architecture: String,
+    pub cpu_model: Option<String>,
+    pub cpu_vendor: Option<String>,
+    pub cpu_frequency_mhz: Option<u64>,
+    pub physical_core_count: Option<usize>,
+    pub logical_cpu_count: usize,
+}
+
 impl Systems {
     pub fn new() -> Self {
         Self {
@@ -214,6 +228,33 @@ impl Systems {
 impl Default for Systems {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SystemDetails {
+    pub fn new(systems: &Systems) -> Self {
+        let sys = systems
+            .sys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_cpu = sys.cpus().first();
+
+        Self {
+            host_name: sysinfo::System::host_name(),
+            os_name: sysinfo::System::name(),
+            os_version: sysinfo::System::long_os_version(),
+            kernel_version: sysinfo::System::kernel_version(),
+            architecture: sysinfo::System::cpu_arch(),
+            cpu_model: first_cpu
+                .map(|cpu| cpu.brand().trim().to_string())
+                .filter(|value| !value.is_empty()),
+            cpu_vendor: first_cpu
+                .map(|cpu| cpu.vendor_id().trim().to_string())
+                .filter(|value| !value.is_empty()),
+            cpu_frequency_mhz: first_cpu.map(sysinfo::Cpu::frequency),
+            physical_core_count: sysinfo::System::physical_core_count(),
+            logical_cpu_count: sys.cpus().len(),
+        }
     }
 }
 
@@ -312,8 +353,10 @@ impl SystemDisk {
 
 impl SystemNetwork {
     pub fn new(net: Arc<Mutex<sysinfo::Networks>>) -> Self {
-        let net = net.lock().unwrap();
-        // net.refresh(true);
+        let mut net = net.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        net.refresh(true);
+        // The dashboard displays counters accumulated since system boot. The
+        // received/transmitted methods only contain the latest refresh delta.
         let n_h: BTreeMap<String, SystemNetInfo> = net
             .list()
             .iter()
@@ -321,8 +364,8 @@ impl SystemNetwork {
                 (
                     net_name.to_string(),
                     SystemNetInfo {
-                        send: net_data.transmitted().to_string(),
-                        receive: net_data.received().to_string(),
+                        send: net_data.total_transmitted().to_string(),
+                        receive: net_data.total_received().to_string(),
                     },
                 )
             })
@@ -1997,6 +2040,7 @@ pub struct ReceiveSystemStatusInfo {
 pub struct SystemStatusJson {
     pub total_c: i32,
     pub status_item: Vec<SystemResource>,
+    pub system_info: SystemDetails,
 }
 
 /// 获取系统状态信息
