@@ -1,5 +1,6 @@
 use actix_web::{HttpResponse, Responder, get, web};
 use deadpool_postgres::Pool;
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -68,7 +69,7 @@ fn validate_ip(value: &str) -> Result<(), &'static str> {
         .map_err(|_| "IP 地址格式无效")
 }
 
-fn validate_cidr(value: &str) -> Result<(), &'static str> {
+fn normalize_cidr(value: &str) -> Result<String, &'static str> {
     let Some((ip, prefix)) = value.split_once('/') else {
         return Err("CIDR 必须包含前缀长度");
     };
@@ -77,7 +78,10 @@ fn validate_cidr(value: &str) -> Result<(), &'static str> {
     if prefix > if ip.is_ipv4() { 32 } else { 128 } {
         return Err("CIDR 前缀长度超出范围");
     }
-    Ok(())
+    Ok(IpNet::new(ip, prefix)
+        .map_err(|_| "CIDR 前缀长度超出范围")?
+        .trunc()
+        .to_string())
 }
 
 fn validate_keyword(value: &str, name: &str) -> Result<(), String> {
@@ -154,7 +158,7 @@ async fn respond_search(
     match search_assets(pool, query_type, query, value, where_clause, limit, offset).await {
         Ok(response) => HttpResponse::Ok().json(response),
         Err(err) => {
-            error!(event = "SearchDatabaseError", query_type, message = %err);
+            error!(event = "SearchDatabaseError", query_type, message = %err, error = ?err);
             HttpResponse::InternalServerError()
                 .json(serde_json::json!({ "message": "搜索服务暂时不可用" }))
         }
@@ -189,9 +193,10 @@ pub async fn search_network(
     query: web::Query<SearchQuery>,
 ) -> impl Responder {
     let q = query.q.trim();
-    if let Err(message) = validate_cidr(q) {
-        return bad_request(message);
-    }
+    let normalized_cidr = match normalize_cidr(q) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
     let (limit, offset) = match pagination(query.limit, query.offset) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
@@ -200,12 +205,42 @@ pub async fn search_network(
         pool.get_ref(),
         "network",
         q.to_string(),
-        q,
-        "i.ip_address <<= $1::TEXT::CIDR",
+        &normalized_cidr,
+        "i.ip_address <<= $1::TEXT::INET",
         limit,
         offset,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_cidr;
+
+    #[test]
+    fn normalizes_ipv4_cidr_with_host_bits() {
+        assert_eq!(
+            normalize_cidr("192.168.1.123/24"),
+            Ok("192.168.1.0/24".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalizes_ipv6_cidr_with_host_bits() {
+        assert_eq!(
+            normalize_cidr("2001:db8::1234/64"),
+            Ok("2001:db8::/64".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_prefixes() {
+        assert_eq!(normalize_cidr("192.0.2.1/33"), Err("CIDR 前缀长度超出范围"));
+        assert_eq!(
+            normalize_cidr("2001:db8::1/129"),
+            Err("CIDR 前缀长度超出范围")
+        );
+    }
 }
 
 #[get("/api/search/port")]
