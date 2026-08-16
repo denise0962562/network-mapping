@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::admin::UserBaseI;
 use crate::logs::write::error_logs;
 
-const DEFAULT_RANGE_DAYS: i64 = 7;
+const DEFAULT_RANGE_MINUTES: i64 = 30;
 const MAX_RANGE_DAYS: i64 = 30;
 const MAX_BUCKETS: i64 = 1_500;
 const RESOURCE_TIMEZONE: &str = "Asia/Shanghai";
@@ -70,6 +70,8 @@ pub(crate) struct ResourceHistoryQuery {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Granularity {
+    TenSeconds,
+    ThirtySeconds,
     OneMinute,
     FiveMinutes,
     FifteenMinutes,
@@ -81,18 +83,24 @@ enum Granularity {
 impl Granularity {
     fn parse(value: &str) -> Result<Self, &'static str> {
         match value {
+            "10s" => Ok(Self::TenSeconds),
+            "30s" => Ok(Self::ThirtySeconds),
             "1m" => Ok(Self::OneMinute),
             "5m" => Ok(Self::FiveMinutes),
             "15m" => Ok(Self::FifteenMinutes),
             "30m" => Ok(Self::ThirtyMinutes),
             "1h" => Ok(Self::OneHour),
             "2h" => Ok(Self::TwoHours),
-            _ => Err("granularity must be auto, 1m, 5m, 15m, 30m, 1h or 2h"),
+            _ => Err("granularity must be auto, 10s, 30s, 1m, 5m, 15m, 30m, 1h or 2h"),
         }
     }
 
     fn auto_for(duration: Duration) -> Self {
-        if duration <= Duration::hours(6) {
+        if duration <= Duration::minutes(30) {
+            Self::TenSeconds
+        } else if duration <= Duration::hours(1) {
+            Self::ThirtySeconds
+        } else if duration <= Duration::hours(6) {
             Self::OneMinute
         } else if duration <= Duration::hours(24) {
             Self::FiveMinutes
@@ -105,6 +113,8 @@ impl Granularity {
 
     fn seconds(self) -> i64 {
         match self {
+            Self::TenSeconds => 10,
+            Self::ThirtySeconds => 30,
             Self::OneMinute => 60,
             Self::FiveMinutes => 300,
             Self::FifteenMinutes => 900,
@@ -116,6 +126,8 @@ impl Granularity {
 
     fn label(self) -> &'static str {
         match self {
+            Self::TenSeconds => "10s",
+            Self::ThirtySeconds => "30s",
             Self::OneMinute => "1m",
             Self::FiveMinutes => "5m",
             Self::FifteenMinutes => "15m",
@@ -170,7 +182,7 @@ fn normalize_query(query: &ResourceHistoryQuery) -> Result<NormalizedHistoryQuer
     let end_at = query.end_at.unwrap_or_else(Utc::now);
     let start_at = query
         .start_at
-        .unwrap_or_else(|| end_at - Duration::days(DEFAULT_RANGE_DAYS));
+        .unwrap_or_else(|| end_at - Duration::minutes(DEFAULT_RANGE_MINUTES));
     if start_at >= end_at {
         return Err("start_at must be earlier than end_at");
     }
@@ -314,6 +326,18 @@ mod tests {
 
     #[test]
     fn automatic_granularity_matches_supported_ranges() {
+        assert_eq!(
+            normalize_query(&query(Duration::minutes(30), "auto"))
+                .unwrap()
+                .granularity,
+            Granularity::TenSeconds
+        );
+        assert_eq!(
+            normalize_query(&query(Duration::hours(1), "auto"))
+                .unwrap()
+                .granularity,
+            Granularity::ThirtySeconds
+        );
         assert_eq!(
             normalize_query(&query(Duration::hours(6), "auto"))
                 .unwrap()
