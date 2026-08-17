@@ -18,8 +18,8 @@ use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::{
     DEFAULT_SESSION_TTL_SECONDS, EmailConfig, MAX_SESSION_TTL_MINUTES, MIN_SESSION_TTL_MINUTES,
     MailSettingsRequest, MailSettingsResponse, NotificationPreferences, PasswordHashConfig,
-    SessionSettingsRequest, SessionSettingsResponse, SystemConfig,
-    session_ttl_seconds_from_minutes,
+    ScanSettingsRequest, ScanSettingsResponse, SessionSettingsRequest, SessionSettingsResponse,
+    SystemConfig, session_ttl_seconds_from_minutes,
 };
 use crate::{decrypt_data, encrypt_data};
 use crate::{generate_hash_password, generate_scanner_token, hash_scanner_token};
@@ -34,6 +34,9 @@ const NOTIFICATION_SETTING_TYPE: &str = "notification";
 const SMTP_SENDER_KEY: &str = "sender_key";
 const SECURITY_SETTING_TYPE: &str = "security";
 const SESSION_TTL_SETTING_KEY: &str = "session_ttl_seconds";
+const SCAN_SETTING_TYPE: &str = "scan";
+const DEFAULT_SCAN_PROFILE_SETTING_KEY: &str = "default_profile";
+const FALLBACK_SCAN_PROFILE: &str = "legacy";
 
 pub enum UserRole {
     System = 0,
@@ -910,6 +913,54 @@ pub async fn write_config_to_database(
 
         _ => Err("插入数据异常".into()),
     }
+}
+
+/// Read the scan profile used when a task does not explicitly select one.
+/// Invalid legacy values are ignored so task creation always has a safe fallback.
+pub async fn get_default_scan_profile_from_database(
+    pool: &deadpool_postgres::Pool,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = pool.get().await?;
+    let row = conn
+        .query_opt(
+            "SELECT value FROM setting WHERE item_type = $1 AND key = $2 LIMIT 1;",
+            &[&SCAN_SETTING_TYPE, &DEFAULT_SCAN_PROFILE_SETTING_KEY],
+        )
+        .await?;
+    Ok(row
+        .map(|row| row.get::<_, String>("value").trim().to_lowercase())
+        .filter(|profile| crate::build_scan_plan(profile).is_ok())
+        .unwrap_or_else(|| FALLBACK_SCAN_PROFILE.to_owned()))
+}
+
+pub async fn get_scan_settings_from_database(
+    pool: &deadpool_postgres::Pool,
+) -> Result<ScanSettingsResponse, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(ScanSettingsResponse {
+        default_scan_profile: get_default_scan_profile_from_database(pool).await?,
+    })
+}
+
+pub async fn write_scan_settings_to_database(
+    pool: &deadpool_postgres::Pool,
+    settings: &ScanSettingsRequest,
+) -> Result<ScanSettingsResponse, Box<dyn std::error::Error>> {
+    let profile = settings.default_scan_profile.trim().to_lowercase();
+    crate::build_scan_plan(&profile)?;
+    let conn = pool.get().await?;
+    conn.execute(
+        "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \
+         ON CONFLICT (item_type, key) DO UPDATE SET value = EXCLUDED.value, update_at = NOW();",
+        &[
+            &SCAN_SETTING_TYPE,
+            &DEFAULT_SCAN_PROFILE_SETTING_KEY,
+            &profile,
+        ],
+    )
+    .await?;
+    Ok(ScanSettingsResponse {
+        default_scan_profile: profile,
+    })
 }
 
 /// 读取用于新登录会话的绝对有效期。缺失或损坏的设置回退到 45 分钟。

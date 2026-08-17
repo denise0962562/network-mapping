@@ -232,5 +232,12 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("public, max-age=31536000, immutable")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;")
+        );
     }
 }

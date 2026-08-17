@@ -7,6 +7,9 @@ use actix_web::{
 };
 use futures_util::future::LocalBoxFuture;
 
+pub(crate) const CONTENT_SECURITY_POLICY: &str =
+    "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;";
+
 // There are two steps in middleware processing.
 // 1. Middleware initialization, middleware factory gets called with
 //    next service in chain as parameter.
@@ -62,9 +65,7 @@ where
 
             res.headers_mut().insert(
                 header::CONTENT_SECURITY_POLICY,
-                header::HeaderValue::from_static(
-                    "default-src \'self\';style-src 'self' 'unsafe-inline';",
-                ), // 暂时允许内联css
+                header::HeaderValue::from_static(CONTENT_SECURITY_POLICY), // 暂时允许内联css
             );
             if immutable_asset && res.status().is_success() {
                 res.headers_mut().insert(

@@ -53,6 +53,7 @@ use uuid::Uuid;
 use admin::TotpInfo;
 use config::PasswordHashConfig;
 use db::get_sql_from_file;
+use logs::write::{database_error_diagnostics, error_chain_diagnostics};
 use maxmind::MaxMindState;
 
 //常量
@@ -392,24 +393,31 @@ impl DbResource {
                 let db_table_size_sql =
                     get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
                 let db_conn_sql = "SELECT COUNT(*) AS db_conn FROM pg_stat_activity;";
-                let sql = match db_table_size_sql {
-                    Ok(sql) => sql,
+                let db_table_size = match db_table_size_sql {
+                    Ok(sql) => get_db_table_size_byte(&o, &sql, &[]).await,
                     Err(e) => {
-                        error!(e);
-                        error!("获取sql失败");
-                        "".to_string()
+                        error!(
+                            event = "DatabaseMetricsSqlLoadError",
+                            operation = "load_table_size_query",
+                            sql_file = "get_table_size.sql",
+                            message = %error_chain_diagnostics(e.as_ref()),
+                        );
+                        BTreeMap::from([("error".to_owned(), DbTableSizeInfo::default())])
                     }
                 };
 
                 Self {
                     db_library_size: get_db_library_size_byte(&o, db_name).await,
-                    db_table_size: get_db_table_size_byte(&o, &sql, &[]).await,
+                    db_table_size,
                     db_conn: get_db_conn(&o, db_conn_sql, &[]).await,
                 }
             }
             Err(e) => {
-                let message = format!("无法从连接池中获得连接 {}", e);
-                error!(event = "DATABASE-ERROR", path = "DbResource::new", message);
+                error!(
+                    event = "DatabaseMetricsPoolError",
+                    operation = "acquire_metrics_connection",
+                    message = %error_chain_diagnostics(&e),
+                );
                 //返回默认值
                 DbResource::default()
             }
@@ -482,7 +490,8 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
     use super::{
-        STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan, parse_ip_or_cidr,
+        CreateTask, STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan,
+        parse_ip_or_cidr,
     };
 
     #[test]
@@ -539,6 +548,19 @@ mod parse_ip_or_cidr_tests {
         let inventory = build_scan_plan("service_inventory").unwrap();
         assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
         assert!(build_scan_plan("arbitrary_command").is_err());
+    }
+
+    #[test]
+    fn create_task_may_defer_scan_profile_to_system_settings() {
+        let task: CreateTask = serde_json::from_value(serde_json::json!({
+            "ip": "192.0.2.1",
+            "port": "443",
+            "level": 1,
+            "remark": null
+        }))
+        .unwrap();
+
+        assert!(task.scan_profile.is_none());
     }
 
     #[test]
@@ -631,16 +653,12 @@ pub struct CreateTask {
     pub dispatch_mode: String,
     #[serde(default)]
     pub scanner_ids: Vec<Uuid>,
-    #[serde(default = "default_scan_profile")]
-    pub scan_profile: String,
+    #[serde(default)]
+    pub scan_profile: Option<String>,
 }
 
 fn default_dispatch_mode() -> String {
     "automatic".into()
-}
-
-fn default_scan_profile() -> String {
-    "legacy".into()
 }
 
 pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
@@ -805,11 +823,10 @@ async fn get_db_table_size_byte(
             // }
         }
         Err(e) => {
-            let message = format!("执行sql语句错误 {:?}", e);
             error!(
-                event = "DATABASE-ERROR",
-                path = "DbResource::new.get_db_table_size_byte",
-                message
+                event = "DatabaseMetricsQueryError",
+                operation = "query_table_sizes",
+                message = %database_error_diagnostics(&e),
             );
             vec![("error".to_string(), DbTableSizeInfo::default())]
                 .into_iter()
@@ -824,27 +841,29 @@ async fn get_db_library_size_byte(
     db_name: &str,
 ) -> String {
     let sql = "SELECT pg_database_size($1::text::name) AS db_size;";
-    if let Ok(result) = pool.query_opt(sql, &[&db_name]).await {
-        if let Some(row) = result {
+    match pool.query_opt(sql, &[&db_name]).await {
+        Ok(Some(row)) => {
             let r: i64 = row.get("db_size");
             r.to_string()
-        } else {
-            let message = format!("没有找到数据库的返回值 {}", sql);
+        }
+        Ok(None) => {
             warn!(
-                event = "DATABASE-WARNING",
-                path = "DbResource::new.get_db_library_size_byte",
-                message
+                event = "DatabaseMetricsEmptyResult",
+                operation = "query_database_size",
+                database = db_name,
+                "database size query returned no row"
             );
             "null".to_string()
         }
-    } else {
-        let message = format!("执行sql语句错误 {}", sql);
-        error!(
-            event = "DATABASE-ERROR",
-            path = "DbResource::new.get_db_library_size_byte",
-            message
-        );
-        "null".to_string()
+        Err(error_value) => {
+            error!(
+                event = "DatabaseMetricsQueryError",
+                operation = "query_database_size",
+                database = db_name,
+                message = %database_error_diagnostics(&error_value),
+            );
+            "null".to_string()
+        }
     }
 }
 
@@ -854,27 +873,27 @@ async fn get_db_conn(
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
 ) -> String {
-    if let Ok(result) = pool.query_opt(sql, params).await {
-        if let Some(row) = result {
+    match pool.query_opt(sql, params).await {
+        Ok(Some(row)) => {
             let r: i64 = row.get("db_conn");
             r.to_string()
-        } else {
-            let message = format!("没有找到数据库的返回值 {}", sql);
+        }
+        Ok(None) => {
             warn!(
-                event = "DATABASE-WARNING",
-                path = "DbResource::new.get_db_conn",
-                message
+                event = "DatabaseMetricsEmptyResult",
+                operation = "query_connection_count",
+                "database connection count query returned no row"
             );
             "null".to_string()
         }
-    } else {
-        let message = format!("执行sql语句错误 {}", sql);
-        error!(
-            event = "DATABASE-ERROR",
-            path = "DbResource::new.get_db_conn",
-            message
-        );
-        "null".to_string()
+        Err(error_value) => {
+            error!(
+                event = "DatabaseMetricsQueryError",
+                operation = "query_connection_count",
+                message = %database_error_diagnostics(&error_value),
+            );
+            "null".to_string()
+        }
     }
 }
 

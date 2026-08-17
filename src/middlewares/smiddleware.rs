@@ -12,8 +12,7 @@ use futures::future::LocalBoxFuture;
 use crate::admin::{UserSession, get_user_base_info};
 use crate::login::LoginToken;
 use crate::login::get_session_from_req;
-use crate::logs::write::info_logs;
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
@@ -98,7 +97,7 @@ where
             && ((frontend_page && frontend_page_available)
                 || path_list.iter().any(|prefix| path.starts_with(prefix)));
 
-        info!(
+        debug!(
             event = "received_requests",
             client_ip = &req
                 .connection_info()
@@ -138,10 +137,13 @@ where
                         )
                         .await;
                     }
-                    info_logs(
-                        req.request(),
-                        "InvalidSession",
-                        "未能从请求中获取到 Session",
+                    debug!(
+                        event = "InvalidSession",
+                        reason = "missing_session_cookie",
+                        method = %req.method(),
+                        path = req.path(),
+                        request_id = %request_id,
+                        "request rejected because no session cookie was provided",
                     );
                     let resp = unauthorized_response(frontend_page);
                     return Ok(req.into_response(resp).map_into_right_body());
@@ -201,10 +203,13 @@ where
                         &audit_event,
                     )
                     .await;
-                    info_logs(
-                        req.request(),
-                        "InvalidSession",
-                        "数据库中未找到符合条件的 Session",
+                    debug!(
+                        event = "InvalidSession",
+                        reason = "invalid_or_expired_session",
+                        method = %req.method(),
+                        path = req.path(),
+                        request_id = %request_id,
+                        "request rejected because the session is invalid or expired",
                     );
                     let resp = unauthorized_response(frontend_page);
                     Ok(req.into_response(resp).map_into_right_body())

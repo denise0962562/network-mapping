@@ -14,6 +14,8 @@ use futures::future::LocalBoxFuture;
 use serde_json::json;
 use tracing::warn;
 
+use super::hmiddleware::CONTENT_SECURITY_POLICY;
+
 const STALE_ENTRY_AGE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
@@ -109,10 +111,7 @@ where
                 .insert_header((header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
                 .insert_header((header::X_FRAME_OPTIONS, "DENY"))
                 .insert_header((header::STRICT_TRANSPORT_SECURITY, "max-age=315360000;"))
-                .insert_header((
-                    header::CONTENT_SECURITY_POLICY,
-                    "default-src 'self';style-src 'self' 'unsafe-inline';",
-                ))
+                .insert_header((header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY))
                 .json(body);
 
             return Box::pin(async move { Ok(req.into_response(response).map_into_right_body()) });

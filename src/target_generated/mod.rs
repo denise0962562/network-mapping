@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::admin::get_default_scan_profile_from_database;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
+use crate::build_scan_plan;
 use crate::config::AutomaticTargetConfig;
 
 const STRATEGY: &str = "sequential_subnet";
@@ -87,6 +89,7 @@ struct FamilyStatus {
 pub struct AutomaticTargetStatus {
     enabled: bool,
     strategy: String,
+    default_scan_profile: String,
     common_ports: String,
     repeat_after_seconds: u64,
     families: Vec<FamilyStatus>,
@@ -162,9 +165,14 @@ impl AutomaticTargetService {
         &self,
         pool: &Pool,
     ) -> Result<RefillReport, Box<dyn std::error::Error + Send + Sync>> {
+        let scan_profile = get_default_scan_profile_from_database(pool).await?;
+        let scan_plan = build_scan_plan(&scan_profile)
+            .map_err(|message| -> Box<dyn std::error::Error + Send + Sync> { message.into() })?;
         let mut report = RefillReport::default();
         for generator in &self.generators {
-            let family = self.refill_family(pool, generator).await?;
+            let family = self
+                .refill_family(pool, generator, &scan_profile, &scan_plan)
+                .await?;
             report.pending_before += family.pending_before;
             report.pending_after += family.pending_after;
             report.generated += family.generated;
@@ -180,6 +188,8 @@ impl AutomaticTargetService {
         &self,
         pool: &Pool,
         generator: &FamilyGenerator,
+        scan_profile: &str,
+        scan_plan: &Value,
     ) -> Result<FamilyRefillReport, Box<dyn std::error::Error + Send + Sync>> {
         let mut client = pool.get().await?;
         let transaction = client.transaction().await?;
@@ -205,7 +215,10 @@ impl AutomaticTargetService {
             0
         };
         let scanner_available: bool = transaction
-            .query_one(&ready_scanner_exists_query(generator.family), &[])
+            .query_one(
+                &ready_scanner_exists_query(generator.family),
+                &[&scan_profile],
+            )
             .await?
             .get("available");
         let pending_before: i64 = transaction
@@ -213,8 +226,8 @@ impl AutomaticTargetService {
                 "SELECT COUNT(*)::BIGINT AS count FROM scan_task_execution e \
                  JOIN scan_task t ON t.id = e.task_id \
                  WHERE t.task_source = 'automatic' AND t.address_family = $1 \
-                   AND e.execution_status = 'pending';",
-                &[&generator.family],
+                   AND t.scan_profile = $2 AND e.execution_status = 'pending';",
+                &[&generator.family, &scan_profile],
             )
             .await?
             .get("count");
@@ -257,8 +270,15 @@ impl AutomaticTargetService {
                 report.skipped_recent += 1;
                 continue;
             }
-            self.insert_task(&transaction, generator, &target, pending_before)
-                .await?;
+            self.insert_task(
+                &transaction,
+                generator,
+                &target,
+                pending_before,
+                scan_profile,
+                scan_plan,
+            )
+            .await?;
             report.generated += 1;
         }
         report.pending_after = pending_before + report.generated as i64;
@@ -280,6 +300,8 @@ impl AutomaticTargetService {
         generator: &FamilyGenerator,
         target: &GeneratedTarget,
         queue_depth_before: i64,
+        scan_profile: &str,
+        scan_plan: &Value,
     ) -> Result<(), tokio_postgres::Error> {
         let system_user_id: i32 = transaction
             .query_one("SELECT id FROM users WHERE role = 0 LIMIT 1;", &[])
@@ -293,16 +315,17 @@ impl AutomaticTargetService {
             "position": target.position.to_string(),
             "policy_hash": generator.policy_hash,
             "queue_depth_before": queue_depth_before,
+            "scan_profile": scan_profile,
         });
         let task_pk: i32 = transaction
             .query_one(
                 "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, \
                  task_level, remarks, dispatch_mode, task_source, generation_strategy, generation_key, \
-                 generation_metadata, address_family) \
+                 generation_metadata, address_family, scan_profile, scan_plan) \
                  VALUES ($1, $2, 'system', ARRAY[$3::text::inet], $4, $5, \
-                 '系统自动生成扫描任务', 'automatic', 'automatic', $6, $7, $8, $9) RETURNING id;",
+                 '系统自动生成扫描任务', 'automatic', 'automatic', $6, $7, $8, $9, $10, $11) RETURNING id;",
                 &[&system_user_id, &task_id, &target.cidr, &self.policy.common_ports, &self.policy.priority,
-                  &STRATEGY, &target.generation_key, &metadata, &generator.family],
+                  &STRATEGY, &target.generation_key, &metadata, &generator.family, &scan_profile, &scan_plan],
             )
             .await?
             .get("id");
@@ -320,6 +343,7 @@ impl AutomaticTargetService {
             target,
             &self.policy.common_ports,
             queue_depth_before,
+            scan_profile,
         );
         write_audit(transaction, &system_audit_context(), &event).await
     }
@@ -328,6 +352,7 @@ impl AutomaticTargetService {
         &self,
         pool: &Pool,
     ) -> Result<AutomaticTargetStatus, Box<dyn std::error::Error + Send + Sync>> {
+        let scan_profile = get_default_scan_profile_from_database(pool).await?;
         let client = pool.get().await?;
         let mut families = Vec::new();
         for generator in &self.generators {
@@ -336,12 +361,16 @@ impl AutomaticTargetService {
                     "SELECT COUNT(*) FILTER (WHERE e.execution_status = 'pending')::BIGINT AS pending, \
                      COUNT(*) FILTER (WHERE e.execution_status = 'running')::BIGINT AS running \
                      FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
-                     WHERE t.task_source = 'automatic' AND t.address_family = $1;",
-                    &[&generator.family],
+                     WHERE t.task_source = 'automatic' AND t.address_family = $1 \
+                       AND t.scan_profile = $2;",
+                    &[&generator.family, &scan_profile],
                 )
                 .await?;
             let ready_scanners: i64 = client
-                .query_one(&ready_scanner_count_query(generator.family), &[])
+                .query_one(
+                    &ready_scanner_count_query(generator.family),
+                    &[&scan_profile],
+                )
                 .await?
                 .get("count");
             let state = client
@@ -374,6 +403,7 @@ impl AutomaticTargetService {
         Ok(AutomaticTargetStatus {
             enabled: self.enabled(),
             strategy: self.policy.strategy.clone(),
+            default_scan_profile: scan_profile,
             common_ports: self.policy.common_ports.clone(),
             repeat_after_seconds: self.policy.repeat_after_seconds,
             families,
@@ -403,20 +433,38 @@ pub async fn run_generator(service: AutomaticTargetService, pool: Pool) {
     }
     let mut ticker =
         tokio::time::interval(std::time::Duration::from_secs(service.interval_seconds()));
+    let mut previous_scanner_available = None;
     loop {
         ticker.tick().await;
         match service.refill(&pool).await {
-            Ok(report) if report.generated > 0 => info!(
-                target: "server::automatic_target",
-                generated = report.generated,
-                pending = report.pending_after,
-                "自动目标队列已补充"
-            ),
-            Ok(report) if !report.scanner_available => info!(
-                target: "server::automatic_target",
-                "没有协议匹配且在线的扫描器，暂停生成自动任务"
-            ),
-            Ok(_) => {}
+            Ok(report) => {
+                if previous_scanner_available == Some(false) && report.scanner_available {
+                    info!(
+                        target: "server::automatic_target",
+                        event = "AutomaticTargetScannerAvailable",
+                        "检测到兼容且在线的扫描器，恢复自动任务生成"
+                    );
+                } else if previous_scanner_available != Some(false) && !report.scanner_available {
+                    info!(
+                        target: "server::automatic_target",
+                        event = "AutomaticTargetScannerUnavailable",
+                        "没有兼容且在线的扫描器，暂停自动任务生成"
+                    );
+                }
+                previous_scanner_available = Some(report.scanner_available);
+                if report.generated > 0 {
+                    info!(
+                        target: "server::automatic_target",
+                        event = "AutomaticTargetQueueRefilled",
+                        generated = report.generated,
+                        pending_before = report.pending_before,
+                        pending_after = report.pending_after,
+                        skipped_recent = report.skipped_recent,
+                        skipped_excluded = report.skipped_excluded,
+                        "自动目标队列已补充"
+                    );
+                }
+            }
             Err(error_value) => {
                 service.record_error(&pool, &error_value.to_string()).await;
                 error!(target: "server::automatic_target", event = "AutomaticTargetRefillError", message = %error_value);
@@ -553,14 +601,16 @@ fn is_excluded(generator: &FamilyGenerator, cidr: &str) -> bool {
 fn ready_scanner_exists_query(family: &str) -> String {
     format!(
         "SELECT EXISTS(SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
-        AND last_seen_at >= NOW() - INTERVAL '90 seconds' AND supports_{family} AND {family}_ready) AS available;"
+        AND last_seen_at >= NOW() - INTERVAL '90 seconds' AND supports_{family} AND {family}_ready \
+        AND ($1 = 'legacy' OR scan_capabilities->'profiles' ? $1)) AS available;"
     )
 }
 
 fn ready_scanner_count_query(family: &str) -> String {
     format!(
         "SELECT COUNT(*)::BIGINT AS count FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
-        AND last_seen_at >= NOW() - INTERVAL '90 seconds' AND supports_{family} AND {family}_ready;"
+        AND last_seen_at >= NOW() - INTERVAL '90 seconds' AND supports_{family} AND {family}_ready \
+        AND ($1 = 'legacy' OR scan_capabilities->'profiles' ? $1);"
     )
 }
 
@@ -626,6 +676,7 @@ fn generated_target_audit_event(
     target: &GeneratedTarget,
     common_ports: &str,
     queue_depth_before: i64,
+    scan_profile: &str,
 ) -> AuditEvent {
     let mut event = AuditEvent::anonymous("automatic_target", "task.auto_generate", "success")
         .resource("task", task_id);
@@ -641,6 +692,7 @@ fn generated_target_audit_event(
         "ports": common_ports,
         "policy_hash": generator.policy_hash,
         "queue_depth_before": queue_depth_before,
+        "scan_profile": scan_profile,
     });
     event
 }
@@ -758,6 +810,7 @@ mod tests {
             &target,
             "80,443",
             3,
+            "service_inventory",
         );
 
         assert_eq!(event.category, "automatic_target");
@@ -766,5 +819,6 @@ mod tests {
         assert_eq!(event.resource_type.as_deref(), Some("task"));
         assert_eq!(event.resource_id.as_deref(), Some("0198-test-task"));
         assert_eq!(event.metadata["target"], "10.0.0.0/24");
+        assert_eq!(event.metadata["scan_profile"], "service_inventory");
     }
 }

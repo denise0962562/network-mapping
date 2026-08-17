@@ -1,7 +1,7 @@
-use crate::admin::UserBaseI;
+use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::AuditContext;
 use crate::config::SecurityConfig;
-use crate::logs::write::{error_logs, info_logs};
+use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
@@ -167,23 +167,6 @@ fn bearer_token(req: &HttpRequest) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-fn database_error_diagnostics(error: &tokio_postgres::Error) -> String {
-    let Some(database_error) = error.as_db_error() else {
-        return format!("{error:?}");
-    };
-
-    format!(
-        "sqlstate={} message={} detail={} hint={} table={} column={} constraint={}",
-        database_error.code().code(),
-        database_error.message(),
-        database_error.detail().unwrap_or("-"),
-        database_error.hint().unwrap_or("-"),
-        database_error.table().unwrap_or("-"),
-        database_error.column().unwrap_or("-"),
-        database_error.constraint().unwrap_or("-"),
-    )
-}
-
 #[derive(Deserialize)]
 pub struct TaskDetailQuery {
     page: Option<i64>,
@@ -247,21 +230,39 @@ pub(crate) async fn scanner_heartbeat_handler(
             ApplyTaskError::ScannerUnauthorized => {
                 HttpResponse::Unauthorized().body("unauthorized")
             }
-            _ => HttpResponse::InternalServerError().finish(),
+            error => {
+                error_logs_error(
+                    &req,
+                    "ScannerHeartbeatCredentialCheckError",
+                    "validate_scanner_credentials",
+                    &error,
+                );
+                HttpResponse::InternalServerError().finish()
+            }
         };
     }
 
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
-            error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+            error_logs_error(
+                &req,
+                "ScannerHeartbeatPoolError",
+                "acquire_connection",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
     let transaction = match connection.transaction().await {
         Ok(transaction) => transaction,
         Err(error) => {
-            error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+            error_logs_error(
+                &req,
+                "ScannerHeartbeatTransactionError",
+                "begin_transaction",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -329,7 +330,12 @@ pub(crate) async fn scanner_heartbeat_handler(
         )
         .await;
     if let Err(error) = update {
-        error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+        error_logs_error(
+            &req,
+            "ScannerHeartbeatUpdateError",
+            "update_scanner_state",
+            &error,
+        );
         return HttpResponse::InternalServerError().finish();
     }
     let mut lease = None;
@@ -346,7 +352,7 @@ pub(crate) async fn scanner_heartbeat_handler(
             .await
         {
             Err(error) => {
-                error_logs(&req, "ScannerLeaseRenewError", &error.to_string());
+                error_logs_error(&req, "ScannerLeaseRenewError", "renew_task_lease", &error);
                 return HttpResponse::InternalServerError().finish();
             }
             Ok(row) => row,
@@ -370,7 +376,12 @@ pub(crate) async fn scanner_heartbeat_handler(
                 Ok(Some(_)) => cancel_task_id = Some(task_id),
                 Ok(None) => {}
                 Err(error) => {
-                    error_logs(&req, "ScannerCancelCommandError", &error.to_string());
+                    error_logs_error(
+                        &req,
+                        "ScannerCancelCommandError",
+                        "read_cancel_command",
+                        &error,
+                    );
                     return HttpResponse::InternalServerError().finish();
                 }
             }
@@ -384,7 +395,12 @@ pub(crate) async fn scanner_heartbeat_handler(
         }
     }
     if let Err(error) = transaction.commit().await {
-        error_logs(&req, "ScannerHeartbeatDatabaseError", &error.to_string());
+        error_logs_error(
+            &req,
+            "ScannerHeartbeatCommitError",
+            "commit_heartbeat",
+            &error,
+        );
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(ScannerHeartbeatResponse {
@@ -407,21 +423,37 @@ pub(crate) async fn scanner_task_failure_handler(
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
-    if validate_scanner_credentials(
+    match validate_scanner_credentials(
         pool.get_ref(),
         failure.scanner_id,
         token,
         &security.scanner_token_pepper,
     )
     .await
-    .is_err()
     {
-        return HttpResponse::Unauthorized().body("unauthorized");
+        Ok(()) => {}
+        Err(ApplyTaskError::ScannerUnauthorized) => {
+            return HttpResponse::Unauthorized().body("unauthorized");
+        }
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerTaskFailureCredentialCheckError",
+                "validate_scanner_credentials",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     }
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
-            error_logs(&req, "ScannerTaskFailureDatabaseError", &error.to_string());
+            error_logs_error(
+                &req,
+                "ScannerTaskFailurePoolError",
+                "acquire_connection",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -432,7 +464,12 @@ pub(crate) async fn scanner_task_failure_handler(
     let transaction = match connection.transaction().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "ScannerTaskFailureDatabaseError", &error.to_string());
+            error_logs_error(
+                &req,
+                "ScannerTaskFailureTransactionError",
+                "begin_transaction",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -471,15 +508,21 @@ pub(crate) async fn scanner_task_failure_handler(
                 );
             }
             if let Err(error) = crate::refresh_task_aggregate(&transaction, task_db_id).await {
-                error_logs(
+                error_logs_error(
                     &req,
-                    "ScannerTaskFailureDatabaseError",
-                    &database_error_diagnostics(&error),
+                    "ScannerTaskFailureAggregateError",
+                    "refresh_task_aggregate",
+                    &error,
                 );
                 return HttpResponse::InternalServerError().finish();
             }
             if let Err(error) = transaction.commit().await {
-                error_logs(&req, "ScannerTaskFailureDatabaseError", &error.to_string());
+                error_logs_error(
+                    &req,
+                    "ScannerTaskFailureCommitError",
+                    "commit_task_failure",
+                    &error,
+                );
                 return HttpResponse::InternalServerError().finish();
             }
             HttpResponse::Ok().json(serde_json::json!({
@@ -490,10 +533,11 @@ pub(crate) async fn scanner_task_failure_handler(
         }
         Ok(_) => HttpResponse::Conflict().body("task is not owned by scanner"),
         Err(error) => {
-            error_logs(
+            error_logs_error(
                 &req,
-                "ScannerTaskFailureDatabaseError",
-                &database_error_diagnostics(&error),
+                "ScannerTaskFailureUpdateError",
+                "record_task_failure",
+                &error,
             );
             HttpResponse::InternalServerError().finish()
         }
@@ -510,31 +554,51 @@ pub(crate) async fn scanner_task_cancelled_handler(
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
-    if validate_scanner_credentials(
+    match validate_scanner_credentials(
         pool.get_ref(),
         cancelled.scanner_id,
         token,
         &security.scanner_token_pepper,
     )
     .await
-    .is_err()
     {
-        return HttpResponse::Unauthorized().body("unauthorized");
+        Ok(()) => {}
+        Err(ApplyTaskError::ScannerUnauthorized) => {
+            return HttpResponse::Unauthorized().body("unauthorized");
+        }
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerTaskCancelledCredentialCheckError",
+                "validate_scanner_credentials",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     }
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
-            error_logs(
+            error_logs_error(
                 &req,
-                "ScannerTaskCancelledDatabaseError",
-                &error.to_string(),
+                "ScannerTaskCancelledPoolError",
+                "acquire_connection",
+                &error,
             );
             return HttpResponse::InternalServerError().finish();
         }
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerTaskCancelledTransactionError",
+                "begin_transaction",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let changed = transaction
         .query(
@@ -547,21 +611,35 @@ pub(crate) async fn scanner_task_cancelled_handler(
         .await;
     match changed {
         Ok(rows) if !rows.is_empty() => {
-            if crate::refresh_task_aggregate(&transaction, rows[0].get("task_id"))
-                .await
-                .is_err()
-                || transaction.commit().await.is_err()
+            if let Err(error) =
+                crate::refresh_task_aggregate(&transaction, rows[0].get("task_id")).await
             {
+                error_logs_error(
+                    &req,
+                    "ScannerTaskCancelledAggregateError",
+                    "refresh_task_aggregate",
+                    &error,
+                );
+                return HttpResponse::InternalServerError().finish();
+            }
+            if let Err(error) = transaction.commit().await {
+                error_logs_error(
+                    &req,
+                    "ScannerTaskCancelledCommitError",
+                    "commit_task_cancellation",
+                    &error,
+                );
                 return HttpResponse::InternalServerError().finish();
             }
             HttpResponse::Ok().json(serde_json::json!({"success": true}))
         }
         Ok(_) => HttpResponse::Conflict().body("task cancellation was not requested"),
         Err(error) => {
-            error_logs(
+            error_logs_error(
                 &req,
-                "ScannerTaskCancelledDatabaseError",
-                &error.to_string(),
+                "ScannerTaskCancelledUpdateError",
+                "mark_task_cancelled",
+                &error,
             );
             HttpResponse::InternalServerError().finish()
         }
@@ -830,7 +908,28 @@ async fn create_task(
                 .json(serde_json::json!({"success": false, "message": message}));
         }
     };
-    let scan_profile = create_data.scan_profile.trim().to_lowercase();
+    let scan_profile = match create_data
+        .scan_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+    {
+        Some(profile) => profile.to_lowercase(),
+        None => match get_default_scan_profile_from_database(database_conn).await {
+            Ok(profile) => profile,
+            Err(error_value) => {
+                error_logs(
+                    &req,
+                    "ReadDefaultScanProfileError",
+                    &error_value.to_string(),
+                );
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "success": false,
+                    "message": "默认扫描模式暂时无法读取"
+                }));
+            }
+        },
+    };
     let scan_plan = match build_scan_plan(&scan_profile) {
         Ok(plan) => plan,
         Err(message) => {
@@ -948,7 +1047,12 @@ async fn apply_task_handler(
             }
             Err(ApplyTaskError::NoTask) => HttpResponse::NotFound().finish(),
             Err(ApplyTaskError::Database(e)) => {
-                error_logs(&req, "ScannerCredentialCheckError", &e.to_string());
+                error_logs_error(
+                    &req,
+                    "ScannerCredentialCheckError",
+                    "validate_scanner_credentials",
+                    e.as_ref(),
+                );
                 HttpResponse::InternalServerError().finish()
             }
         };
@@ -970,7 +1074,12 @@ async fn apply_task_handler(
             .content_type(TEXT_HTML_UTF_8)
             .body("没有可领取的任务"),
         Err(ApplyTaskError::Database(e)) => {
-            error_logs(&req, "ApplyTaskError", &e.to_string());
+            error_logs_error(
+                &req,
+                "ApplyTaskDatabaseError",
+                "claim_scan_task",
+                e.as_ref(),
+            );
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -1009,7 +1118,7 @@ async fn upload_scanner_result_handler(
             "saved": saved,
         })),
         Err(e) => {
-            error_logs(&req, "SaveScannerResultError", &e.to_string());
+            error_logs_error(&req, "SaveScannerResultError", "persist_scan_results", &e);
             match e {
                 SaveScannerResultsError::InvalidIp { .. } => {
                     HttpResponse::BadRequest().body("invalid ip")
