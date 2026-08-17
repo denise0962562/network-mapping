@@ -482,7 +482,8 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
     use super::{
-        STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan, parse_ip_or_cidr,
+        CreateTask, STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan,
+        parse_ip_or_cidr,
     };
 
     #[test]
@@ -539,6 +540,19 @@ mod parse_ip_or_cidr_tests {
         let inventory = build_scan_plan("service_inventory").unwrap();
         assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
         assert!(build_scan_plan("arbitrary_command").is_err());
+    }
+
+    #[test]
+    fn create_task_may_defer_scan_profile_to_system_settings() {
+        let task: CreateTask = serde_json::from_value(serde_json::json!({
+            "ip": "192.0.2.1",
+            "port": "443",
+            "level": 1,
+            "remark": null
+        }))
+        .unwrap();
+
+        assert!(task.scan_profile.is_none());
     }
 
     #[test]
@@ -631,16 +645,12 @@ pub struct CreateTask {
     pub dispatch_mode: String,
     #[serde(default)]
     pub scanner_ids: Vec<Uuid>,
-    #[serde(default = "default_scan_profile")]
-    pub scan_profile: String,
+    #[serde(default)]
+    pub scan_profile: Option<String>,
 }
 
 fn default_dispatch_mode() -> String {
     "automatic".into()
-}
-
-fn default_scan_profile() -> String {
-    "legacy".into()
 }
 
 pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {

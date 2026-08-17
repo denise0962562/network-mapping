@@ -6,13 +6,14 @@ use tracing::error;
 use crate::TEXT_HTML_UTF_8;
 use crate::admin::{
     UserBaseI, UserSession, get_config_from_database, get_mail_sender_key_from_database,
-    get_mail_settings_from_database, get_session_settings_from_database, try_send_email,
-    write_mail_settings_to_database, write_session_settings_to_database,
+    get_mail_settings_from_database, get_scan_settings_from_database,
+    get_session_settings_from_database, try_send_email, write_mail_settings_to_database,
+    write_scan_settings_to_database, write_session_settings_to_database,
 };
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::config::{
-    DatabaseConfig, EmailConfig, GetConfig, MailSettingsRequest, MailTestRequest, ServerConfig,
-    SessionSettingsRequest, session_ttl_seconds_from_minutes,
+    DatabaseConfig, EmailConfig, GetConfig, MailSettingsRequest, MailTestRequest,
+    ScanSettingsRequest, ServerConfig, SessionSettingsRequest, session_ttl_seconds_from_minutes,
 };
 use crate::{FrontEndErrorInfo, TemplatesInit, front_end_error_page, logs::write::info_logs};
 
@@ -304,6 +305,104 @@ async fn save_session_settings_h(
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
                 "message": "会话策略保存失败"
+            }))
+        }
+    }
+}
+
+#[get("/api/config/scan")]
+async fn get_scan_settings_h(
+    pool: web::Data<deadpool_postgres::Pool>,
+    _user_base_i: UserBaseI,
+) -> impl Responder {
+    match get_scan_settings_from_database(pool.get_ref()).await {
+        Ok(settings) => HttpResponse::Ok().json(json!({
+            "success": true,
+            "data": settings
+        })),
+        Err(error_value) => {
+            error!(
+                event = "GetScanSettingsError",
+                path = "fn get_scan_settings_h",
+                message = %error_value
+            );
+            HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "扫描设置暂时无法读取"
+            }))
+        }
+    }
+}
+
+#[post("/api/config/scan")]
+async fn save_scan_settings_h(
+    req: HttpRequest,
+    settings: web::Json<ScanSettingsRequest>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    user_base_i: UserBaseI,
+) -> impl Responder {
+    if user_base_i.role != 1 {
+        let mut audit_event = AuditEvent::user(
+            "configuration",
+            "configuration.scan_settings_update",
+            "failure",
+            &user_base_i,
+        );
+        audit_event.response_status = Some(403);
+        audit_event.reason_code = Some("insufficient_role".to_owned());
+        write_standalone(
+            pool.get_ref(),
+            &AuditContext::from_request(&req),
+            &audit_event,
+        )
+        .await;
+        return HttpResponse::Forbidden().json(json!({
+            "success": false,
+            "message": "仅管理员可以修改扫描设置"
+        }));
+    }
+    let requested_profile = settings.default_scan_profile.trim().to_lowercase();
+    if crate::build_scan_plan(&requested_profile).is_err() {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": "不支持的默认扫描模式"
+        }));
+    }
+
+    match write_scan_settings_to_database(pool.get_ref(), &settings).await {
+        Ok(saved_settings) => {
+            let mut audit_event = AuditEvent::user(
+                "configuration",
+                "configuration.scan_settings_update",
+                "success",
+                &user_base_i,
+            )
+            .resource("setting", "scan.default_profile");
+            audit_event.response_status = Some(200);
+            audit_event.changes = Some(json!({
+                "default_scan_profile": saved_settings.default_scan_profile
+            }));
+            write_standalone(
+                pool.get_ref(),
+                &AuditContext::from_request(&req),
+                &audit_event,
+            )
+            .await;
+            HttpResponse::Ok().json(json!({
+                "success": true,
+                "message": "扫描设置已保存",
+                "data": saved_settings
+            }))
+        }
+        Err(error_value) => {
+            error!(
+                event = "SaveScanSettingsError",
+                path = "fn save_scan_settings_h",
+                message = %error_value
+            );
+            HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": "扫描设置保存失败"
             }))
         }
     }

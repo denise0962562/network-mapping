@@ -546,6 +546,18 @@ pub const MAX_SESSION_TTL_MINUTES: i32 = 24 * 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ScanSettingsRequest {
+    pub default_scan_profile: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanSettingsResponse {
+    pub default_scan_profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionSettingsRequest {
     pub session_ttl_minutes: i32,
     #[serde(default)]
@@ -861,6 +873,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(utils::save_mail_settings_h)
         .service(utils::get_session_settings_h)
         .service(utils::save_session_settings_h)
+        .service(utils::get_scan_settings_h)
+        .service(utils::save_scan_settings_h)
         .service(utils::test_mail_server_h);
 
     #[cfg(feature = "rir")]

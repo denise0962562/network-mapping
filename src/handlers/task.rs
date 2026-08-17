@@ -1,4 +1,4 @@
-use crate::admin::UserBaseI;
+use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::AuditContext;
 use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, info_logs};
@@ -830,7 +830,28 @@ async fn create_task(
                 .json(serde_json::json!({"success": false, "message": message}));
         }
     };
-    let scan_profile = create_data.scan_profile.trim().to_lowercase();
+    let scan_profile = match create_data
+        .scan_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+    {
+        Some(profile) => profile.to_lowercase(),
+        None => match get_default_scan_profile_from_database(database_conn).await {
+            Ok(profile) => profile,
+            Err(error_value) => {
+                error_logs(
+                    &req,
+                    "ReadDefaultScanProfileError",
+                    &error_value.to_string(),
+                );
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "success": false,
+                    "message": "默认扫描模式暂时无法读取"
+                }));
+            }
+        },
+    };
     let scan_plan = match build_scan_plan(&scan_profile) {
         Ok(plan) => plan,
         Err(message) => {

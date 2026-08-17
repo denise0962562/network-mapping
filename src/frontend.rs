@@ -18,6 +18,7 @@ const SPA_ROUTES: &[&str] = &[
     "/open-source",
     "/testpage",
     "/setting",
+    "/setting/scan",
     "/setting/mail-templates",
     "/user/info",
     "/user/security",
