@@ -6,7 +6,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::admin::UserBaseI;
-use crate::logs::write::error_logs;
+use crate::logs::write::{database_error_diagnostics, error_logs};
 
 const DEFAULT_RANGE_MINUTES: i64 = 30;
 const MAX_RANGE_DAYS: i64 = 30;
@@ -313,23 +313,6 @@ fn rounded(value: Option<f64>) -> Option<f64> {
 
 fn bad_request(message: &'static str) -> HttpResponse {
     HttpResponse::BadRequest().json(json!({"success": false, "message": message}))
-}
-
-fn database_error_diagnostics(error: &tokio_postgres::Error) -> String {
-    let Some(database_error) = error.as_db_error() else {
-        return format!("{error:?}");
-    };
-
-    format!(
-        "sqlstate={} message={} detail={} hint={} table={} column={} constraint={}",
-        database_error.code().code(),
-        database_error.message(),
-        database_error.detail().unwrap_or("-"),
-        database_error.hint().unwrap_or("-"),
-        database_error.table().unwrap_or("-"),
-        database_error.column().unwrap_or("-"),
-        database_error.constraint().unwrap_or("-"),
-    )
 }
 
 fn table_sizes_from_json(value: serde_json::Value) -> BTreeMap<String, DatabaseTableSize> {

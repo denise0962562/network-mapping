@@ -5,10 +5,13 @@ use std::io;
 use tokio::time::{Duration, Instant, interval_at};
 use tracing::{error, info};
 
-use network_mapping_server::admin::{check_default_admin_user, check_system_user, reset_admin_password};
+use network_mapping_server::admin::{
+    check_default_admin_user, check_system_user, reset_admin_password,
+};
 use network_mapping_server::audit::RequestId;
 use network_mapping_server::config::{Clis, SelfChecking};
 use network_mapping_server::frontend::{self, FrontendAssets};
+use network_mapping_server::logs::write::error_chain_diagnostics;
 use network_mapping_server::logs::{self, LogRollingMode};
 use network_mapping_server::maxmind::MaxMindState;
 use network_mapping_server::middlewares::{
@@ -191,11 +194,11 @@ async fn main() -> io::Result<()> {
             match insert_system_status(&db_pool, database_c.db_name.clone(), sys.clone()).await {
                 Ok(_) => (),
                 Err(e) => {
-                    let message = format!("插入系统状态错误: {}", e);
                     error!(
-                        event = "INSERTSystemStatusError",
-                        path = "fn insert_system_status",
-                        message
+                        event = "SystemStatusInsertError",
+                        operation = "insert_system_status",
+                        retry_interval_seconds = log.status_duration,
+                        message = %error_chain_diagnostics(e.as_ref()),
                     )
                 }
             };

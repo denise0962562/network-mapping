@@ -433,20 +433,38 @@ pub async fn run_generator(service: AutomaticTargetService, pool: Pool) {
     }
     let mut ticker =
         tokio::time::interval(std::time::Duration::from_secs(service.interval_seconds()));
+    let mut previous_scanner_available = None;
     loop {
         ticker.tick().await;
         match service.refill(&pool).await {
-            Ok(report) if report.generated > 0 => info!(
-                target: "server::automatic_target",
-                generated = report.generated,
-                pending = report.pending_after,
-                "自动目标队列已补充"
-            ),
-            Ok(report) if !report.scanner_available => info!(
-                target: "server::automatic_target",
-                "没有协议匹配且在线的扫描器，暂停生成自动任务"
-            ),
-            Ok(_) => {}
+            Ok(report) => {
+                if previous_scanner_available == Some(false) && report.scanner_available {
+                    info!(
+                        target: "server::automatic_target",
+                        event = "AutomaticTargetScannerAvailable",
+                        "检测到兼容且在线的扫描器，恢复自动任务生成"
+                    );
+                } else if previous_scanner_available != Some(false) && !report.scanner_available {
+                    info!(
+                        target: "server::automatic_target",
+                        event = "AutomaticTargetScannerUnavailable",
+                        "没有兼容且在线的扫描器，暂停自动任务生成"
+                    );
+                }
+                previous_scanner_available = Some(report.scanner_available);
+                if report.generated > 0 {
+                    info!(
+                        target: "server::automatic_target",
+                        event = "AutomaticTargetQueueRefilled",
+                        generated = report.generated,
+                        pending_before = report.pending_before,
+                        pending_after = report.pending_after,
+                        skipped_recent = report.skipped_recent,
+                        skipped_excluded = report.skipped_excluded,
+                        "自动目标队列已补充"
+                    );
+                }
+            }
             Err(error_value) => {
                 service.record_error(&pool, &error_value.to_string()).await;
                 error!(target: "server::automatic_target", event = "AutomaticTargetRefillError", message = %error_value);
