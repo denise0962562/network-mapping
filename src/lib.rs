@@ -1353,6 +1353,84 @@ where
     SaveScannerResultsError::Database(Box::new(value))
 }
 
+/// PostgreSQL 的 text/jsonb 类型不接受 NUL 字节，写入会报
+/// 22P05 unsupported Unicode escape sequence。zgrab2 抓取的服务数据
+/// （banner、响应体等）常含 NUL，写库前必须剔除。
+fn sanitize_text(value: &str) -> String {
+    if value.contains('\0') {
+        value.replace('\0', "")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn sanitize_json_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(sanitize_text(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(sanitize_json_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (sanitize_text(&key), sanitize_json_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn sanitize_result_item(item: ScannerResultItem) -> ScannerResultItem {
+    ScannerResultItem {
+        protocol: item.protocol.map(|value| sanitize_text(&value)),
+        service: item.service.map(|value| sanitize_text(&value)),
+        banner: item.banner.map(|value| sanitize_text(&value)),
+        other: item.other.map(sanitize_json_value),
+        ..item
+    }
+}
+
+#[cfg(test)]
+mod sanitize_nul_tests {
+    use super::{ScannerResultItem, sanitize_json_value, sanitize_result_item, sanitize_text};
+
+    #[test]
+    fn strips_nul_from_plain_text() {
+        assert_eq!(sanitize_text("a\u{0}b\u{0}c"), "abc");
+        assert_eq!(sanitize_text("no nul"), "no nul");
+    }
+
+    #[test]
+    fn strips_nul_from_nested_json_values() {
+        let value = serde_json::json!({
+            "module": "http\u{0}",
+            "data": {
+                "response": {"body": "bin\u{0}ary"},
+                "tags": ["a\u{0}", "b"],
+            }
+        });
+        let sanitized = sanitize_json_value(value);
+        assert_eq!(sanitized["module"], "http");
+        assert_eq!(sanitized["data"]["response"]["body"], "binary");
+        assert_eq!(sanitized["data"]["tags"][0], "a");
+        assert_eq!(sanitized["data"]["tags"][1], "b");
+    }
+
+    #[test]
+    fn strips_nul_from_result_item() {
+        let item = ScannerResultItem {
+            ip: "192.0.2.1".into(),
+            port: 80,
+            protocol: Some("tcp\u{0}".into()),
+            service: Some("http\u{0}".into()),
+            banner: Some("banner\u{0}".into()),
+            other: Some(serde_json::json!({"data": "x\u{0}y"})),
+        };
+        let sanitized = sanitize_result_item(item);
+        assert_eq!(sanitized.protocol.as_deref(), Some("tcp"));
+        assert_eq!(sanitized.service.as_deref(), Some("http"));
+        assert_eq!(sanitized.banner.as_deref(), Some("banner"));
+        assert_eq!(sanitized.other.unwrap()["data"], "xy");
+    }
+}
+
 pub async fn save_scanner_results(
     pool: &deadpool_postgres::Pool,
     maxmind: &MaxMindState,
@@ -1428,9 +1506,15 @@ pub async fn save_scanner_results(
                     })),
                 },
             })
+            .map(sanitize_result_item)
             .collect()
     } else {
-        upload.results.clone()
+        upload
+            .results
+            .iter()
+            .cloned()
+            .map(sanitize_result_item)
+            .collect()
     };
     let mut mirror_results = vec![true; normalized_results.len()];
 
@@ -1553,12 +1637,17 @@ pub async fn save_scanner_results(
                     data.clone(),
                 ),
             };
+            let protocol = sanitize_text(protocol);
+            let source = sanitize_text(source);
+            let service = service.map(sanitize_text);
+            let banner = banner.map(sanitize_text);
+            let data = data.map(sanitize_json_value);
             if protocol.is_empty()
                 || protocol.len() > 16
                 || source.is_empty()
                 || source.len() > 64
-                || service.is_some_and(|value| value.len() > 128)
-                || banner.is_some_and(|value| value.len() > 4096)
+                || service.as_ref().is_some_and(|value| value.len() > 128)
+                || banner.as_ref().is_some_and(|value| value.len() > 4096)
                 || (kind == "port"
                     && data.as_ref().and_then(|value| value["state"].as_str()) != Some("open"))
                 || data
