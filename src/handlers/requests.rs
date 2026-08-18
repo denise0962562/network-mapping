@@ -7,6 +7,7 @@ use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::admin::UserBaseI;
+use crate::handlers::system_resources::{Granularity, MAX_BUCKETS};
 use crate::logs::write::error_logs;
 
 /// 请求日志查询过滤。`$9` 为「仅看错误」开关：开启时过滤 `error_level <> 'ok'`。
@@ -49,6 +50,8 @@ pub struct RequestSummaryQuery {
     only_errors: Option<bool>,
     /// 预设延迟窗口：`1h` / `24h` / `7d`；提供时覆盖任意 start/end 并启用 P95/P99。
     window: Option<String>,
+    /// 趋势分桶粒度：`auto` / `1m` / `5m` / `15m` / `30m` / `1h` / `2h` / `6h`。
+    granularity: Option<String>,
 }
 
 fn is_admin(user: &UserBaseI) -> bool {
@@ -149,20 +152,26 @@ fn window_range(window: Option<&str>) -> Option<(DateTime<Utc>, DateTime<Utc>)> 
     }
 }
 
-fn trend_bucket(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> &'static str {
-    match (start, end) {
-        (Some(start), Some(end)) => {
-            let span_seconds = (end - start).num_seconds();
-            if span_seconds <= 2 * 3600 {
-                "minute"
-            } else if span_seconds <= 2 * 24 * 3600 {
-                "hour"
-            } else {
-                "day"
-            }
-        }
-        _ => "hour",
+fn resolve_granularity(
+    granularity: &Option<String>,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+) -> Result<Granularity, &'static str> {
+    // 无界范围（「全部时间」）按保留期上限 30 天估算跨度，仅用于控制分桶数量。
+    let duration = match (start, end) {
+        (Some(start), Some(end)) if end > start => end - start,
+        _ => chrono::Duration::days(30),
+    };
+    let resolved = match granularity.as_deref().unwrap_or("auto") {
+        "auto" => Granularity::auto_for_request(duration),
+        value => Granularity::parse(value)?,
+    };
+    let seconds = resolved.seconds();
+    let bucket_count = (duration.num_seconds().max(1) + seconds - 1) / seconds;
+    if bucket_count > MAX_BUCKETS {
+        return Err("selected granularity produces more than 1500 data points");
     }
+    Ok(resolved)
 }
 
 fn row_to_value(row: tokio_postgres::Row) -> Value {
@@ -256,6 +265,15 @@ pub(crate) async fn request_summary(
         None => (query.start, query.end),
     };
 
+    // 趋势分桶粒度：auto 按跨度自适应，固定档校验桶数上限。
+    let granularity = match resolve_granularity(&query.granularity, start, end) {
+        Ok(granularity) => granularity,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
+        }
+    };
+    let bucket_seconds = granularity.seconds();
+
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
@@ -310,16 +328,43 @@ pub(crate) async fn request_summary(
         }
     };
 
-    // 趋势（date_trunc 分桶），桶粒度随窗口跨度自适应。
-    let bucket = trend_bucket(start, end);
-    let trend_sql = format!(
-        "SELECT date_trunc($10::text, occurred_at) AS bucket, COUNT(*) AS total, \
-                COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
-                COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
-         FROM request_log {FILTER_SQL} GROUP BY bucket ORDER BY bucket"
-    );
+    // 趋势（epoch 算术分桶），粒度由 granularity 决定。
+    // 有界范围用 generate_series 补齐空桶，保证时间轴连续；无界（全部时间）退化为稀疏分桶。
+    let trend_sql = if start.is_some() && end.is_some() {
+        format!(
+            "WITH bucket_range AS ( \
+                 SELECT generate_series( \
+                     (EXTRACT(EPOCH FROM $7::TIMESTAMPTZ)::BIGINT / $10::BIGINT) * $10::BIGINT, \
+                     ((EXTRACT(EPOCH FROM $8::TIMESTAMPTZ)::BIGINT - 1) / $10::BIGINT) * $10::BIGINT, \
+                     $10::BIGINT)::BIGINT AS bucket_start \
+             ), aggregated AS ( \
+                 SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                        COUNT(*) AS total, \
+                        COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
+                        COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
+                 FROM request_log {FILTER_SQL} \
+                 GROUP BY bucket_start \
+             ) \
+             SELECT to_timestamp(b.bucket_start) AS bucket, \
+                    COALESCE(a.total, 0)::BIGINT AS total, \
+                    COALESCE(a.client_errors, 0)::BIGINT AS client_errors, \
+                    COALESCE(a.server_errors, 0)::BIGINT AS server_errors \
+             FROM bucket_range b \
+             LEFT JOIN aggregated a USING (bucket_start) \
+             ORDER BY b.bucket_start"
+        )
+    } else {
+        format!(
+            "SELECT to_timestamp((EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT) AS bucket, \
+                    COUNT(*) AS total, \
+                    COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
+                    COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
+             FROM request_log {FILTER_SQL} \
+             GROUP BY bucket ORDER BY bucket"
+        )
+    };
     let mut trend_params = params.clone();
-    trend_params.push(&bucket);
+    trend_params.push(&bucket_seconds);
     let trend: Vec<Value> = match client.query(&trend_sql, &trend_params).await {
         Ok(rows) => rows
             .iter()
@@ -372,13 +417,14 @@ pub(crate) async fn request_summary(
             "p99_ms": p99,
             "error_types": error_types,
             "trend": trend,
+            "granularity": granularity.label(),
         }
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{trend_bucket, window_range};
+    use super::{resolve_granularity, window_range};
     use chrono::{Duration, Utc};
 
     #[test]
@@ -398,11 +444,41 @@ mod tests {
     }
 
     #[test]
-    fn trend_bucket_adapts_to_span() {
+    fn resolve_granularity_auto_adapts_to_span() {
         let now = Utc::now();
-        assert_eq!(trend_bucket(Some(now - Duration::hours(1)), Some(now)), "minute");
-        assert_eq!(trend_bucket(Some(now - Duration::hours(24)), Some(now)), "hour");
-        assert_eq!(trend_bucket(Some(now - Duration::days(7)), Some(now)), "day");
-        assert_eq!(trend_bucket(None, None), "hour");
+        let auto = None;
+        assert_eq!(
+            resolve_granularity(&auto, Some(now - Duration::hours(1)), Some(now))
+                .unwrap()
+                .seconds(),
+            60
+        );
+        assert_eq!(
+            resolve_granularity(&auto, Some(now - Duration::hours(24)), Some(now))
+                .unwrap()
+                .seconds(),
+            300
+        );
+        assert_eq!(
+            resolve_granularity(&auto, Some(now - Duration::days(7)), Some(now))
+                .unwrap()
+                .seconds(),
+            1800
+        );
+        assert_eq!(resolve_granularity(&auto, None, None).unwrap().seconds(), 3600);
+    }
+
+    #[test]
+    fn resolve_granularity_rejects_overly_fine_buckets() {
+        let now = Utc::now();
+        let fine = Some("1m".to_string());
+        assert!(resolve_granularity(&fine, Some(now - Duration::days(7)), Some(now)).is_err());
+        assert!(resolve_granularity(&fine, Some(now - Duration::hours(24)), Some(now)).is_ok());
+    }
+
+    #[test]
+    fn resolve_granularity_rejects_unknown_value() {
+        let bad = Some("3m".to_string());
+        assert!(resolve_granularity(&bad, None, None).is_err());
     }
 }
