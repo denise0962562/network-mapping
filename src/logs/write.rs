@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::audit::RequestId;
 use crate::{get_conn_ip, get_user_agent, logs::LoginLog};
 
-fn request_id(req: &HttpRequest) -> Uuid {
+pub fn request_id(req: &HttpRequest) -> Uuid {
     req.extensions()
         .get::<RequestId>()
         .map(|value| value.0)

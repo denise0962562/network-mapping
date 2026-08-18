@@ -18,6 +18,7 @@ pub struct AuditQuery {
     resource_type: Option<String>,
     resource_id: Option<String>,
     keyword: Option<String>,
+    request_id: Option<Uuid>,
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     page: Option<i64>,
@@ -84,7 +85,8 @@ const FILTER_SQL: &str = "
       AND ($8::TIMESTAMPTZ IS NULL OR occurred_at <= $8)
       AND ($9::TEXT IS NULL OR action ILIKE '%' || $9 || '%'
            OR COALESCE(actor_name, '') ILIKE '%' || $9 || '%'
-           OR COALESCE(resource_id, '') ILIKE '%' || $9 || '%')";
+           OR COALESCE(resource_id, '') ILIKE '%' || $9 || '%')
+      AND ($10::UUID IS NULL OR request_id = $10)";
 
 fn is_admin(user: &UserBaseI) -> bool {
     user.role == 1
@@ -131,6 +133,7 @@ pub(crate) async fn list_audit_events(
         &query.start,
         &query.end,
         &query.keyword,
+        &query.request_id,
     ];
     let count_sql = format!("SELECT COUNT(*) FROM audit_event {FILTER_SQL}");
     let total: i64 = match client.query_one(&count_sql, filter_params).await {
@@ -144,7 +147,7 @@ pub(crate) async fn list_audit_events(
         "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
          actor_name, resource_type, resource_id, request_id, source_ip::TEXT AS source_ip, user_agent, \
          http_method, request_path, response_status, reason_code, changes, metadata \
-         FROM audit_event {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $10 OFFSET $11"
+         FROM audit_event {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $11 OFFSET $12"
     );
     let mut params = filter_params.to_vec();
     params.push(&page_size);
@@ -244,6 +247,7 @@ pub(crate) async fn export_audit_events(
         &query.start,
         &query.end,
         &query.keyword,
+        &query.request_id,
     ];
     let sql = format!(
         "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
