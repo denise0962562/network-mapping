@@ -15,6 +15,7 @@ use crate::login::get_session_from_req;
 use tracing::{debug, error, info};
 
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
+use crate::request_log::RequestActor;
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
 use crate::middlewares::{get_pool_from_app_data, is_scanner_api_path};
 use uuid::Uuid;
@@ -182,6 +183,13 @@ where
                             return Ok(req.into_response(res).map_into_right_body());
                         }
                     };
+
+                    // 将操作者写入最外层 wrap_fn 预置的槽位，供请求日志采集（request_log）。
+                    // 槽位仅在采集开启且未被跳过的请求上存在；匿名/被拒绝请求保持 NULL。
+                    if let Some(slot) = req.extensions().get::<RequestActor>() {
+                        *slot.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some((tmp_info.id, tmp_info.username.clone()));
+                    }
 
                     // 向通过检查的请求注入用户基础数据
                     req.extensions_mut().insert(tmp_info);

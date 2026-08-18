@@ -35,6 +35,12 @@ directory = "../network-mapping-vue/dist"
 # 相对路径以本配置文件所在目录为基准；缺失时服务继续运行，IP 情报字段保持为空
 directory = "source/maxmind"
 
+[requests]
+# 是否采集请求日志（request_log），用于请求级分析与错误自动识别
+enabled = true
+# 请求日志在线保留天数，超过该天数的记录会被后台任务分批清理
+retention_days = 30
+
 [automatic_target]
 # 仅从明确授权的 IPv4/IPv6 范围生成任务；两种地址族分别控制和补充队列
 # IPv4 自动目标生成开关

@@ -35,6 +35,8 @@ pub struct Config {
     pub maxmind: MaxMindConfig,
     #[serde(default)]
     pub automatic_target: AutomaticTargetConfig,
+    #[serde(default)]
+    pub requests: RequestsConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -65,6 +67,7 @@ impl SelfChecking for Config {
         let _ = &self.server.check();
         let _ = &self.database.check();
         let _ = &self.security.check();
+        let _ = &self.requests.check();
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -82,6 +85,7 @@ impl SelfChecking for Config {
             Err(e) => return Err(e),
         }
         self.security.try_check()?;
+        self.requests.try_check()?;
         self.automatic_target.validate()?;
         Ok(true)
     }
@@ -114,6 +118,40 @@ impl SelfChecking for SecurityConfig {
             return Err(
                 "scanner_token_pepper 至少需要 32 个字符，请使用 openssl rand -hex 32 生成".into(),
             );
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RequestsConfig {
+    /// 是否采集请求日志（`request_log`）。
+    pub enabled: bool,
+    /// 请求日志在线保留天数，超过该天数的记录会被后台任务分批清理。
+    pub retention_days: i32,
+}
+
+impl Default for RequestsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 30,
+        }
+    }
+}
+
+impl SelfChecking for RequestsConfig {
+    fn check(&self) {
+        if let Err(error) = self.try_check() {
+            panic!("{error}");
+        }
+        info!(target: "server::startup", component = "requests", enabled = self.enabled, retention_days = self.retention_days, "配置检查通过");
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.retention_days < 1 {
+            return Err("requests.retention_days 必须大于等于 1".into());
         }
         Ok(true)
     }
@@ -865,6 +903,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::audit::list_audit_events)
         .service(handlers::audit::export_audit_events)
         .service(handlers::audit::get_audit_event)
+        .service(handlers::requests::list_requests)
+        .service(handlers::requests::request_summary)
         .service(user::user_logout)
         .service(user::verify_totp_h)
         .service(user::bind_twofa_h)

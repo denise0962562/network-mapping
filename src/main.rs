@@ -19,6 +19,7 @@ use network_mapping_server::middlewares::{
     smiddleware::AuthMiddleware,
 };
 use network_mapping_server::open_source::OpenSourceCatalog;
+use network_mapping_server::request_log;
 use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
 use network_mapping_server::tls::build_acceptor;
 use network_mapping_server::{Systems, TemplatesInit, config, db, insert_system_status};
@@ -50,6 +51,7 @@ async fn main() -> io::Result<()> {
         "日志系统已启动"
     );
     config.check();
+    let request_log_config = config.requests.clone();
     let frontend_directory = config.frontend.directory.clone();
     let maxmind_directory = config.maxmind.directory.clone();
     let automatic_target_service = AutomaticTargetService::new(config.automatic_target.clone())
@@ -87,6 +89,7 @@ async fn main() -> io::Result<()> {
     .await
     .expect("创建连接池错误");
     let pool = db_pool.clone();
+    let request_log_pool = db_pool.clone();
     if let Some(username) = args.reset_admin_password.as_deref() {
         match reset_admin_password(username, &db_pool, config.pwd_hash.clone()).await {
             Ok(password) => {
@@ -207,7 +210,22 @@ async fn main() -> io::Result<()> {
         }
     });
 
+    // 请求日志采集：有界 channel + 后台 writer（永不退出）+ 定期清理。
+    let request_log_tx = if request_log_config.enabled {
+        let (tx, rx) = tokio::sync::mpsc::channel(request_log::CHANNEL_CAPACITY);
+        tokio::spawn(request_log::run_writer(request_log_pool.clone(), rx));
+        tokio::spawn(request_log::run_retention(
+            request_log_pool.clone(),
+            request_log_config.retention_days,
+        ));
+        Some(tx)
+    } else {
+        None
+    };
+
     HttpServer::new(move || {
+        let request_log_tx = request_log_tx.clone();
+
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(template_info.clone()))
@@ -226,7 +244,7 @@ async fn main() -> io::Result<()> {
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
             .wrap(rate_limiter.clone())
-            .wrap_fn(|req, service| {
+            .wrap_fn(move |req, service| {
                 let request_id = req
                     .headers()
                     .get("X-Request-ID")
@@ -236,16 +254,69 @@ async fn main() -> io::Result<()> {
                 req.extensions_mut().insert(RequestId(request_id));
                 let response_request_id = header::HeaderValue::from_str(&request_id.to_string())
                     .expect("UUID is a valid header value");
+
+                // 请求日志采集：service.call 前抓取元数据，响应后抓取状态码与耗时。
+                // 跳过静态资源与高频心跳，避免污染与放大数据量。
+                let path = req.path().to_owned();
+                let capture = request_log_tx.is_some()
+                    && !network_mapping_server::frontend::is_frontend_resource_path(&path)
+                    && path != "/api/scanner/heartbeat";
+                let actor = std::sync::Arc::new(std::sync::Mutex::new(None));
+                req.extensions_mut()
+                    .insert(request_log::RequestActor(actor.clone()));
+                let method = req.method().to_string();
+                let client_ip = req
+                    .connection_info()
+                    .realip_remote_addr()
+                    .and_then(request_log::parse_ip);
+                let user_agent = req
+                    .headers()
+                    .get(header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.chars().take(512).collect::<String>());
+                let started = std::time::Instant::now();
+
                 // 用 request_id 建立 tracing span，使请求处理链路上的所有日志自动携带该 id，
                 // 无需在每个日志宏里手动重复写 request_id。
                 let span = tracing::info_span!("http_request", request_id = %request_id);
                 let future = service.call(req).instrument(span);
+                let request_log_tx = request_log_tx.clone();
                 async move {
                     let mut response = future.await?;
                     response.headers_mut().insert(
                         header::HeaderName::from_static("x-request-id"),
                         response_request_id,
                     );
+                    if capture {
+                        let status = response.status().as_u16();
+                        let (error_level, error_type) = request_log::classify_status(status);
+                        let duration_ms = i32::try_from(started.elapsed().as_millis()).ok();
+                        let actor = actor
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        let (actor_id, actor_name) = match actor {
+                            Some((id, name)) => (Some(id), Some(name)),
+                            None => (None, None),
+                        };
+                        let entry = request_log::RequestLogEntry {
+                            request_id,
+                            occurred_at: chrono::Utc::now(),
+                            http_method: method,
+                            request_path: path,
+                            status_code: status as i16,
+                            duration_ms,
+                            client_ip,
+                            user_agent,
+                            actor_id,
+                            actor_name,
+                            error_level: error_level.to_owned(),
+                            error_type: error_type.map(str::to_owned),
+                        };
+                        if let Some(tx) = &request_log_tx {
+                            let _ = tx.try_send(entry);
+                        }
+                    }
                     Ok(response)
                 }
             })
