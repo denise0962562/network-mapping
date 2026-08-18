@@ -589,3 +589,29 @@ WHERE status = 'published';
 INSERT INTO mail_template (template_key, display_name)
 VALUES ('login_success', '登录成功')
 ON CONFLICT (template_key) DO UPDATE SET display_name = EXCLUDED.display_name;
+
+-- 请求日志（访问日志）：覆盖每一个业务请求，用于请求级分析与错误自动识别。
+-- 与 audit_event（安全审计，只记录敏感操作）不同，本表不记录请求体、原始查询串、
+-- Session、CSRF Token、Authorization 请求头、扫描器令牌。
+CREATE TABLE IF NOT EXISTS request_log (
+	id BIGSERIAL PRIMARY KEY,
+	request_id UUID NOT NULL,
+	occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	http_method TEXT NOT NULL,
+	request_path TEXT NOT NULL,
+	status_code SMALLINT NOT NULL,
+	duration_ms INTEGER,
+	client_ip INET,
+	user_agent TEXT,
+	actor_id INT,                        -- 已认证用户 id；匿名/扫描器请求为 NULL
+	actor_name TEXT,                     -- 已认证用户名；匿名/扫描器请求为 NULL
+	error_level TEXT NOT NULL DEFAULT 'ok'
+		CHECK (error_level IN ('ok', 'client_error', 'server_error')),
+	error_type TEXT                      -- bad_request / unauthorized / not_found / ...
+);
+
+-- 只保留 2 个索引：分页/趋势/保留清理走 time 索引，错误查询与错误率趋势走 error 索引。
+CREATE INDEX IF NOT EXISTS idx_request_log_time
+	ON request_log (occurred_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_request_log_error
+	ON request_log (error_level, occurred_at DESC);

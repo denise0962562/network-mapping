@@ -10,7 +10,7 @@ use crate::logs::write::{database_error_diagnostics, error_logs};
 
 const DEFAULT_RANGE_MINUTES: i64 = 30;
 const MAX_RANGE_DAYS: i64 = 30;
-const MAX_BUCKETS: i64 = 1_500;
+pub(crate) const MAX_BUCKETS: i64 = 1_500;
 const RESOURCE_TIMEZONE: &str = "Asia/Shanghai";
 const RESOURCE_HISTORY_SQL: &str = r#"
 WITH bucket_range AS (
@@ -107,7 +107,7 @@ pub(crate) struct ResourceHistoryQuery {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Granularity {
+pub(crate) enum Granularity {
     TenSeconds,
     ThirtySeconds,
     OneMinute,
@@ -120,7 +120,7 @@ enum Granularity {
 }
 
 impl Granularity {
-    fn parse(value: &str) -> Result<Self, &'static str> {
+    pub(crate) fn parse(value: &str) -> Result<Self, &'static str> {
         match value {
             "10s" => Ok(Self::TenSeconds),
             "30s" => Ok(Self::ThirtySeconds),
@@ -165,7 +165,19 @@ impl Granularity {
         }
     }
 
-    fn seconds(self) -> i64 {
+    pub(crate) fn auto_for_request(duration: Duration) -> Self {
+        if duration <= Duration::hours(6) {
+            Self::OneMinute
+        } else if duration <= Duration::days(1) {
+            Self::FiveMinutes
+        } else if duration <= Duration::days(7) {
+            Self::ThirtyMinutes
+        } else {
+            Self::OneHour
+        }
+    }
+
+    pub(crate) fn seconds(self) -> i64 {
         match self {
             Self::TenSeconds => 10,
             Self::ThirtySeconds => 30,
@@ -179,7 +191,7 @@ impl Granularity {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::TenSeconds => "10s",
             Self::ThirtySeconds => "30s",

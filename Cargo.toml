@@ -1,6 +1,6 @@
 [package]
 name = "network_mapping_server"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 
 [dependencies]
@@ -21,7 +21,7 @@ deadpool-postgres = { version = "0.14"}
 deadpool = "0.12"
 argon2 = "0.5"
 password-hash = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 uuid = { version = "1.18", features = ["v4", "v7", "serde"]}
 sysinfo = "0.38"
 chrono = {version = "0.4", features = ["serde"]}

@@ -15,6 +15,7 @@ const SPA_ROUTES: &[&str] = &[
     "/analysis",
     "/admin/users",
     "/audit",
+    "/requests",
     "/open-source",
     "/testpage",
     "/setting",
