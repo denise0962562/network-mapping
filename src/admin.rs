@@ -1087,6 +1087,10 @@ pub async fn get_mail_settings_from_database(
             report_daily: notification_value("report_daily", defaults.report_daily),
             report_weekly: notification_value("report_weekly", defaults.report_weekly),
             report_monthly: notification_value("report_monthly", defaults.report_monthly),
+            health_alert_enabled: notification_value(
+                "health_alert_enabled",
+                defaults.health_alert_enabled,
+            ),
         },
     })
 }
@@ -1177,6 +1181,10 @@ pub async fn write_mail_settings_to_database(
         (
             "report_monthly",
             settings.notification_prefs.report_monthly.to_string(),
+        ),
+        (
+            "health_alert_enabled",
+            settings.notification_prefs.health_alert_enabled.to_string(),
         ),
     ];
     const UPSERT_SETTING: &str = "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \

@@ -1,0 +1,10 @@
+健康告警
+
+{{ summary }}
+
+告警类型：{{ alert_type }}
+严重级别：{{ severity }}
+发生时间：{{ occurred_at }}
+{% for d in details %}{{ d.label }}：{{ d.value }}
+{% endfor %}
+此邮件由 {{ system_name }} 健康监控自动发送，请及时检查服务状态。

@@ -8,6 +8,7 @@ pub mod login;
 pub mod logs;
 pub mod mail_template;
 pub mod maxmind;
+pub mod monitor;
 pub mod target_generated;
 pub mod tls;
 
