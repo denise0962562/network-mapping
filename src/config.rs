@@ -124,12 +124,25 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub encrypt_key: String,
+    /// 全局请求体大小上限（字节）。actix-web 的 JSON 提取器默认 2MB，
+    /// 这里放宽以容纳扫描器大批量结果上传，对所有 JSON 接口生效。
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size: usize,
+}
+
+/// 默认 64MB：500 条/批 × 64KB/条 ≈ 32MB，再预留 JSON 转义与协议字段开销。
+fn default_max_body_size() -> usize {
+    64 * 1024 * 1024
 }
 
 impl SelfChecking for ServerConfig {
     fn check(&self) {
         if self.host.is_empty() {
             panic!("监听地址为空")
+        }
+
+        if self.max_body_size == 0 {
+            panic!("max_body_size 必须大于 0")
         }
 
         match &self.encrypt_key.len() {

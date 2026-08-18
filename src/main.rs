@@ -59,6 +59,7 @@ async fn main() -> io::Result<()> {
     let server = config.server;
     let server_host = server.host;
     let server_port = server.port;
+    let server_max_body = server.max_body_size;
 
     //日志系统配置
     let log = config.log;
@@ -220,6 +221,7 @@ async fn main() -> io::Result<()> {
             .app_data(open_source_catalog.clone())
             .app_data(security.clone())
             .app_data(frontend_assets.clone())
+            .app_data(web::JsonConfig::default().limit(server_max_body))
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
