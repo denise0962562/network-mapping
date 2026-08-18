@@ -57,6 +57,15 @@ pub async fn not_found(
         .body(front_end_error_page(&error_info, &page_template))
 }
 
+/// 获取服务端版本号
+#[get("/api/version")]
+async fn get_server_version() -> impl Responder {
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
 /// 用于启动加载 RIR 数据
 #[cfg(feature = "rir")]
 #[get("/api/updaterir")]

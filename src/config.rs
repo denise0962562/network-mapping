@@ -928,7 +928,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(utils::save_session_settings_h)
         .service(utils::get_scan_settings_h)
         .service(utils::save_scan_settings_h)
-        .service(utils::test_mail_server_h);
+        .service(utils::test_mail_server_h)
+        .service(utils::get_server_version);
 
     #[cfg(feature = "rir")]
     cfg.service(handlers::utils::update_rir);
