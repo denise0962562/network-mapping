@@ -95,6 +95,7 @@ struct FrontEndErrorInfo<'a> {
     status_code: u16,
     error_title: &'a str,
     error_message: &'a str,
+    request_id: String,
 }
 
 pub struct _ProxySetting {
@@ -1030,6 +1031,7 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
     context.insert("status_code", &info.status_code);
     context.insert("error_title", &info.error_title);
     context.insert("error_message", &info.error_message);
+    context.insert("request_id", &info.request_id);
 
     match tera.render(&templates.templates_name, &context) {
         Ok(body) => body,

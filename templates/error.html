@@ -28,6 +28,7 @@
         }
         a:hover { text-decoration: underline; }
         .sad-face { font-size: 4em; margin: 20px 0; }
+        .request-id { color: #999; font-size: 0.85em; font-family: monospace; }
     </style>
 
 </head>
@@ -37,6 +38,7 @@
         <h1>{{status_code}}</h1>
         <h2>{{error_title}}</h2>
         <p>{{error_message}}</p>
+        <p class="request-id">请求 ID：{{request_id}}</p>
         <p><a href="/">返回首页</a></p>
     </div>
 

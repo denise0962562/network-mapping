@@ -35,8 +35,8 @@ pub fn init(
         .json()
         .with_writer(nb)
         .with_timer(LogTime)
-        .with_current_span(*log_debug_mode)
-        .with_span_list(*log_debug_mode)
+        .with_current_span(true)
+        .with_span_list(true)
         .with_target(*log_debug_mode)
         // .with_ansi(false)
         // .with_env_filter("info") //支持RUST_LOG

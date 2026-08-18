@@ -3,7 +3,7 @@ use clap::Parser;
 use core::panic;
 use std::io;
 use tokio::time::{Duration, Instant, interval_at};
-use tracing::{error, info};
+use tracing::{Instrument, error, info};
 
 use network_mapping_server::admin::{
     check_default_admin_user, check_system_user, reset_admin_password,
@@ -59,6 +59,7 @@ async fn main() -> io::Result<()> {
     let server = config.server;
     let server_host = server.host;
     let server_port = server.port;
+    let server_max_body = server.max_body_size;
 
     //日志系统配置
     let log = config.log;
@@ -220,6 +221,7 @@ async fn main() -> io::Result<()> {
             .app_data(open_source_catalog.clone())
             .app_data(security.clone())
             .app_data(frontend_assets.clone())
+            .app_data(web::JsonConfig::default().limit(server_max_body))
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
@@ -234,7 +236,10 @@ async fn main() -> io::Result<()> {
                 req.extensions_mut().insert(RequestId(request_id));
                 let response_request_id = header::HeaderValue::from_str(&request_id.to_string())
                     .expect("UUID is a valid header value");
-                let future = service.call(req);
+                // 用 request_id 建立 tracing span，使请求处理链路上的所有日志自动携带该 id，
+                // 无需在每个日志宏里手动重复写 request_id。
+                let span = tracing::info_span!("http_request", request_id = %request_id);
+                let future = service.call(req).instrument(span);
                 async move {
                     let mut response = future.await?;
                     response.headers_mut().insert(

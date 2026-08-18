@@ -12,7 +12,7 @@ use futures::future::LocalBoxFuture;
 use crate::admin::{UserSession, get_user_base_info};
 use crate::login::LoginToken;
 use crate::login::get_session_from_req;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
@@ -97,7 +97,7 @@ where
             && ((frontend_page && frontend_page_available)
                 || path_list.iter().any(|prefix| path.starts_with(prefix)));
 
-        debug!(
+        info!(
             event = "received_requests",
             client_ip = &req
                 .connection_info()

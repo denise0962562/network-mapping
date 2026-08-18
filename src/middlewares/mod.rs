@@ -59,6 +59,7 @@ pub fn render_403(req: &HttpRequest, page_template: &TemplatesInit, message: &st
         status_code: 403,
         error_title: "Forbidden",
         error_message: "您已被屏蔽",
+        request_id: logs::write::request_id(req).to_string(),
     };
     HttpResponse::Forbidden()
         .content_type(TEXT_HTML_UTF_8)
@@ -73,6 +74,7 @@ pub fn render_500(req: &HttpRequest, page_template: &TemplatesInit, message: &st
         status_code: 500,
         error_title: "Internal Server Error",
         error_message: "服务器内部系统错误，别担心，这不是你的错误",
+        request_id: logs::write::request_id(req).to_string(),
     };
     HttpResponse::InternalServerError()
         .content_type(TEXT_HTML_UTF_8)
@@ -83,7 +85,9 @@ pub fn render_500(req: &HttpRequest, page_template: &TemplatesInit, message: &st
 /// 常用于模板系统无法正常从 app_data 中加载时
 pub fn render_500_simple(req: &HttpRequest, message: &str) -> HttpResponse {
     logs::write::error_logs(req, "未能正确获取到模板系统", message);
-    HttpResponse::InternalServerError().body("500 Internal Server Error")
+    let request_id = logs::write::request_id(req);
+    HttpResponse::InternalServerError()
+        .body(format!("500 Internal Server Error\nRequest ID: {request_id}"))
 }
 
 impl FromRequest for UserBaseI {

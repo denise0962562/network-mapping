@@ -15,7 +15,7 @@ use crate::config::{
     DatabaseConfig, EmailConfig, GetConfig, MailSettingsRequest, MailTestRequest,
     ScanSettingsRequest, ServerConfig, SessionSettingsRequest, session_ttl_seconds_from_minutes,
 };
-use crate::{FrontEndErrorInfo, TemplatesInit, front_end_error_page, logs::write::info_logs};
+use crate::{FrontEndErrorInfo, TemplatesInit, front_end_error_page, logs::write::{info_logs, request_id}};
 
 #[cfg(feature = "rir")]
 use crate::rir::get_rir_data;
@@ -41,7 +41,8 @@ pub async fn not_found(
     if req.path() == "/api" || req.path().starts_with("/api/") {
         return HttpResponse::NotFound().json(serde_json::json!({
             "success": false,
-            "message": "not found"
+            "message": "not found",
+            "request_id": request_id(&req).to_string(),
         }));
     }
 
@@ -49,6 +50,7 @@ pub async fn not_found(
         status_code: 404,
         error_title: "NotFound",
         error_message: "没有找到对应的资源",
+        request_id: request_id(&req).to_string(),
     };
     HttpResponse::NotFound()
         .content_type(TEXT_HTML_UTF_8)
