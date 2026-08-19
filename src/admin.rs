@@ -394,19 +394,6 @@ pub async fn create_default_admin_user(
     transaction.commit().await.unwrap();
 }
 
-/// 发送邮件
-///
-pub async fn send_email(emailconf: &EmailConfig, mail: Message) {
-    if let Err(e) = try_send_email(emailconf, 465, mail).await {
-        warn!(
-            event = "SendEmailError",
-            path = "fn send_email",
-            message = format!("Could not send email: {e:?}")
-        );
-        println!("Could not send email: {e:?}")
-    }
-}
-
 /// 发送邮件并将连接或发送错误返回给调用方。
 pub async fn try_send_email(
     emailconf: &EmailConfig,
@@ -431,6 +418,56 @@ pub async fn try_send_email(
         message = "Email sent successfully!"
     );
     Ok(())
+}
+
+/// 将 SMTP 发送错误映射为面向管理员的中文提示。
+///
+/// lettre 透传的 SMTP 服务器响应文本（如 `permanent error (535): authentication failed`、
+/// `permanent error (500): plugin timeout`）对用户不直观，这里按关键字归类成可执行的中文提示。
+/// 无法识别时回退为原始错误文本，保证细节不丢失。
+pub fn smtp_send_error_message(error: &dyn std::error::Error) -> String {
+    let raw = error.to_string();
+    let lower = raw.to_lowercase();
+
+    // 模板校验（Tera）错误通常是超长的上下文转储，这里单独识别，避免误当成 SMTP 错误。
+    if raw.len() > 500 || lower.contains("tera") {
+        return "模板校验失败，请检查 Tera 语法和变量".to_owned();
+    }
+
+    if lower.contains("authentication")
+        || lower.contains("auth failed")
+        || lower.contains("invalid credentials")
+        || lower.contains("incorrect password")
+        || lower.contains("login failed")
+        || lower.contains("535")
+        || lower.contains("530")
+    {
+        "认证失败：请检查发件邮箱密钥（授权码）是否正确".to_owned()
+    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("handshake") {
+        "邮件服务器 TLS/证书校验失败：请确认端口使用 SMTPS（隐式 TLS）".to_owned()
+    } else if lower.contains("plugin timeout")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        "邮件服务器处理超时：认证后端未响应，请稍后重试或检查邮件服务器状态".to_owned()
+    } else if lower.contains("connection refused")
+        || lower.contains("could not resolve")
+        || lower.contains("failed to lookup")
+        || lower.contains("dns")
+        || lower.contains("no route")
+        || lower.contains("network")
+    {
+        "无法连接邮件服务器：请检查服务器地址与端口".to_owned()
+    } else if lower.contains("relay")
+        || lower.contains("rejected")
+        || lower.contains("sender")
+        || lower.contains("550")
+        || lower.contains("554")
+    {
+        "邮件被服务器拒绝：请检查发件人地址或服务器白名单".to_owned()
+    } else {
+        raw
+    }
 }
 
 // 创建 TOTP 结构体
@@ -1087,6 +1124,10 @@ pub async fn get_mail_settings_from_database(
             report_daily: notification_value("report_daily", defaults.report_daily),
             report_weekly: notification_value("report_weekly", defaults.report_weekly),
             report_monthly: notification_value("report_monthly", defaults.report_monthly),
+            health_alert_enabled: notification_value(
+                "health_alert_enabled",
+                defaults.health_alert_enabled,
+            ),
         },
     })
 }
@@ -1177,6 +1218,10 @@ pub async fn write_mail_settings_to_database(
         (
             "report_monthly",
             settings.notification_prefs.report_monthly.to_string(),
+        ),
+        (
+            "health_alert_enabled",
+            settings.notification_prefs.health_alert_enabled.to_string(),
         ),
     ];
     const UPSERT_SETTING: &str = "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \

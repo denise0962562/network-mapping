@@ -16,6 +16,7 @@ const SPA_ROUTES: &[&str] = &[
     "/admin/users",
     "/audit",
     "/requests",
+    "/health",
     "/open-source",
     "/testpage",
     "/setting",
@@ -293,6 +294,8 @@ mod tests {
     fn only_declared_paths_are_spa_routes() {
         assert!(is_spa_path("/"));
         assert!(is_spa_path("/audit"));
+        assert!(is_spa_path("/requests"));
+        assert!(is_spa_path("/health"));
         assert!(is_spa_path("/task/019c0000-0000-7000-8000-000000000001"));
         assert!(is_spa_path("/scanner/019c0000-0000-4000-8000-000000000001"));
 

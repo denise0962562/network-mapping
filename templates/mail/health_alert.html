@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { margin: 0; padding: 24px; background: #f3f4f6; color: #1f2937; font-family: Arial, sans-serif; }
+    .card { max-width: 640px; margin: 0 auto; padding: 32px; background: #ffffff; border-radius: 12px; }
+    .title { margin: 0 0 16px; color: #b91c1c; font-size: 24px; }
+    .summary { margin: 8px 0 16px; color: #111827; font-weight: bold; }
+    .detail { margin: 6px 0; color: #4b5563; }
+    .label { color: #6b7280; }
+    .footer { margin-top: 24px; color: #9ca3af; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 class="title">健康告警</h1>
+    <p class="summary">{{ summary }}</p>
+    <p class="detail"><span class="label">告警类型：</span>{{ alert_type }}</p>
+    <p class="detail"><span class="label">严重级别：</span>{{ severity }}</p>
+    <p class="detail"><span class="label">发生时间：</span>{{ occurred_at }}</p>
+    {% for d in details %}
+    <p class="detail"><span class="label">{{ d.label }}：</span>{{ d.value }}</p>
+    {% endfor %}
+    <p class="footer">此邮件由 {{ system_name }} 健康监控自动发送，请及时检查服务状态。</p>
+  </div>
+</body>
+</html>

@@ -143,6 +143,15 @@ repeat_after_seconds = 604800
 完整的心跳载荷、数据库字段、调度规则、升级兼容和故障排查参见
 [双栈扫描与自动目标文档](docs/DUAL_STACK_SCANNING.md)。
 
+## 健康监控与告警
+
+服务端内置健康监控，实时检测慢请求、5xx 服务端错误，并轮询 `pg_stat_statements`
+检测慢 SQL，命中阈值后通过邮件通知所有启用中的管理员。`[monitor]` 配置段控制阈值、
+轮询间隔与冷却时间，通知偏好中的 `health_alert_enabled`（默认开启）控制是否发送。
+慢 SQL 检测需要数据库预先启用 `pg_stat_statements` 扩展。完整的使用方法、前提与
+注意事项参见
+[健康监控与告警](docs/HEALTH_ALERT.md)。
+
 ## 开源项目清单
 
 `GET /api/open-source/projects` 返回编译进服务端的主要直接依赖清单。升级 `Cargo.toml`、扫描器依赖或前端 `package.json` 后，应同步复核 `source/open_source_projects.json` 中的版本、许可证和上游链接。

@@ -18,6 +18,7 @@ use network_mapping_server::middlewares::{
     csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, ratelimit::RateLimitMiddleware,
     smiddleware::AuthMiddleware,
 };
+use network_mapping_server::monitor::{self, HealthEvent};
 use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
 use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
@@ -52,6 +53,7 @@ async fn main() -> io::Result<()> {
     );
     config.check();
     let request_log_config = config.requests.clone();
+    let monitor_config = config.monitor.clone();
     let frontend_directory = config.frontend.directory.clone();
     let maxmind_directory = config.maxmind.directory.clone();
     let automatic_target_service = AutomaticTargetService::new(config.automatic_target.clone())
@@ -143,6 +145,12 @@ async fn main() -> io::Result<()> {
 
     let mail_c = config.email_config;
 
+    let monitor_handle = monitor::MonitorHandle::new(
+        &monitor_config,
+        db_pool.clone(),
+        ser_con.encrypt_key.clone(),
+    );
+
     let tls = build_acceptor(&config.tls)?;
     let frontend_assets = FrontendAssets::new(frontend_directory);
     let frontend_directory = frontend_assets.directory().to_path_buf();
@@ -225,6 +233,7 @@ async fn main() -> io::Result<()> {
 
     HttpServer::new(move || {
         let request_log_tx = request_log_tx.clone();
+        let monitor_handle = monitor_handle.clone();
 
         App::new()
             .app_data(web::Data::new(pool.clone()))
@@ -281,6 +290,7 @@ async fn main() -> io::Result<()> {
                 let span = tracing::info_span!("http_request", request_id = %request_id);
                 let future = service.call(req).instrument(span);
                 let request_log_tx = request_log_tx.clone();
+                let monitor_handle = monitor_handle.clone();
                 async move {
                     let mut response = future.await?;
                     response.headers_mut().insert(
@@ -299,6 +309,42 @@ async fn main() -> io::Result<()> {
                             Some((id, name)) => (Some(id), Some(name)),
                             None => (None, None),
                         };
+
+                        // 健康告警：慢请求与 5xx 错误实时判定，仅在命中阈值时才分配/克隆字符串。
+                        if let Some(monitor) = &monitor_handle {
+                            let slow_duration = duration_ms
+                                .map(i64::from)
+                                .filter(|value| monitor.is_slow_request(*value));
+                            let is_server_error =
+                                monitor.server_error_enabled() && status >= 500;
+                            if slow_duration.is_some() || is_server_error {
+                                let client_ip_str = client_ip.map(|ip| ip.to_string());
+                                let actor_name_str = actor_name.clone();
+                                if let Some(duration_ms) = slow_duration {
+                                    monitor.emit(HealthEvent::slow_request(
+                                        &method,
+                                        &path,
+                                        status,
+                                        duration_ms,
+                                        request_id,
+                                        client_ip_str.clone(),
+                                        actor_name_str.clone(),
+                                    ));
+                                }
+                                if is_server_error {
+                                    monitor.emit(HealthEvent::server_error(
+                                        &method,
+                                        &path,
+                                        status,
+                                        duration_ms.map(i64::from),
+                                        request_id,
+                                        client_ip_str,
+                                        actor_name_str,
+                                    ));
+                                }
+                            }
+                        }
+
                         let entry = request_log::RequestLogEntry {
                             request_id,
                             occurred_at: chrono::Utc::now(),

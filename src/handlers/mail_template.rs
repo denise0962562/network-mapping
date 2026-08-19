@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::error;
 
-use crate::admin::UserBaseI;
+use crate::admin::{UserBaseI, smtp_send_error_message};
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::config::ServerConfig;
 use crate::mail_template::{
@@ -283,7 +283,8 @@ pub async fn test_mail_template(
             error!(event = "TestMailTemplateError", message = %error_value);
             HttpResponse::BadGateway().json(json!({
                 "success": false,
-                "message": validation_error_message(error_value.as_ref())
+                "message": smtp_send_error_message(error_value.as_ref()),
+                "detail": error_value.to_string()
             }))
         }
     }

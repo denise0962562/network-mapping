@@ -11,13 +11,18 @@ use crate::admin::{
     get_mail_sender_key_from_database, get_mail_settings_from_database, try_send_email,
 };
 use crate::config::EmailConfig;
+use crate::monitor::HealthEvent;
 
 pub const LOGIN_SUCCESS_TEMPLATE_KEY: &str = "login_success";
+pub const HEALTH_ALERT_TEMPLATE_KEY: &str = "health_alert";
 const MAX_SUBJECT_TEMPLATE_CHARS: usize = 500;
 const MAX_BODY_TEMPLATE_BYTES: usize = 256 * 1024;
 const DEFAULT_LOGIN_SUBJECT: &str = "{{ system_name }} 登录成功提醒";
 const DEFAULT_LOGIN_HTML: &str = include_str!("../templates/mail/login_success.html");
 const DEFAULT_LOGIN_TEXT: &str = include_str!("../templates/mail/login_success.txt");
+const DEFAULT_HEALTH_ALERT_SUBJECT: &str = "{{ system_name }} 健康告警：{{ alert_type }}";
+const DEFAULT_HEALTH_ALERT_HTML: &str = include_str!("../templates/mail/health_alert.html");
+const DEFAULT_HEALTH_ALERT_TEXT: &str = include_str!("../templates/mail/health_alert.txt");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,9 +100,23 @@ const LOGIN_SUCCESS_DEFINITION: MailTemplateDefinition = MailTemplateDefinition 
     default_text: DEFAULT_LOGIN_TEXT,
 };
 
+const HEALTH_ALERT_DEFINITION: MailTemplateDefinition = MailTemplateDefinition {
+    template_key: HEALTH_ALERT_TEMPLATE_KEY,
+    display_name: "健康告警",
+    default_subject: DEFAULT_HEALTH_ALERT_SUBJECT,
+    default_html: DEFAULT_HEALTH_ALERT_HTML,
+    default_text: DEFAULT_HEALTH_ALERT_TEXT,
+};
+
+const ALL_TEMPLATE_DEFINITIONS: &[MailTemplateDefinition] = &[
+    LOGIN_SUCCESS_DEFINITION,
+    HEALTH_ALERT_DEFINITION,
+];
+
 fn template_definition(template_key: &str) -> Option<MailTemplateDefinition> {
     match template_key {
         LOGIN_SUCCESS_TEMPLATE_KEY => Some(LOGIN_SUCCESS_DEFINITION),
+        HEALTH_ALERT_TEMPLATE_KEY => Some(HEALTH_ALERT_DEFINITION),
         _ => None,
     }
 }
@@ -134,6 +153,38 @@ fn template_variables(template_key: &str) -> Vec<MailTemplateVariable> {
                 example: "192.0.2.10",
             },
         ],
+        HEALTH_ALERT_TEMPLATE_KEY => vec![
+            MailTemplateVariable {
+                key: "system_name",
+                label: "系统名称",
+                example: "Network Mapping",
+            },
+            MailTemplateVariable {
+                key: "alert_type",
+                label: "告警类型",
+                example: "slow_request / server_error / slow_sql",
+            },
+            MailTemplateVariable {
+                key: "severity",
+                label: "严重级别",
+                example: "warning / critical",
+            },
+            MailTemplateVariable {
+                key: "occurred_at",
+                label: "发生时间",
+                example: "2026-08-18 15:30:00",
+            },
+            MailTemplateVariable {
+                key: "summary",
+                label: "告警摘要",
+                example: "请求耗时 5123ms 超过阈值：POST /api/task/create",
+            },
+            MailTemplateVariable {
+                key: "details",
+                label: "详情列表（label/value）",
+                example: "[{\"label\":\"请求路径\",\"value\":\"/api/task/create\"}]",
+            },
+        ],
         _ => Vec::new(),
     }
 }
@@ -141,6 +192,19 @@ fn template_variables(template_key: &str) -> Vec<MailTemplateVariable> {
 pub fn sample_context(template_key: &str) -> Result<Context, Box<dyn std::error::Error>> {
     if template_definition(template_key).is_none() {
         return Err("未知邮件模板".into());
+    }
+    if template_key == HEALTH_ALERT_TEMPLATE_KEY {
+        return Ok(Context::from_serialize(json!({
+            "system_name": "Network Mapping",
+            "alert_type": "slow_request",
+            "severity": "warning",
+            "occurred_at": "2026-08-18 15:30:00",
+            "summary": "请求耗时 5123ms 超过阈值：POST /api/task/create",
+            "details": [
+                {"label": "请求方法", "value": "POST"},
+                {"label": "请求路径", "value": "/api/task/create"}
+            ]
+        }))?);
     }
     Ok(Context::from_serialize(json!({
         "system_name": "Network Mapping",
@@ -285,31 +349,35 @@ pub async fn list_templates(
     pool: &Pool,
 ) -> Result<Vec<MailTemplateSummary>, Box<dyn std::error::Error>> {
     let conn = pool.get().await?;
-    let row = conn
-        .query_opt(
-            "SELECT active_version, enabled, EXISTS(SELECT 1 FROM mail_template_version v \
-             WHERE v.template_key = t.template_key AND v.status = 'draft') AS has_draft \
-             FROM mail_template t WHERE template_key = $1;",
-            &[&LOGIN_SUCCESS_TEMPLATE_KEY],
-        )
-        .await?;
-    let (active_version, enabled, has_draft) = row
-        .map(|row| {
-            (
-                row.get::<_, Option<i32>>("active_version"),
-                row.get::<_, bool>("enabled"),
-                row.get::<_, bool>("has_draft"),
+    let mut summaries = Vec::with_capacity(ALL_TEMPLATE_DEFINITIONS.len());
+    for definition in ALL_TEMPLATE_DEFINITIONS {
+        let row = conn
+            .query_opt(
+                "SELECT active_version, enabled, EXISTS(SELECT 1 FROM mail_template_version v \
+                 WHERE v.template_key = t.template_key AND v.status = 'draft') AS has_draft \
+                 FROM mail_template t WHERE template_key = $1;",
+                &[&definition.template_key],
             )
-        })
-        .unwrap_or((None, true, false));
+            .await?;
+        let (active_version, enabled, has_draft) = row
+            .map(|row| {
+                (
+                    row.get::<_, Option<i32>>("active_version"),
+                    row.get::<_, bool>("enabled"),
+                    row.get::<_, bool>("has_draft"),
+                )
+            })
+            .unwrap_or((None, true, false));
 
-    Ok(vec![MailTemplateSummary {
-        template_key: LOGIN_SUCCESS_DEFINITION.template_key,
-        display_name: LOGIN_SUCCESS_DEFINITION.display_name,
-        enabled,
-        active_version,
-        has_draft,
-    }])
+        summaries.push(MailTemplateSummary {
+            template_key: definition.template_key,
+            display_name: definition.display_name,
+            enabled,
+            active_version,
+            has_draft,
+        });
+    }
+    Ok(summaries)
 }
 
 pub async fn get_template_detail(
@@ -654,6 +722,77 @@ pub async fn send_login_notification(
     let rendered = render_template(LOGIN_SUCCESS_TEMPLATE_KEY, &source, &context)?;
     send_rendered_mail(pool, encryption_key, &recipient, rendered).await?;
     Ok(true)
+}
+
+/// 向所有启用中的管理员发送健康告警。
+///
+/// 发送前依次检查全局通知偏好、管理员收件人与已发布模板；任一条件不满足即静默跳过。
+pub async fn send_health_alert(
+    pool: &Pool,
+    encryption_key: &str,
+    event: &HealthEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let settings = get_mail_settings_from_database(pool).await?;
+    if !settings.notification_prefs.health_alert_enabled {
+        return Ok(());
+    }
+    if settings.smtp_host.trim().is_empty()
+        || settings.sender.trim().is_empty()
+        || !settings.sender_key_configured
+    {
+        return Ok(());
+    }
+    let recipients = get_admin_recipients(pool).await?;
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    let Some(source) = get_published_source(pool, HEALTH_ALERT_TEMPLATE_KEY).await? else {
+        return Ok(());
+    };
+    let context = health_alert_context(event)?;
+    let rendered = render_template(HEALTH_ALERT_TEMPLATE_KEY, &source, &context)?;
+    for recipient in recipients {
+        send_rendered_mail(pool, encryption_key, &recipient, rendered.clone()).await?;
+    }
+    Ok(())
+}
+
+/// 枚举所有启用中的管理员（`role = 1`）邮箱，过滤掉无效或缺失的地址。
+pub async fn get_admin_recipients(
+    pool: &Pool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let conn = pool.get().await?;
+    let rows = conn
+        .query(
+            "SELECT email FROM users WHERE role = 1 AND disabled_at IS NULL AND deleted_at IS NULL \
+             AND email IS NOT NULL AND trim(email) <> '';",
+            &[],
+        )
+        .await?;
+    let mut recipients = Vec::new();
+    for row in rows {
+        let email = row.get::<_, String>("email");
+        if let Ok(Some(validated)) = normalize_user_notification_recipient(Some(&email)) {
+            recipients.push(validated.to_owned());
+        }
+    }
+    Ok(recipients)
+}
+
+fn health_alert_context(event: &HealthEvent) -> Result<Context, tera::Error> {
+    let details = event
+        .details
+        .iter()
+        .map(|(label, value)| json!({ "label": label, "value": value }))
+        .collect::<Vec<_>>();
+    Context::from_serialize(json!({
+        "system_name": "Network Mapping",
+        "alert_type": event.alert_type,
+        "severity": event.severity,
+        "occurred_at": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "summary": event.summary,
+        "details": details,
+    }))
 }
 
 /// 获取真实通知的用户收件地址。系统级测试收件人不得在此处作为回退值。

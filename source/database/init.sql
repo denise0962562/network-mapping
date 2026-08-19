@@ -615,3 +615,18 @@ CREATE INDEX IF NOT EXISTS idx_request_log_time
 	ON request_log (occurred_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_request_log_error
 	ON request_log (error_level, occurred_at DESC);
+
+-- 健康告警历史：记录慢请求、5xx 错误、慢 SQL 的告警事件，供告警历史页与跨重启冷却去重使用。
+-- detail 为 JSONB，存储告警详情键值列表（结构与 health_alert 邮件模板的 details 一致）。
+CREATE TABLE IF NOT EXISTS health_alert (
+	id BIGSERIAL PRIMARY KEY,
+	alert_type TEXT NOT NULL,
+	alert_key TEXT NOT NULL,
+	severity TEXT NOT NULL DEFAULT 'warning',
+	summary TEXT NOT NULL DEFAULT '',
+	detail JSONB NOT NULL DEFAULT '{}',
+	occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_alert_key_time
+	ON health_alert (alert_type, alert_key, occurred_at DESC);

@@ -344,23 +344,51 @@ pub(crate) async fn request_summary(
                         COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
                  FROM request_log {FILTER_SQL} \
                  GROUP BY bucket_start \
+             ), status_agg AS ( \
+                 SELECT bucket_start, jsonb_object_agg(status_code::TEXT, cnt) AS status_codes \
+                 FROM ( \
+                     SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                            status_code, COUNT(*) AS cnt \
+                     FROM request_log {FILTER_SQL} AND status_code >= 400 \
+                     GROUP BY bucket_start, status_code \
+                 ) grouped \
+                 GROUP BY bucket_start \
              ) \
              SELECT to_timestamp(b.bucket_start) AS bucket, \
                     COALESCE(a.total, 0)::BIGINT AS total, \
                     COALESCE(a.client_errors, 0)::BIGINT AS client_errors, \
-                    COALESCE(a.server_errors, 0)::BIGINT AS server_errors \
+                    COALESCE(a.server_errors, 0)::BIGINT AS server_errors, \
+                    COALESCE(sa.status_codes, jsonb_build_object()) AS status_codes \
              FROM bucket_range b \
              LEFT JOIN aggregated a USING (bucket_start) \
+             LEFT JOIN status_agg sa USING (bucket_start) \
              ORDER BY b.bucket_start"
         )
     } else {
         format!(
-            "SELECT to_timestamp((EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT) AS bucket, \
-                    COUNT(*) AS total, \
-                    COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
-                    COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
-             FROM request_log {FILTER_SQL} \
-             GROUP BY bucket ORDER BY bucket"
+            "WITH aggregated AS ( \
+                 SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                        COUNT(*) AS total, \
+                        COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
+                        COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
+                 FROM request_log {FILTER_SQL} \
+                 GROUP BY bucket_start \
+             ), status_agg AS ( \
+                 SELECT bucket_start, jsonb_object_agg(status_code::TEXT, cnt) AS status_codes \
+                 FROM ( \
+                     SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                            status_code, COUNT(*) AS cnt \
+                     FROM request_log {FILTER_SQL} AND status_code >= 400 \
+                     GROUP BY bucket_start, status_code \
+                 ) grouped \
+                 GROUP BY bucket_start \
+             ) \
+             SELECT to_timestamp(a.bucket_start) AS bucket, \
+                    a.total, a.client_errors, a.server_errors, \
+                    COALESCE(sa.status_codes, jsonb_build_object()) AS status_codes \
+             FROM aggregated a \
+             LEFT JOIN status_agg sa USING (bucket_start) \
+             ORDER BY a.bucket_start"
         )
     };
     let mut trend_params = params.clone();
@@ -374,6 +402,7 @@ pub(crate) async fn request_summary(
                     "total": row.get::<_, i64>("total"),
                     "client_errors": row.get::<_, i64>("client_errors"),
                     "server_errors": row.get::<_, i64>("server_errors"),
+                    "status_codes": row.get::<_, Value>("status_codes"),
                 })
             })
             .collect(),

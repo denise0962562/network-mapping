@@ -37,6 +37,8 @@ pub struct Config {
     pub automatic_target: AutomaticTargetConfig,
     #[serde(default)]
     pub requests: RequestsConfig,
+    #[serde(default)]
+    pub monitor: MonitorConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -68,6 +70,7 @@ impl SelfChecking for Config {
         let _ = &self.database.check();
         let _ = &self.security.check();
         let _ = &self.requests.check();
+        let _ = &self.monitor.check();
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -86,6 +89,7 @@ impl SelfChecking for Config {
         }
         self.security.try_check()?;
         self.requests.try_check()?;
+        self.monitor.try_check()?;
         self.automatic_target.validate()?;
         Ok(true)
     }
@@ -152,6 +156,65 @@ impl SelfChecking for RequestsConfig {
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
         if self.retention_days < 1 {
             return Err("requests.retention_days 必须大于等于 1".into());
+        }
+        Ok(true)
+    }
+}
+
+/// 健康监控与告警配置。
+///
+/// 慢请求与 5xx 错误由请求中间件实时判定，慢 SQL 由后台任务轮询
+/// `pg_stat_statements` 视图判定，三者统一走邮件通知并共享同一冷却去重窗口。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct MonitorConfig {
+    /// 是否启用健康监控与告警。
+    pub enabled: bool,
+    /// 慢请求阈值（毫秒），响应耗时达到该值即触发告警。
+    pub slow_request_threshold_ms: i64,
+    /// 是否对 5xx 服务端错误告警。
+    pub server_error_enabled: bool,
+    /// 慢 SQL 阈值（毫秒），基于 `pg_stat_statements.mean_exec_time`。
+    pub slow_sql_threshold_ms: i64,
+    /// 慢 SQL 轮询间隔（秒）。
+    pub slow_sql_check_interval_seconds: u64,
+    /// 同一告警 key 的冷却时间（秒），冷却窗口内的重复事件被合并丢弃。
+    pub alert_cooldown_seconds: u64,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            slow_request_threshold_ms: 3000,
+            server_error_enabled: true,
+            slow_sql_threshold_ms: 3000,
+            slow_sql_check_interval_seconds: 60,
+            alert_cooldown_seconds: 300,
+        }
+    }
+}
+
+impl SelfChecking for MonitorConfig {
+    fn check(&self) {
+        if let Err(error) = self.try_check() {
+            panic!("{error}");
+        }
+        info!(target: "server::startup", component = "monitor", enabled = self.enabled, slow_request_threshold_ms = self.slow_request_threshold_ms, slow_sql_threshold_ms = self.slow_sql_threshold_ms, "配置检查通过");
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.slow_request_threshold_ms <= 0 {
+            return Err("monitor.slow_request_threshold_ms 必须大于 0".into());
+        }
+        if self.slow_sql_threshold_ms <= 0 {
+            return Err("monitor.slow_sql_threshold_ms 必须大于 0".into());
+        }
+        if self.slow_sql_check_interval_seconds == 0 {
+            return Err("monitor.slow_sql_check_interval_seconds 必须大于 0".into());
+        }
+        if self.alert_cooldown_seconds == 0 {
+            return Err("monitor.alert_cooldown_seconds 必须大于 0".into());
         }
         Ok(true)
     }
@@ -550,6 +613,14 @@ pub struct NotificationPreferences {
     pub report_daily: bool,
     pub report_weekly: bool,
     pub report_monthly: bool,
+    /// 是否发送健康告警（慢请求 / 5xx / 慢 SQL）。
+    /// 字段级默认值为 `true`，保证旧前端保存邮件设置时不带该字段也能正常反序列化。
+    #[serde(default = "default_health_alert_enabled")]
+    pub health_alert_enabled: bool,
+}
+
+fn default_health_alert_enabled() -> bool {
+    true
 }
 
 impl Default for NotificationPreferences {
@@ -561,6 +632,7 @@ impl Default for NotificationPreferences {
             report_daily: false,
             report_weekly: true,
             report_monthly: false,
+            health_alert_enabled: true,
         }
     }
 }
@@ -668,11 +740,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomaticTargetConfig, Clis, FrontendConfig, MaxMindConfig, SecurityConfig, SelfChecking,
-        TlsConfig, session_ttl_seconds_from_minutes,
+        AutomaticTargetConfig, Clis, FrontendConfig, MaxMindConfig, NotificationPreferences,
+        SecurityConfig, SelfChecking, TlsConfig, session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn notification_preferences_default_health_alert_when_field_missing() {
+        let prefs: NotificationPreferences = serde_json::from_value(serde_json::json!({
+            "loginNotifyEnabled": true,
+            "notifyOnStuck": true,
+            "notifyOnComplete": true,
+            "reportDaily": false,
+            "reportWeekly": true,
+            "reportMonthly": false
+        }))
+        .expect("旧前端缺少 healthAlertEnabled 时应能正常反序列化");
+        assert!(prefs.health_alert_enabled);
+    }
 
     #[test]
     fn session_ttl_minutes_are_converted_and_bounded() {
@@ -905,6 +991,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::audit::get_audit_event)
         .service(handlers::requests::list_requests)
         .service(handlers::requests::request_summary)
+        .service(handlers::health::list_health_alerts)
         .service(user::user_logout)
         .service(user::verify_totp_h)
         .service(user::bind_twofa_h)
