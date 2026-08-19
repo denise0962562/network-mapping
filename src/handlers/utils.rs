@@ -7,8 +7,9 @@ use crate::TEXT_HTML_UTF_8;
 use crate::admin::{
     UserBaseI, UserSession, get_config_from_database, get_mail_sender_key_from_database,
     get_mail_settings_from_database, get_scan_settings_from_database,
-    get_session_settings_from_database, try_send_email, write_mail_settings_to_database,
-    write_scan_settings_to_database, write_session_settings_to_database,
+    get_session_settings_from_database, smtp_send_error_message, try_send_email,
+    write_mail_settings_to_database, write_scan_settings_to_database,
+    write_session_settings_to_database,
 };
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::config::{
@@ -674,7 +675,8 @@ async fn test_mail_server_h(
             );
             HttpResponse::BadGateway().json(json!({
                 "success": false,
-                "message": "无法连接邮件服务器或发送失败"
+                "message": smtp_send_error_message(error_value.as_ref()),
+                "detail": error_value.to_string()
             }))
         }
     }

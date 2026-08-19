@@ -1045,7 +1045,7 @@ async fn apply_task_handler(
             Err(ApplyTaskError::ScannerUnauthorized) => {
                 HttpResponse::Unauthorized().body("unauthorized")
             }
-            Err(ApplyTaskError::NoTask) => HttpResponse::NotFound().finish(),
+            Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
             Err(ApplyTaskError::Database(e)) => {
                 error_logs_error(
                     &req,
@@ -1070,9 +1070,7 @@ async fn apply_task_handler(
         Err(ApplyTaskError::ScannerUnauthorized) => {
             HttpResponse::Unauthorized().body("unauthorized")
         }
-        Err(ApplyTaskError::NoTask) => HttpResponse::NotFound()
-            .content_type(TEXT_HTML_UTF_8)
-            .body("没有可领取的任务"),
+        Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
         Err(ApplyTaskError::Database(e)) => {
             error_logs_error(
                 &req,
