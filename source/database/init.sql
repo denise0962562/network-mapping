@@ -524,6 +524,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
+CREATE INDEX IF NOT EXISTS idx_scan_task_user_list
+	ON scan_task (user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_task_status_list
+	ON scan_task (task_status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_task_scanner_list
+	ON scan_task (assigned_scanner_id, id DESC)
+	WHERE assigned_scanner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_create_time_list
+	ON scan_task (task_create_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_task_manual_list
+	ON scan_task (id DESC) WHERE task_source <> 'automatic';
 CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_queue
 	ON scan_task (task_status, task_create_time) WHERE task_source = 'automatic';
 CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_family_queue

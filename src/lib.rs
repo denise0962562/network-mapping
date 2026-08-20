@@ -2132,23 +2132,55 @@ pub struct TaskItem {
 /// 表示 Json 格式的任务列表
 #[derive(Serialize)]
 pub struct TaskItemJson {
-    pub total_c: i64,
-    pub item_c: i64,
-    pub start_id: i32,
-    pub task_item: Vec<TaskItem>,
+    pub total: i64,
+    pub page_size: i64,
+    pub next_cursor: Option<i32>,
+    pub has_more: bool,
+    pub items: Vec<TaskItem>,
 }
 
 /// 该结构体表示接收查询任务列表信息
 #[derive(Deserialize)]
 pub struct ReceiveTaskItemQueryInfo {
-    pub start: Option<i32>,
-    pub count: Option<i64>,
+    #[serde(alias = "start")]
+    pub cursor: Option<i32>,
+    #[serde(alias = "count")]
+    pub limit: Option<i64>,
     pub include_system: Option<bool>,
+    pub task_id: Option<String>,
+    pub target: Option<String>,
+    pub status: Option<String>,
+    pub operator: Option<String>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub scanner_id: Option<String>,
+}
+
+pub struct TaskListFilters {
+    pub cursor: Option<i32>,
+    pub limit: i64,
+    pub include_system: bool,
+    pub task_id: Option<String>,
+    pub target: Option<String>,
+    pub status: Option<String>,
+    pub operator: Option<String>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub scanner_id: Option<String>,
+}
+
+pub struct TaskListPage {
+    pub items: Vec<TaskItem>,
+    pub total: i64,
+    pub page_size: i64,
+    pub next_cursor: Option<i32>,
+    pub has_more: bool,
 }
 
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
 ///
 /// 接收多个参数，分别为
+#[deprecated(note = "use get_filtered_task_page for stable pagination and server-side filters")]
 pub async fn get_task_item(
     pool: &deadpool_postgres::Pool,
     s_count: i64,
@@ -2247,6 +2279,134 @@ pub async fn get_task_item(
         count += 1;
     }
     Ok((task_item_r, total_count_item, count, start_id))
+}
+
+/// 使用服务端筛选和排他游标分页获取任务，单次最多返回 100 条记录。
+pub async fn get_filtered_task_page(
+    pool: &deadpool_postgres::Pool,
+    filters: &TaskListFilters,
+    permissions: Permission,
+) -> Result<TaskListPage, Box<dyn std::error::Error>> {
+    let mut connection = pool.get().await?;
+    let transaction = connection.transaction().await?;
+    let expired = transaction
+        .query(
+            "UPDATE scan_task_execution SET execution_status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'pending' END, \
+             assigned_scanner_id = CASE WHEN cancel_requested THEN assigned_scanner_id ELSE NULL END, lease_expires_at = NULL, \
+             task_start_time = CASE WHEN cancel_requested THEN task_start_time ELSE NULL END, \
+             task_end_time = CASE WHEN cancel_requested THEN (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT ELSE NULL END, \
+             cancel_requested = false, failure_reason = CASE WHEN cancel_requested THEN NULL ELSE 'task lease expired' END \
+             WHERE execution_status = 'running' AND lease_expires_at IS NOT NULL \
+               AND lease_expires_at < (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT RETURNING task_id;",
+            &[],
+        )
+        .await?;
+    let expired_tasks: std::collections::HashSet<i32> =
+        expired.iter().map(|row| row.get("task_id")).collect();
+    for task_id in expired_tasks {
+        refresh_task_aggregate(&transaction, task_id).await?;
+    }
+    transaction.commit().await?;
+
+    let (role, user_id) = match permissions {
+        Permission::Administrator(id) => (1_i32, id),
+        Permission::Users(id) => (2_i32, id),
+    };
+    const FILTER_SQL: &str = "($1 = 1 OR t.user_id = $2) \
+        AND ($3::BOOLEAN OR t.task_source <> 'automatic') \
+        AND ($4::TEXT IS NULL OR t.task_id ILIKE '%' || $4 || '%') \
+        AND ($5::TEXT IS NULL OR EXISTS (\
+            SELECT 1 FROM unnest(t.task_target) AS targets(target) \
+            WHERE targets.target::TEXT ILIKE '%' || $5 || '%'\
+        )) \
+        AND ($6::TEXT IS NULL OR t.task_status = $6) \
+        AND ($7::TEXT IS NULL OR t.task_initiator ILIKE '%' || $7 || '%') \
+        AND ($8::BIGINT IS NULL OR t.task_create_time >= $8) \
+        AND ($9::BIGINT IS NULL OR t.task_create_time <= $9) \
+        AND ($10::TEXT IS NULL OR COALESCE(t.assigned_scanner_id, '') ILIKE '%' || $10 || '%')";
+    let count_sql = format!("SELECT COUNT(*)::BIGINT AS total FROM scan_task t WHERE {FILTER_SQL}");
+    let count_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+        &role,
+        &user_id,
+        &filters.include_system,
+        &filters.task_id,
+        &filters.target,
+        &filters.status,
+        &filters.operator,
+        &filters.start_time,
+        &filters.end_time,
+        &filters.scanner_id,
+    ];
+    let total = connection
+        .query_one(&count_sql, count_params)
+        .await?
+        .get("total");
+
+    let page_size = filters.limit.clamp(1, 100);
+    let fetch_limit = page_size + 1;
+    let page_sql = format!(
+        "SELECT t.* FROM scan_task t WHERE {FILTER_SQL} \
+         AND ($11::INTEGER IS NULL OR t.id < $11) \
+         ORDER BY t.id DESC LIMIT $12"
+    );
+    let mut rows = connection
+        .query(
+            &page_sql,
+            &[
+                &role,
+                &user_id,
+                &filters.include_system,
+                &filters.task_id,
+                &filters.target,
+                &filters.status,
+                &filters.operator,
+                &filters.start_time,
+                &filters.end_time,
+                &filters.scanner_id,
+                &filters.cursor,
+                &fetch_limit,
+            ],
+        )
+        .await?;
+    let has_more = rows.len() > page_size as usize;
+    if has_more {
+        rows.truncate(page_size as usize);
+    }
+    let next_cursor = if has_more {
+        rows.last().map(|row| row.get::<_, i32>("id"))
+    } else {
+        None
+    };
+    let items = rows
+        .into_iter()
+        .map(|row| TaskItem {
+            task_id: row.get("task_id"),
+            task_target: row.get("task_target"),
+            task_initiator: row.get("task_initiator"),
+            task_port: row.get("task_port"),
+            task_create_time: row.get("task_create_time"),
+            task_level: row.get("task_level"),
+            scanner_id: row.get("assigned_scanner_id"),
+            task_status: row.get("task_status"),
+            lease_expires_at: row.get("lease_expires_at"),
+            attempt_count: row.get("attempt_count"),
+            failure_reason: row.get("failure_reason"),
+            start_at: row.get("task_start_time"),
+            end_at: row.get("task_end_time"),
+            remarks: row.get("remarks"),
+            task_source: row.get("task_source"),
+            address_family: row.get("address_family"),
+            scan_profile: row.get("scan_profile"),
+            scan_plan: row.get("scan_plan"),
+        })
+        .collect();
+    Ok(TaskListPage {
+        items,
+        total,
+        page_size,
+        next_cursor,
+        has_more,
+    })
 }
 
 /// 用于接收系统信息查询

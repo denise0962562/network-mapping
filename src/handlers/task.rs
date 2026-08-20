@@ -5,7 +5,8 @@ use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
-    TaskItemJson, apply_task, build_scan_plan, get_task_item, validate_scanner_credentials,
+    TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
+    validate_scanner_credentials,
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
@@ -1151,6 +1152,63 @@ async fn upload_scanner_result_handler(
 /// 获取所有任务接口
 ///
 /// 分为管理员权限和普通用户权限
+fn normalize_task_list_text(
+    value: &Option<String>,
+    max_length: usize,
+    field_name: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if value.chars().count() > max_length {
+        return Err(format!("{field_name}长度不能超过 {max_length} 个字符"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn normalize_task_list_query(query: &ReceiveTaskItemQueryInfo) -> Result<TaskListFilters, String> {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return Err("limit 必须在 1 到 100 之间".to_owned());
+    }
+    if query.cursor.is_some_and(|cursor| cursor <= 0) {
+        return Err("cursor 必须是正整数".to_owned());
+    }
+    if query.start_time.is_some_and(|value| value < 0)
+        || query.end_time.is_some_and(|value| value < 0)
+    {
+        return Err("时间范围不能为负数".to_owned());
+    }
+    if matches!((query.start_time, query.end_time), (Some(start), Some(end)) if start > end) {
+        return Err("开始时间不能晚于结束时间".to_owned());
+    }
+    let status = normalize_task_list_text(&query.status, 32, "状态")?;
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "pending" | "running" | "succeeded" | "failed" | "cancelled" | "partial"
+        )
+    }) {
+        return Err("任务状态无效".to_owned());
+    }
+    Ok(TaskListFilters {
+        cursor: query.cursor,
+        limit,
+        include_system: query.include_system.unwrap_or(false),
+        task_id: normalize_task_list_text(&query.task_id, 36, "任务 ID")?,
+        target: normalize_task_list_text(&query.target, 128, "目标")?,
+        status,
+        operator: normalize_task_list_text(&query.operator, 64, "操作者")?,
+        start_time: query.start_time,
+        end_time: query.end_time,
+        scanner_id: normalize_task_list_text(&query.scanner_id, 36, "扫描器 ID")?,
+    })
+}
+
 #[get("/api/task/all")]
 async fn get_all_task_handler(
     _req: HttpRequest,
@@ -1159,6 +1217,12 @@ async fn get_all_task_handler(
     user_base_i: UserBaseI,
 ) -> impl Responder {
     let p = pool.get_ref();
+    let filters = match normalize_task_list_query(&query_info) {
+        Ok(value) => value,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"message": message}));
+        }
+    };
 
     let user_id = user_base_i.id;
     let user_role = user_base_i.role;
@@ -1176,15 +1240,7 @@ async fn get_all_task_handler(
         }
     };
 
-    let (tmp_result, total_count, item_count, start_index) = match get_task_item(
-        p,
-        query_info.count.unwrap_or(5),
-        query_info.start,
-        query_info.include_system.unwrap_or(false),
-        permi,
-    )
-    .await
-    {
+    let page = match get_filtered_task_page(p, &filters, permi).await {
         Ok(o) => o,
         Err(e) => {
             error!(
@@ -1197,10 +1253,11 @@ async fn get_all_task_handler(
     };
 
     let tmp_json = TaskItemJson {
-        total_c: total_count,
-        item_c: item_count,
-        start_id: start_index,
-        task_item: tmp_result,
+        total: page.total,
+        page_size: page.page_size,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+        items: page.items,
     };
 
     HttpResponse::Ok().json(tmp_json)
@@ -1210,7 +1267,7 @@ async fn get_all_task_handler(
 mod tests {
     use super::{
         ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerScanCapabilities,
-        task_result_pagination, validate_public_ip,
+        normalize_task_list_query, task_result_pagination, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
@@ -1220,11 +1277,40 @@ mod tests {
         let default_query =
             web::Query::<ReceiveTaskItemQueryInfo>::from_query("").expect("empty query is valid");
         assert!(!default_query.include_system.unwrap_or(false));
+        let normalized = normalize_task_list_query(&default_query).expect("normalize defaults");
+        assert_eq!(normalized.limit, 20);
+        assert!(!normalized.include_system);
 
         let include_query =
             web::Query::<ReceiveTaskItemQueryInfo>::from_query("include_system=true&count=10")
                 .expect("include_system query is valid");
         assert_eq!(include_query.include_system, Some(true));
+        assert_eq!(include_query.limit, Some(10));
+    }
+
+    #[test]
+    fn task_list_query_validates_filters_and_pagination() {
+        let valid = web::Query::<ReceiveTaskItemQueryInfo>::from_query(
+            "limit=20&status=running&operator=admin&start_time=10&end_time=20",
+        )
+        .expect("valid task query");
+        let normalized = normalize_task_list_query(&valid).expect("normalize task query");
+        assert_eq!(normalized.limit, 20);
+        assert_eq!(normalized.status.as_deref(), Some("running"));
+        assert_eq!(normalized.operator.as_deref(), Some("admin"));
+
+        let invalid_status = web::Query::<ReceiveTaskItemQueryInfo>::from_query("status=unknown")
+            .expect("deserialize invalid status");
+        assert!(normalize_task_list_query(&invalid_status).is_err());
+
+        let invalid_range =
+            web::Query::<ReceiveTaskItemQueryInfo>::from_query("start_time=20&end_time=10")
+                .expect("deserialize invalid range");
+        assert!(normalize_task_list_query(&invalid_range).is_err());
+
+        let invalid_cursor = web::Query::<ReceiveTaskItemQueryInfo>::from_query("cursor=0")
+            .expect("deserialize invalid cursor");
+        assert!(normalize_task_list_query(&invalid_cursor).is_err());
     }
 
     #[test]
