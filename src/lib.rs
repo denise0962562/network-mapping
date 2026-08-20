@@ -1271,7 +1271,6 @@ struct NormalizedObservation {
     banner: Option<String>,
     source: String,
     data: Option<Value>,
-    scaninfo_other: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -1429,13 +1428,8 @@ fn normalize_upload_observations(
                         protocol: Some(sanitize_text(protocol)),
                         service: None,
                         banner: None,
-                        source: source.clone(),
+                        source,
                         data: Some(serde_json::json!({"state": state})),
-                        scaninfo_other: Some(serde_json::json!({
-                            "observation_kind": "port",
-                            "state": state,
-                            "source": source,
-                        })),
                     }
                 }
                 ScannerObservation::Service {
@@ -1456,13 +1450,8 @@ fn normalize_upload_observations(
                         protocol: Some(sanitize_text(protocol)),
                         service: service.as_deref().map(sanitize_text),
                         banner: banner.as_deref().map(sanitize_text),
-                        source: source.clone(),
-                        data: data.clone(),
-                        scaninfo_other: Some(serde_json::json!({
-                            "observation_kind": "service",
-                            "source": source,
-                            "data": data,
-                        })),
+                        source,
+                        data,
                     }
                 }
             })
@@ -1508,7 +1497,6 @@ fn normalize_upload_observations(
                     banner: item.banner,
                     source,
                     data,
-                    scaninfo_other: item.other,
                 }
             })
             .collect()
@@ -1691,16 +1679,13 @@ pub async fn save_scanner_results(
     let scanner_id = upload.scanner_id.to_string();
 
     let scanner = transaction.query_opt(
-        "SELECT id, name FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
+        "SELECT id FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
         &[&scanner_id, &token_hash]
     ).await.map_err(scanner_result_database_error)?;
 
-    let scanner_name: String = match scanner {
-        Some(row) => row
-            .get::<_, Option<String>>("name")
-            .unwrap_or_else(|| upload.scanner_id.to_string()),
-        None => return Err(SaveScannerResultsError::ScannerUnauthorized),
-    };
+    if scanner.is_none() {
+        return Err(SaveScannerResultsError::ScannerUnauthorized);
+    }
 
     let task_row = transaction
         .query_opt(
@@ -1769,7 +1754,7 @@ pub async fn save_scanner_results(
         return Ok(0);
     };
     let batch_db_id: i64 = row.get("id");
-    let mut mirror_results = vec![false; normalized_observations.len()];
+    let mut inserted_observations = vec![false; normalized_observations.len()];
 
     for (observation_index, observation) in normalized_observations.iter().enumerate() {
         let parsed_ip = parse_ip_or_cidr(&observation.ip).map_err(|source_error| {
@@ -1810,14 +1795,14 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
-        mirror_results[observation_index] = inserted == 1;
+        inserted_observations[observation_index] = inserted == 1;
     }
 
     let mut saved = 0usize;
     let mut ip_intel_cache = HashMap::new();
 
-    for (item, should_mirror) in normalized_observations.iter().zip(mirror_results) {
-        if !should_mirror {
+    for (item, should_project) in normalized_observations.iter().zip(inserted_observations) {
+        if !should_project {
             continue;
         }
         let parsed_ip =
@@ -1863,31 +1848,13 @@ pub async fn save_scanner_results(
         let ip_id: i32 = ip_row.get("ip_id");
 
         let port_i32 = i32::from(item.port);
-        let port_row = transaction
-            .query_one(
+        transaction
+            .execute(
                 "INSERT INTO ports (ip_id, port) \
              VALUES ($1, $2) \
              ON CONFLICT (ip_id, port) DO UPDATE SET \
-                update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
-             RETURNING port_id;",
+                update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT;",
                 &[&ip_id, &port_i32],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
-        let port_id: i32 = port_row.get("port_id");
-
-        transaction
-            .execute(
-                "INSERT INTO scaninfo (port_id, scanner_name, protocol, service, banner, other) \
-             VALUES ($1, $2, $3, $4, $5, $6);",
-                &[
-                    &port_id,
-                    &scanner_name,
-                    &item.protocol,
-                    &item.service,
-                    &item.banner,
-                    &item.scaninfo_other,
-                ],
             )
             .await
             .map_err(scanner_result_database_error)?;

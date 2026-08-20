@@ -3,8 +3,8 @@
 ## 数据语义
 
 `scan_observation` 保存每次执行产生的端口和服务观察，是扫描结果的事实来源。
-`ips`、`ports` 继续用于资产分页、地理信息和端口索引。`scaninfo` 仅在迁移期双写，供必要时
-回滚，不再作为业务查询来源。
+`ips`、`ports` 继续用于资产分页、地理信息和端口索引。服务端不再写入 `scaninfo`，该表仅
+可能作为升级后尚未由用户手动删除的遗留数据存在，不再作为业务查询来源。
 
 扫描器当前只上传开放端口，因此系统不会根据“某次没有发现”推断端口已经关闭：
 
@@ -37,10 +37,22 @@ GET /api/assets/port-history?ip=192.0.2.1&port=443&limit=50&offset=0
 
 ## 历史回填
 
-启动时的 `source/database/init.sql` 为还没有 observation 的旧 execution 创建协议版本 1
-合成批次，并从 `scaninfo -> ports -> ips` 回填事实记录。回填键使用
+当 `scaninfo` 仍存在时，启动时的 `source/database/init.sql` 为还没有 observation 的旧
+execution 创建协议版本 1 合成批次，并从 `scaninfo -> ports -> ips` 回填事实记录。回填键使用
 `legacy:<scan_info_id>`，可以安全重复执行；已有 v2 observation 的 execution 不会再次导入
-兼容镜像。
+旧双写时期的兼容镜像。若表不存在，初始化会直接跳过这一步，且不会重新创建它。
+
+## 下线核验与手动删除
+
+代码不会自动删除或清空 `scaninfo`。完成升级并确保所有服务端实例均已使用停止双写的版本后：
+
+1. 在 `scaninfo` 仍存在时执行只读脚本 `source/database/verify_scaninfo_migration.sql`；
+2. 确认结果中的 `missing_backfill_rows` 和 `mismatched_backfill_rows` 都为 `0`；
+3. 经过业务观察期，核对任务详情、搜索、导出、资产当前端口及端口历史均正常；
+4. 由用户或 DBA 按自身变更流程手动删除 `scaninfo`，应用不会代为执行；
+5. 删除后重启一次服务，确认初始化和数据库容量监控正常。
+
+若核验值不为 `0`，应保留该表并排查对应旧 execution，不要进入手动删除步骤。
 
 ## 后续覆盖模型
 
