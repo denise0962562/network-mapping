@@ -693,13 +693,16 @@ async fn get_task(
         "SELECT e.id, e.execution_id, e.requested_scanner_id, e.assigned_scanner_id, \
          COALESCE(s.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, s.location, \
          e.execution_status, e.attempt_count, e.task_start_time, e.task_end_time, e.lease_expires_at, \
-         e.failure_reason, e.cancel_requested, COUNT(DISTINCT i.ip_id)::BIGINT AS ip_count, \
-         COUNT(DISTINCT p.port_id)::BIGINT AS port_count, COUNT(si.scan_info_id)::BIGINT AS result_count \
+         e.failure_reason, e.cancel_requested, COALESCE(assets.ip_count, 0)::BIGINT AS ip_count, \
+         COALESCE(assets.port_count, 0)::BIGINT AS port_count, COALESCE(observations.result_count, 0)::BIGINT AS result_count \
          FROM scan_task_execution e \
          LEFT JOIN scanner_info s ON s.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
-         LEFT JOIN ips i ON i.execution_id = e.id LEFT JOIN ports p ON p.ip_id = i.ip_id \
-         LEFT JOIN scaninfo si ON si.port_id = p.port_id WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
-         GROUP BY e.id, s.name, s.location ORDER BY e.id;", &[&task_pk]).await {
+         LEFT JOIN LATERAL (SELECT COUNT(DISTINCT i.ip_id) AS ip_count, COUNT(DISTINCT p.port_id) AS port_count \
+             FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id WHERE i.execution_id = e.id) assets ON true \
+         LEFT JOIN LATERAL (SELECT COUNT(*) AS result_count FROM scan_observation o \
+             WHERE o.execution_id = e.id) observations ON true \
+         WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
+         ORDER BY e.id;", &[&task_pk]).await {
         Ok(rows) => rows,
         Err(error) => { error_logs(&req, "GetTaskExecutionsError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
     };
@@ -738,11 +741,10 @@ async fn get_task(
     let (page, page_size, offset) = task_result_pagination(query.page, query.page_size);
     let summary = match connection
         .query_one(
-            "SELECT COUNT(DISTINCT i.ip_id)::BIGINT AS ip_count, \
-             COUNT(DISTINCT p.port_id)::BIGINT AS port_count, \
-             COUNT(si.scan_info_id)::BIGINT AS result_count \
-             FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id \
-             LEFT JOIN scaninfo si ON si.port_id = p.port_id WHERE i.execution_id = $1;",
+            "SELECT \
+             (SELECT COUNT(*)::BIGINT FROM ips WHERE execution_id = $1) AS ip_count, \
+             (SELECT COUNT(*)::BIGINT FROM ports p JOIN ips i ON i.ip_id = p.ip_id WHERE i.execution_id = $1) AS port_count, \
+             (SELECT COUNT(*)::BIGINT FROM scan_observation WHERE execution_id = $1) AS result_count;",
             &[&selected_execution_pk],
         )
         .await
@@ -774,9 +776,14 @@ async fn get_task(
         let port_rows = match connection
             .query(
                 "SELECT p.ip_id, p.port, latest.protocol, latest.service, latest.banner, \
-                 latest.other, latest.scan_time FROM ports p \
-                 LEFT JOIN LATERAL (SELECT protocol, service, banner, other, scan_time \
-                    FROM scaninfo WHERE port_id = p.port_id ORDER BY scan_time DESC LIMIT 1) latest ON true \
+                 CASE WHEN latest.kind IS NULL THEN NULL \
+                 WHEN latest.kind = 'port' THEN jsonb_strip_nulls(jsonb_build_object( \
+                    'observation_kind', latest.kind, 'state', latest.data->>'state', 'source', latest.source)) \
+                 ELSE jsonb_strip_nulls(jsonb_build_object('observation_kind', latest.kind, \
+                    'source', latest.source, 'data', latest.data)) END AS other, \
+                 latest.scan_time FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
+                 LEFT JOIN scan_execution_endpoint_latest latest \
+                    ON latest.execution_id = i.execution_id AND latest.ip_address = i.ip_address AND latest.port = p.port \
                  WHERE p.ip_id = ANY($1) ORDER BY p.ip_id, p.port;",
                 &[&ip_ids],
             )

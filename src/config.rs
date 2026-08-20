@@ -957,6 +957,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::search::search_port)
         .service(handlers::search::search_service)
         .service(handlers::search::search_banner)
+        .service(handlers::assets::get_asset_ports)
+        .service(handlers::assets::get_asset_port_history)
         .service(crate::target_generated::automatic_target_status)
         .service(handlers::task::create_task)
         .service(handlers::task::apply_task_handler) //更换了 apply_task_handler 和 get_task的注册顺序

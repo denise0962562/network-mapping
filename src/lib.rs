@@ -1261,6 +1261,19 @@ pub struct ScannerResultItem {
     pub other: Option<Value>,
 }
 
+#[derive(Clone, Debug)]
+struct NormalizedObservation {
+    kind: &'static str,
+    ip: String,
+    port: u16,
+    protocol: Option<String>,
+    service: Option<String>,
+    banner: Option<String>,
+    source: String,
+    data: Option<Value>,
+    scaninfo_other: Option<Value>,
+}
+
 #[derive(Debug)]
 pub enum SaveScannerResultsError {
     Database(Box<dyn std::error::Error + Send + Sync>),
@@ -1391,9 +1404,162 @@ fn sanitize_result_item(item: ScannerResultItem) -> ScannerResultItem {
     }
 }
 
+fn normalize_upload_observations(
+    upload: &ScannerResultUpload,
+) -> Result<Vec<NormalizedObservation>, SaveScannerResultsError> {
+    let is_v2 = upload.protocol_version == 2;
+    let observations: Vec<NormalizedObservation> = if is_v2 {
+        upload
+            .observations
+            .iter()
+            .map(|observation| match observation {
+                ScannerObservation::Port {
+                    ip,
+                    port,
+                    protocol,
+                    state,
+                    source,
+                } => {
+                    let state = sanitize_text(state);
+                    let source = sanitize_text(source);
+                    NormalizedObservation {
+                        kind: "port",
+                        ip: ip.clone(),
+                        port: *port,
+                        protocol: Some(sanitize_text(protocol)),
+                        service: None,
+                        banner: None,
+                        source: source.clone(),
+                        data: Some(serde_json::json!({"state": state})),
+                        scaninfo_other: Some(serde_json::json!({
+                            "observation_kind": "port",
+                            "state": state,
+                            "source": source,
+                        })),
+                    }
+                }
+                ScannerObservation::Service {
+                    ip,
+                    port,
+                    protocol,
+                    service,
+                    banner,
+                    source,
+                    data,
+                } => {
+                    let source = sanitize_text(source);
+                    let data = data.clone().map(sanitize_json_value);
+                    NormalizedObservation {
+                        kind: "service",
+                        ip: ip.clone(),
+                        port: *port,
+                        protocol: Some(sanitize_text(protocol)),
+                        service: service.as_deref().map(sanitize_text),
+                        banner: banner.as_deref().map(sanitize_text),
+                        source: source.clone(),
+                        data: data.clone(),
+                        scaninfo_other: Some(serde_json::json!({
+                            "observation_kind": "service",
+                            "source": source,
+                            "data": data,
+                        })),
+                    }
+                }
+            })
+            .collect()
+    } else {
+        upload
+            .results
+            .iter()
+            .cloned()
+            .map(sanitize_result_item)
+            .map(|item| {
+                let kind = if item
+                    .service
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                    || item
+                        .banner
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                {
+                    "service"
+                } else {
+                    "port"
+                };
+                let source = item
+                    .other
+                    .as_ref()
+                    .and_then(|value| value.get("source"))
+                    .and_then(Value::as_str)
+                    .map(sanitize_text)
+                    .filter(|value| !value.is_empty() && value.len() <= 64)
+                    .unwrap_or_else(|| "legacy".to_owned());
+                let data = Some(serde_json::json!({
+                    "state": "open",
+                    "legacy_other": item.other.clone(),
+                }));
+                NormalizedObservation {
+                    kind,
+                    ip: item.ip,
+                    port: item.port,
+                    protocol: item.protocol.filter(|value| !value.is_empty()),
+                    service: item.service,
+                    banner: item.banner,
+                    source,
+                    data,
+                    scaninfo_other: item.other,
+                }
+            })
+            .collect()
+    };
+
+    for observation in &observations {
+        if observation
+            .protocol
+            .as_ref()
+            .is_some_and(|value| value.len() > 16)
+            || (is_v2
+                && observation
+                    .protocol
+                    .as_ref()
+                    .is_none_or(|value| value.is_empty()))
+            || observation.source.is_empty()
+            || observation.source.len() > 64
+            || observation
+                .service
+                .as_ref()
+                .is_some_and(|value| value.len() > 128)
+            || observation
+                .banner
+                .as_ref()
+                .is_some_and(|value| value.len() > 4096)
+            || (observation.kind == "port"
+                && observation
+                    .data
+                    .as_ref()
+                    .and_then(|value| value["state"].as_str())
+                    != Some("open"))
+            || observation
+                .data
+                .as_ref()
+                .is_some_and(|value| value.to_string().len() > 1_048_576)
+        {
+            return Err(SaveScannerResultsError::InvalidUpload(
+                "observation fields exceed allowed values or sizes".into(),
+            ));
+        }
+    }
+
+    Ok(observations)
+}
+
 #[cfg(test)]
 mod sanitize_nul_tests {
-    use super::{ScannerResultItem, sanitize_json_value, sanitize_result_item, sanitize_text};
+    use super::{
+        ScannerResultItem, ScannerResultUpload, normalize_upload_observations, sanitize_json_value,
+        sanitize_result_item, sanitize_text,
+    };
 
     #[test]
     fn strips_nul_from_plain_text() {
@@ -1433,6 +1599,53 @@ mod sanitize_nul_tests {
         assert_eq!(sanitized.banner.as_deref(), Some("banner"));
         assert_eq!(sanitized.other.unwrap()["data"], "xy");
     }
+
+    #[test]
+    fn normalizes_legacy_results_into_observations() {
+        let upload: ScannerResultUpload = serde_json::from_value(serde_json::json!({
+            "scanner_id": "00000000-0000-0000-0000-000000000001",
+            "task_id": "00000000-0000-0000-0000-000000000002",
+            "results": [{
+                "ip": "192.0.2.1",
+                "port": 443,
+                "protocol": null,
+                "service": "https",
+                "banner": null,
+                "other": {"source": "legacy-probe", "tls": true}
+            }]
+        }))
+        .unwrap();
+
+        let observations = normalize_upload_observations(&upload).unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].kind, "service");
+        assert_eq!(observations[0].protocol, None);
+        assert_eq!(observations[0].source, "legacy-probe");
+        assert_eq!(observations[0].data.as_ref().unwrap()["state"], "open");
+    }
+
+    #[test]
+    fn rejects_typed_observations_without_protocol() {
+        let upload: ScannerResultUpload = serde_json::from_value(serde_json::json!({
+            "protocol_version": 2,
+            "scanner_id": "00000000-0000-0000-0000-000000000001",
+            "task_id": "00000000-0000-0000-0000-000000000002",
+            "upload_id": "00000000-0000-0000-0000-000000000003",
+            "batch_index": 0,
+            "is_final": true,
+            "observations": [{
+                "kind": "port",
+                "ip": "192.0.2.1",
+                "port": 80,
+                "protocol": "",
+                "state": "open",
+                "source": "masscan"
+            }]
+        }))
+        .unwrap();
+
+        assert!(normalize_upload_observations(&upload).is_err());
+    }
 }
 
 pub async fn save_scanner_results(
@@ -1466,61 +1679,7 @@ pub async fn save_scanner_results(
         ));
     }
 
-    let normalized_results: Vec<ScannerResultItem> = if is_v2 {
-        upload
-            .observations
-            .iter()
-            .map(|observation| match observation {
-                ScannerObservation::Port {
-                    ip,
-                    port,
-                    protocol,
-                    state,
-                    source,
-                } => ScannerResultItem {
-                    ip: ip.clone(),
-                    port: *port,
-                    protocol: Some(protocol.clone()),
-                    service: None,
-                    banner: None,
-                    other: Some(serde_json::json!({
-                        "observation_kind": "port",
-                        "state": state,
-                        "source": source,
-                    })),
-                },
-                ScannerObservation::Service {
-                    ip,
-                    port,
-                    protocol,
-                    service,
-                    banner,
-                    source,
-                    data,
-                } => ScannerResultItem {
-                    ip: ip.clone(),
-                    port: *port,
-                    protocol: Some(protocol.clone()),
-                    service: service.clone(),
-                    banner: banner.clone(),
-                    other: Some(serde_json::json!({
-                        "observation_kind": "service",
-                        "source": source,
-                        "data": data,
-                    })),
-                },
-            })
-            .map(sanitize_result_item)
-            .collect()
-    } else {
-        upload
-            .results
-            .iter()
-            .cloned()
-            .map(sanitize_result_item)
-            .collect()
-    };
-    let mut mirror_results = vec![true; normalized_results.len()];
+    let normalized_observations = normalize_upload_observations(upload)?;
 
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
@@ -1545,7 +1704,7 @@ pub async fn save_scanner_results(
 
     let task_row = transaction
         .query_opt(
-            "SELECT t.id AS task_id, e.id AS execution_id, e.execution_status \
+            "SELECT t.id AS task_id, e.id AS execution_id, e.execution_id AS public_execution_id, e.execution_status \
              FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id \
              WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
              AND e.execution_status IN ('running', 'succeeded') LIMIT 1;",
@@ -1554,7 +1713,7 @@ pub async fn save_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
 
-    let (task_db_id, execution_db_id): (i32, i32) = match task_row {
+    let (task_db_id, execution_db_id, public_execution_id): (i32, i32, String) = match task_row {
         Some(row) if row.get::<_, String>("execution_status") == "succeeded" => {
             transaction
                 .commit()
@@ -1562,152 +1721,102 @@ pub async fn save_scanner_results(
                 .map_err(scanner_result_database_error)?;
             return Ok(0);
         }
-        Some(row) if row.get::<_, String>("execution_status") == "running" => {
-            (row.get("task_id"), row.get("execution_id"))
-        }
+        Some(row) if row.get::<_, String>("execution_status") == "running" => (
+            row.get("task_id"),
+            row.get("execution_id"),
+            row.get("public_execution_id"),
+        ),
         Some(_) => return Err(SaveScannerResultsError::TaskNotOwned),
         None => return Err(SaveScannerResultsError::TaskNotFound),
     };
 
-    let batch_db_id = if is_v2 {
-        let upload_id = upload.upload_id.expect("validated above").to_string();
-        let batch_index =
+    let (upload_id, batch_index, is_final) = if is_v2 {
+        (
+            upload.upload_id.expect("validated above").to_string(),
             i32::try_from(upload.batch_index.expect("validated above")).map_err(|_| {
                 SaveScannerResultsError::InvalidUpload("batch_index is too large".into())
-            })?;
-        let observation_count = i32::try_from(upload.observations.len()).expect("bounded above");
-        let row = transaction
-            .query_opt(
-                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count) \
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (execution_id, upload_id, batch_index) \
-                 DO NOTHING RETURNING id;",
+            })?,
+            upload.is_final.expect("validated above"),
+        )
+    } else {
+        (public_execution_id, 0, true)
+    };
+    let observation_count = i32::try_from(normalized_observations.len()).map_err(|_| {
+        SaveScannerResultsError::InvalidUpload("too many observations in one upload".into())
+    })?;
+    let protocol_version = i16::try_from(upload.protocol_version).expect("validated above");
+    let row = transaction
+        .query_opt(
+            "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, protocol_version) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (execution_id, upload_id, batch_index) \
+             DO NOTHING RETURNING id;",
+            &[
+                &execution_db_id,
+                &upload_id,
+                &batch_index,
+                &is_final,
+                &observation_count,
+                &protocol_version,
+            ],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    let Some(row) = row else {
+        transaction
+            .commit()
+            .await
+            .map_err(scanner_result_database_error)?;
+        return Ok(0);
+    };
+    let batch_db_id: i64 = row.get("id");
+    let mut mirror_results = vec![false; normalized_observations.len()];
+
+    for (observation_index, observation) in normalized_observations.iter().enumerate() {
+        let parsed_ip = parse_ip_or_cidr(&observation.ip).map_err(|source_error| {
+            SaveScannerResultsError::InvalidIp {
+                ip: observation.ip.clone(),
+                source: source_error,
+            }
+        })?;
+        let canonical_ip = parsed_ip.to_string();
+        let observation_key = serde_json::to_string(&serde_json::json!([
+            observation.kind,
+            canonical_ip,
+            observation.port,
+            observation.protocol,
+            observation.service,
+            observation.source
+        ]))
+        .map_err(scanner_result_database_error)?;
+        let port_i32 = i32::from(observation.port);
+        let inserted = transaction
+            .execute(
+                "INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, ip_address, port, protocol, service, banner, source, data) \
+                 VALUES ($1, $2, $3, $4, $5::text::inet, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (execution_id, observation_key) DO NOTHING;",
                 &[
                     &execution_db_id,
-                    &upload_id,
-                    &batch_index,
-                    &upload.is_final.expect("validated above"),
-                    &observation_count,
+                    &batch_db_id,
+                    &observation_key,
+                    &observation.kind,
+                    &canonical_ip,
+                    &port_i32,
+                    &observation.protocol,
+                    &observation.service,
+                    &observation.banner,
+                    &observation.source,
+                    &observation.data,
                 ],
             )
             .await
             .map_err(scanner_result_database_error)?;
-        let Some(row) = row else {
-            transaction
-                .commit()
-                .await
-                .map_err(scanner_result_database_error)?;
-            return Ok(0);
-        };
-        Some(row.get::<_, i64>("id"))
-    } else {
-        None
-    };
-
-    if let Some(batch_db_id) = batch_db_id {
-        for (observation_index, observation) in upload.observations.iter().enumerate() {
-            let (kind, ip, port, protocol, service, banner, source, data) = match observation {
-                ScannerObservation::Port {
-                    ip,
-                    port,
-                    protocol,
-                    state,
-                    source,
-                } => (
-                    "port",
-                    ip,
-                    *port,
-                    protocol,
-                    None,
-                    None,
-                    source,
-                    Some(serde_json::json!({"state": state})),
-                ),
-                ScannerObservation::Service {
-                    ip,
-                    port,
-                    protocol,
-                    service,
-                    banner,
-                    source,
-                    data,
-                } => (
-                    "service",
-                    ip,
-                    *port,
-                    protocol,
-                    service.as_deref(),
-                    banner.as_deref(),
-                    source,
-                    data.clone(),
-                ),
-            };
-            let protocol = sanitize_text(protocol);
-            let source = sanitize_text(source);
-            let service = service.map(sanitize_text);
-            let banner = banner.map(sanitize_text);
-            let data = data.map(sanitize_json_value);
-            if protocol.is_empty()
-                || protocol.len() > 16
-                || source.is_empty()
-                || source.len() > 64
-                || service.as_ref().is_some_and(|value| value.len() > 128)
-                || banner.as_ref().is_some_and(|value| value.len() > 4096)
-                || (kind == "port"
-                    && data.as_ref().and_then(|value| value["state"].as_str()) != Some("open"))
-                || data
-                    .as_ref()
-                    .is_some_and(|value| value.to_string().len() > 1_048_576)
-            {
-                return Err(SaveScannerResultsError::InvalidUpload(
-                    "observation fields exceed allowed values or sizes".into(),
-                ));
-            }
-            let parsed_ip = parse_ip_or_cidr(ip).map_err(|source_error| {
-                SaveScannerResultsError::InvalidIp {
-                    ip: ip.clone(),
-                    source: source_error,
-                }
-            })?;
-            let canonical_ip = parsed_ip.to_string();
-            let observation_key = serde_json::to_string(&serde_json::json!([
-                kind,
-                canonical_ip,
-                port,
-                protocol,
-                service,
-                source
-            ]))
-            .map_err(scanner_result_database_error)?;
-            let port_i32 = i32::from(port);
-            let inserted = transaction
-                .execute(
-                    "INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, ip_address, port, protocol, service, banner, source, data) \
-                     VALUES ($1, $2, $3, $4, $5::text::inet, $6, $7, $8, $9, $10, $11) \
-                     ON CONFLICT (execution_id, observation_key) DO NOTHING;",
-                    &[
-                        &execution_db_id,
-                        &batch_db_id,
-                        &observation_key,
-                        &kind,
-                        &canonical_ip,
-                        &port_i32,
-                        &protocol,
-                        &service,
-                        &banner,
-                        &source,
-                        &data,
-                    ],
-                )
-                .await
-                .map_err(scanner_result_database_error)?;
-            mirror_results[observation_index] = inserted == 1;
-        }
+        mirror_results[observation_index] = inserted == 1;
     }
 
     let mut saved = 0usize;
     let mut ip_intel_cache = HashMap::new();
 
-    for (item, should_mirror) in normalized_results.iter().zip(mirror_results) {
+    for (item, should_mirror) in normalized_observations.iter().zip(mirror_results) {
         if !should_mirror {
             continue;
         }
@@ -1777,7 +1886,7 @@ pub async fn save_scanner_results(
                     &item.protocol,
                     &item.service,
                     &item.banner,
-                    &item.other,
+                    &item.scaninfo_other,
                 ],
             )
             .await

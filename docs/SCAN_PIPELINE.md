@@ -29,3 +29,10 @@
 `scan_observation`，同时镜像到现有 `ips`、`ports`、`scaninfo` 表以兼容现有查询界面。
 只有最终批提交后任务执行才进入 `succeeded`。协议版本 1 的 `results` 请求继续支持，便于
 滚动升级旧扫描器。
+
+`scan_observation` 是扫描结果的事实来源；`ips`、`ports` 是资产与端口索引。读取接口通过
+`scan_execution_endpoint_latest` 统一选择一次执行内的展示结果：服务观察优先于端口观察，
+再按观察时间和记录 ID 排序。迁移期仍写入 `scaninfo`，但任务详情、搜索、导出和分析查询
+不再依赖该表。协议版本 1 的结果会转换为 observation，并绑定到 execution 对应的合成批次。
+
+资产当前状态和端口历史接口参见 [`ASSET_PORT_HISTORY.md`](ASSET_PORT_HISTORY.md)。
