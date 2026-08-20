@@ -46,6 +46,25 @@ struct AssetPortCurrent {
 }
 
 #[derive(Serialize)]
+struct AssetSummary {
+    ip: String,
+    asn: Option<String>,
+    isp: Option<String>,
+    as_org: Option<String>,
+    country_code: Option<String>,
+    country_name: Option<String>,
+    city_name: Option<String>,
+    port_count: i64,
+    active_port_count: i64,
+    stale_port_count: i64,
+    service_count: i64,
+    scanner_count: i64,
+    observation_count: i64,
+    first_seen_at: Option<i64>,
+    last_seen_at: Option<i64>,
+}
+
+#[derive(Serialize)]
 struct AssetObservationHistoryItem {
     id: i64,
     kind: String,
@@ -94,6 +113,117 @@ fn normalize_history_pagination(
 
 fn bad_request(message: &'static str) -> HttpResponse {
     HttpResponse::BadRequest().json(serde_json::json!({"message": message}))
+}
+
+#[get("/api/assets/summary")]
+pub(crate) async fn get_asset_summary(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    query: web::Query<AssetPortsQuery>,
+    user: UserBaseI,
+) -> impl Responder {
+    let ip = match normalize_ip(&query.ip) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
+    let stale_after_days = match normalize_stale_after_days(query.stale_after_days) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
+    let stale_before = Utc::now() - Duration::days(stale_after_days);
+    let connection = match pool.get().await {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(&req, "AssetSummaryPoolError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    let row = match connection
+        .query_one(
+            "WITH eligible AS (\
+                SELECT o.port, o.service, o.observed_at, \
+                       COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name \
+                FROM scan_observation o \
+                JOIN scan_task_execution e ON e.id = o.execution_id \
+                JOIN scan_task t ON t.id = e.task_id \
+                LEFT JOIN scanner_info scanner \
+                    ON scanner.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
+                WHERE o.ip_address = $1::TEXT::INET \
+                  AND e.execution_status = 'succeeded' \
+                  AND ($2 = 1 OR t.user_id = $3)\
+             ), endpoints AS (\
+                SELECT port, MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at \
+                FROM eligible WHERE port > 0 GROUP BY port\
+             ), stats AS (\
+                SELECT COUNT(*)::BIGINT AS port_count, \
+                       COUNT(*) FILTER (WHERE last_seen_at >= $4)::BIGINT AS active_port_count, \
+                       COUNT(*) FILTER (WHERE last_seen_at < $4)::BIGINT AS stale_port_count, \
+                       FLOOR(EXTRACT(EPOCH FROM MIN(first_seen_at)) * 1000)::BIGINT AS first_seen_at, \
+                       FLOOR(EXTRACT(EPOCH FROM MAX(last_seen_at)) * 1000)::BIGINT AS last_seen_at \
+                FROM endpoints\
+             ), latest_intel AS (\
+                SELECT i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name \
+                FROM ips i \
+                JOIN scan_task_execution e ON e.id = i.execution_id \
+                JOIN scan_task t ON t.id = e.task_id \
+                WHERE i.ip_address = $1::TEXT::INET \
+                  AND e.execution_status = 'succeeded' \
+                  AND ($2 = 1 OR t.user_id = $3) \
+                ORDER BY i.update_time DESC, i.ip_id DESC LIMIT 1\
+             ) \
+             SELECT stats.*, \
+                    (SELECT COUNT(DISTINCT service)::BIGINT FROM eligible \
+                     WHERE NULLIF(BTRIM(service), '') IS NOT NULL) AS service_count, \
+                    (SELECT COUNT(DISTINCT scanner_name)::BIGINT FROM eligible \
+                     WHERE scanner_name IS NOT NULL) AS scanner_count, \
+                    (SELECT COUNT(*)::BIGINT FROM eligible) AS observation_count, \
+                    latest_intel.asn, latest_intel.isp, latest_intel.as_org, \
+                    latest_intel.country_code, latest_intel.country_name, latest_intel.city_name \
+             FROM stats LEFT JOIN latest_intel ON true;",
+            &[&ip, &user.role, &user.id, &stale_before],
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(&req, "AssetSummaryQueryError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    let observation_count = row.get("observation_count");
+    if observation_count == 0_i64 {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "message": "没有可访问的资产观察记录"
+        }));
+    }
+
+    let summary = AssetSummary {
+        ip,
+        asn: row.get("asn"),
+        isp: row.get("isp"),
+        as_org: row.get("as_org"),
+        country_code: row.get("country_code"),
+        country_name: row.get("country_name"),
+        city_name: row.get("city_name"),
+        port_count: row.get("port_count"),
+        active_port_count: row.get("active_port_count"),
+        stale_port_count: row.get("stale_port_count"),
+        service_count: row.get("service_count"),
+        scanner_count: row.get("scanner_count"),
+        observation_count,
+        first_seen_at: row.get("first_seen_at"),
+        last_seen_at: row.get("last_seen_at"),
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "data": {
+            "stale_after_days": stale_after_days,
+            "summary": summary,
+        }
+    }))
 }
 
 #[get("/api/assets/ports")]
