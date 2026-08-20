@@ -2,7 +2,6 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use actix_web::{HttpRequest, HttpResponse, Responder, get, web};
-use chrono::{Duration, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,14 +9,21 @@ use serde_json::Value;
 use crate::admin::UserBaseI;
 use crate::logs::write::error_logs;
 
-const DEFAULT_STALE_AFTER_DAYS: i64 = 30;
+const DEFAULT_PORT_LIMIT: i64 = 20;
+const MAX_PORT_LIMIT: i64 = 100;
 const DEFAULT_HISTORY_LIMIT: i64 = 50;
 const MAX_HISTORY_LIMIT: i64 = 100;
 
 #[derive(Deserialize)]
+pub(crate) struct AssetQuery {
+    ip: String,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct AssetPortsQuery {
     ip: String,
-    stale_after_days: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -32,7 +38,6 @@ pub(crate) struct AssetPortHistoryQuery {
 struct AssetPortCurrent {
     port: i32,
     protocol: Option<String>,
-    state: String,
     service: Option<String>,
     banner: Option<String>,
     source: String,
@@ -55,8 +60,6 @@ struct AssetSummary {
     country_name: Option<String>,
     city_name: Option<String>,
     port_count: i64,
-    active_port_count: i64,
-    stale_port_count: i64,
     service_count: i64,
     scanner_count: i64,
     observation_count: i64,
@@ -88,12 +91,19 @@ fn normalize_ip(value: &str) -> Result<String, &'static str> {
         .map_err(|_| "IP 地址格式无效")
 }
 
-fn normalize_stale_after_days(value: Option<i64>) -> Result<i64, &'static str> {
-    let value = value.unwrap_or(DEFAULT_STALE_AFTER_DAYS);
-    if !(1..=3650).contains(&value) {
-        return Err("stale_after_days 必须在 1 到 3650 之间");
+fn normalize_port_pagination(
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<(i64, i64), &'static str> {
+    let limit = limit.unwrap_or(DEFAULT_PORT_LIMIT);
+    let offset = offset.unwrap_or(0);
+    if !(1..=MAX_PORT_LIMIT).contains(&limit) {
+        return Err("limit 必须在 1 到 100 之间");
     }
-    Ok(value)
+    if !(0..=10_000).contains(&offset) {
+        return Err("offset 超出允许范围");
+    }
+    Ok((limit, offset))
 }
 
 fn normalize_history_pagination(
@@ -119,18 +129,13 @@ fn bad_request(message: &'static str) -> HttpResponse {
 pub(crate) async fn get_asset_summary(
     req: HttpRequest,
     pool: web::Data<Pool>,
-    query: web::Query<AssetPortsQuery>,
+    query: web::Query<AssetQuery>,
     user: UserBaseI,
 ) -> impl Responder {
     let ip = match normalize_ip(&query.ip) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    let stale_after_days = match normalize_stale_after_days(query.stale_after_days) {
-        Ok(value) => value,
-        Err(message) => return bad_request(message),
-    };
-    let stale_before = Utc::now() - Duration::days(stale_after_days);
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
@@ -157,8 +162,6 @@ pub(crate) async fn get_asset_summary(
                 FROM eligible WHERE port > 0 GROUP BY port\
              ), stats AS (\
                 SELECT COUNT(*)::BIGINT AS port_count, \
-                       COUNT(*) FILTER (WHERE last_seen_at >= $4)::BIGINT AS active_port_count, \
-                       COUNT(*) FILTER (WHERE last_seen_at < $4)::BIGINT AS stale_port_count, \
                        FLOOR(EXTRACT(EPOCH FROM MIN(first_seen_at)) * 1000)::BIGINT AS first_seen_at, \
                        FLOOR(EXTRACT(EPOCH FROM MAX(last_seen_at)) * 1000)::BIGINT AS last_seen_at \
                 FROM endpoints\
@@ -181,7 +184,7 @@ pub(crate) async fn get_asset_summary(
                     latest_intel.asn, latest_intel.isp, latest_intel.as_org, \
                     latest_intel.country_code, latest_intel.country_name, latest_intel.city_name \
              FROM stats LEFT JOIN latest_intel ON true;",
-            &[&ip, &user.role, &user.id, &stale_before],
+            &[&ip, &user.role, &user.id],
         )
         .await
     {
@@ -208,8 +211,6 @@ pub(crate) async fn get_asset_summary(
         country_name: row.get("country_name"),
         city_name: row.get("city_name"),
         port_count: row.get("port_count"),
-        active_port_count: row.get("active_port_count"),
-        stale_port_count: row.get("stale_port_count"),
         service_count: row.get("service_count"),
         scanner_count: row.get("scanner_count"),
         observation_count,
@@ -220,7 +221,6 @@ pub(crate) async fn get_asset_summary(
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "data": {
-            "stale_after_days": stale_after_days,
             "summary": summary,
         }
     }))
@@ -237,11 +237,10 @@ pub(crate) async fn get_asset_ports(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    let stale_after_days = match normalize_stale_after_days(query.stale_after_days) {
+    let (limit, offset) = match normalize_port_pagination(query.limit, query.offset) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    let stale_before = Utc::now() - Duration::days(stale_after_days);
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
@@ -262,16 +261,16 @@ pub(crate) async fn get_asset_ports(
                   AND ($2 = 1 OR t.user_id = $3)\
              ), endpoint AS (\
                 SELECT port, MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at \
-                FROM eligible GROUP BY port\
+                FROM eligible WHERE port > 0 GROUP BY port\
              ) \
              SELECT endpoint.port, latest.protocol, \
-                    CASE WHEN endpoint.last_seen_at < $4 THEN 'stale' ELSE 'open' END AS state, \
                     service.service, service.banner, latest.source, service.source AS service_source, \
                     FLOOR(EXTRACT(EPOCH FROM endpoint.first_seen_at) * 1000)::BIGINT AS first_seen_at, \
                     FLOOR(EXTRACT(EPOCH FROM endpoint.last_seen_at) * 1000)::BIGINT AS last_seen_at, \
                     FLOOR(EXTRACT(EPOCH FROM service.observed_at) * 1000)::BIGINT AS service_observed_at, \
                     COALESCE(service.observed_at < endpoint.last_seen_at, false) AS service_stale, \
-                    latest.public_execution_id AS execution_id, latest.public_task_id AS task_id \
+                    latest.public_execution_id AS execution_id, latest.public_task_id AS task_id, \
+                    COUNT(*) OVER()::BIGINT AS total \
              FROM endpoint \
              JOIN LATERAL (\
                 SELECT protocol, source, observed_at, id, public_execution_id, public_task_id \
@@ -283,8 +282,8 @@ pub(crate) async fn get_asset_ports(
                 FROM eligible WHERE eligible.port = endpoint.port AND kind = 'service' \
                 ORDER BY observed_at DESC, id DESC LIMIT 1\
              ) service ON true \
-             ORDER BY endpoint.port;",
-            &[&ip, &user.role, &user.id, &stale_before],
+             ORDER BY endpoint.port LIMIT $4 OFFSET $5;",
+            &[&ip, &user.role, &user.id, &limit, &offset],
         )
         .await
     {
@@ -301,12 +300,12 @@ pub(crate) async fn get_asset_ports(
         }));
     }
 
+    let total = rows.first().map(|row| row.get("total")).unwrap_or(0_i64);
     let items: Vec<AssetPortCurrent> = rows
         .into_iter()
         .map(|row| AssetPortCurrent {
             port: row.get("port"),
             protocol: row.get("protocol"),
-            state: row.get("state"),
             service: row.get("service"),
             banner: row.get("banner"),
             source: row.get("source"),
@@ -324,8 +323,10 @@ pub(crate) async fn get_asset_ports(
         "success": true,
         "data": {
             "ip": ip,
-            "stale_after_days": stale_after_days,
             "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         }
     }))
 }
@@ -421,7 +422,7 @@ pub(crate) async fn get_asset_port_history(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_history_pagination, normalize_ip, normalize_stale_after_days};
+    use super::{normalize_history_pagination, normalize_ip, normalize_port_pagination};
 
     #[test]
     fn normalizes_asset_ip_addresses() {
@@ -432,8 +433,8 @@ mod tests {
 
     #[test]
     fn validates_asset_query_ranges() {
-        assert_eq!(normalize_stale_after_days(None), Ok(30));
-        assert!(normalize_stale_after_days(Some(0)).is_err());
+        assert_eq!(normalize_port_pagination(None, None), Ok((20, 0)));
+        assert!(normalize_port_pagination(Some(101), None).is_err());
         assert_eq!(normalize_history_pagination(None, None), Ok((50, 0)));
         assert!(normalize_history_pagination(Some(101), None).is_err());
     }
