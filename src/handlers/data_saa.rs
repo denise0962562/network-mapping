@@ -228,20 +228,18 @@ pub(crate) async fn get_analysis_distribution(
     let (label_expression, additional_filter) = match dimension {
         DistributionDimension::Service => (
             "LOWER(BTRIM(s.service))",
-            "AND s.service IS NOT NULL AND BTRIM(s.service) <> ''",
+            "AND s.kind = 'service' AND s.service IS NOT NULL AND BTRIM(s.service) <> ''",
         ),
-        DistributionDimension::Port => ("p.port::TEXT", ""),
+        DistributionDimension::Port => ("s.port::TEXT", ""),
     };
     let sql = format!(
         "WITH grouped AS (\
             SELECT {label_expression} AS label, \
-                   COUNT(DISTINCT (i.execution_id, i.ip_address, p.port))::BIGINT AS endpoint_count \
-            FROM scaninfo s \
-            JOIN ports p ON p.port_id = s.port_id \
-            JOIN ips i ON i.ip_id = p.ip_id \
-            JOIN scan_task t ON t.id = i.task_id \
-            JOIN scan_task_execution e ON e.id = i.execution_id \
-            WHERE s.scan_time >= $1 AND s.scan_time < $2 \
+                   COUNT(DISTINCT (s.execution_id, s.ip_address, s.port))::BIGINT AS endpoint_count \
+            FROM scan_observation s \
+            JOIN scan_task_execution e ON e.id = s.execution_id \
+            JOIN scan_task t ON t.id = e.task_id \
+            WHERE s.observed_at >= $1 AND s.observed_at < $2 \
               AND ($3 = 1 OR t.user_id = $4) \
               AND ($5::TEXT IS NULL OR e.assigned_scanner_id = $5) \
               AND ($6::TEXT IS NULL OR t.task_source = $6) \
@@ -255,8 +253,8 @@ pub(crate) async fn get_analysis_distribution(
         .query(
             &sql,
             &[
-                &filters.start_ms,
-                &filters.end_ms,
+                &filters.start_at,
+                &filters.end_at,
                 &user.role,
                 &user.id,
                 &filters.scanner_id,

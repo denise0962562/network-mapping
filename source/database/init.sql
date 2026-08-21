@@ -166,22 +166,8 @@ CREATE TABLE IF NOT EXISTS ports (
 		ON UPDATE CASCADE 
 ); 
 
--- 表 scaninfo 用于存储扫描数据，其中port_id通过外键关联到表ports
-CREATE TABLE IF NOT EXISTS scaninfo ( 
-	port_id INT NOT NULL, 
-	scan_info_id SERIAL PRIMARY KEY, 
-	scanner_name TEXT NOT NULL, 
-	scan_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
-	protocol TEXT DEFAULT NULL, 
-	service TEXT DEFAULT NULL, 
-	banner TEXT DEFAULT NULL, 
-	other JSONB DEFAULT NULL,
-	CONSTRAINT fk_port 
-		FOREIGN KEY (port_id) 
-		REFERENCES ports(port_id) 
-		ON DELETE CASCADE 
-		ON UPDATE CASCADE 
-);
+-- scaninfo 是旧版本遗留表。初始化流程不会创建、清空或删除该表；
+-- 若升级时该表仍存在，下方迁移块只读取它并幂等回填 observation。
 
 -- Versioned, idempotent scanner uploads. A retry with the same execution/upload/batch
 -- identity is acknowledged without inserting observations again.
@@ -192,9 +178,24 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	batch_index INT NOT NULL CHECK (batch_index >= 0),
 	is_final BOOLEAN NOT NULL,
 	observation_count INT NOT NULL CHECK (observation_count >= 0),
+	protocol_version SMALLINT NOT NULL DEFAULT 2 CHECK (protocol_version IN (1, 2)),
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	UNIQUE(execution_id, upload_id, batch_index)
 );
+
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT NOT NULL DEFAULT 2;
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conrelid = 'scan_result_batch'::regclass
+			AND conname = 'scan_result_batch_protocol_version_check'
+	) THEN
+		ALTER TABLE scan_result_batch
+			ADD CONSTRAINT scan_result_batch_protocol_version_check
+			CHECK (protocol_version IN (1, 2));
+	END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS scan_observation (
 	id BIGSERIAL PRIMARY KEY,
@@ -213,16 +214,128 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 	UNIQUE(execution_id, observation_key)
 );
 
+-- 旧版结果允许协议为空；v2 上传仍由应用层要求协议非空。
+ALTER TABLE scan_observation ALTER COLUMN protocol DROP NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
 	ON scan_observation(execution_id, kind);
+CREATE INDEX IF NOT EXISTS idx_scan_observation_endpoint_latest
+	ON scan_observation(execution_id, ip_address, port, kind, observed_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_observation_observed_at
+	ON scan_observation(observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_observation_service
+	ON scan_observation(service)
+	WHERE kind = 'service' AND service IS NOT NULL;
+
+-- 将尚未进入 typed observation 模型的 v1 scaninfo 历史记录回填到合成批次。
+-- 使用动态 SQL，确保 scaninfo 已由用户手动删除或新安装不存在时仍可正常初始化。
+-- 限定为完全没有 observation 的 execution，避免把旧双写时期的兼容镜像重复导入。
+DO $scaninfo_migration$
+BEGIN
+	IF to_regclass('public.scaninfo') IS NOT NULL THEN
+		EXECUTE $sql$
+			INSERT INTO scan_result_batch (
+				execution_id, upload_id, batch_index, is_final, observation_count, protocol_version
+			)
+			SELECT e.id, e.execution_id, 0, true, COUNT(si.scan_info_id)::INT, 1
+			FROM scan_task_execution e
+			JOIN ips i ON i.execution_id = e.id
+			JOIN ports p ON p.ip_id = i.ip_id
+			JOIN scaninfo si ON si.port_id = p.port_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM scan_observation existing WHERE existing.execution_id = e.id
+			)
+			GROUP BY e.id, e.execution_id
+			ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING
+		$sql$;
+
+		EXECUTE $sql$
+			INSERT INTO scan_observation (
+				execution_id, batch_id, observation_key, kind, ip_address, port,
+				protocol, service, banner, source, data, observed_at
+			)
+			SELECT
+				e.id,
+				b.id,
+				'legacy:' || si.scan_info_id,
+				CASE
+					WHEN si.other->>'observation_kind' IN ('port', 'service')
+						THEN si.other->>'observation_kind'
+					WHEN NULLIF(BTRIM(si.service), '') IS NOT NULL OR NULLIF(BTRIM(si.banner), '') IS NOT NULL
+						THEN 'service'
+					ELSE 'port'
+				END,
+				i.ip_address,
+				p.port,
+				si.protocol,
+				si.service,
+				si.banner,
+				COALESCE(NULLIF(si.other->>'source', ''), 'legacy'),
+				CASE
+					WHEN COALESCE(si.other->>'observation_kind', '') = 'service'
+						OR NULLIF(BTRIM(si.service), '') IS NOT NULL
+						OR NULLIF(BTRIM(si.banner), '') IS NOT NULL
+						THEN COALESCE(si.other->'data', si.other)
+					ELSE jsonb_strip_nulls(jsonb_build_object(
+						'state', COALESCE(NULLIF(si.other->>'state', ''), 'open'),
+						'legacy_other', si.other
+					))
+				END,
+				COALESCE(to_timestamp(si.scan_time / 1000.0), NOW())
+			FROM scaninfo si
+			JOIN ports p ON p.port_id = si.port_id
+			JOIN ips i ON i.ip_id = p.ip_id
+			JOIN scan_task_execution e ON e.id = i.execution_id
+			JOIN scan_result_batch b
+				ON b.execution_id = e.id
+				AND b.upload_id = e.execution_id
+				AND b.batch_index = 0
+				AND b.protocol_version = 1
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM scan_observation existing
+				WHERE existing.execution_id = e.id
+					AND existing.observation_key = 'legacy:' || si.scan_info_id
+			)
+			ON CONFLICT (execution_id, observation_key) DO NOTHING
+		$sql$;
+	END IF;
+END
+$scaninfo_migration$;
+
+-- 统一定义一次执行内端口的展示结果：服务识别优先，其次取最近观察。
+CREATE OR REPLACE VIEW scan_execution_endpoint_latest AS
+SELECT
+	ranked.id AS observation_id,
+	ranked.execution_id,
+	ranked.ip_address,
+	ranked.port,
+	ranked.kind,
+	ranked.protocol,
+	ranked.service,
+	ranked.banner,
+	ranked.source,
+	ranked.data,
+	ranked.observed_at,
+	FLOOR(EXTRACT(EPOCH FROM ranked.observed_at) * 1000)::BIGINT AS scan_time
+FROM (
+	SELECT
+		o.*,
+		ROW_NUMBER() OVER (
+			PARTITION BY o.execution_id, o.ip_address, o.port
+			ORDER BY
+				(o.kind = 'service') DESC,
+				(o.service IS NOT NULL OR o.banner IS NOT NULL) DESC,
+				o.observed_at DESC,
+				o.id DESC
+		) AS row_number
+	FROM scan_observation o
+) ranked
+WHERE ranked.row_number = 1;
 
 -- 数据分析查询按观察时间筛选，并通过端口、任务和执行记录进行权限过滤。
 CREATE INDEX IF NOT EXISTS idx_ips_create_time_task
 	ON ips(create_time, task_id);
-CREATE INDEX IF NOT EXISTS idx_scaninfo_scan_time_port
-	ON scaninfo(scan_time, port_id);
-CREATE INDEX IF NOT EXISTS idx_scaninfo_port
-	ON scaninfo(port_id);
 
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (
@@ -404,6 +517,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
+CREATE INDEX IF NOT EXISTS idx_scan_task_user_list
+	ON scan_task (user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_task_status_list
+	ON scan_task (task_status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_task_scanner_list
+	ON scan_task (assigned_scanner_id, id DESC)
+	WHERE assigned_scanner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_create_time_list
+	ON scan_task (task_create_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_task_manual_list
+	ON scan_task (id DESC) WHERE task_source <> 'automatic';
 CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_queue
 	ON scan_task (task_status, task_create_time) WHERE task_source = 'automatic';
 CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_family_queue

@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use tracing::error;
 
+use crate::admin::UserBaseI;
+
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 100;
 const MAX_OFFSET: i64 = 10_000;
@@ -98,25 +100,34 @@ fn bad_request(message: impl Into<String>) -> HttpResponse {
 
 async fn search_assets(
     pool: &Pool,
+    user: &UserBaseI,
     query_type: &'static str,
     query: String,
     value: &str,
     where_clause: &str,
-    limit: i64,
-    offset: i64,
+    pagination: (i64, i64),
 ) -> Result<SearchResponse, Box<dyn std::error::Error>> {
+    let (limit, offset) = pagination;
     let client = pool.get().await?;
     let statement = format!(
         "SELECT latest.*, COUNT(*) OVER() AS total FROM (\
-         SELECT DISTINCT ON (i.ip_address, p.port) i.ip_address::TEXT AS ip_address, \
-         p.port, s.protocol, s.service, s.banner, s.scanner_name, s.scan_time, \
+         SELECT DISTINCT ON (s.ip_address, s.port) host(s.ip_address) AS ip_address, \
+         s.port, s.protocol, s.service, s.banner, \
+         COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, \
+         FLOOR(EXTRACT(EPOCH FROM s.observed_at) * 1000)::BIGINT AS scan_time, \
          i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name \
-         FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id \
-         LEFT JOIN scaninfo s ON s.port_id = p.port_id WHERE {where_clause} \
-         ORDER BY i.ip_address, p.port NULLS LAST, s.scan_time DESC NULLS LAST\
-         ) latest ORDER BY latest.ip_address, latest.port NULLS LAST LIMIT $2 OFFSET $3"
+         FROM scan_observation s \
+         JOIN scan_task_execution e ON e.id = s.execution_id \
+         JOIN scan_task t ON t.id = e.task_id \
+         LEFT JOIN scanner_info scanner ON scanner.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
+         LEFT JOIN ips i ON i.execution_id = s.execution_id AND i.ip_address = s.ip_address \
+         WHERE {where_clause} AND e.execution_status <> 'superseded' AND ($2 = 1 OR t.user_id = $3) \
+         ORDER BY s.ip_address, s.port, s.observed_at DESC, s.id DESC\
+         ) latest ORDER BY latest.ip_address, latest.port LIMIT $4 OFFSET $5"
     );
-    let rows = client.query(&statement, &[&value, &limit, &offset]).await?;
+    let rows = client
+        .query(&statement, &[&value, &user.role, &user.id, &limit, &offset])
+        .await?;
     let total = rows.first().map(|row| row.get("total")).unwrap_or(0);
     let items = rows
         .into_iter()
@@ -148,14 +159,24 @@ async fn search_assets(
 
 async fn respond_search(
     pool: &Pool,
+    user: &UserBaseI,
     query_type: &'static str,
     query: String,
     value: &str,
     where_clause: &str,
-    limit: i64,
-    offset: i64,
+    pagination: (i64, i64),
 ) -> HttpResponse {
-    match search_assets(pool, query_type, query, value, where_clause, limit, offset).await {
+    match search_assets(
+        pool,
+        user,
+        query_type,
+        query,
+        value,
+        where_clause,
+        pagination,
+    )
+    .await
+    {
         Ok(response) => HttpResponse::Ok().json(response),
         Err(err) => {
             error!(event = "SearchDatabaseError", query_type, message = %err, error = ?err);
@@ -166,7 +187,11 @@ async fn respond_search(
 }
 
 #[get("/api/search/ip")]
-pub async fn search_ip(pool: web::Data<Pool>, query: web::Query<SearchQuery>) -> impl Responder {
+pub async fn search_ip(
+    pool: web::Data<Pool>,
+    query: web::Query<SearchQuery>,
+    user: UserBaseI,
+) -> impl Responder {
     let q = query.q.trim();
     if let Err(message) = validate_ip(q) {
         return bad_request(message);
@@ -177,12 +202,12 @@ pub async fn search_ip(pool: web::Data<Pool>, query: web::Query<SearchQuery>) ->
     };
     respond_search(
         pool.get_ref(),
+        &user,
         "ip",
         q.to_string(),
         q,
-        "i.ip_address = $1::TEXT::INET",
-        limit,
-        offset,
+        "s.ip_address = $1::TEXT::INET",
+        (limit, offset),
     )
     .await
 }
@@ -191,6 +216,7 @@ pub async fn search_ip(pool: web::Data<Pool>, query: web::Query<SearchQuery>) ->
 pub async fn search_network(
     pool: web::Data<Pool>,
     query: web::Query<SearchQuery>,
+    user: UserBaseI,
 ) -> impl Responder {
     let q = query.q.trim();
     let normalized_cidr = match normalize_cidr(q) {
@@ -203,12 +229,12 @@ pub async fn search_network(
     };
     respond_search(
         pool.get_ref(),
+        &user,
         "network",
         q.to_string(),
         &normalized_cidr,
-        "i.ip_address <<= $1::TEXT::INET",
-        limit,
-        offset,
+        "s.ip_address <<= $1::TEXT::INET",
+        (limit, offset),
     )
     .await
 }
@@ -247,6 +273,7 @@ mod tests {
 pub async fn search_port(
     pool: web::Data<Pool>,
     query: web::Query<PortSearchQuery>,
+    user: UserBaseI,
 ) -> impl Responder {
     let port = match query.port.trim().parse::<u16>() {
         Ok(value @ 1..=65535) => value,
@@ -259,12 +286,12 @@ pub async fn search_port(
     let port = port.to_string();
     respond_search(
         pool.get_ref(),
+        &user,
         "port",
         port.clone(),
         &port,
-        "p.port = $1::TEXT::INTEGER",
-        limit,
-        offset,
+        "s.port = $1::TEXT::INTEGER",
+        (limit, offset),
     )
     .await
 }
@@ -273,6 +300,7 @@ pub async fn search_port(
 pub async fn search_service(
     pool: web::Data<Pool>,
     query: web::Query<SearchQuery>,
+    user: UserBaseI,
 ) -> impl Responder {
     let q = query.q.trim();
     if let Err(message) = validate_keyword(q, "服务名") {
@@ -284,12 +312,12 @@ pub async fn search_service(
     };
     respond_search(
         pool.get_ref(),
+        &user,
         "service",
         q.to_string(),
         q,
         "s.service ILIKE '%' || $1 || '%'",
-        limit,
-        offset,
+        (limit, offset),
     )
     .await
 }
@@ -298,6 +326,7 @@ pub async fn search_service(
 pub async fn search_banner(
     pool: web::Data<Pool>,
     query: web::Query<SearchQuery>,
+    user: UserBaseI,
 ) -> impl Responder {
     let q = query.q.trim();
     if let Err(message) = validate_keyword(q, "Banner 关键字") {
@@ -309,12 +338,12 @@ pub async fn search_banner(
     };
     respond_search(
         pool.get_ref(),
+        &user,
         "banner",
         q.to_string(),
         q,
         "s.banner ILIKE '%' || $1 || '%'",
-        limit,
-        offset,
+        (limit, offset),
     )
     .await
 }

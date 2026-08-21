@@ -5,7 +5,8 @@ use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
-    TaskItemJson, apply_task, build_scan_plan, get_task_item, validate_scanner_credentials,
+    TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
+    validate_scanner_credentials,
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
@@ -693,13 +694,16 @@ async fn get_task(
         "SELECT e.id, e.execution_id, e.requested_scanner_id, e.assigned_scanner_id, \
          COALESCE(s.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, s.location, \
          e.execution_status, e.attempt_count, e.task_start_time, e.task_end_time, e.lease_expires_at, \
-         e.failure_reason, e.cancel_requested, COUNT(DISTINCT i.ip_id)::BIGINT AS ip_count, \
-         COUNT(DISTINCT p.port_id)::BIGINT AS port_count, COUNT(si.scan_info_id)::BIGINT AS result_count \
+         e.failure_reason, e.cancel_requested, COALESCE(assets.ip_count, 0)::BIGINT AS ip_count, \
+         COALESCE(assets.port_count, 0)::BIGINT AS port_count, COALESCE(observations.result_count, 0)::BIGINT AS result_count \
          FROM scan_task_execution e \
          LEFT JOIN scanner_info s ON s.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
-         LEFT JOIN ips i ON i.execution_id = e.id LEFT JOIN ports p ON p.ip_id = i.ip_id \
-         LEFT JOIN scaninfo si ON si.port_id = p.port_id WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
-         GROUP BY e.id, s.name, s.location ORDER BY e.id;", &[&task_pk]).await {
+         LEFT JOIN LATERAL (SELECT COUNT(DISTINCT i.ip_id) AS ip_count, COUNT(DISTINCT p.port_id) AS port_count \
+             FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id WHERE i.execution_id = e.id) assets ON true \
+         LEFT JOIN LATERAL (SELECT COUNT(*) AS result_count FROM scan_observation o \
+             WHERE o.execution_id = e.id) observations ON true \
+         WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
+         ORDER BY e.id;", &[&task_pk]).await {
         Ok(rows) => rows,
         Err(error) => { error_logs(&req, "GetTaskExecutionsError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
     };
@@ -738,11 +742,10 @@ async fn get_task(
     let (page, page_size, offset) = task_result_pagination(query.page, query.page_size);
     let summary = match connection
         .query_one(
-            "SELECT COUNT(DISTINCT i.ip_id)::BIGINT AS ip_count, \
-             COUNT(DISTINCT p.port_id)::BIGINT AS port_count, \
-             COUNT(si.scan_info_id)::BIGINT AS result_count \
-             FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id \
-             LEFT JOIN scaninfo si ON si.port_id = p.port_id WHERE i.execution_id = $1;",
+            "SELECT \
+             (SELECT COUNT(*)::BIGINT FROM ips WHERE execution_id = $1) AS ip_count, \
+             (SELECT COUNT(*)::BIGINT FROM ports p JOIN ips i ON i.ip_id = p.ip_id WHERE i.execution_id = $1) AS port_count, \
+             (SELECT COUNT(*)::BIGINT FROM scan_observation WHERE execution_id = $1) AS result_count;",
             &[&selected_execution_pk],
         )
         .await
@@ -774,9 +777,14 @@ async fn get_task(
         let port_rows = match connection
             .query(
                 "SELECT p.ip_id, p.port, latest.protocol, latest.service, latest.banner, \
-                 latest.other, latest.scan_time FROM ports p \
-                 LEFT JOIN LATERAL (SELECT protocol, service, banner, other, scan_time \
-                    FROM scaninfo WHERE port_id = p.port_id ORDER BY scan_time DESC LIMIT 1) latest ON true \
+                 CASE WHEN latest.kind IS NULL THEN NULL \
+                 WHEN latest.kind = 'port' THEN jsonb_strip_nulls(jsonb_build_object( \
+                    'observation_kind', latest.kind, 'state', latest.data->>'state', 'source', latest.source)) \
+                 ELSE jsonb_strip_nulls(jsonb_build_object('observation_kind', latest.kind, \
+                    'source', latest.source, 'data', latest.data)) END AS other, \
+                 latest.scan_time FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
+                 LEFT JOIN scan_execution_endpoint_latest latest \
+                    ON latest.execution_id = i.execution_id AND latest.ip_address = i.ip_address AND latest.port = p.port \
                  WHERE p.ip_id = ANY($1) ORDER BY p.ip_id, p.port;",
                 &[&ip_ids],
             )
@@ -1144,6 +1152,63 @@ async fn upload_scanner_result_handler(
 /// 获取所有任务接口
 ///
 /// 分为管理员权限和普通用户权限
+fn normalize_task_list_text(
+    value: &Option<String>,
+    max_length: usize,
+    field_name: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if value.chars().count() > max_length {
+        return Err(format!("{field_name}长度不能超过 {max_length} 个字符"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn normalize_task_list_query(query: &ReceiveTaskItemQueryInfo) -> Result<TaskListFilters, String> {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return Err("limit 必须在 1 到 100 之间".to_owned());
+    }
+    if query.cursor.is_some_and(|cursor| cursor <= 0) {
+        return Err("cursor 必须是正整数".to_owned());
+    }
+    if query.start_time.is_some_and(|value| value < 0)
+        || query.end_time.is_some_and(|value| value < 0)
+    {
+        return Err("时间范围不能为负数".to_owned());
+    }
+    if matches!((query.start_time, query.end_time), (Some(start), Some(end)) if start > end) {
+        return Err("开始时间不能晚于结束时间".to_owned());
+    }
+    let status = normalize_task_list_text(&query.status, 32, "状态")?;
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "pending" | "running" | "succeeded" | "failed" | "cancelled" | "partial"
+        )
+    }) {
+        return Err("任务状态无效".to_owned());
+    }
+    Ok(TaskListFilters {
+        cursor: query.cursor,
+        limit,
+        include_system: query.include_system.unwrap_or(false),
+        task_id: normalize_task_list_text(&query.task_id, 36, "任务 ID")?,
+        target: normalize_task_list_text(&query.target, 128, "目标")?,
+        status,
+        operator: normalize_task_list_text(&query.operator, 64, "操作者")?,
+        start_time: query.start_time,
+        end_time: query.end_time,
+        scanner_id: normalize_task_list_text(&query.scanner_id, 36, "扫描器 ID")?,
+    })
+}
+
 #[get("/api/task/all")]
 async fn get_all_task_handler(
     _req: HttpRequest,
@@ -1152,6 +1217,12 @@ async fn get_all_task_handler(
     user_base_i: UserBaseI,
 ) -> impl Responder {
     let p = pool.get_ref();
+    let filters = match normalize_task_list_query(&query_info) {
+        Ok(value) => value,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"message": message}));
+        }
+    };
 
     let user_id = user_base_i.id;
     let user_role = user_base_i.role;
@@ -1169,15 +1240,7 @@ async fn get_all_task_handler(
         }
     };
 
-    let (tmp_result, total_count, item_count, start_index) = match get_task_item(
-        p,
-        query_info.count.unwrap_or(5),
-        query_info.start,
-        query_info.include_system.unwrap_or(false),
-        permi,
-    )
-    .await
-    {
+    let page = match get_filtered_task_page(p, &filters, permi).await {
         Ok(o) => o,
         Err(e) => {
             error!(
@@ -1190,10 +1253,11 @@ async fn get_all_task_handler(
     };
 
     let tmp_json = TaskItemJson {
-        total_c: total_count,
-        item_c: item_count,
-        start_id: start_index,
-        task_item: tmp_result,
+        total: page.total,
+        page_size: page.page_size,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+        items: page.items,
     };
 
     HttpResponse::Ok().json(tmp_json)
@@ -1203,7 +1267,7 @@ async fn get_all_task_handler(
 mod tests {
     use super::{
         ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerScanCapabilities,
-        task_result_pagination, validate_public_ip,
+        normalize_task_list_query, task_result_pagination, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
@@ -1213,11 +1277,40 @@ mod tests {
         let default_query =
             web::Query::<ReceiveTaskItemQueryInfo>::from_query("").expect("empty query is valid");
         assert!(!default_query.include_system.unwrap_or(false));
+        let normalized = normalize_task_list_query(&default_query).expect("normalize defaults");
+        assert_eq!(normalized.limit, 20);
+        assert!(!normalized.include_system);
 
         let include_query =
             web::Query::<ReceiveTaskItemQueryInfo>::from_query("include_system=true&count=10")
                 .expect("include_system query is valid");
         assert_eq!(include_query.include_system, Some(true));
+        assert_eq!(include_query.limit, Some(10));
+    }
+
+    #[test]
+    fn task_list_query_validates_filters_and_pagination() {
+        let valid = web::Query::<ReceiveTaskItemQueryInfo>::from_query(
+            "limit=20&status=running&operator=admin&start_time=10&end_time=20",
+        )
+        .expect("valid task query");
+        let normalized = normalize_task_list_query(&valid).expect("normalize task query");
+        assert_eq!(normalized.limit, 20);
+        assert_eq!(normalized.status.as_deref(), Some("running"));
+        assert_eq!(normalized.operator.as_deref(), Some("admin"));
+
+        let invalid_status = web::Query::<ReceiveTaskItemQueryInfo>::from_query("status=unknown")
+            .expect("deserialize invalid status");
+        assert!(normalize_task_list_query(&invalid_status).is_err());
+
+        let invalid_range =
+            web::Query::<ReceiveTaskItemQueryInfo>::from_query("start_time=20&end_time=10")
+                .expect("deserialize invalid range");
+        assert!(normalize_task_list_query(&invalid_range).is_err());
+
+        let invalid_cursor = web::Query::<ReceiveTaskItemQueryInfo>::from_query("cursor=0")
+            .expect("deserialize invalid cursor");
+        assert!(normalize_task_list_query(&invalid_cursor).is_err());
     }
 
     #[test]

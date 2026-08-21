@@ -26,7 +26,7 @@ const SPA_ROUTES: &[&str] = &[
     "/user/security",
 ];
 
-const REQUIRED_FRONTEND_FILES: &[&str] = &["index.html", "login.html", "search.html"];
+const REQUIRED_FRONTEND_FILES: &[&str] = &["index.html", "login.html", "search.html", "asset.html"];
 
 #[derive(Clone, Debug)]
 pub struct FrontendAssets {
@@ -68,6 +68,8 @@ impl FrontendAssets {
             "index.html"
         } else if path == "/search.html" {
             "search.html"
+        } else if matches!(path, "/asset" | "/asset.html") {
+            "asset.html"
         } else {
             return true;
         };
@@ -129,6 +131,16 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::head().to(search_page)),
     )
     .service(
+        web::resource("/asset")
+            .route(web::get().to(asset_page))
+            .route(web::head().to(asset_page)),
+    )
+    .service(
+        web::resource("/asset.html")
+            .route(web::get().to(asset_page))
+            .route(web::head().to(asset_page)),
+    )
+    .service(
         web::resource("/favicon.ico")
             .route(web::get().to(favicon))
             .route(web::head().to(favicon)),
@@ -159,7 +171,7 @@ pub fn is_spa_path(path: &str) -> bool {
 }
 
 pub fn is_protected_frontend_path(path: &str) -> bool {
-    is_spa_path(path) || path == "/search.html"
+    is_spa_path(path) || matches!(path, "/search.html" | "/asset" | "/asset.html")
 }
 
 pub fn is_frontend_resource_path(path: &str) -> bool {
@@ -211,6 +223,13 @@ async fn search_page(
     assets: web::Data<FrontendAssets>,
 ) -> actix_web::Result<HttpResponse> {
     html_response(&req, &assets, "search.html").await
+}
+
+async fn asset_page(
+    req: HttpRequest,
+    assets: web::Data<FrontendAssets>,
+) -> actix_web::Result<HttpResponse> {
+    html_response(&req, &assets, "asset.html").await
 }
 
 async fn html_response(
@@ -285,6 +304,8 @@ mod tests {
             .expect("write login fixture");
         fs::write(directory.join("search.html"), "<main>search entry</main>")
             .expect("write search fixture");
+        fs::write(directory.join("asset.html"), "<main>asset entry</main>")
+            .expect("write asset fixture");
         fs::write(directory.join("assets/app.js"), "export default true")
             .expect("write asset fixture");
         directory
@@ -296,6 +317,7 @@ mod tests {
         assert!(is_spa_path("/audit"));
         assert!(is_spa_path("/requests"));
         assert!(is_spa_path("/health"));
+        assert!(!is_spa_path("/asset"));
         assert!(is_spa_path("/task/019c0000-0000-7000-8000-000000000001"));
         assert!(is_spa_path("/scanner/019c0000-0000-4000-8000-000000000001"));
 
@@ -313,6 +335,8 @@ mod tests {
     fn frontend_resources_are_narrowly_scoped() {
         assert!(is_frontend_resource_path("/login"));
         assert!(is_frontend_resource_path("/search.html"));
+        assert!(is_frontend_resource_path("/asset"));
+        assert!(is_frontend_resource_path("/asset.html"));
         assert!(is_frontend_resource_path("/assets/app.js"));
         assert!(!is_frontend_resource_path("/api/unknown"));
         assert!(!is_frontend_resource_path("/missing.js"));
@@ -353,6 +377,17 @@ mod tests {
         assert_eq!(
             actix_test::read_body(spa_response).await,
             web::Bytes::from_static(b"<main>spa entry</main>")
+        );
+
+        let asset_request = actix_test::TestRequest::get()
+            .uri("/asset.html?ip=192.0.2.1")
+            .insert_header(("Accept", "text/html"))
+            .to_request();
+        let asset_response = actix_test::call_service(&app, asset_request).await;
+        assert_eq!(asset_response.status(), StatusCode::OK);
+        assert_eq!(
+            actix_test::read_body(asset_response).await,
+            web::Bytes::from_static(b"<main>asset entry</main>")
         );
 
         let head_request = actix_test::TestRequest::default()
