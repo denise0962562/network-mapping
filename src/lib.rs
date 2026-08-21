@@ -1754,9 +1754,9 @@ pub async fn save_scanner_results(
         return Ok(0);
     };
     let batch_db_id: i64 = row.get("id");
-    let mut inserted_observations = vec![false; normalized_observations.len()];
-
-    for (observation_index, observation) in normalized_observations.iter().enumerate() {
+    let mut observation_rows = Vec::with_capacity(normalized_observations.len());
+    let mut ip_intel_cache = HashMap::new();
+    for observation in &normalized_observations {
         let parsed_ip = parse_ip_or_cidr(&observation.ip).map_err(|source_error| {
             SaveScannerResultsError::InvalidIp {
                 ip: observation.ip.clone(),
@@ -1773,94 +1773,89 @@ pub async fn save_scanner_results(
             observation.source
         ]))
         .map_err(scanner_result_database_error)?;
-        let port_i32 = i32::from(observation.port);
-        let inserted = transaction
-            .execute(
-                "INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, ip_address, port, protocol, service, banner, source, data) \
-                 VALUES ($1, $2, $3, $4, $5::text::inet, $6, $7, $8, $9, $10, $11) \
-                 ON CONFLICT (execution_id, observation_key) DO NOTHING;",
-                &[
-                    &execution_db_id,
-                    &batch_db_id,
-                    &observation_key,
-                    &observation.kind,
-                    &canonical_ip,
-                    &port_i32,
-                    &observation.protocol,
-                    &observation.service,
-                    &observation.banner,
-                    &observation.source,
-                    &observation.data,
-                ],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
-        inserted_observations[observation_index] = inserted == 1;
-    }
-
-    let mut saved = 0usize;
-    let mut ip_intel_cache = HashMap::new();
-
-    for (item, should_project) in normalized_observations.iter().zip(inserted_observations) {
-        if !should_project {
-            continue;
-        }
-        let parsed_ip =
-            parse_ip_or_cidr(&item.ip).map_err(|source| SaveScannerResultsError::InvalidIp {
-                ip: item.ip.clone(),
-                source,
-            })?;
         let ip_addr = parsed_ip.addr();
         let intel = ip_intel_cache
             .entry(ip_addr)
             .or_insert_with(|| maxmind.lookup(ip_addr))
             .clone();
-        let ip_text = parsed_ip.to_string();
-
-        let ip_row = transaction
-            .query_one(
-                "INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
-                 country_code, country_name, city_name) \
-             VALUES ($1, $2, $3::text::inet, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
-                asn = COALESCE(EXCLUDED.asn, ips.asn), \
-                isp = COALESCE(EXCLUDED.isp, ips.isp), \
-                as_org = COALESCE(EXCLUDED.as_org, ips.as_org), \
-                country_code = COALESCE(EXCLUDED.country_code, ips.country_code), \
-                country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
-                city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
-                update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
-             RETURNING ip_id;",
-                &[
-                    &task_db_id,
-                    &execution_db_id,
-                    &ip_text,
-                    &intel.asn,
-                    &intel.isp,
-                    &intel.as_org,
-                    &intel.country_code,
-                    &intel.country_name,
-                    &intel.city_name,
-                ],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
-        let ip_id: i32 = ip_row.get("ip_id");
-
-        let port_i32 = i32::from(item.port);
-        transaction
-            .execute(
-                "INSERT INTO ports (ip_id, port) \
-             VALUES ($1, $2) \
-             ON CONFLICT (ip_id, port) DO UPDATE SET \
-                update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT;",
-                &[&ip_id, &port_i32],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
-
-        saved += 1;
+        observation_rows.push(serde_json::json!({
+            "observation_key": observation_key,
+            "kind": observation.kind,
+            "ip_address": canonical_ip,
+            "port": i32::from(observation.port),
+            "protocol": observation.protocol,
+            "service": observation.service,
+            "banner": observation.banner,
+            "source": observation.source,
+            "data": observation.data,
+            "asn": intel.asn,
+            "isp": intel.isp,
+            "as_org": intel.as_org,
+            "country_code": intel.country_code,
+            "country_name": intel.country_name,
+            "city_name": intel.city_name,
+        }));
     }
+    let observation_rows = Value::Array(observation_rows);
+    // Keep the fact rows and their asset projection in one set-based statement. The
+    // projection reads only rows inserted by this batch and deduplicates both IPs and
+    // endpoints, so port/service observations do not repeat the same UPSERT work.
+    let saved_row = transaction
+        .query_one(
+            "WITH input AS MATERIALIZED ( \
+                SELECT * FROM jsonb_to_recordset($4::jsonb) AS item( \
+                    observation_key TEXT, kind TEXT, ip_address INET, port INT, \
+                    protocol TEXT, service TEXT, banner TEXT, source TEXT, data JSONB, \
+                    asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
+                    country_name TEXT, city_name TEXT) \
+             ), inserted_observations AS ( \
+                INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
+                    ip_address, port, protocol, service, banner, source, data) \
+                SELECT $2, $3, observation_key, kind, ip_address, port, protocol, service, \
+                    banner, source, data FROM input \
+                ON CONFLICT (execution_id, observation_key) DO NOTHING \
+                RETURNING ip_address, port \
+             ), inserted_endpoints AS MATERIALIZED ( \
+                SELECT DISTINCT ip_address, port FROM inserted_observations \
+             ), inserted_ip_addresses AS MATERIALIZED ( \
+                SELECT DISTINCT ip_address FROM inserted_endpoints \
+             ), upserted_ips AS ( \
+                INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
+                    country_code, country_name, city_name) \
+                SELECT DISTINCT ON (item.ip_address) $1, $2, item.ip_address, item.asn, \
+                    item.isp, item.as_org, item.country_code, item.country_name, item.city_name \
+                FROM input item \
+                JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.ip_address \
+                ORDER BY item.ip_address \
+                ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
+                    asn = COALESCE(EXCLUDED.asn, ips.asn), \
+                    isp = COALESCE(EXCLUDED.isp, ips.isp), \
+                    as_org = COALESCE(EXCLUDED.as_org, ips.as_org), \
+                    country_code = COALESCE(EXCLUDED.country_code, ips.country_code), \
+                    country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
+                    city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
+                    update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+                RETURNING ip_id, ip_address \
+             ), upserted_ports AS ( \
+                INSERT INTO ports (ip_id, port) \
+                SELECT ip.ip_id, endpoint.port FROM inserted_endpoints endpoint \
+                JOIN upserted_ips ip ON ip.ip_address = endpoint.ip_address \
+                ON CONFLICT (ip_id, port) DO UPDATE SET \
+                    update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+                RETURNING port_id \
+             ) \
+             SELECT COUNT(*)::BIGINT AS saved FROM inserted_observations;",
+            &[
+                &task_db_id,
+                &execution_db_id,
+                &batch_db_id,
+                &observation_rows,
+            ],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    let saved =
+        usize::try_from(saved_row.get::<_, i64>("saved")).map_err(scanner_result_database_error)?;
 
     if !is_v2 || upload.is_final == Some(true) {
         transaction

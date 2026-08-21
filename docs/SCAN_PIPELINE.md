@@ -27,7 +27,8 @@
 
 服务端通过 `(execution_id, upload_id, batch_index)` 唯一约束实现批次幂等。观察结果写入
 `scan_observation`，并投影到 `ips`、`ports` 供资产索引与地理信息查询使用，不再写入
-`scaninfo`。
+`scaninfo`。服务端以单条集合化 SQL 写入整批观察结果，并按 IP 和 `(IP, port)` 去重后更新
+资产投影；同一端点的端口观察和服务观察不会重复执行资产 UPSERT。
 只有最终批提交后任务执行才进入 `succeeded`。协议版本 1 的 `results` 请求继续支持，便于
 滚动升级旧扫描器。
 
