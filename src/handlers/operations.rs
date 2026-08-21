@@ -278,8 +278,15 @@ pub(crate) async fn export_task(
              p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
              FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id JOIN ips i ON i.execution_id = e.id \
              LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id LEFT JOIN ports p ON p.ip_id = i.ip_id \
-             LEFT JOIN scan_execution_endpoint_latest latest \
-                ON latest.execution_id = e.id AND latest.ip_address = i.ip_address AND latest.port = p.port \
+             LEFT JOIN LATERAL ( \
+                SELECT o.protocol, o.service, o.banner, \
+                    FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
+                FROM scan_observation o \
+                WHERE o.execution_id = e.id AND o.ip_address = i.ip_address AND o.port = p.port \
+                ORDER BY (o.kind = 'service') DESC, \
+                    (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
+                    o.observed_at DESC, o.id DESC LIMIT 1 \
+             ) latest ON true \
              WHERE t.task_id = $1 AND e.execution_status <> 'superseded' \
              AND ($2 = 1 OR t.user_id = $3) ORDER BY i.ip_address, p.port;",
             &[&id, &user.role, &user.id],

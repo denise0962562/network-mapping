@@ -783,8 +783,16 @@ async fn get_task(
                  ELSE jsonb_strip_nulls(jsonb_build_object('observation_kind', latest.kind, \
                     'source', latest.source, 'data', latest.data)) END AS other, \
                  latest.scan_time FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
-                 LEFT JOIN scan_execution_endpoint_latest latest \
-                    ON latest.execution_id = i.execution_id AND latest.ip_address = i.ip_address AND latest.port = p.port \
+                 LEFT JOIN LATERAL ( \
+                    SELECT o.kind, o.protocol, o.service, o.banner, o.source, o.data, \
+                        FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
+                    FROM scan_observation o \
+                    WHERE o.execution_id = i.execution_id \
+                        AND o.ip_address = i.ip_address AND o.port = p.port \
+                    ORDER BY (o.kind = 'service') DESC, \
+                        (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
+                        o.observed_at DESC, o.id DESC LIMIT 1 \
+                 ) latest ON true \
                  WHERE p.ip_id = ANY($1) ORDER BY p.ip_id, p.port;",
                 &[&ip_ids],
             )

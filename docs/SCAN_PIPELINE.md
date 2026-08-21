@@ -27,13 +27,15 @@
 
 服务端通过 `(execution_id, upload_id, batch_index)` 唯一约束实现批次幂等。观察结果写入
 `scan_observation`，并投影到 `ips`、`ports` 供资产索引与地理信息查询使用，不再写入
-`scaninfo`。
+`scaninfo`。服务端以单条集合化 SQL 写入整批观察结果，并按 IP 和 `(IP, port)` 去重后更新
+资产投影；同一端点的端口观察和服务观察不会重复执行资产 UPSERT。
 只有最终批提交后任务执行才进入 `succeeded`。协议版本 1 的 `results` 请求继续支持，便于
 滚动升级旧扫描器。
 
-`scan_observation` 是扫描结果的事实来源；`ips`、`ports` 是资产与端口索引。读取接口通过
-`scan_execution_endpoint_latest` 统一选择一次执行内的展示结果：服务观察优先于端口观察，
-再按观察时间和记录 ID 排序。任务详情、搜索、导出和分析查询均不依赖 `scaninfo`。协议版本
+`scan_observation` 是扫描结果的事实来源；`ips`、`ports` 是资产与端口索引。读取接口按
+`scan_execution_endpoint_latest` 定义的顺序选择一次执行内的展示结果：服务观察优先于端口观察，
+再按观察时间和记录 ID 排序。端点列表使用参数化查询，仅检查当前端点的观察记录，避免为分页
+结果计算全表窗口。任务详情、搜索、导出和分析查询均不依赖 `scaninfo`。协议版本
 1 的结果会直接转换为 observation，并绑定到 execution 对应的合成批次。
 
 升级时，若遗留 `scaninfo` 仍存在，数据库初始化只读取它并幂等回填尚无 observation 的旧
