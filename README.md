@@ -89,6 +89,23 @@ directory = "source/maxmind"
 cargo run -- --refresh-ip-intel
 ```
 
+## 资产高级搜索
+
+搜索页支持 IP/CIDR、端口、协议、服务、Banner、ASN、地理信息、扫描器、观察时间和资产
+标签的组合查询。可以使用 `AND`、`OR`、`NOT`、括号、比较运算、包含匹配、`IN`、
+`EXISTS`，并通过 `has_endpoint(...)` 表达同一个 IP 上存在多个不同端点。
+
+```text
+ip IN 192.0.2.0/24
+AND port IN (80, 443)
+AND service ~ "http"
+AND tag = "生产环境"
+```
+
+统一接口为 `POST /api/search/v2`；裸 IP、裸 CIDR、`port:443`、`service:https` 和
+`banner:nginx` 等旧输入仍然兼容。完整字段表、标签否定语义、逻辑优先级、跨端点查询、
+API 请求响应和限制参见[资产搜索语法与 API](docs/SEARCH_SYNTAX.md)。
+
 ## 扫描器调度
 
 创建任务接口 `POST /api/task/create` 支持 `dispatch_mode`：`automatic` 由下一台可用扫描器领取一次，`selected` 配合 `scanner_ids` 指定一台或多台扫描器，`all` 会为创建时所有已启用扫描器分别创建执行实例。离线的指定扫描器会在重新上线后领取任务。

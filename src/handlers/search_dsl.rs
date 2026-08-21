@@ -1208,4 +1208,28 @@ mod tests {
         assert!(!compiled.sql.contains("OR TRUE"));
         assert_eq!(compiled.parameters, vec!["https' OR TRUE --"]);
     }
+
+    #[test]
+    fn documented_queries_compile() {
+        let queries = [
+            "ip IN 192.0.2.0/24 AND port IN (80, 443) AND service ~ \"http\" AND tag = \"生产环境\"",
+            "country = CN AND service = \"https\" AND last_seen >= now-7d",
+            "(country = CN OR country = SG) AND port = 443",
+            "asn IN (4134, AS4837)",
+            "ip = 2001:db8::10",
+            "EXISTS(service) AND NOT EXISTS(banner)",
+            "tag = \"公网\" AND tag = \"核心资产\"",
+            "tag.kind IN (malicious, info)",
+            "port = 80 AND has_endpoint(port = 443 AND service = \"https\")",
+            "scanner ~ \"上海\" AND port = 443",
+            "last_seen >= \"2026-08-01T00:00:00+08:00\"",
+            "service IN (mysql, postgresql, mongodb, redis) OR port IN (3306, 5432, 27017, 6379)",
+        ];
+
+        for query in queries {
+            parse_and_compile(query).unwrap_or_else(|error| {
+                panic!("documented query failed: {query}: {}", error.message)
+            });
+        }
+    }
 }
