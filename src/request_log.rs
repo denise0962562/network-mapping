@@ -146,7 +146,8 @@ async fn insert_batch(
          status_code, duration_ms, client_ip, user_agent, actor_id, actor_name, \
          error_level, error_type) VALUES ",
     );
-    let mut params: Vec<Box<dyn ToSql + Send + Sync>> = Vec::with_capacity(entries.len() * COLUMN_COUNT);
+    let mut params: Vec<Box<dyn ToSql + Send + Sync>> =
+        Vec::with_capacity(entries.len() * COLUMN_COUNT);
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             sql.push_str(", ");

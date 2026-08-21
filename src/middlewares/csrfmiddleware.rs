@@ -10,7 +10,7 @@ use crate::logs::write::warn_logs;
 use crate::{
     TemplatesInit,
     frontend::is_frontend_resource_path,
-    middlewares::{get_pool_from_app_data, is_scanner_api_path, render_500, render_500_simple},
+    middlewares::{get_pool_from_app_data, is_scanner_api_request, render_500, render_500_simple},
 };
 
 use actix_web::{
@@ -74,7 +74,9 @@ where
             "/logout" | "/api/totp/bind" | "/api/updaterir"
         );
         let safe_method = matches!(req.method().as_str(), "GET" | "HEAD") && !csrf_protected_get;
-        let pass = is_scanner_api_path(&path) || is_frontend_resource_path(&path) || safe_method;
+        let pass = is_scanner_api_request(req.method(), &path)
+            || is_frontend_resource_path(&path)
+            || safe_method;
 
         Box::pin(async move {
             // 扫描器接口、前端资源和无副作用的 GET/HEAD 请求无需 CSRF 校验。

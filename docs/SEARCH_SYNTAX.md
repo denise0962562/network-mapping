@@ -1,0 +1,541 @@
+# 资产搜索语法与 API
+
+本文档描述 Network-Mapping 高级搜索的结果语义、查询语法、字段、标签行为、API、限制和
+兼容策略。前端搜索页使用 `POST /api/search/v2`，旧版单条件搜索接口暂时保留。
+
+## 1. 搜索结果语义
+
+### 1.1 默认结果单位
+
+每条结果表示一个当前可见的服务端点：
+
+```text
+(IP 地址, 端口)
+```
+
+因此下面的条件要求同一个端点同时满足端口和服务条件：
+
+```text
+port = 443 AND service = "https"
+```
+
+返回结果仍包含资产级信息，包括 ASN、ISP、AS 组织、国家、城市和该 IP 的全部有效标签。
+
+### 1.2 当前状态来源
+
+高级搜索只读取当前用户有权访问且 execution 状态为 `succeeded` 的 observation：
+
+- 普通用户只能搜索自己任务产生的数据；
+- 管理员可以搜索全部用户的数据；
+- 端口、协议和扫描器取该端点最新 observation；
+- 服务和 Banner 取该端点最新的 `service` observation；`source` 在存在服务 observation
+  时取该服务来源，否则取端点最新 observation 来源；
+- `first_seen`、`last_seen` 是可访问成功 execution 中该端点的首次和末次观察时间；
+- IP 情报取当前用户可访问的最新记录；
+- 标签按 IP 全局绑定，不属于某一次扫描任务。
+
+扫描器当前只报告发现的开放端口，因此搜索结果表示“曾被成功执行观察到的当前端点视图”，
+不会因后续扫描没有发现某端口就自动推断该端口已经关闭。
+
+## 2. 快速开始
+
+搜索单个 IP：
+
+```text
+192.0.2.10
+```
+
+搜索 CIDR 内的资产：
+
+```text
+192.0.2.0/24
+```
+
+搜索指定端口：
+
+```text
+port = 443
+```
+
+组合资产、服务和标签：
+
+```text
+ip IN 192.0.2.0/24
+AND port IN (80, 443)
+AND service ~ "http"
+AND tag = "生产环境"
+```
+
+搜索最近七天观察到的中国 HTTPS 端点：
+
+```text
+country = CN
+AND service = "https"
+AND last_seen >= now-7d
+```
+
+## 3. 语法规则
+
+### 3.1 表达式结构
+
+简化语法如下：
+
+```text
+expression     := or_expression
+or_expression := and_expression (OR and_expression)*
+and_expression:= unary_expression (AND unary_expression)*
+unary_expression := NOT unary_expression
+                  | ( expression )
+                  | predicate
+                  | EXISTS(field)
+                  | has_endpoint(expression)
+
+predicate      := field operator value
+                | field IN value
+                | field IN (value, value, ...)
+                | field NOT IN (value, value, ...)
+                | field:value
+```
+
+字段名和关键字不区分大小写。字符串值可以使用单引号或双引号；包含空格、逗号、括号或
+关键字的值必须加引号：
+
+```text
+tag = "核心生产资产"
+banner ~ 'Welcome to nginx'
+```
+
+字符串内使用反斜杠转义引号或反斜杠：
+
+```text
+tag = "业务方标记：\"重点\""
+```
+
+条件之间必须显式写出 `AND` 或 `OR`，当前不支持以空格表示隐式 AND：
+
+```text
+# 正确
+port = 443 AND service = "https"
+
+# 错误
+port = 443 service = "https"
+```
+
+### 3.2 逻辑优先级
+
+优先级从高到低为：
+
+1. 括号；
+2. `NOT`；
+3. `AND`；
+4. `OR`。
+
+以下两个查询等价：
+
+```text
+country = CN OR port = 443 AND service = "https"
+country = CN OR (port = 443 AND service = "https")
+```
+
+需要先执行 OR 时必须使用括号：
+
+```text
+(country = CN OR country = SG) AND port = 443
+```
+
+### 3.3 运算符
+
+| 运算符 | 含义 | 示例 |
+|---|---|---|
+| `=` | 不区分大小写精确匹配 | `service = "https"` |
+| `!=` | 不等于或不存在指定标签 | `tag != "已下线"` |
+| `~` | 不区分大小写的文字包含 | `banner ~ "nginx"` |
+| `!~` | 不包含指定文字 | `service !~ "unknown"` |
+| `>` | 大于 | `port > 1024` |
+| `>=` | 大于等于 | `last_seen >= now-7d` |
+| `<` | 小于 | `port < 1024` |
+| `<=` | 小于等于 | `first_seen <= "2026-08-01T00:00:00Z"` |
+| `IN` | 属于集合；对 IP 也表示属于 CIDR | `port IN (80, 443)` |
+| `NOT IN` | 不属于集合 | `country NOT IN (US, RU)` |
+| `EXISTS(field)` | 字段存在且非空 | `EXISTS(banner)` |
+
+`~` 和 `!~` 是字面包含操作。搜索值中的 `%`、`_` 不会被当作 SQL 通配符，系统会转义后
+作为普通字符搜索。当前不支持用户提供正则表达式。
+
+### 3.4 冒号简写
+
+为兼容旧版和方便输入，可以使用 `field:value`：
+
+```text
+port:443
+service:https
+banner:nginx
+tag:生产环境
+```
+
+冒号会根据字段转换为不同操作：
+
+- `service`、`banner`、`isp`、`org`、`city`、`scanner`：转换为包含匹配 `~`；
+- 其他字段：转换为精确匹配 `=`；
+- `ip` 的值为 CIDR 时，按网段包含关系处理。
+
+对于复杂查询建议使用完整运算符，语义更明确。
+
+## 4. 字段参考
+
+### 4.1 资产级字段
+
+资产级字段属于 IP，不随结果端口变化。
+
+| 字段 | 类型 | 支持操作 | 说明 |
+|---|---|---|---|
+| `ip`、`network` | IP/CIDR | `=`、`!=`、`IN`、`NOT IN` | `network` 是 `ip` 的别名 |
+| `asn` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | `AS4134` 与 `4134` 精确匹配等价 |
+| `isp` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | ISP 名称 |
+| `org`、`as_org` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | AS 组织；`as_org` 是别名 |
+| `country`、`country_code` | 两位代码 | `=`、`!=`、`IN`、`NOT IN` | 例如 `CN`、`US` |
+| `city`、`city_name` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 城市名称 |
+| `tag` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 标签名称 |
+| `tag.id` | 正整数 | `=`、`!=`、`IN`、`NOT IN` | 稳定标签 ID |
+| `tag.kind` | 枚举 | `=`、`!=`、`IN`、`NOT IN` | `info`、`malicious`、`benign` |
+
+示例：
+
+```text
+ip IN 2001:db8::/32 AND country = CN
+asn IN (4134, AS4837)
+org ~ "Cloud"
+tag.kind = malicious
+```
+
+IPv6 可以直接使用；在复杂表达式中也可以加引号：
+
+```text
+ip = 2001:db8::10
+ip IN "2001:db8::/32"
+```
+
+### 4.2 端点与服务字段
+
+以下字段默认作用于当前 `(IP, port)` 结果行：
+
+| 字段 | 类型 | 支持操作 | 说明 |
+|---|---|---|---|
+| `port` | 1–65535 | 比较、`IN`、`NOT IN` | 开放端口 |
+| `protocol` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 例如 `tcp` |
+| `service` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新服务识别结果 |
+| `banner` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新服务 Banner |
+| `source` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | observation 来源 |
+
+示例：
+
+```text
+port >= 8000 AND port <= 8999
+protocol = tcp AND port IN (22, 80, 443)
+service = "https" AND banner ~ "nginx"
+EXISTS(service) AND NOT EXISTS(banner)
+```
+
+Banner 查询值最少需要两个字符；其他文本值长度必须在 1–128 个字符之间。
+
+### 4.3 扫描器字段
+
+| 字段 | 类型 | 支持操作 | 说明 |
+|---|---|---|---|
+| `scanner`、`scanner_name` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新端点 observation 对应的扫描器名称或 ID |
+
+```text
+scanner ~ "上海" AND port = 443
+```
+
+### 4.4 时间字段
+
+| 字段 | 类型 | 支持操作 | 说明 |
+|---|---|---|---|
+| `first_seen` | 时间 | `=`、`!=`、`>`、`>=`、`<`、`<=` | 首次观察时间 |
+| `last_seen` | 时间 | `=`、`!=`、`>`、`>=`、`<`、`<=` | 最近观察时间 |
+
+支持 RFC 3339：
+
+```text
+last_seen >= "2026-08-01T00:00:00+08:00"
+```
+
+支持相对当前时间：
+
+```text
+last_seen >= now-30m
+last_seen >= now-24h
+last_seen >= now-7d
+last_seen >= now-4w
+```
+
+相对时间单位：`m` 分钟、`h` 小时、`d` 天、`w` 周。数值必须为正整数。
+
+## 5. 标签查询语义
+
+标签通过 `asset_tag` 目录定义，通过 `asset_ip_tag` 绑定到 IP。同一个标签会应用到该 IP 的
+所有端口和历史任务。
+
+### 5.1 同时拥有多个标签
+
+```text
+tag = "公网" AND tag = "核心资产"
+```
+
+含义是同一个 IP 同时拥有两个标签。服务端为每个条件生成独立的存在性判断，不会要求一条
+标签记录同时拥有两个名称。
+
+### 5.2 排除标签
+
+```text
+tag != "已下线"
+```
+
+含义是该 IP 不存在名为“已下线”的有效标签。没有任何标签的资产也可以满足该条件。
+
+以下写法等价：
+
+```text
+tag != "已下线"
+NOT tag = "已下线"
+```
+
+### 5.3 标签集合和分类
+
+```text
+tag IN ("生产环境", "预发布环境")
+tag.kind = malicious
+tag.kind IN (malicious, info)
+```
+
+`tag.kind` 的值必须使用小写 `info`、`malicious` 或 `benign`。
+
+## 6. 跨端点资产条件
+
+普通端点条件必须由同一结果行满足：
+
+```text
+port = 443 AND service = "https"
+```
+
+搜索“同一个 IP 同时存在 80 和 443 两个端点”时，必须使用 `has_endpoint`：
+
+```text
+has_endpoint(port = 80) AND has_endpoint(port = 443)
+```
+
+搜索 80 端口，并要求同一 IP 还存在 HTTPS 443 端点：
+
+```text
+port = 80 AND has_endpoint(port = 443 AND service = "https")
+```
+
+`has_endpoint(...)` 内只允许使用端点字段：
+
+```text
+port, protocol, service, banner, source
+```
+
+资产字段应写在函数外部：
+
+```text
+# 正确
+tag = "生产环境" AND has_endpoint(port = 443)
+
+# 错误
+has_endpoint(tag = "生产环境" AND port = 443)
+```
+
+`has_endpoint` 不能嵌套。只使用 `has_endpoint` 而不指定外层端口时，会返回满足资产条件的
+全部端点；如果只希望展示某个端点，应同时增加外层 `port` 或 `service` 条件。
+
+## 7. 常用查询示例
+
+### 7.1 Web 服务
+
+```text
+port IN (80, 443, 8080, 8443)
+AND (service ~ "http" OR banner ~ "nginx" OR banner ~ "apache")
+```
+
+### 7.2 暴露的数据库服务
+
+```text
+service IN (mysql, postgresql, mongodb, redis)
+OR port IN (3306, 5432, 27017, 6379)
+```
+
+### 7.3 最近出现的高位端口
+
+```text
+port > 1024 AND first_seen >= now-24h
+```
+
+### 7.4 指定网段内的恶意资产
+
+```text
+ip IN 10.20.0.0/16 AND tag.kind = malicious
+```
+
+### 7.5 有服务名但没有 Banner
+
+```text
+EXISTS(service) AND NOT EXISTS(banner)
+```
+
+### 7.6 同时提供 SSH 和 HTTPS
+
+```text
+has_endpoint(port = 22 AND service ~ "ssh")
+AND has_endpoint(port = 443 AND service ~ "https")
+```
+
+## 8. HTTP API
+
+### 8.1 请求
+
+```text
+POST /api/search/v2
+Content-Type: application/json
+```
+
+接口要求有效登录 Session 和 CSRF Token。前端统一 HTTP 客户端会自动附加
+`X-CSRF-Token`。
+
+请求体：
+
+```json
+{
+  "query": "country = CN AND port = 443 AND tag = \"生产环境\"",
+  "limit": 50,
+  "offset": 0
+}
+```
+
+| 参数 | 必填 | 默认值 | 范围 | 说明 |
+|---|---|---|---|---|
+| `query` | 是 | 无 | 最多 2048 字符 | 搜索表达式 |
+| `limit` | 否 | 50 | 1–100 | 每页条数 |
+| `offset` | 否 | 0 | 0–10000 | 分页偏移 |
+
+### 8.2 成功响应
+
+```json
+{
+  "query_type": "advanced",
+  "query": "country = CN AND port = 443",
+  "items": [
+    {
+      "ip_address": "192.0.2.10",
+      "port": 443,
+      "protocol": "tcp",
+      "service": "https",
+      "banner": "nginx",
+      "scanner_name": "scanner-east-1",
+      "scan_time": 1787270400000,
+      "asn": "4134",
+      "isp": "Example ISP",
+      "as_org": "Example Network",
+      "country_code": "CN",
+      "country_name": "China",
+      "city_name": "Shanghai",
+      "tags": [
+        {
+          "id": 1,
+          "name": "生产环境",
+          "kind": "info",
+          "description": null
+        }
+      ]
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`scan_time` 是 `last_seen` 的 Unix 毫秒时间戳。
+
+### 8.3 语法错误
+
+语法、字段、类型或操作符校验失败时返回 HTTP `422`：
+
+```json
+{
+  "code": "SEARCH_SYNTAX_ERROR",
+  "message": "条件之间需要使用 AND 或 OR",
+  "span": {
+    "start": 11,
+    "end": 18
+  }
+}
+```
+
+`span` 是前端 JavaScript 字符串使用的 UTF-16 起止位置，可直接传给输入框的
+`setSelectionRange(start, end)`。
+
+分页参数错误返回 HTTP `400`；数据库或连接池异常返回 HTTP `500`，不会向客户端暴露
+内部 SQL 和数据库错误。
+
+## 9. 查询限制与安全
+
+服务端执行以下限制：
+
+| 限制 | 数值 |
+|---|---:|
+| 查询长度 | 2048 字符 |
+| 逻辑/函数嵌套 | 12 层 |
+| 条件数量 | 50 个 |
+| 单个 `IN` 列表 | 100 个值 |
+| 文本值长度 | 1–128 字符 |
+| Banner 值长度 | 2–128 字符 |
+| 每页结果 | 1–100 条 |
+| 最大 offset | 10000 |
+
+查询字符串不会作为 SQL 片段执行：
+
+- 字段和操作符必须来自服务端白名单；
+- 所有搜索值使用 PostgreSQL 绑定参数；
+- `%`、`_` 在包含搜索中作为普通字符；
+- 用户权限过滤由服务端固定注入，搜索语法不能覆盖；
+- 当前不开放任意 `scan_observation.data` JSON 路径和正则搜索。
+
+## 10. 兼容旧版搜索
+
+`POST /api/search/v2` 接受旧版单条件输入：
+
+| 旧输入 | 等价高级语法 |
+|---|---|
+| `192.0.2.10` | `ip = 192.0.2.10` |
+| `192.0.2.0/24` | `ip IN 192.0.2.0/24` |
+| `port:443` | `port = 443` |
+| `service:https` | `service ~ "https"` |
+| `banner:nginx` | `banner ~ "nginx"` |
+
+以下旧接口暂时保留，供尚未迁移的客户端使用：
+
+```text
+GET /api/search/ip
+GET /api/search/network
+GET /api/search/port
+GET /api/search/service
+GET /api/search/banner
+```
+
+新客户端应只使用 `/api/search/v2`，避免把查询拆分为互斥的搜索类型。
+
+## 11. 当前边界与后续方向
+
+当前版本尚未提供：
+
+- 正则表达式；
+- 任意 JSON 路径查询；
+- 标签命名空间和端口级标签；
+- facets 聚合；
+- 保存查询和变化订阅；
+- 游标分页。
+
+如果新增 TLS、HTTP、证书等扫描字段，应先将稳定字段加入后端字段注册表并建立对应索引，
+不应直接开放用户控制的 JSON 路径或 SQL 表达式。

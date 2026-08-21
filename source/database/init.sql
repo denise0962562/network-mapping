@@ -151,6 +151,36 @@ ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_name TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS city_name TEXT DEFAULT NULL;
 
+-- 资产标签独立于扫描执行保存。同一个 IP 的标签会应用到所有任务与历史结果。
+CREATE TABLE IF NOT EXISTS asset_tag (
+	id BIGSERIAL PRIMARY KEY,
+	name VARCHAR(32) NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('info', 'malicious', 'benign')),
+	description VARCHAR(256),
+	is_active BOOLEAN NOT NULL DEFAULT TRUE,
+	created_by INT REFERENCES users(id) ON DELETE SET NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_tag_active_name
+	ON asset_tag (LOWER(name)) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_asset_tag_kind_active
+	ON asset_tag (kind, is_active);
+
+CREATE TABLE IF NOT EXISTS asset_ip_tag (
+	ip_address INET NOT NULL,
+	tag_id BIGINT NOT NULL REFERENCES asset_tag(id) ON DELETE CASCADE,
+	assigned_by INT REFERENCES users(id) ON DELETE SET NULL,
+	assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	PRIMARY KEY (ip_address, tag_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_ip_tag_address
+	ON asset_ip_tag (ip_address);
+CREATE INDEX IF NOT EXISTS idx_asset_ip_tag_tag_address
+	ON asset_ip_tag (tag_id, ip_address);
+
 -- 表 ports 用于存储扫描出的端口，其中ip_id通过外键关联到表ips，并配置了级联更新删除
 CREATE TABLE IF NOT EXISTS ports ( 
 	ip_id INT NOT NULL, 
@@ -225,6 +255,15 @@ CREATE INDEX IF NOT EXISTS idx_scan_observation_observed_at
 	ON scan_observation(observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_observation_service
 	ON scan_observation(service)
+	WHERE kind = 'service' AND service IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_observation_asset_endpoint_latest
+	ON scan_observation(ip_address, port, observed_at DESC, id DESC)
+	WHERE port > 0;
+CREATE INDEX IF NOT EXISTS idx_scan_observation_port_latest
+	ON scan_observation(port, observed_at DESC, id DESC)
+	WHERE port > 0;
+CREATE INDEX IF NOT EXISTS idx_scan_observation_service_lower
+	ON scan_observation(LOWER(service))
 	WHERE kind = 'service' AND service IS NOT NULL;
 
 -- 将尚未进入 typed observation 模型的 v1 scaninfo 历史记录回填到合成批次。
@@ -336,6 +375,8 @@ WHERE ranked.row_number = 1;
 -- 数据分析查询按观察时间筛选，并通过端口、任务和执行记录进行权限过滤。
 CREATE INDEX IF NOT EXISTS idx_ips_create_time_task
 	ON ips(create_time, task_id);
+CREATE INDEX IF NOT EXISTS idx_ips_address_update
+	ON ips(ip_address, update_time DESC, ip_id DESC);
 
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (

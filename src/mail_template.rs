@@ -108,10 +108,8 @@ const HEALTH_ALERT_DEFINITION: MailTemplateDefinition = MailTemplateDefinition {
     default_text: DEFAULT_HEALTH_ALERT_TEXT,
 };
 
-const ALL_TEMPLATE_DEFINITIONS: &[MailTemplateDefinition] = &[
-    LOGIN_SUCCESS_DEFINITION,
-    HEALTH_ALERT_DEFINITION,
-];
+const ALL_TEMPLATE_DEFINITIONS: &[MailTemplateDefinition] =
+    &[LOGIN_SUCCESS_DEFINITION, HEALTH_ALERT_DEFINITION];
 
 fn template_definition(template_key: &str) -> Option<MailTemplateDefinition> {
     match template_key {
@@ -758,9 +756,7 @@ pub async fn send_health_alert(
 }
 
 /// 枚举所有启用中的管理员（`role = 1`）邮箱，过滤掉无效或缺失的地址。
-pub async fn get_admin_recipients(
-    pool: &Pool,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub async fn get_admin_recipients(pool: &Pool) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let conn = pool.get().await?;
     let rows = conn
         .query(

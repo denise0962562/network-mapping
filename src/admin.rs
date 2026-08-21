@@ -443,7 +443,8 @@ pub fn smtp_send_error_message(error: &dyn std::error::Error) -> String {
         || lower.contains("530")
     {
         "认证失败：请检查发件邮箱密钥（授权码）是否正确".to_owned()
-    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("handshake") {
+    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("handshake")
+    {
         "邮件服务器 TLS/证书校验失败：请确认端口使用 SMTPS（隐式 TLS）".to_owned()
     } else if lower.contains("plugin timeout")
         || lower.contains("timed out")

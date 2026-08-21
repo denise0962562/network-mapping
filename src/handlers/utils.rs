@@ -16,7 +16,10 @@ use crate::config::{
     DatabaseConfig, EmailConfig, GetConfig, MailSettingsRequest, MailTestRequest,
     ScanSettingsRequest, ServerConfig, SessionSettingsRequest, session_ttl_seconds_from_minutes,
 };
-use crate::{FrontEndErrorInfo, TemplatesInit, front_end_error_page, logs::write::{info_logs, request_id}};
+use crate::{
+    FrontEndErrorInfo, TemplatesInit, front_end_error_page,
+    logs::write::{info_logs, request_id},
+};
 
 #[cfg(feature = "rir")]
 use crate::rir::get_rir_data;

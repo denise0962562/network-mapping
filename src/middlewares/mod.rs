@@ -1,7 +1,7 @@
 use actix_web::dev::ServiceRequest;
 use actix_web::{
     Error, FromRequest, HttpMessage, HttpRequest, HttpResponse, dev::Payload,
-    error::ErrorInternalServerError, web,
+    error::ErrorInternalServerError, http::Method, web,
 };
 use std::future::{Ready, ready};
 use tracing::error;
@@ -19,17 +19,16 @@ pub mod csrfmiddleware;
 // 该中间件用于限制公开入口请求频率
 pub mod ratelimit;
 
-const SCANNER_API_PATHS: &[&str] = &[
-    "/api/scanner/register",
-    "/api/scanner/heartbeat",
-    "/api/scanner/result",
-    "/api/scanner/task/fail",
-    "/api/scanner/task/cancelled",
-    "/api/task/apply",
-];
-
-pub(crate) fn is_scanner_api_path(path: &str) -> bool {
-    SCANNER_API_PATHS.contains(&path)
+pub(crate) fn is_scanner_api_request(method: &Method, path: &str) -> bool {
+    match path {
+        "/api/task/apply" => method == Method::GET,
+        "/api/scanner/register"
+        | "/api/scanner/heartbeat"
+        | "/api/scanner/result"
+        | "/api/scanner/task/fail"
+        | "/api/scanner/task/cancelled" => method == Method::POST,
+        _ => false,
+    }
 }
 
 /// 该函数用于从 app_data 中获取数据库连接池
@@ -86,8 +85,9 @@ pub fn render_500(req: &HttpRequest, page_template: &TemplatesInit, message: &st
 pub fn render_500_simple(req: &HttpRequest, message: &str) -> HttpResponse {
     logs::write::error_logs(req, "未能正确获取到模板系统", message);
     let request_id = logs::write::request_id(req);
-    HttpResponse::InternalServerError()
-        .body(format!("500 Internal Server Error\nRequest ID: {request_id}"))
+    HttpResponse::InternalServerError().body(format!(
+        "500 Internal Server Error\nRequest ID: {request_id}"
+    ))
 }
 
 impl FromRequest for UserBaseI {
@@ -118,24 +118,48 @@ impl FromRequest for UserSession {
 
 #[cfg(test)]
 mod tests {
-    use super::is_scanner_api_path;
+    use super::is_scanner_api_request;
     use super::{
         csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, smiddleware::AuthMiddleware,
     };
+    use crate::admin::UserBaseI;
     use crate::frontend::{self, FrontendAssets};
-    use actix_web::{App, HttpResponse, http::StatusCode, test as actix_test, web};
+    use actix_web::{App, HttpResponse, http::Method, http::StatusCode, test as actix_test, web};
+    use uuid::Uuid;
 
     #[test]
-    fn scanner_api_paths_use_exact_matching() {
-        assert!(is_scanner_api_path("/api/scanner/register"));
-        assert!(is_scanner_api_path("/api/scanner/heartbeat"));
-        assert!(is_scanner_api_path("/api/scanner/result"));
-        assert!(is_scanner_api_path("/api/scanner/task/fail"));
-        assert!(is_scanner_api_path("/api/scanner/task/cancelled"));
-        assert!(is_scanner_api_path("/api/task/apply"));
-        assert!(!is_scanner_api_path("/api/task/apply-extra"));
-        assert!(!is_scanner_api_path("/api/task/apply/anything"));
-        assert!(!is_scanner_api_path("/api/task"));
+    fn scanner_api_requests_use_exact_method_and_path_matching() {
+        assert!(is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/register"
+        ));
+        assert!(is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/heartbeat"
+        ));
+        assert!(is_scanner_api_request(&Method::POST, "/api/scanner/result"));
+        assert!(is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/task/fail"
+        ));
+        assert!(is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/task/cancelled"
+        ));
+        assert!(is_scanner_api_request(&Method::GET, "/api/task/apply"));
+
+        assert!(!is_scanner_api_request(&Method::GET, "/api/scanner/result"));
+        assert!(!is_scanner_api_request(&Method::PUT, "/api/scanner/result"));
+        assert!(!is_scanner_api_request(&Method::POST, "/api/task/apply"));
+        assert!(!is_scanner_api_request(
+            &Method::GET,
+            "/api/task/apply-extra"
+        ));
+        assert!(!is_scanner_api_request(
+            &Method::GET,
+            "/api/task/apply/anything"
+        ));
+        assert!(!is_scanner_api_request(&Method::GET, "/api/task"));
     }
 
     #[actix_web::test]
@@ -166,6 +190,41 @@ mod tests {
             .to_request();
         let similar_response = actix_test::call_service(&app, similar_request).await;
         assert_eq!(similar_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn wrong_method_on_scanner_path_requires_browser_auth() {
+        let app = actix_test::init_service(
+            App::new()
+                .wrap(CsrfMiddleware)
+                .wrap(AuthMiddleware)
+                .route(
+                    "/api/scanner/result",
+                    web::post().to(|| async { HttpResponse::NoContent().finish() }),
+                )
+                .route(
+                    "/api/scanner/{scanner_id}",
+                    web::get().to(|_user: UserBaseI, _scanner_id: web::Path<Uuid>| async {
+                        HttpResponse::NoContent().finish()
+                    }),
+                ),
+        )
+        .await;
+
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            let wrong_method = actix_test::TestRequest::default()
+                .method(method)
+                .uri("/api/scanner/result")
+                .to_request();
+            let wrong_method_response = actix_test::call_service(&app, wrong_method).await;
+            assert_eq!(wrong_method_response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let scanner_request = actix_test::TestRequest::post()
+            .uri("/api/scanner/result")
+            .to_request();
+        let scanner_response = actix_test::call_service(&app, scanner_request).await;
+        assert_eq!(scanner_response.status(), StatusCode::NO_CONTENT);
     }
 
     #[actix_web::test]
