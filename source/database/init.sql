@@ -178,6 +178,8 @@ CREATE TABLE IF NOT EXISTS asset_ip_tag (
 
 CREATE INDEX IF NOT EXISTS idx_asset_ip_tag_address
 	ON asset_ip_tag (ip_address);
+CREATE INDEX IF NOT EXISTS idx_asset_ip_tag_tag_address
+	ON asset_ip_tag (tag_id, ip_address);
 
 -- 表 ports 用于存储扫描出的端口，其中ip_id通过外键关联到表ips，并配置了级联更新删除
 CREATE TABLE IF NOT EXISTS ports ( 
@@ -253,6 +255,15 @@ CREATE INDEX IF NOT EXISTS idx_scan_observation_observed_at
 	ON scan_observation(observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_observation_service
 	ON scan_observation(service)
+	WHERE kind = 'service' AND service IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_observation_asset_endpoint_latest
+	ON scan_observation(ip_address, port, observed_at DESC, id DESC)
+	WHERE port > 0;
+CREATE INDEX IF NOT EXISTS idx_scan_observation_port_latest
+	ON scan_observation(port, observed_at DESC, id DESC)
+	WHERE port > 0;
+CREATE INDEX IF NOT EXISTS idx_scan_observation_service_lower
+	ON scan_observation(LOWER(service))
 	WHERE kind = 'service' AND service IS NOT NULL;
 
 -- 将尚未进入 typed observation 模型的 v1 scaninfo 历史记录回填到合成批次。
@@ -364,6 +375,8 @@ WHERE ranked.row_number = 1;
 -- 数据分析查询按观察时间筛选，并通过端口、任务和执行记录进行权限过滤。
 CREATE INDEX IF NOT EXISTS idx_ips_create_time_task
 	ON ips(create_time, task_id);
+CREATE INDEX IF NOT EXISTS idx_ips_address_update
+	ON ips(ip_address, update_time DESC, ip_id DESC);
 
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (

@@ -957,6 +957,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::search::search_port)
         .service(handlers::search::search_service)
         .service(handlers::search::search_banner)
+        .service(handlers::search::search_v2)
         .service(handlers::assets::get_asset_summary)
         .service(handlers::assets::get_asset_ports)
         .service(handlers::assets::get_asset_port_history)

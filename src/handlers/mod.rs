@@ -9,6 +9,7 @@ pub mod open_source;
 pub mod operations;
 pub mod requests;
 pub mod search;
+mod search_dsl;
 pub mod system_resources;
 pub mod tags;
 pub mod task;
