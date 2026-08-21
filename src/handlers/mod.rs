@@ -10,6 +10,7 @@ pub mod operations;
 pub mod requests;
 pub mod search;
 pub mod system_resources;
+pub mod tags;
 pub mod task;
 pub mod user;
 pub mod utils;

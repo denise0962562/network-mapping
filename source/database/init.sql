@@ -151,6 +151,34 @@ ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_name TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS city_name TEXT DEFAULT NULL;
 
+-- 资产标签独立于扫描执行保存。同一个 IP 的标签会应用到所有任务与历史结果。
+CREATE TABLE IF NOT EXISTS asset_tag (
+	id BIGSERIAL PRIMARY KEY,
+	name VARCHAR(32) NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('info', 'malicious', 'benign')),
+	description VARCHAR(256),
+	is_active BOOLEAN NOT NULL DEFAULT TRUE,
+	created_by INT REFERENCES users(id) ON DELETE SET NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_tag_active_name
+	ON asset_tag (LOWER(name)) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_asset_tag_kind_active
+	ON asset_tag (kind, is_active);
+
+CREATE TABLE IF NOT EXISTS asset_ip_tag (
+	ip_address INET NOT NULL,
+	tag_id BIGINT NOT NULL REFERENCES asset_tag(id) ON DELETE CASCADE,
+	assigned_by INT REFERENCES users(id) ON DELETE SET NULL,
+	assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	PRIMARY KEY (ip_address, tag_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_ip_tag_address
+	ON asset_ip_tag (ip_address);
+
 -- 表 ports 用于存储扫描出的端口，其中ip_id通过外键关联到表ips，并配置了级联更新删除
 CREATE TABLE IF NOT EXISTS ports ( 
 	ip_id INT NOT NULL, 

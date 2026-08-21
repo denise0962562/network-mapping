@@ -7,6 +7,7 @@ use std::str::FromStr;
 use tracing::error;
 
 use crate::admin::UserBaseI;
+use crate::handlers::tags::{AssetTag, tags_from_json};
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 100;
@@ -51,6 +52,7 @@ struct SearchItem {
     country_code: Option<String>,
     country_name: Option<String>,
     city_name: Option<String>,
+    tags: Vec<AssetTag>,
 }
 
 fn pagination(limit: Option<i64>, offset: Option<i64>) -> Result<(i64, i64), &'static str> {
@@ -115,12 +117,18 @@ async fn search_assets(
          s.port, s.protocol, s.service, s.banner, \
          COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, \
          FLOOR(EXTRACT(EPOCH FROM s.observed_at) * 1000)::BIGINT AS scan_time, \
-         i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name \
+         i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name, \
+         COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
          FROM scan_observation s \
          JOIN scan_task_execution e ON e.id = s.execution_id \
          JOIN scan_task t ON t.id = e.task_id \
          LEFT JOIN scanner_info scanner ON scanner.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
          LEFT JOIN ips i ON i.execution_id = s.execution_id AND i.ip_address = s.ip_address \
+         LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT(\
+             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
+             ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
+             FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
+             WHERE assignment.ip_address = s.ip_address AND tag.is_active) tag_data ON true \
          WHERE {where_clause} AND e.execution_status <> 'superseded' AND ($2 = 1 OR t.user_id = $3) \
          ORDER BY s.ip_address, s.port, s.observed_at DESC, s.id DESC\
          ) latest ORDER BY latest.ip_address, latest.port LIMIT $4 OFFSET $5"
@@ -145,6 +153,7 @@ async fn search_assets(
             country_code: row.get("country_code"),
             country_name: row.get("country_name"),
             city_name: row.get("city_name"),
+            tags: tags_from_json(row.get("tags")),
         })
         .collect();
     Ok(SearchResponse {

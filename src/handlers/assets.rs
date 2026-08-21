@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::admin::UserBaseI;
+use crate::handlers::tags::{AssetTag, tags_from_json};
 use crate::logs::write::error_logs;
 
 const DEFAULT_PORT_LIMIT: i64 = 20;
@@ -65,6 +66,8 @@ struct AssetSummary {
     observation_count: i64,
     first_seen_at: Option<i64>,
     last_seen_at: Option<i64>,
+    tags: Vec<AssetTag>,
+    can_manage_tags: bool,
 }
 
 #[derive(Serialize)]
@@ -174,6 +177,12 @@ pub(crate) async fn get_asset_summary(
                   AND e.execution_status = 'succeeded' \
                   AND ($2 = 1 OR t.user_id = $3) \
                 ORDER BY i.update_time DESC, i.ip_id DESC LIMIT 1\
+             ), asset_tags AS (\
+                SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(\
+                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
+                    ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id), '[]'::JSONB) AS tags \
+                FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
+                WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active\
              ) \
              SELECT stats.*, \
                     (SELECT COUNT(DISTINCT service)::BIGINT FROM eligible \
@@ -182,8 +191,9 @@ pub(crate) async fn get_asset_summary(
                      WHERE scanner_name IS NOT NULL) AS scanner_count, \
                     (SELECT COUNT(*)::BIGINT FROM eligible) AS observation_count, \
                     latest_intel.asn, latest_intel.isp, latest_intel.as_org, \
-                    latest_intel.country_code, latest_intel.country_name, latest_intel.city_name \
-             FROM stats LEFT JOIN latest_intel ON true;",
+                    latest_intel.country_code, latest_intel.country_name, latest_intel.city_name, \
+                    asset_tags.tags \
+             FROM stats LEFT JOIN latest_intel ON true CROSS JOIN asset_tags;",
             &[&ip, &user.role, &user.id],
         )
         .await
@@ -216,6 +226,8 @@ pub(crate) async fn get_asset_summary(
         observation_count,
         first_seen_at: row.get("first_seen_at"),
         last_seen_at: row.get("last_seen_at"),
+        tags: tags_from_json(row.get("tags")),
+        can_manage_tags: user.role == 1,
     };
 
     HttpResponse::Ok().json(serde_json::json!({
