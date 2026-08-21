@@ -15,9 +15,9 @@ use crate::login::get_session_from_req;
 use tracing::{debug, error, info};
 
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
-use crate::request_log::RequestActor;
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
-use crate::middlewares::{get_pool_from_app_data, is_scanner_api_path};
+use crate::middlewares::{get_pool_from_app_data, is_scanner_api_request};
+use crate::request_log::RequestActor;
 use uuid::Uuid;
 
 /// 用于 session 检查的中间件的 Transform
@@ -84,6 +84,7 @@ where
         // 向量 path_list 定义了需要做权限校验的路径
         let path_list = ["/api", "/dashboard", "/logout"];
         let path = req.path().to_owned();
+        let scanner_api_request = is_scanner_api_request(req.method(), &path);
         let svc = self.service.clone();
 
         let frontend_page =
@@ -94,7 +95,7 @@ where
                 .map(|assets| assets.has_page_for_path(&path))
                 .unwrap_or(true);
         let need_check = path != "/api/login"
-            && !is_scanner_api_path(&path)
+            && !scanner_api_request
             && ((frontend_page && frontend_page_available)
                 || path_list.iter().any(|prefix| path.starts_with(prefix)));
 
@@ -167,7 +168,7 @@ where
                 pool: g_pool.clone(),
             };
 
-            let v_csrf_token = path != "/api/totp/verify" && !is_scanner_api_path(&path);
+            let v_csrf_token = path != "/api/totp/verify" && !scanner_api_request;
 
             match login_t.check_token(&session, v_csrf_token).await {
                 Ok((true, uid)) => {
