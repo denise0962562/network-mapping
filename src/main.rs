@@ -315,8 +315,7 @@ async fn main() -> io::Result<()> {
                             let slow_duration = duration_ms
                                 .map(i64::from)
                                 .filter(|value| monitor.is_slow_request(*value));
-                            let is_server_error =
-                                monitor.server_error_enabled() && status >= 500;
+                            let is_server_error = monitor.server_error_enabled() && status >= 500;
                             if slow_duration.is_some() || is_server_error {
                                 let client_ip_str = client_ip.map(|ip| ip.to_string());
                                 let actor_name_str = actor_name.clone();

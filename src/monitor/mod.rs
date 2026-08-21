@@ -160,7 +160,12 @@ impl MonitorHandle {
             return None;
         }
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        tokio::spawn(run_notifier(rx, pool.clone(), encryption_key, config.clone()));
+        tokio::spawn(run_notifier(
+            rx,
+            pool.clone(),
+            encryption_key,
+            config.clone(),
+        ));
         tokio::spawn(slow_sql::run_monitor(pool, tx.clone(), config.clone()));
         info!(target: "server::startup", component = "monitor", "健康监控任务已启动");
         Some(Self {

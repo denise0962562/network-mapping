@@ -290,16 +290,14 @@ pub(crate) async fn request_summary(
                 COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
          FROM request_log {FILTER_SQL}"
     );
-    let (total, client_errors, server_errors): (i64, i64, i64) = match client
-        .query_one(&counts_sql, &params)
-        .await
-    {
-        Ok(row) => (row.get(0), row.get(1), row.get(2)),
-        Err(error_value) => {
-            error_logs(&req, "RequestsSummaryError", &error_value.to_string());
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
+    let (total, client_errors, server_errors): (i64, i64, i64) =
+        match client.query_one(&counts_sql, &params).await {
+            Ok(row) => (row.get(0), row.get(1), row.get(2)),
+            Err(error_value) => {
+                error_logs(&req, "RequestsSummaryError", &error_value.to_string());
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
     let errors = client_errors + server_errors;
     let error_rate = if total == 0 {
         0.0
@@ -421,10 +419,7 @@ pub(crate) async fn request_summary(
                  FROM request_log {FILTER_SQL} AND duration_ms IS NOT NULL"
             );
             match client.query_one(&percentile_sql, &params).await {
-                Ok(row) => (
-                    row.get::<_, Option<f64>>(0),
-                    row.get::<_, Option<f64>>(1),
-                ),
+                Ok(row) => (row.get::<_, Option<f64>>(0), row.get::<_, Option<f64>>(1)),
                 Err(error_value) => {
                     error_logs(&req, "RequestsSummaryError", &error_value.to_string());
                     return HttpResponse::InternalServerError().finish();
@@ -494,7 +489,10 @@ mod tests {
                 .seconds(),
             1800
         );
-        assert_eq!(resolve_granularity(&auto, None, None).unwrap().seconds(), 3600);
+        assert_eq!(
+            resolve_granularity(&auto, None, None).unwrap().seconds(),
+            3600
+        );
     }
 
     #[test]

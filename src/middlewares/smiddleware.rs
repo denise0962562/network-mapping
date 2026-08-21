@@ -188,7 +188,10 @@ where
                     // 将操作者写入最外层 wrap_fn 预置的槽位，供请求日志采集（request_log）。
                     // 槽位仅在采集开启且未被跳过的请求上存在；匿名/被拒绝请求保持 NULL。
                     if let Some(slot) = req.extensions().get::<RequestActor>() {
-                        *slot.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        *slot
+                            .0
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                             Some((tmp_info.id, tmp_info.username.clone()));
                     }
 

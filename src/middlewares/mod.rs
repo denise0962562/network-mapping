@@ -85,8 +85,9 @@ pub fn render_500(req: &HttpRequest, page_template: &TemplatesInit, message: &st
 pub fn render_500_simple(req: &HttpRequest, message: &str) -> HttpResponse {
     logs::write::error_logs(req, "未能正确获取到模板系统", message);
     let request_id = logs::write::request_id(req);
-    HttpResponse::InternalServerError()
-        .body(format!("500 Internal Server Error\nRequest ID: {request_id}"))
+    HttpResponse::InternalServerError().body(format!(
+        "500 Internal Server Error\nRequest ID: {request_id}"
+    ))
 }
 
 impl FromRequest for UserBaseI {
