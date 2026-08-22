@@ -20,6 +20,7 @@ pub mod rir; // 该模块用于从五大 RIR 获取 ASN 和组织等信息
 pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
+pub mod scanner_latency;
 
 #[cfg(test)]
 pub mod test; // 测试模块

@@ -468,6 +468,30 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_capabilities_updated_a
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities JSONB NOT NULL
     DEFAULT '{"plan_versions":[],"profiles":["legacy"],"stages":["port_discovery"]}'::jsonb;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities_updated_at TIMESTAMPTZ;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_rtt_us BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_network_rtt_us BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_server_processing_us BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_measured_at TIMESTAMPTZ;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_probe_id UUID;
+
+-- 扫描器到服务端的 HTTPS 心跳延迟历史。最新值同时冗余在 scanner_info，
+-- 避免扫描器列表查询历史表。
+CREATE TABLE IF NOT EXISTS scanner_latency_sample (
+	id BIGSERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL REFERENCES scanner_info(scanner_id) ON UPDATE CASCADE,
+	probe_id UUID NOT NULL,
+	measured_at TIMESTAMPTZ NOT NULL,
+	reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	rtt_us BIGINT NOT NULL CHECK (rtt_us >= 0),
+	server_processing_us BIGINT NOT NULL CHECK (server_processing_us >= 0),
+	network_rtt_us BIGINT NOT NULL CHECK (network_rtt_us >= 0),
+	UNIQUE(scanner_id, probe_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scanner_latency_scanner_time
+	ON scanner_latency_sample(scanner_id, measured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scanner_latency_time
+	ON scanner_latency_sample(measured_at);
 
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,

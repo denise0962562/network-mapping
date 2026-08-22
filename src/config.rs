@@ -1099,6 +1099,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::data_saa::get_analysis_discovery_heatmap)
         .service(handlers::system_resources::get_system_resource_history)
         .service(handlers::system_resources::get_database_size_history)
+        .service(handlers::scanner_latency::get_scanner_latency_history)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
         .service(handlers::search::search_ip)
