@@ -11,7 +11,7 @@ use crate::{
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
-use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
+use actix_web::{HttpRequest, HttpResponse, Responder, get, http::header, post, web};
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
@@ -222,6 +222,77 @@ fn bearer_token(req: &HttpRequest) -> Option<&str> {
         .get("Authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+#[derive(Deserialize)]
+pub struct ScannerPublicIpQuery {
+    scannerid: Uuid,
+}
+
+#[derive(Serialize)]
+struct ScannerPublicIpResponse {
+    ip: String,
+}
+
+fn normalize_peer_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
+    }
+}
+
+/// Returns the source address observed by the server to an authenticated scanner.
+#[get("/api/scanner/network/public-ip")]
+pub(crate) async fn scanner_public_ip_handler(
+    req: HttpRequest,
+    query: web::Query<ScannerPublicIpQuery>,
+    pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
+) -> impl Responder {
+    let Some(token) = bearer_token(&req) else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+    if let Err(error) = validate_scanner_credentials(
+        pool.get_ref(),
+        query.scannerid,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
+        return match error {
+            ApplyTaskError::ScannerUnauthorized => {
+                HttpResponse::Unauthorized().body("unauthorized")
+            }
+            error => {
+                error_logs_error(
+                    &req,
+                    "ScannerPublicIpCredentialCheckError",
+                    "validate_scanner_credentials",
+                    &error,
+                );
+                HttpResponse::InternalServerError().finish()
+            }
+        };
+    }
+
+    let Some(peer_address) = req.peer_addr() else {
+        error!(
+            event = "ScannerPublicIpUnavailable",
+            scanner_id = %query.scannerid,
+            "authenticated scanner request had no peer address"
+        );
+        return HttpResponse::ServiceUnavailable().body("client address unavailable");
+    };
+    let address = normalize_peer_ip(peer_address.ip());
+    HttpResponse::Ok()
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .json(ScannerPublicIpResponse {
+            ip: address.to_string(),
+        })
 }
 
 #[derive(Deserialize)]
@@ -1383,12 +1454,13 @@ async fn get_all_task_handler(
 mod tests {
     use super::{
         ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
-        ScannerScanCapabilities, normalize_task_list_query, task_result_pagination,
-        validate_latency_report, validate_public_ip,
+        ScannerScanCapabilities, normalize_peer_ip, normalize_task_list_query,
+        task_result_pagination, validate_latency_report, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
     use chrono::Utc;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use uuid::Uuid;
 
     #[test]
@@ -1467,6 +1539,19 @@ mod tests {
         );
         assert!(validate_public_ip(Some("2001:db8::1"), false).is_err());
         assert!(validate_public_ip(Some("not-an-ip"), true).is_err());
+    }
+
+    #[test]
+    fn peer_ip_normalizes_ipv4_mapped_ipv6_addresses() {
+        let mapped = IpAddr::V6(Ipv6Addr::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 64, 81, 116, 137,
+        ]));
+        assert_eq!(
+            normalize_peer_ip(mapped),
+            IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137))
+        );
+        let native_ipv6 = IpAddr::V6("2001:db8::1".parse().unwrap());
+        assert_eq!(normalize_peer_ip(native_ipv6), native_ipv6);
     }
 
     #[test]

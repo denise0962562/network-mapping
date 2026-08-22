@@ -21,7 +21,7 @@ pub mod ratelimit;
 
 pub(crate) fn is_scanner_api_request(method: &Method, path: &str) -> bool {
     match path {
-        "/api/task/apply" => method == Method::GET,
+        "/api/task/apply" | "/api/scanner/network/public-ip" => method == Method::GET,
         "/api/scanner/register"
         | "/api/scanner/heartbeat"
         | "/api/scanner/result"
@@ -147,10 +147,18 @@ mod tests {
             "/api/scanner/task/cancelled"
         ));
         assert!(is_scanner_api_request(&Method::GET, "/api/task/apply"));
+        assert!(is_scanner_api_request(
+            &Method::GET,
+            "/api/scanner/network/public-ip"
+        ));
 
         assert!(!is_scanner_api_request(&Method::GET, "/api/scanner/result"));
         assert!(!is_scanner_api_request(&Method::PUT, "/api/scanner/result"));
         assert!(!is_scanner_api_request(&Method::POST, "/api/task/apply"));
+        assert!(!is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/network/public-ip"
+        ));
         assert!(!is_scanner_api_request(
             &Method::GET,
             "/api/task/apply-extra"
@@ -175,6 +183,10 @@ mod tests {
                 .route(
                     "/api/task/apply-extra",
                     web::get().to(|| async { HttpResponse::NoContent().finish() }),
+                )
+                .route(
+                    "/api/scanner/network/public-ip",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
                 ),
         )
         .await;
@@ -184,6 +196,12 @@ mod tests {
             .to_request();
         let scanner_response = actix_test::call_service(&app, scanner_request).await;
         assert_eq!(scanner_response.status(), StatusCode::NO_CONTENT);
+
+        let public_ip_request = actix_test::TestRequest::get()
+            .uri("/api/scanner/network/public-ip?scannerid=019fe6b8-1b2b-7720-91d2-132d8c0c724e")
+            .to_request();
+        let public_ip_response = actix_test::call_service(&app, public_ip_request).await;
+        assert_eq!(public_ip_response.status(), StatusCode::OK);
 
         let similar_request = actix_test::TestRequest::get()
             .uri("/api/task/apply-extra")

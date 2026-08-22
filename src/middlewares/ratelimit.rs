@@ -149,6 +149,11 @@ fn policy_for_path(path: &str) -> Option<RateLimitPolicy> {
             window: Duration::from_secs(60),
             message: "扫描器心跳过于频繁，请稍后再试",
         }),
+        "/api/scanner/network/public-ip" => Some(RateLimitPolicy {
+            max_requests: 30,
+            window: Duration::from_secs(60),
+            message: "扫描器网络探测过于频繁，请稍后再试",
+        }),
         "/api/scanner/task/fail" | "/api/scanner/task/cancelled" => Some(RateLimitPolicy {
             max_requests: 30,
             window: Duration::from_secs(60),
@@ -199,6 +204,7 @@ fn rate_limit_key(req: &ServiceRequest, path: &str, client: &str) -> String {
         path,
         "/api/scanner/result"
             | "/api/scanner/heartbeat"
+            | "/api/scanner/network/public-ip"
             | "/api/scanner/task/fail"
             | "/api/scanner/task/cancelled"
     ) && let Some(token_fingerprint) = bearer_fingerprint(req)
@@ -227,4 +233,29 @@ fn bearer_fingerprint(req: &ServiceRequest) -> Option<u64> {
     let mut hasher = DefaultHasher::new();
     token.hash(&mut hasher);
     Some(hasher.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{policy_for_path, rate_limit_key};
+    use actix_web::{http::header, test as actix_test};
+
+    #[test]
+    fn public_ip_endpoint_has_a_bounded_rate_limit() {
+        let policy = policy_for_path("/api/scanner/network/public-ip")
+            .expect("public IP endpoint must be rate limited");
+        assert_eq!(policy.max_requests, 30);
+    }
+
+    #[test]
+    fn public_ip_endpoint_is_rate_limited_by_token() {
+        let request = actix_test::TestRequest::get()
+            .uri("/api/scanner/network/public-ip")
+            .insert_header((header::AUTHORIZATION, "Bearer runtime-secret"))
+            .to_srv_request();
+        let key = rate_limit_key(&request, "/api/scanner/network/public-ip", "192.0.2.10");
+        assert!(key.starts_with("scanner-result:"));
+        assert!(!key.contains("runtime-secret"));
+        assert!(!key.contains("192.0.2.10"));
+    }
 }
