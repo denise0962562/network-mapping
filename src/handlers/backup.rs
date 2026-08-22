@@ -132,6 +132,8 @@ pub(crate) async fn backup_summary(
             "enabled": false,
             "available": false,
             "stanza": manager.stanza(),
+            "executionMode": if manager.run_as_user().is_some() { "sudo" } else { "direct" },
+            "runAsUser": manager.run_as_user(),
             "operationRunning": manager.operation_running(),
             "stanzas": [],
             "message": "pgBackRest 管理功能未启用"
@@ -144,6 +146,8 @@ pub(crate) async fn backup_summary(
             "enabled": true,
             "available": true,
             "stanza": manager.stanza(),
+            "executionMode": if manager.run_as_user().is_some() { "sudo" } else { "direct" },
+            "runAsUser": manager.run_as_user(),
             "operationRunning": manager.operation_running(),
             "stanzas": stanzas
         })),
@@ -152,6 +156,8 @@ pub(crate) async fn backup_summary(
             "enabled": true,
             "available": false,
             "stanza": manager.stanza(),
+            "executionMode": if manager.run_as_user().is_some() { "sudo" } else { "direct" },
+            "runAsUser": manager.run_as_user(),
             "operationRunning": manager.operation_running(),
             "stanzas": [],
             "message": message

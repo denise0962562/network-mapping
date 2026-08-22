@@ -1,0 +1,14 @@
+# Network Mapping Web backup operations.
+#
+# Install as /etc/sudoers.d/network-mapping-pgbackrest with owner root:root and mode 0440.
+# If the service account, stanza, binary, or config path differs, update this file and config.toml
+# together. Keep every command fully specified; do not add wildcards or a shell.
+
+Cmnd_Alias NM_PGBACKREST = \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --output=json info, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping check, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=full backup, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=diff backup, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=incr backup
+
+network-mapping ALL=(postgres) NOPASSWD: NM_PGBACKREST

@@ -41,6 +41,10 @@ impl BackupManager {
         &self.config.stanza
     }
 
+    pub fn run_as_user(&self) -> Option<&str> {
+        self.config.run_as_user.as_deref()
+    }
+
     pub fn operation_running(&self) -> bool {
         self.operation_gate.available_permits() == 0
     }
@@ -70,7 +74,9 @@ impl BackupManager {
     }
 
     pub async fn run_backup(&self, backup_type: &str) -> Result<CommandResult, String> {
-        debug_assert!(matches!(backup_type, "full" | "diff" | "incr"));
+        if !matches!(backup_type, "full" | "diff" | "incr") {
+            return Err("不支持的备份类型".to_owned());
+        }
         self.execute(
             &[format!("--type={backup_type}"), "backup".to_owned()],
             self.config.command_timeout_seconds,
@@ -92,18 +98,14 @@ impl BackupManager {
             return Err("pgBackRest 管理功能未启用".to_owned());
         }
 
-        let mut command = Command::new(&self.config.binary);
+        let (program, arguments) = self.command_spec(operation_arguments);
+        let mut command = Command::new(program);
         command
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        append_common_arguments(
-            &mut command,
-            &self.config.stanza,
-            self.config.config_file.as_deref(),
-        );
-        command.args(operation_arguments);
+        command.args(arguments);
 
         let output = timeout(Duration::from_secs(timeout_seconds), command.output())
             .await
@@ -117,13 +119,36 @@ impl BackupManager {
             stderr: truncate_output(&output.stderr, self.config.max_output_bytes),
         })
     }
+
+    fn command_spec(&self, operation_arguments: &[String]) -> (&Path, Vec<String>) {
+        let mut arguments = Vec::new();
+        let program = if let Some(run_as_user) = self.config.run_as_user.as_deref() {
+            arguments.extend([
+                "-n".to_owned(),
+                "-u".to_owned(),
+                run_as_user.to_owned(),
+                "--".to_owned(),
+                self.config.binary.display().to_string(),
+            ]);
+            self.config.sudo_binary.as_path()
+        } else {
+            self.config.binary.as_path()
+        };
+        append_common_arguments(
+            &mut arguments,
+            &self.config.stanza,
+            self.config.config_file.as_deref(),
+        );
+        arguments.extend_from_slice(operation_arguments);
+        (program, arguments)
+    }
 }
 
-fn append_common_arguments(command: &mut Command, stanza: &str, config_file: Option<&Path>) {
+fn append_common_arguments(arguments: &mut Vec<String>, stanza: &str, config_file: Option<&Path>) {
     if let Some(config_file) = config_file {
-        command.arg(format!("--config={}", config_file.display()));
+        arguments.push(format!("--config={}", config_file.display()));
     }
-    command.arg(format!("--stanza={stanza}"));
+    arguments.push(format!("--stanza={stanza}"));
 }
 
 fn truncate_output(output: &[u8], maximum_bytes: usize) -> String {
@@ -156,6 +181,7 @@ fn command_failure_message(result: &CommandResult) -> String {
 mod tests {
     use super::{BackupManager, truncate_output};
     use crate::config::BackupConfig;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn operation_gate_allows_only_one_mutating_command() {
@@ -173,5 +199,61 @@ mod tests {
         let truncated = truncate_output(value.as_bytes(), 8);
         assert!(truncated.starts_with("[前部日志因长度限制已省略]"));
         assert!(truncated.ends_with("完成"));
+    }
+
+    #[test]
+    fn sudo_execution_uses_non_interactive_fixed_run_as_prefix() {
+        let manager = BackupManager::new(BackupConfig {
+            enabled: true,
+            config_file: Some(PathBuf::from("/etc/pgbackrest/pgbackrest.conf")),
+            run_as_user: Some("postgres".to_owned()),
+            ..BackupConfig::default()
+        });
+        let (program, arguments) =
+            manager.command_spec(&["--type=full".to_owned(), "backup".to_owned()]);
+
+        assert_eq!(program, Path::new("/usr/bin/sudo"));
+        assert_eq!(
+            arguments,
+            [
+                "-n",
+                "-u",
+                "postgres",
+                "--",
+                "/usr/bin/pgbackrest",
+                "--config=/etc/pgbackrest/pgbackrest.conf",
+                "--stanza=network_mapping",
+                "--type=full",
+                "backup",
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_execution_remains_available_when_run_as_is_unset() {
+        let manager = BackupManager::new(BackupConfig {
+            enabled: true,
+            ..BackupConfig::default()
+        });
+        let (program, arguments) =
+            manager.command_spec(&["--output=json".to_owned(), "info".to_owned()]);
+
+        assert_eq!(program, Path::new("/usr/bin/pgbackrest"));
+        assert_eq!(
+            arguments,
+            ["--stanza=network_mapping", "--output=json", "info"]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_backup_rejects_non_allowlisted_types_before_execution() {
+        let manager = BackupManager::new(BackupConfig {
+            enabled: true,
+            ..BackupConfig::default()
+        });
+
+        let result = manager.run_backup("full --config=/tmp/other.conf").await;
+
+        assert_eq!(result.unwrap_err(), "不支持的备份类型");
     }
 }

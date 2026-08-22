@@ -107,6 +107,8 @@ pub struct BackupConfig {
     pub binary: PathBuf,
     pub stanza: String,
     pub config_file: Option<PathBuf>,
+    pub run_as_user: Option<String>,
+    pub sudo_binary: PathBuf,
     pub command_timeout_seconds: u64,
     pub max_output_bytes: usize,
 }
@@ -118,6 +120,8 @@ impl Default for BackupConfig {
             binary: PathBuf::from("/usr/bin/pgbackrest"),
             stanza: "network_mapping".to_owned(),
             config_file: None,
+            run_as_user: None,
+            sudo_binary: PathBuf::from("/usr/bin/sudo"),
             command_timeout_seconds: 6 * 60 * 60,
             max_output_bytes: 1024 * 1024,
         }
@@ -153,6 +157,17 @@ impl SelfChecking for BackupConfig {
         {
             return Err("backup.stanza 只能包含字母、数字、下划线和连字符".into());
         }
+        if let Some(run_as_user) = self.run_as_user.as_deref() {
+            if !valid_run_as_user(run_as_user) {
+                return Err(
+                    "backup.run_as_user 必须是非 root 的本机账户名，只能包含字母、数字、下划线和连字符"
+                        .into(),
+                );
+            }
+            if !self.sudo_binary.is_absolute() {
+                return Err("backup.sudo_binary 必须是绝对路径".into());
+            }
+        }
         if self.command_timeout_seconds == 0 {
             return Err("backup.command_timeout_seconds 必须大于 0".into());
         }
@@ -161,6 +176,18 @@ impl SelfChecking for BackupConfig {
         }
         Ok(true)
     }
+}
+
+fn valid_run_as_user(value: &str) -> bool {
+    if value.is_empty() || value == "root" {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 impl BackupConfig {
@@ -903,6 +930,26 @@ mod tests {
         assert!(matches!(backup.try_check(), Ok(true)));
 
         backup.stanza = "unsafe stanza".to_owned();
+        assert!(backup.try_check().is_err());
+    }
+
+    #[test]
+    fn backup_run_as_user_rejects_root_and_unsafe_names() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            run_as_user: Some("postgres".to_owned()),
+            ..BackupConfig::default()
+        };
+        assert!(matches!(backup.try_check(), Ok(true)));
+
+        backup.run_as_user = Some("root".to_owned());
+        assert!(backup.try_check().is_err());
+        backup.run_as_user = Some("postgres --preserve-env".to_owned());
+        assert!(backup.try_check().is_err());
+        backup.run_as_user = Some("#0".to_owned());
+        assert!(backup.try_check().is_err());
+        backup.run_as_user = Some("postgres".to_owned());
+        backup.sudo_binary = PathBuf::from("sudo");
         assert!(backup.try_check().is_err());
     }
 

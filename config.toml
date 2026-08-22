@@ -90,6 +90,10 @@ binary = "/usr/bin/pgbackrest"
 stanza = "network_mapping"
 # 如使用 pgBackRest 默认配置文件，可删除或注释此项。
 config_file = "/etc/pgbackrest/pgbackrest.conf"
+# pgBackRest 通常需要以 postgres 身份读取数据目录。设置后后端固定使用：
+# /usr/bin/sudo -n -u postgres -- /usr/bin/pgbackrest <白名单参数>
+run_as_user = "postgres"
+sudo_binary = "/usr/bin/sudo"
 # 全量备份可能耗时较长，默认超时 6 小时。
 command_timeout_seconds = 21600
 # 每个任务最多持久化 1MiB stdout/stderr，超出时保留末尾内容。

@@ -56,7 +56,7 @@ systemd timers ── 直接定时执行 pgBackRest
 2. 已评估数据库大小、每日 WAL 量、备份窗口和恢复目标。
 3. 备份仓库不位于 PostgreSQL 数据目录内，并有足够空间。
 4. PostgreSQL 主机和备份仓库时钟已同步。
-5. pgBackRest 可执行文件和配置文件对执行账户可用。
+5. pgBackRest 可执行文件由 root 管理，配置、数据目录和仓库对 postgres 可用。
 6. 已预留独立恢复环境，不能把首次恢复测试直接指向生产数据目录。
 
 可先收集环境信息：
@@ -200,6 +200,8 @@ enabled = true
 binary = "/usr/bin/pgbackrest"
 stanza = "network_mapping"
 config_file = "/etc/pgbackrest/pgbackrest.conf"
+run_as_user = "postgres"
+sudo_binary = "/usr/bin/sudo"
 command_timeout_seconds = 21600
 max_output_bytes = 1048576
 ```
@@ -212,27 +214,188 @@ max_output_bytes = 1048576
 | `binary` | pgBackRest 或经过审计的本机代理绝对路径 |
 | `stanza` | 允许管理的固定 stanza，只允许字母、数字、下划线和连字符 |
 | `config_file` | pgBackRest 配置文件；可省略以使用其默认搜索路径 |
+| `run_as_user` | 可选的固定执行账户；推荐设置为 `postgres`，设置后使用非交互 sudo |
+| `sudo_binary` | sudo 绝对路径，仅在配置 `run_as_user` 时使用 |
 | `command_timeout_seconds` | 手动备份/check 最大执行时间，超时会终止子进程 |
 | `max_output_bytes` | 每个 stdout/stderr 字段最大保存量，超出时保留末尾内容 |
 
 修改后重启 Network Mapping 服务。启动时会自动创建 `backup_job` 表；升级前仍建议按正常
 流程备份应用数据库。
 
-### 6.1 执行账户权限
+### 6.1 推荐权限模型
 
-Network Mapping 进程不能以 root 身份运行。执行账户必须同时满足：
+仓库已经提供可直接落地的 sudo 模式，不需要让 Network Mapping 读取 PostgreSQL 数据目录，
+也不需要把 Web 服务改成 root 或 postgres：
 
-- 可以执行配置的 `binary`；
-- 可以读取 pgBackRest 配置；
-- 可以按 pgBackRest 部署方式访问 PostgreSQL 和仓库；
-- 不能通过 Web 参数选择任意二进制、stanza 或命令。
+```text
+network-mapping 服务账户
+    │ 只能提交五条完全固定的 sudoers 命令
+    ▼
+sudo -n -u postgres -- /usr/bin/pgbackrest <固定参数>
+    │
+    ▼
+postgres 账户读取数据目录、pgBackRest 配置和仓库
+```
 
-后端只允许 `full`、`diff`、`incr` 和 `check`，使用进程参数数组调用，不拼接 shell
-字符串。同一服务实例只有一个操作许可，数据库中也只允许一条 queued/running 手动任务。
+当 `run_as_user = "postgres"` 时，后端实际生成的命令前缀固定为：
 
-如果 pgBackRest 只能由 `postgres` 执行，推荐使用只暴露固定操作的本机代理。若组织必须
-使用 sudoers，应让安全管理员精确限定绝对路径和参数，并在生产前验证无法执行 shell、
-无法覆盖配置路径、无法切换 stanza。不要授权 `/bin/sh`、通配脚本或无限制的 sudo。
+```sh
+/usr/bin/sudo -n -u postgres -- /usr/bin/pgbackrest
+```
+
+`-n` 表示非交互模式；如果 sudoers 不允许或仍要求密码，命令会立即失败，不会让 Web
+请求卡在密码提示。后端仍只生成以下五种 pgBackRest 参数组合：
+
+```text
+--config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --output=json info
+--config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping check
+--config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=full backup
+--config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=diff backup
+--config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=incr backup
+```
+
+`run_as_user` 不允许设置为 root，也不接受空格、`#0` 或命令行片段。Web 请求不能覆盖
+`binary`、`sudo_binary`、`run_as_user`、`config_file` 或 `stanza`。
+
+### 6.2 安装精确 sudoers 规则
+
+以下步骤假设：
+
+- Network Mapping systemd 服务账户是 `network-mapping`；
+- pgBackRest 运行账户是 `postgres`；
+- 二进制为 `/usr/bin/pgbackrest`；
+- 配置为 `/etc/pgbackrest/pgbackrest.conf`；
+- stanza 为 `network_mapping`。
+
+先确认实际值：
+
+```sh
+systemctl show network-mapping-server.service -p User -p Group -p NoNewPrivileges
+command -v sudo
+command -v pgbackrest
+id network-mapping
+id postgres
+```
+
+如果该 unit 显示 `NoNewPrivileges=yes`，set-user-ID sudo 无法切换到 postgres。不要盲目关闭
+这项防护；应由安全管理员在“保留 NoNewPrivileges 并部署只暴露固定操作的本机代理”
+和“对该 unit 允许精确 sudoers 桥接”之间做明确选择。本节的 sudo 方案要求
+`NoNewPrivileges=no`。
+
+如果服务账户尚未创建，应在安装 Network Mapping 服务时创建系统账户，并让应用目录由部署
+账户管理、运行所需文件只读。示例：
+
+```sh
+sudo useradd --system --home-dir /var/lib/network-mapping --create-home \
+  --shell /usr/sbin/nologin network-mapping
+```
+
+账户已存在时不要重复执行 `useradd`。如果实际账户或路径不同，必须同时修改
+`config.toml` 和 `deploy/sudoers/network-mapping-pgbackrest`，不能只改一边。
+
+先检查仓库提供的规则：
+
+```sh
+sudo visudo -cf deploy/sudoers/network-mapping-pgbackrest
+```
+
+确认输出 `parsed OK` 后安装：
+
+```sh
+sudo install -o root -g root -m 0440 \
+  deploy/sudoers/network-mapping-pgbackrest \
+  /etc/sudoers.d/network-mapping-pgbackrest
+sudo visudo -cf /etc/sudoers.d/network-mapping-pgbackrest
+sudo visudo -c
+```
+
+模板使用完整命令和完整参数，不包含 `*`、目录授权、正则表达式或 shell：
+
+```sudoers
+Cmnd_Alias NM_PGBACKREST = \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --output=json info, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping check, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=full backup, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=diff backup, \
+    /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping --type=incr backup
+
+network-mapping ALL=(postgres) NOPASSWD: NM_PGBACKREST
+```
+
+sudoers 在规则中指定参数时，请求参数必须匹配；如果不写参数，则意味着该命令可携带任意
+参数。因此不能简化成下面任何一种形式：
+
+```sudoers
+# 错误：允许 pgBackRest 的任意命令和参数，包括 restore 和其他配置路径
+network-mapping ALL=(postgres) NOPASSWD: /usr/bin/pgbackrest
+
+# 错误：参数通配符会跨空格匹配，边界比看起来更宽
+network-mapping ALL=(postgres) NOPASSWD: /usr/bin/pgbackrest *
+
+# 错误：允许直接获得 postgres shell
+network-mapping ALL=(postgres) NOPASSWD: /bin/sh
+```
+
+### 6.3 正向和反向验证
+
+查看服务账户实际获得的权限：
+
+```sh
+sudo -l -U network-mapping
+```
+
+以服务账户测试页面查询所需的精确命令：
+
+```sh
+sudo -u network-mapping sudo -n -u postgres -- \
+  /usr/bin/pgbackrest \
+  --config=/etc/pgbackrest/pgbackrest.conf \
+  --stanza=network_mapping \
+  --output=json info
+```
+
+再测试 `check`；它会触发 WAL 切换，应在允许的维护窗口执行：
+
+```sh
+sudo -u network-mapping sudo -n -u postgres -- \
+  /usr/bin/pgbackrest \
+  --config=/etc/pgbackrest/pgbackrest.conf \
+  --stanza=network_mapping \
+  check
+```
+
+还必须确认下面三种越权尝试全部被 sudo 拒绝：
+
+```sh
+# 修改 stanza：必须失败
+sudo -u network-mapping sudo -n -u postgres -- \
+  /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=other info
+
+# 执行 restore：必须失败
+sudo -u network-mapping sudo -n -u postgres -- \
+  /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping restore
+
+# 获取 shell：必须失败
+sudo -u network-mapping sudo -n -u postgres -- /bin/sh -c id
+```
+
+拒绝时 sudo 应返回非零退出码并记录 `not allowed to execute` 或等效信息。如果任意负向测试
+成功，立即删除或禁用该 sudoers 规则并重新检查，不要启用 Web 备份。
+
+### 6.4 文件权限和启动验证
+
+使用 sudo 模式时，Network Mapping 服务账户只需要执行 `/usr/bin/sudo`；pgBackRest 配置、
+PostgreSQL 数据目录和备份仓库继续只授权给 postgres：
+
+```sh
+sudo chown root:postgres /etc/pgbackrest/pgbackrest.conf
+sudo chmod 0640 /etc/pgbackrest/pgbackrest.conf
+sudo chown -R postgres:postgres /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest
+sudo chmod 0750 /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest
+```
+
+最后重启 Network Mapping，进入数据备份页面。页面应显示“sudo → postgres”，能够刷新状态
+并运行检查；标准错误中不应出现密码提示。
 
 ## 7. 安装定时任务
 
@@ -414,14 +577,30 @@ sudo -u postgres pgbackrest \
 
 ### 页面提示无法执行 pgBackRest
 
-在 Network Mapping 服务账户下执行：
+先确认页面显示的执行模式。使用本文推荐的 `run_as_user = "postgres"`
+时，应在 Network Mapping 服务账户下测试与后端完全相同的命令：
 
 ```sh
-/usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=network_mapping info
+sudo -u network-mapping sudo -n -u postgres -- \
+  /usr/bin/pgbackrest \
+  --config=/etc/pgbackrest/pgbackrest.conf \
+  --stanza=network_mapping \
+  --output=json info
 ```
 
-检查二进制路径、配置文件读取权限、数据目录访问权限和仓库网络。不要为了消除权限错误把
-服务改为 root。
+处理顺序：
+
+1. 如果 sudo 返回“password is required”或“not allowed”，运行
+   `sudo visudo -cf /etc/sudoers.d/network-mapping-pgbackrest` 并核对服务账户、二进制路径、
+   config、stanza、参数和顺序。
+2. 如果 sudo 报“no new privileges”，检查 systemd unit 的 `NoNewPrivileges`，按 6.2 节选择
+   本机代理或精确 sudoers 桥接。
+3. 如果 sudo 已允许，但 pgBackRest 返回 permission denied，检查 postgres 对配置、
+   数据目录、spool、日志、仓库和远端存储的访问。
+4. 如果命令行成功而页面失败，确认 systemd 服务实际读取的 `config.toml`，然后
+   重启后端并查看任务 stderr。
+
+不要为了消除权限错误把服务改为 root，也不要将 sudoers 改成任意参数。
 
 ### stanza 显示 no valid backups
 
@@ -497,6 +676,9 @@ systemctl list-units 'pgbackrest-*'
 
 - [ ] `stanza-create`、`check` 和第一次全量备份成功。
 - [ ] `info --output=json` 中 stanza 状态码为 0。
+- [ ] 数据备份页面显示“sudo → postgres”，服务本身仍以非 root 账户运行。
+- [ ] sudoers 中只有五条完整命令，不包含通配符、脚本或 shell。
+- [ ] info 和 check 正向测试成功，更换 stanza、restore 和 `/bin/sh` 反向测试被拒绝。
 - [ ] 管理员能打开数据备份页面，普通用户 API 返回 403。
 - [ ] 页面能提交一次手动增量或差异备份并查看完整任务结果。
 - [ ] 备份成功后，新标签出现在备份集列表。
