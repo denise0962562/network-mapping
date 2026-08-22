@@ -59,6 +59,7 @@ struct AssetSummary {
     as_org: Option<String>,
     country_code: Option<String>,
     country_name: Option<String>,
+    region_name: Option<String>,
     city_name: Option<String>,
     port_count: i64,
     service_count: i64,
@@ -169,7 +170,8 @@ pub(crate) async fn get_asset_summary(
                        FLOOR(EXTRACT(EPOCH FROM MAX(last_seen_at)) * 1000)::BIGINT AS last_seen_at \
                 FROM endpoints\
              ), latest_intel AS (\
-                SELECT i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name \
+                SELECT i.asn, i.isp, i.as_org, i.country_code, i.country_name, \
+                       i.region_name, i.city_name \
                 FROM ips i \
                 JOIN scan_task_execution e ON e.id = i.execution_id \
                 JOIN scan_task t ON t.id = e.task_id \
@@ -191,7 +193,8 @@ pub(crate) async fn get_asset_summary(
                      WHERE scanner_name IS NOT NULL) AS scanner_count, \
                     (SELECT COUNT(*)::BIGINT FROM eligible) AS observation_count, \
                     latest_intel.asn, latest_intel.isp, latest_intel.as_org, \
-                    latest_intel.country_code, latest_intel.country_name, latest_intel.city_name, \
+                    latest_intel.country_code, latest_intel.country_name, \
+                    latest_intel.region_name, latest_intel.city_name, \
                     asset_tags.tags \
              FROM stats LEFT JOIN latest_intel ON true CROSS JOIN asset_tags;",
             &[&ip, &user.role, &user.id],
@@ -219,6 +222,7 @@ pub(crate) async fn get_asset_summary(
         as_org: row.get("as_org"),
         country_code: row.get("country_code"),
         country_name: row.get("country_name"),
+        region_name: row.get("region_name"),
         city_name: row.get("city_name"),
         port_count: row.get("port_count"),
         service_count: row.get("service_count"),

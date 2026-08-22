@@ -439,6 +439,7 @@ Content-Type: application/json
       "as_org": "Example Network",
       "country_code": "CN",
       "country_name": "China",
+      "region_name": "Shanghai",
       "city_name": "Shanghai",
       "tags": [
         {

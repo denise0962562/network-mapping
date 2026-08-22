@@ -60,6 +60,7 @@ struct SearchItem {
     as_org: Option<String>,
     country_code: Option<String>,
     country_name: Option<String>,
+    region_name: Option<String>,
     city_name: Option<String>,
     tags: Vec<AssetTag>,
 }
@@ -173,7 +174,7 @@ pub async fn search_v2(
          ), latest_intel AS (\
             SELECT ranked.* FROM (\
                 SELECT intel.ip_address, intel.asn, intel.isp, intel.as_org, intel.country_code, \
-                       intel.country_name, intel.city_name, ROW_NUMBER() OVER (\
+                       intel.country_name, intel.region_name, intel.city_name, ROW_NUMBER() OVER (\
                            PARTITION BY intel.ip_address ORDER BY intel.update_time DESC, intel.ip_id DESC\
                        ) AS row_number \
                 FROM ips intel \
@@ -186,7 +187,7 @@ pub async fn search_v2(
             SELECT stats.ip_address, stats.port, endpoint.protocol, service.service, service.banner, \
                    COALESCE(service.source, endpoint.source) AS source, endpoint.scanner_name, \
                    stats.first_seen_at, stats.last_seen_at, intel.asn, intel.isp, intel.as_org, \
-                   intel.country_code, intel.country_name, intel.city_name \
+                   intel.country_code, intel.country_name, intel.region_name, intel.city_name \
             FROM endpoint_stats stats \
             JOIN latest_endpoint endpoint \
               ON endpoint.ip_address = stats.ip_address AND endpoint.port = stats.port \
@@ -203,7 +204,7 @@ pub async fn search_v2(
                 filtered.service, filtered.banner, filtered.scanner_name, \
                 FLOOR(EXTRACT(EPOCH FROM filtered.last_seen_at) * 1000)::BIGINT AS scan_time, \
                 filtered.asn, filtered.isp, filtered.as_org, filtered.country_code, \
-                filtered.country_name, filtered.city_name, filtered.total, \
+                filtered.country_name, filtered.region_name, filtered.city_name, filtered.total, \
                 COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
          FROM filtered \
          LEFT JOIN LATERAL (\
@@ -262,6 +263,7 @@ pub async fn search_v2(
             as_org: row.get("as_org"),
             country_code: row.get("country_code"),
             country_name: row.get("country_name"),
+            region_name: row.get("region_name"),
             city_name: row.get("city_name"),
             tags: tags_from_json(row.get("tags")),
         })
@@ -294,7 +296,7 @@ async fn search_assets(
          s.port, s.protocol, s.service, s.banner, \
          COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, \
          FLOOR(EXTRACT(EPOCH FROM s.observed_at) * 1000)::BIGINT AS scan_time, \
-         i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name, \
+         i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.region_name, i.city_name, \
          COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
          FROM scan_observation s \
          JOIN scan_task_execution e ON e.id = s.execution_id \
@@ -329,6 +331,7 @@ async fn search_assets(
             as_org: row.get("as_org"),
             country_code: row.get("country_code"),
             country_name: row.get("country_name"),
+            region_name: row.get("region_name"),
             city_name: row.get("city_name"),
             tags: tags_from_json(row.get("tags")),
         })

@@ -75,7 +75,7 @@ directory = "../network-mapping-vue/dist"
 ## MaxMind IP 情报
 
 将 `GeoLite2-City.mmdb`、`GeoLite2-Country.mmdb` 和 `GeoLite2-ASN.mmdb` 放入配置的
-目录，服务端会在扫描结果入库时保存 ASN、AS 组织、国家和城市信息：
+目录，服务端会在扫描结果入库时保存 ASN、AS 组织、国家、地区和城市信息：
 
 ```toml
 [maxmind]
