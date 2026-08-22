@@ -1,0 +1,11 @@
+[Unit]
+Description=Six-hourly incremental pgBackRest backup
+
+[Timer]
+OnCalendar=*-*-* 08,14,20:10:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=pgbackrest-backup@incr.service
+
+[Install]
+WantedBy=timers.target

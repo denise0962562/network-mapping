@@ -169,6 +169,13 @@ repeat_after_seconds = 604800
 注意事项参见
 [健康监控与告警](docs/HEALTH_ALERT.md)。
 
+## PostgreSQL 备份
+
+服务端可通过管理员页面查询 pgBackRest stanza 和备份集、手动执行全量/差异/增量备份、
+运行 WAL 归档检查并查看任务日志。功能默认关闭；定时备份使用独立 systemd timer，避免
+依赖 Web 进程存活。部署、权限、配置和恢复验证步骤参见
+[pgBackRest 备份管理](docs/PGBACKREST_BACKUP.md)。
+
 ## 开源项目清单
 
 `GET /api/open-source/projects` 返回编译进服务端的主要直接依赖清单。升级 `Cargo.toml`、扫描器依赖或前端 `package.json` 后，应同步复核 `source/open_source_projects.json` 中的版本、许可证和上游链接。

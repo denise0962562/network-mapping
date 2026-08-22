@@ -9,6 +9,7 @@ use network_mapping_server::admin::{
     check_default_admin_user, check_system_user, reset_admin_password,
 };
 use network_mapping_server::audit::RequestId;
+use network_mapping_server::backup::BackupManager;
 use network_mapping_server::config::{Clis, SelfChecking};
 use network_mapping_server::frontend::{self, FrontendAssets};
 use network_mapping_server::logs::write::error_chain_diagnostics;
@@ -111,6 +112,18 @@ async fn main() -> io::Result<()> {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(e) => panic!("初始化数据库错误{}", e),
     };
+    if let Ok(client) = db_pool.get().await
+        && let Err(error_value) = client
+            .execute(
+                "UPDATE backup_job SET status = 'failed', finished_at = NOW(), \
+                 stderr = CASE WHEN stderr = '' THEN '服务重启，任务执行状态已中断' ELSE stderr END \
+                 WHERE status IN ('queued', 'running')",
+                &[],
+            )
+            .await
+    {
+        error!(event = "BackupJobRecoveryError", message = %error_value);
+    }
 
     let maxmind_state = MaxMindState::from_directory(&maxmind_directory);
     if args.refresh_ip_intel {
@@ -166,6 +179,7 @@ async fn main() -> io::Result<()> {
         OpenSourceCatalog::from_embedded()
             .map_err(|error| io::Error::other(format!("开源项目清单格式错误: {error}")))?,
     );
+    let backup_manager = web::Data::new(BackupManager::new(config.backup.clone()));
 
     info!(target: "server::startup",
         address = %format!("{}:{}", server_host, server_port),
@@ -246,6 +260,7 @@ async fn main() -> io::Result<()> {
             .app_data(maxmind_state.clone())
             .app_data(automatic_target_service.clone())
             .app_data(open_source_catalog.clone())
+            .app_data(backup_manager.clone())
             .app_data(security.clone())
             .app_data(frontend_assets.clone())
             .app_data(web::JsonConfig::default().limit(server_max_body))

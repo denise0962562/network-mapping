@@ -797,3 +797,25 @@ CREATE TABLE IF NOT EXISTS health_alert (
 
 CREATE INDEX IF NOT EXISTS idx_health_alert_key_time
 	ON health_alert (alert_type, alert_key, occurred_at DESC);
+
+-- pgBackRest Web 管理任务。仓库中的 backup.info 仍是备份集的权威数据源；
+-- 本表只保存手动操作的执行状态、日志和审计关联。
+CREATE TABLE IF NOT EXISTS backup_job (
+	id UUID PRIMARY KEY,
+	operation TEXT NOT NULL CHECK (operation IN ('full', 'diff', 'incr', 'check')),
+	source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'scheduled')),
+	status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+	requested_by INT REFERENCES users(id) ON DELETE SET NULL,
+	remark TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	started_at TIMESTAMPTZ,
+	finished_at TIMESTAMPTZ,
+	exit_code INT,
+	stdout TEXT NOT NULL DEFAULT '',
+	stderr TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_job_created_at
+	ON backup_job (created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_job_single_active
+	ON backup_job ((1)) WHERE status IN ('queued', 'running');

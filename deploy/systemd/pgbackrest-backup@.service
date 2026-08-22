@@ -1,0 +1,16 @@
+[Unit]
+Description=pgBackRest %i backup for network_mapping
+Documentation=https://pgbackrest.org/user-guide.html
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+ExecStart=/usr/bin/pgbackrest --stanza=network_mapping --type=%i backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true

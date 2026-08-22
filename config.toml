@@ -83,6 +83,18 @@ slow_sql_check_interval_seconds = 60
 # 同一告警 key 的冷却时间（秒），冷却窗口内的重复告警被合并丢弃。
 alert_cooldown_seconds = 300
 
+[backup]
+# pgBackRest 管理功能默认关闭。完成 pgBackRest stanza 初始化和权限配置后再启用。
+enabled = false
+binary = "/usr/bin/pgbackrest"
+stanza = "network_mapping"
+# 如使用 pgBackRest 默认配置文件，可删除或注释此项。
+config_file = "/etc/pgbackrest/pgbackrest.conf"
+# 全量备份可能耗时较长，默认超时 6 小时。
+command_timeout_seconds = 21600
+# 每个任务最多持久化 1MiB stdout/stderr，超出时保留末尾内容。
+max_output_bytes = 1048576
+
 [database]
 host = "127.0.0.1"
 port = 5432
