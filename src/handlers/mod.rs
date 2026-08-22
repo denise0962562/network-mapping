@@ -1,6 +1,7 @@
 pub mod admin_user;
 pub mod assets;
 pub mod audit;
+pub mod backup;
 pub mod data_saa; //数据统计与分析
 pub mod health;
 pub mod login_record;
@@ -8,6 +9,7 @@ pub mod mail_template;
 pub mod open_source;
 pub mod operations;
 pub mod requests;
+pub mod scanner_latency;
 pub mod search;
 mod search_dsl;
 pub mod system_resources;

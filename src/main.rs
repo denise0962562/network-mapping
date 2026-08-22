@@ -9,6 +9,7 @@ use network_mapping_server::admin::{
     check_default_admin_user, check_system_user, reset_admin_password,
 };
 use network_mapping_server::audit::RequestId;
+use network_mapping_server::backup::BackupManager;
 use network_mapping_server::config::{Clis, SelfChecking};
 use network_mapping_server::frontend::{self, FrontendAssets};
 use network_mapping_server::logs::write::error_chain_diagnostics;
@@ -21,8 +22,10 @@ use network_mapping_server::middlewares::{
 use network_mapping_server::monitor::{self, HealthEvent};
 use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
+use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
 use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
 use network_mapping_server::tls::build_acceptor;
+use network_mapping_server::trusted_proxy::TrustedProxyState;
 use network_mapping_server::{Systems, TemplatesInit, config, db, insert_system_status};
 
 #[actix_web::main]
@@ -92,6 +95,7 @@ async fn main() -> io::Result<()> {
     .expect("创建连接池错误");
     let pool = db_pool.clone();
     let request_log_pool = db_pool.clone();
+    let scanner_latency_pool = db_pool.clone();
     if let Some(username) = args.reset_admin_password.as_deref() {
         match reset_admin_password(username, &db_pool, config.pwd_hash.clone()).await {
             Ok(password) => {
@@ -111,6 +115,23 @@ async fn main() -> io::Result<()> {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(e) => panic!("初始化数据库错误{}", e),
     };
+    let trusted_proxy_state = web::Data::new(
+        TrustedProxyState::from_database(&db_pool)
+            .await
+            .map_err(|error| io::Error::other(format!("加载可信代理配置失败：{error}")))?,
+    );
+    if let Ok(client) = db_pool.get().await
+        && let Err(error_value) = client
+            .execute(
+                "UPDATE backup_job SET status = 'failed', finished_at = NOW(), \
+                 stderr = CASE WHEN stderr = '' THEN '服务重启，任务执行状态已中断' ELSE stderr END \
+                 WHERE status IN ('queued', 'running')",
+                &[],
+            )
+            .await
+    {
+        error!(event = "BackupJobRecoveryError", message = %error_value);
+    }
 
     let maxmind_state = MaxMindState::from_directory(&maxmind_directory);
     if args.refresh_ip_intel {
@@ -166,6 +187,7 @@ async fn main() -> io::Result<()> {
         OpenSourceCatalog::from_embedded()
             .map_err(|error| io::Error::other(format!("开源项目清单格式错误: {error}")))?,
     );
+    let backup_manager = web::Data::new(BackupManager::new(config.backup.clone()));
 
     info!(target: "server::startup",
         address = %format!("{}:{}", server_host, server_port),
@@ -231,6 +253,16 @@ async fn main() -> io::Result<()> {
         None
     };
 
+    let (scanner_latency_history, scanner_latency_rx) = ScannerLatencyHistory::channel();
+    tokio::spawn(scanner_latency::run_writer(
+        scanner_latency_pool.clone(),
+        scanner_latency_rx,
+    ));
+    tokio::spawn(scanner_latency::run_retention(
+        scanner_latency_pool,
+        scanner_latency::RETENTION_DAYS,
+    ));
+
     HttpServer::new(move || {
         let request_log_tx = request_log_tx.clone();
         let monitor_handle = monitor_handle.clone();
@@ -246,7 +278,10 @@ async fn main() -> io::Result<()> {
             .app_data(maxmind_state.clone())
             .app_data(automatic_target_service.clone())
             .app_data(open_source_catalog.clone())
+            .app_data(backup_manager.clone())
+            .app_data(trusted_proxy_state.clone())
             .app_data(security.clone())
+            .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())
             .app_data(web::JsonConfig::default().limit(server_max_body))
             .wrap(CsrfMiddleware)
@@ -267,9 +302,23 @@ async fn main() -> io::Result<()> {
                 // 请求日志采集：service.call 前抓取元数据，响应后抓取状态码与耗时。
                 // 跳过静态资源与高频心跳，避免污染与放大数据量。
                 let path = req.path().to_owned();
+                let is_scanner_heartbeat = path == "/api/scanner/heartbeat";
+                let latency_probe = (is_scanner_heartbeat
+                    && req
+                        .headers()
+                        .get("NM-Latency-Version")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("1"))
+                .then(|| {
+                    req.headers()
+                        .get("NM-Latency-Probe")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                })
+                .flatten();
                 let capture = request_log_tx.is_some()
                     && !network_mapping_server::frontend::is_frontend_resource_path(&path)
-                    && path != "/api/scanner/heartbeat";
+                    && !is_scanner_heartbeat;
                 let actor = std::sync::Arc::new(std::sync::Mutex::new(None));
                 req.extensions_mut()
                     .insert(request_log::RequestActor(actor.clone()));
@@ -297,6 +346,31 @@ async fn main() -> io::Result<()> {
                         header::HeaderName::from_static("x-request-id"),
                         response_request_id,
                     );
+                    if response.status().is_success()
+                        && let Some(probe_id) = latency_probe
+                    {
+                        let processing_us = started.elapsed().as_micros();
+                        let sent_at_ms = network_mapping_server::get_unix_epoch_ms();
+                        response.headers_mut().insert(
+                            header::HeaderName::from_static("nm-latency-version"),
+                            header::HeaderValue::from_static("1"),
+                        );
+                        response.headers_mut().insert(
+                            header::HeaderName::from_static("nm-latency-probe"),
+                            header::HeaderValue::from_str(&probe_id.to_string())
+                                .expect("UUID is a valid header value"),
+                        );
+                        response.headers_mut().insert(
+                            header::HeaderName::from_static("nm-server-processing-us"),
+                            header::HeaderValue::from_str(&processing_us.to_string())
+                                .expect("integer is a valid header value"),
+                        );
+                        response.headers_mut().insert(
+                            header::HeaderName::from_static("nm-server-sent-at-ms"),
+                            header::HeaderValue::from_str(&sent_at_ms.to_string())
+                                .expect("integer is a valid header value"),
+                        );
+                    }
                     if capture {
                         let status = response.status().as_u16();
                         let (error_level, error_type) = request_log::classify_status(status);

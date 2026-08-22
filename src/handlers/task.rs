@@ -3,6 +3,8 @@ use crate::audit::AuditContext;
 use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
+use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
+use crate::trusted_proxy::TrustedProxyState;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
     TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
@@ -10,7 +12,8 @@ use crate::{
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
-use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
+use actix_web::{HttpRequest, HttpResponse, Responder, get, http::header, post, web};
+use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +65,60 @@ pub struct ScannerHeartbeat {
     network_capabilities: ScannerNetworkCapabilities,
     #[serde(default)]
     scan_capabilities: ScannerScanCapabilities,
+    #[serde(default)]
+    latency_report: Option<ScannerLatencyReport>,
+}
+
+const LATENCY_PROTOCOL_VERSION: u16 = 1;
+const MAX_LATENCY_US: i64 = 120_000_000;
+
+#[derive(Deserialize)]
+pub struct ScannerLatencyReport {
+    version: u16,
+    probe_id: Uuid,
+    rtt_us: i64,
+    server_processing_us: i64,
+    network_rtt_us: i64,
+    server_sent_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedScannerLatency {
+    probe_id: Uuid,
+    measured_at: DateTime<Utc>,
+    rtt_us: i64,
+    server_processing_us: i64,
+    network_rtt_us: i64,
+}
+
+fn validate_latency_report(
+    report: &ScannerLatencyReport,
+) -> Result<ValidatedScannerLatency, &'static str> {
+    if report.version != LATENCY_PROTOCOL_VERSION {
+        return Err("unsupported latency protocol version");
+    }
+    if !(0..=MAX_LATENCY_US).contains(&report.rtt_us)
+        || !(0..=MAX_LATENCY_US).contains(&report.server_processing_us)
+        || !(0..=MAX_LATENCY_US).contains(&report.network_rtt_us)
+    {
+        return Err("latency value is out of range");
+    }
+    if report.server_processing_us > report.rtt_us {
+        return Err("server processing time exceeds total RTT");
+    }
+    let network_rtt_us = report.rtt_us.saturating_sub(report.server_processing_us);
+    let now = Utc::now();
+    let measured_at = DateTime::from_timestamp_millis(report.server_sent_at_ms)
+        .filter(|value| (*value - now).num_seconds().abs() <= 24 * 60 * 60)
+        .unwrap_or(now);
+
+    Ok(ValidatedScannerLatency {
+        probe_id: report.probe_id,
+        measured_at,
+        rtt_us: report.rtt_us,
+        server_processing_us: report.server_processing_us,
+        network_rtt_us,
+    })
 }
 
 #[derive(Deserialize, Serialize)]
@@ -169,6 +226,67 @@ fn bearer_token(req: &HttpRequest) -> Option<&str> {
 }
 
 #[derive(Deserialize)]
+pub struct ScannerPublicIpQuery {
+    scannerid: Uuid,
+}
+
+#[derive(Serialize)]
+struct ScannerPublicIpResponse {
+    ip: String,
+}
+
+/// Returns the source address observed by the server to an authenticated scanner.
+#[get("/api/scanner/network/public-ip")]
+pub(crate) async fn scanner_public_ip_handler(
+    req: HttpRequest,
+    query: web::Query<ScannerPublicIpQuery>,
+    pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
+    trusted_proxies: web::Data<TrustedProxyState>,
+) -> impl Responder {
+    let Some(token) = bearer_token(&req) else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+    if let Err(error) = validate_scanner_credentials(
+        pool.get_ref(),
+        query.scannerid,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
+        return match error {
+            ApplyTaskError::ScannerUnauthorized => {
+                HttpResponse::Unauthorized().body("unauthorized")
+            }
+            error => {
+                error_logs_error(
+                    &req,
+                    "ScannerPublicIpCredentialCheckError",
+                    "validate_scanner_credentials",
+                    &error,
+                );
+                HttpResponse::InternalServerError().finish()
+            }
+        };
+    }
+
+    let Some(address) = trusted_proxies.client_ip(&req).await else {
+        error!(
+            event = "ScannerPublicIpUnavailable",
+            scanner_id = %query.scannerid,
+            "authenticated scanner request had no peer address"
+        );
+        return HttpResponse::ServiceUnavailable().body("client address unavailable");
+    };
+    HttpResponse::Ok()
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .json(ScannerPublicIpResponse {
+            ip: address.to_string(),
+        })
+}
+
+#[derive(Deserialize)]
 pub struct TaskDetailQuery {
     page: Option<i64>,
     page_size: Option<i64>,
@@ -193,6 +311,7 @@ struct TaskResultIp {
     as_org: Option<String>,
     country_code: Option<String>,
     country_name: Option<String>,
+    region_name: Option<String>,
     city_name: Option<String>,
     ports: Vec<TaskResultPort>,
 }
@@ -208,6 +327,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    latency_history: web::Data<ScannerLatencyHistory>,
     heartbeat: web::Json<ScannerHeartbeat>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
@@ -298,6 +418,25 @@ pub(crate) async fn scanner_heartbeat_handler(
         Ok(value) => value,
         Err(_) => return HttpResponse::BadRequest().body("invalid scan capabilities"),
     };
+    let latency =
+        heartbeat.latency_report.as_ref().and_then(|report| {
+            match validate_latency_report(report) {
+                Ok(latency) => Some(latency),
+                Err(reason) => {
+                    tracing::warn!(
+                        scanner_id = %heartbeat.scanner_id,
+                        reason,
+                        "ignored invalid scanner latency report"
+                    );
+                    None
+                }
+            }
+        });
+    let latency_rtt_us = latency.as_ref().map(|value| value.rtt_us);
+    let latency_network_rtt_us = latency.as_ref().map(|value| value.network_rtt_us);
+    let latency_server_processing_us = latency.as_ref().map(|value| value.server_processing_us);
+    let latency_measured_at = latency.as_ref().map(|value| value.measured_at);
+    let latency_probe_id = latency.as_ref().map(|value| value.probe_id);
     let update = transaction
         .execute(
             "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
@@ -307,8 +446,23 @@ pub(crate) async fn scanner_heartbeat_handler(
              supports_ipv6 = $10, ipv4_ready = $11, ipv6_ready = $12, \
              public_ipv4 = $13::text::inet, public_ipv6 = $14::text::inet, \
              network_status_reason = $15, network_capabilities_updated_at = NOW(), \
-             scan_capabilities = $16, scan_capabilities_updated_at = NOW() \
-             WHERE scanner_id = $17;",
+             scan_capabilities = $16, scan_capabilities_updated_at = NOW(), \
+             latency_rtt_us = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
+                 AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
+                 THEN $17 ELSE latency_rtt_us END, \
+             latency_network_rtt_us = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
+                 AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
+                 THEN $18 ELSE latency_network_rtt_us END, \
+             latency_server_processing_us = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
+                 AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
+                 THEN $19 ELSE latency_server_processing_us END, \
+             latency_probe_id = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
+                 AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
+                 THEN $21 ELSE latency_probe_id END, \
+             latency_measured_at = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
+                 AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
+                 THEN $20 ELSE latency_measured_at END \
+             WHERE scanner_id = $22;",
             &[
                 &system_version,
                 &heartbeat.scanner_version,
@@ -326,6 +480,11 @@ pub(crate) async fn scanner_heartbeat_handler(
                 &public_ipv6.as_deref(),
                 &network_status_reason,
                 &scan_capabilities,
+                &latency_rtt_us,
+                &latency_network_rtt_us,
+                &latency_server_processing_us,
+                &latency_measured_at,
+                &latency_probe_id,
                 &scanner_id,
             ],
         )
@@ -403,6 +562,16 @@ pub(crate) async fn scanner_heartbeat_handler(
             &error,
         );
         return HttpResponse::InternalServerError().finish();
+    }
+    if let Some(latency) = latency {
+        latency_history.record(ScannerLatencyHistoryEntry {
+            scanner_id,
+            probe_id: latency.probe_id,
+            measured_at: latency.measured_at,
+            rtt_us: latency.rtt_us,
+            server_processing_us: latency.server_processing_us,
+            network_rtt_us: latency.network_rtt_us,
+        });
     }
     HttpResponse::Ok().json(ScannerHeartbeatResponse {
         success: true,
@@ -759,7 +928,7 @@ async fn get_task(
     let ip_rows = match connection
         .query(
             "SELECT ip_id, ip_address::text AS ip, asn, isp, as_org, \
-             country_code, country_name, city_name FROM ips \
+             country_code, country_name, region_name, city_name FROM ips \
              WHERE execution_id = $1 ORDER BY ip_address LIMIT $2 OFFSET $3;",
             &[&selected_execution_pk, &page_size, &offset],
         )
@@ -829,6 +998,7 @@ async fn get_task(
                 as_org: row.get("as_org"),
                 country_code: row.get("country_code"),
                 country_name: row.get("country_name"),
+                region_name: row.get("region_name"),
                 city_name: row.get("city_name"),
                 ports: ports_by_ip.remove(&ip_id).unwrap_or_default(),
             }
@@ -1274,11 +1444,34 @@ async fn get_all_task_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerScanCapabilities,
-        normalize_task_list_query, task_result_pagination, validate_public_ip,
+        ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
+        ScannerScanCapabilities, normalize_task_list_query, task_result_pagination,
+        validate_latency_report, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    #[test]
+    fn latency_reports_are_bounded_and_recomputed() {
+        let report = ScannerLatencyReport {
+            version: 1,
+            probe_id: Uuid::now_v7(),
+            rtt_us: 42_000,
+            server_processing_us: 7_000,
+            network_rtt_us: 1,
+            server_sent_at_ms: Utc::now().timestamp_millis(),
+        };
+        let validated = validate_latency_report(&report).expect("valid latency report");
+        assert_eq!(validated.network_rtt_us, 35_000);
+
+        let invalid = ScannerLatencyReport {
+            server_processing_us: 50_000,
+            ..report
+        };
+        assert!(validate_latency_report(&invalid).is_err());
+    }
 
     #[test]
     fn task_list_query_excludes_system_tasks_by_default() {

@@ -39,6 +39,8 @@ pub struct Config {
     pub requests: RequestsConfig,
     #[serde(default)]
     pub monitor: MonitorConfig,
+    #[serde(default)]
+    pub backup: BackupConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -71,6 +73,7 @@ impl SelfChecking for Config {
         let _ = &self.security.check();
         let _ = &self.requests.check();
         let _ = &self.monitor.check();
+        let _ = &self.backup.check();
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -90,8 +93,112 @@ impl SelfChecking for Config {
         self.security.try_check()?;
         self.requests.try_check()?;
         self.monitor.try_check()?;
+        self.backup.try_check()?;
         self.automatic_target.validate()?;
         Ok(true)
+    }
+}
+
+/// pgBackRest 管理接口配置。默认关闭，避免未部署 pgBackRest 的现有安装在升级后失败。
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    pub binary: PathBuf,
+    pub stanza: String,
+    pub config_file: Option<PathBuf>,
+    pub run_as_user: Option<String>,
+    pub sudo_binary: PathBuf,
+    pub command_timeout_seconds: u64,
+    pub max_output_bytes: usize,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary: PathBuf::from("/usr/bin/pgbackrest"),
+            stanza: "network_mapping".to_owned(),
+            config_file: None,
+            run_as_user: None,
+            sudo_binary: PathBuf::from("/usr/bin/sudo"),
+            command_timeout_seconds: 6 * 60 * 60,
+            max_output_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl SelfChecking for BackupConfig {
+    fn check(&self) {
+        if let Err(error) = self.try_check() {
+            panic!("{error}");
+        }
+        info!(
+            target: "server::startup",
+            component = "backup",
+            enabled = self.enabled,
+            stanza = %self.stanza,
+            "配置检查通过"
+        );
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if !self.enabled {
+            return Ok(true);
+        }
+        if !self.binary.is_absolute() {
+            return Err("backup.binary 必须是绝对路径".into());
+        }
+        if self.stanza.is_empty()
+            || !self
+                .stanza
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-'))
+        {
+            return Err("backup.stanza 只能包含字母、数字、下划线和连字符".into());
+        }
+        if let Some(run_as_user) = self.run_as_user.as_deref() {
+            if !valid_run_as_user(run_as_user) {
+                return Err(
+                    "backup.run_as_user 必须是非 root 的本机账户名，只能包含字母、数字、下划线和连字符"
+                        .into(),
+                );
+            }
+            if !self.sudo_binary.is_absolute() {
+                return Err("backup.sudo_binary 必须是绝对路径".into());
+            }
+        }
+        if self.command_timeout_seconds == 0 {
+            return Err("backup.command_timeout_seconds 必须大于 0".into());
+        }
+        if self.max_output_bytes < 4096 {
+            return Err("backup.max_output_bytes 必须大于等于 4096".into());
+        }
+        Ok(true)
+    }
+}
+
+fn valid_run_as_user(value: &str) -> bool {
+    if value.is_empty() || value == "root" {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+impl BackupConfig {
+    fn resolve_relative_to(&mut self, config_path: &Path) {
+        let Some(config_file) = &mut self.config_file else {
+            return;
+        };
+        if config_file.is_relative() {
+            let base_directory = config_path.parent().unwrap_or_else(|| Path::new(""));
+            *config_file = base_directory.join(&*config_file);
+        }
     }
 }
 
@@ -733,6 +840,7 @@ impl Config {
         config.tls.resolve_relative_to(path);
         config.frontend.resolve_relative_to(path);
         config.maxmind.resolve_relative_to(path);
+        config.backup.resolve_relative_to(path);
         config
     }
 }
@@ -740,8 +848,9 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomaticTargetConfig, Clis, FrontendConfig, MaxMindConfig, NotificationPreferences,
-        SecurityConfig, SelfChecking, TlsConfig, session_ttl_seconds_from_minutes,
+        AutomaticTargetConfig, BackupConfig, Clis, FrontendConfig, MaxMindConfig,
+        NotificationPreferences, SecurityConfig, SelfChecking, TlsConfig,
+        session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -802,6 +911,46 @@ mod tests {
             PathBuf::from("/run/secrets/cert.pem")
         );
         assert_eq!(tls.private_key_file, PathBuf::from("/run/secrets/key.pem"));
+    }
+
+    #[test]
+    fn backup_config_validates_allowlisted_stanza_and_resolves_config_path() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            config_file: Some(PathBuf::from("pgbackrest/pgbackrest.conf")),
+            ..BackupConfig::default()
+        };
+        backup.resolve_relative_to(Path::new("/etc/network-mapping/config.toml"));
+        assert_eq!(
+            backup.config_file,
+            Some(PathBuf::from(
+                "/etc/network-mapping/pgbackrest/pgbackrest.conf"
+            ))
+        );
+        assert!(matches!(backup.try_check(), Ok(true)));
+
+        backup.stanza = "unsafe stanza".to_owned();
+        assert!(backup.try_check().is_err());
+    }
+
+    #[test]
+    fn backup_run_as_user_rejects_root_and_unsafe_names() {
+        let mut backup = BackupConfig {
+            enabled: true,
+            run_as_user: Some("postgres".to_owned()),
+            ..BackupConfig::default()
+        };
+        assert!(matches!(backup.try_check(), Ok(true)));
+
+        backup.run_as_user = Some("root".to_owned());
+        assert!(backup.try_check().is_err());
+        backup.run_as_user = Some("postgres --preserve-env".to_owned());
+        assert!(backup.try_check().is_err());
+        backup.run_as_user = Some("#0".to_owned());
+        assert!(backup.try_check().is_err());
+        backup.run_as_user = Some("postgres".to_owned());
+        backup.sudo_binary = PathBuf::from("sudo");
+        assert!(backup.try_check().is_err());
     }
 
     #[test]
@@ -950,6 +1099,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::data_saa::get_analysis_discovery_heatmap)
         .service(handlers::system_resources::get_system_resource_history)
         .service(handlers::system_resources::get_database_size_history)
+        .service(handlers::scanner_latency::get_scanner_latency_history)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
         .service(handlers::search::search_ip)
@@ -970,6 +1120,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(crate::target_generated::automatic_target_status)
         .service(handlers::task::create_task)
         .service(handlers::task::apply_task_handler) //更换了 apply_task_handler 和 get_task的注册顺序
+        .service(handlers::task::scanner_public_ip_handler)
         .service(handlers::task::scanner_heartbeat_handler)
         .service(handlers::task::scanner_task_failure_handler)
         .service(handlers::task::scanner_task_cancelled_handler)
@@ -1002,6 +1153,11 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::requests::list_requests)
         .service(handlers::requests::request_summary)
         .service(handlers::health::list_health_alerts)
+        .service(handlers::backup::backup_summary)
+        .service(handlers::backup::list_backup_jobs)
+        .service(handlers::backup::get_backup_job)
+        .service(handlers::backup::create_backup_job)
+        .service(handlers::backup::create_backup_check)
         .service(user::user_logout)
         .service(user::verify_totp_h)
         .service(user::bind_twofa_h)
@@ -1023,6 +1179,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(utils::save_mail_settings_h)
         .service(utils::get_session_settings_h)
         .service(utils::save_session_settings_h)
+        .service(utils::get_trusted_proxy_settings_h)
+        .service(utils::save_trusted_proxy_settings_h)
         .service(utils::get_scan_settings_h)
         .service(utils::save_scan_settings_h)
         .service(utils::test_mail_server_h)

@@ -17,6 +17,7 @@ pub struct IpIntel {
     pub isp: Option<String>,
     pub country_code: Option<String>,
     pub country_name: Option<String>,
+    pub region_name: Option<String>,
     pub city_name: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
@@ -61,6 +62,11 @@ impl MaxMindState {
             if let Some(city) = lookup_city(reader, ip) {
                 intel.country_code = city.country.iso_code.map(str::to_string);
                 intel.country_name = city.country.names.english.map(str::to_string);
+                intel.region_name = city
+                    .subdivisions
+                    .first()
+                    .and_then(|subdivision| subdivision.names.english)
+                    .map(str::to_string);
                 intel.city_name = city.city.names.english.map(str::to_string);
                 intel.latitude = city.location.latitude;
                 intel.longitude = city.location.longitude;
@@ -137,7 +143,8 @@ impl MaxMindState {
                          as_org = COALESCE($4, as_org), \
                          country_code = COALESCE($5, country_code), \
                          country_name = COALESCE($6, country_name), \
-                         city_name = COALESCE($7, city_name), \
+                         region_name = COALESCE($7, region_name), \
+                         city_name = COALESCE($8, city_name), \
                          update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
                          WHERE ip_id = $1;",
                         &[
@@ -147,6 +154,7 @@ impl MaxMindState {
                             &intel.as_org,
                             &intel.country_code,
                             &intel.country_name,
+                            &intel.region_name,
                             &intel.city_name,
                         ],
                     )
@@ -166,6 +174,7 @@ impl IpIntel {
             || self.as_org.is_some()
             || self.country_code.is_some()
             || self.country_name.is_some()
+            || self.region_name.is_some()
             || self.city_name.is_some()
     }
 }
@@ -232,8 +241,13 @@ mod tests {
             country_code: Some("CN".to_owned()),
             ..IpIntel::default()
         };
+        let with_region = IpIntel {
+            region_name: Some("Hubei".to_owned()),
+            ..IpIntel::default()
+        };
 
         assert!(!only_time_zone.has_persisted_data());
         assert!(with_country.has_persisted_data());
+        assert!(with_region.has_persisted_data());
     }
 }

@@ -124,6 +124,16 @@ pub struct ScannerInfo {
     pub network_capabilities_updated_at: Option<DateTime<Utc>>,
     pub scan_capabilities: serde_json::Value,
     pub scan_capabilities_updated_at: Option<DateTime<Utc>>,
+    pub latency: Option<ScannerLatencyInfo>,
+}
+
+#[derive(Serialize)]
+pub struct ScannerLatencyInfo {
+    pub rtt_ms: f64,
+    pub network_rtt_ms: f64,
+    pub server_processing_ms: f64,
+    pub measured_at: DateTime<Utc>,
+    pub stale: bool,
 }
 
 pub enum ScannerEvent {
@@ -1431,11 +1441,32 @@ const SCANNER_INFO_SELECT: &str = "\
            s.is_run, s.is_enable, s.remark, s.tag, s.supports_ipv4, s.supports_ipv6, \
            s.ipv4_ready, s.ipv6_ready, host(s.public_ipv4) AS public_ipv4, \
            host(s.public_ipv6) AS public_ipv6, s.network_status_reason, \
-           s.network_capabilities_updated_at, s.scan_capabilities, s.scan_capabilities_updated_at \
+           s.network_capabilities_updated_at, s.scan_capabilities, s.scan_capabilities_updated_at, \
+           s.latency_rtt_us, s.latency_network_rtt_us, s.latency_server_processing_us, \
+           s.latency_measured_at, \
+           (s.latency_measured_at IS NULL OR s.latency_measured_at < NOW() - INTERVAL '90 seconds') \
+              AS latency_stale \
     FROM scanner_info s \
     LEFT JOIN users u ON u.id = s.create_user";
 
 fn scanner_info_from_row(row: &Row) -> ScannerInfo {
+    let latency = match (
+        row.get::<_, Option<i64>>("latency_rtt_us"),
+        row.get::<_, Option<i64>>("latency_network_rtt_us"),
+        row.get::<_, Option<i64>>("latency_server_processing_us"),
+        row.get::<_, Option<DateTime<Utc>>>("latency_measured_at"),
+    ) {
+        (Some(rtt), Some(network), Some(processing), Some(measured_at)) => {
+            Some(ScannerLatencyInfo {
+                rtt_ms: rtt as f64 / 1_000.0,
+                network_rtt_ms: network as f64 / 1_000.0,
+                server_processing_ms: processing as f64 / 1_000.0,
+                measured_at,
+                stale: row.get("latency_stale"),
+            })
+        }
+        _ => None,
+    };
     ScannerInfo {
         scanner_id: row.get("scanner_id"),
         name: row.get("name"),
@@ -1469,6 +1500,7 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         network_capabilities_updated_at: row.get("network_capabilities_updated_at"),
         scan_capabilities: row.get("scan_capabilities"),
         scan_capabilities_updated_at: row.get("scan_capabilities_updated_at"),
+        latency,
     }
 }
 

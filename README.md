@@ -75,7 +75,7 @@ directory = "../network-mapping-vue/dist"
 ## MaxMind IP 情报
 
 将 `GeoLite2-City.mmdb`、`GeoLite2-Country.mmdb` 和 `GeoLite2-ASN.mmdb` 放入配置的
-目录，服务端会在扫描结果入库时保存 ASN、AS 组织、国家和城市信息：
+目录，服务端会在扫描结果入库时保存 ASN、AS 组织、国家、地区和城市信息：
 
 ```toml
 [maxmind]
@@ -168,6 +168,13 @@ repeat_after_seconds = 604800
 慢 SQL 检测需要数据库预先启用 `pg_stat_statements` 扩展。完整的使用方法、前提与
 注意事项参见
 [健康监控与告警](docs/HEALTH_ALERT.md)。
+
+## PostgreSQL 备份
+
+服务端可通过管理员页面查询 pgBackRest stanza 和备份集、手动执行全量/差异/增量备份、
+运行 WAL 归档检查并查看任务日志。功能默认关闭；定时备份使用独立 systemd timer，避免
+依赖 Web 进程存活。部署、权限、配置和恢复验证步骤参见
+[pgBackRest 备份管理](docs/PGBACKREST_BACKUP.md)。
 
 ## 开源项目清单
 

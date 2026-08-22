@@ -16,6 +16,10 @@ use crate::config::{
     DatabaseConfig, EmailConfig, GetConfig, MailSettingsRequest, MailTestRequest,
     ScanSettingsRequest, ServerConfig, SessionSettingsRequest, session_ttl_seconds_from_minutes,
 };
+use crate::trusted_proxy::{
+    MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState, validate_settings,
+    write_settings_to_database,
+};
 use crate::{
     FrontEndErrorInfo, TemplatesInit, front_end_error_page,
     logs::write::{info_logs, request_id},
@@ -323,6 +327,107 @@ async fn save_session_settings_h(
             }))
         }
     }
+}
+
+#[get("/api/config/security/trusted-proxies")]
+async fn get_trusted_proxy_settings_h(
+    trusted_proxies: web::Data<TrustedProxyState>,
+    user_base_i: UserBaseI,
+) -> impl Responder {
+    if user_base_i.role != 1 {
+        return HttpResponse::Forbidden().json(json!({
+            "success": false,
+            "message": "仅管理员可以读取可信代理配置"
+        }));
+    }
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": trusted_proxies.settings().await,
+        "limits": {
+            "maximumCidrs": MAX_TRUSTED_PROXY_CIDRS
+        }
+    }))
+}
+
+#[post("/api/config/security/trusted-proxies")]
+async fn save_trusted_proxy_settings_h(
+    req: HttpRequest,
+    settings: web::Json<TrustedProxySettings>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    trusted_proxies: web::Data<TrustedProxyState>,
+    user_base_i: UserBaseI,
+) -> impl Responder {
+    if user_base_i.role != 1 {
+        let mut audit_event = AuditEvent::user(
+            "configuration",
+            "configuration.trusted_proxies_update",
+            "failure",
+            &user_base_i,
+        );
+        audit_event.response_status = Some(403);
+        audit_event.reason_code = Some("insufficient_role".to_owned());
+        write_standalone(
+            pool.get_ref(),
+            &AuditContext::from_request(&req),
+            &audit_event,
+        )
+        .await;
+        return HttpResponse::Forbidden().json(json!({
+            "success": false,
+            "message": "仅管理员可以修改可信代理配置"
+        }));
+    }
+
+    let validated = match validate_settings(settings.into_inner()) {
+        Ok(settings) => settings,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({
+                "success": false,
+                "message": message
+            }));
+        }
+    };
+    let saved_settings = validated.settings.clone();
+    if let Err(error_value) = write_settings_to_database(pool.get_ref(), &saved_settings).await {
+        error!(
+            event = "SaveTrustedProxySettingsError",
+            path = "fn save_trusted_proxy_settings_h",
+            message = %error_value
+        );
+        return HttpResponse::InternalServerError().json(json!({
+            "success": false,
+            "message": "可信代理配置保存失败"
+        }));
+    }
+    trusted_proxies.replace(validated).await;
+
+    let mut audit_event = AuditEvent::user(
+        "configuration",
+        "configuration.trusted_proxies_update",
+        "success",
+        &user_base_i,
+    )
+    .resource("setting", "network.trusted_proxies");
+    audit_event.response_status = Some(200);
+    audit_event.changes = Some(json!({
+        "trusted_proxy_cidrs": &saved_settings.trusted_proxy_cidrs,
+        "client_ip_header": saved_settings.client_ip_header
+    }));
+    write_standalone(
+        pool.get_ref(),
+        &AuditContext::from_request(&req),
+        &audit_event,
+    )
+    .await;
+
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "message": "可信代理配置已保存并立即生效",
+        "data": saved_settings,
+        "limits": {
+            "maximumCidrs": MAX_TRUSTED_PROXY_CIDRS
+        }
+    }))
 }
 
 #[get("/api/config/scan")]

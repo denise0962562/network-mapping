@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod audit;
+pub mod backup;
 pub mod config;
 pub mod db;
 pub mod frontend;
@@ -11,6 +12,7 @@ pub mod maxmind;
 pub mod monitor;
 pub mod target_generated;
 pub mod tls;
+pub mod trusted_proxy;
 
 #[cfg(feature = "rir")]
 pub mod rir; // 该模块用于从五大 RIR 获取 ASN 和组织等信息
@@ -19,6 +21,7 @@ pub mod rir; // 该模块用于从五大 RIR 获取 ASN 和组织等信息
 pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
+pub mod scanner_latency;
 
 #[cfg(test)]
 pub mod test; // 测试模块
@@ -1793,6 +1796,7 @@ pub async fn save_scanner_results(
             "as_org": intel.as_org,
             "country_code": intel.country_code,
             "country_name": intel.country_name,
+            "region_name": intel.region_name,
             "city_name": intel.city_name,
         }));
     }
@@ -1807,7 +1811,7 @@ pub async fn save_scanner_results(
                     observation_key TEXT, kind TEXT, ip_address INET, port INT, \
                     protocol TEXT, service TEXT, banner TEXT, source TEXT, data JSONB, \
                     asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
-                    country_name TEXT, city_name TEXT) \
+                    country_name TEXT, region_name TEXT, city_name TEXT) \
              ), inserted_observations AS ( \
                 INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
                     ip_address, port, protocol, service, banner, source, data) \
@@ -1821,9 +1825,10 @@ pub async fn save_scanner_results(
                 SELECT DISTINCT ip_address FROM inserted_endpoints \
              ), upserted_ips AS ( \
                 INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
-                    country_code, country_name, city_name) \
+                    country_code, country_name, region_name, city_name) \
                 SELECT DISTINCT ON (item.ip_address) $1, $2, item.ip_address, item.asn, \
-                    item.isp, item.as_org, item.country_code, item.country_name, item.city_name \
+                    item.isp, item.as_org, item.country_code, item.country_name, \
+                    item.region_name, item.city_name \
                 FROM input item \
                 JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.ip_address \
                 ORDER BY item.ip_address \
@@ -1833,6 +1838,7 @@ pub async fn save_scanner_results(
                     as_org = COALESCE(EXCLUDED.as_org, ips.as_org), \
                     country_code = COALESCE(EXCLUDED.country_code, ips.country_code), \
                     country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
+                    region_name = COALESCE(EXCLUDED.region_name, ips.region_name), \
                     city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
                     update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
                 RETURNING ip_id, ip_address \

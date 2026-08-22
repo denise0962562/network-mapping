@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS ips (
 	as_org TEXT DEFAULT NULL,
 	country_code VARCHAR(2) DEFAULT NULL,
 	country_name TEXT DEFAULT NULL,
+	region_name TEXT DEFAULT NULL,
 	city_name TEXT DEFAULT NULL,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
 	update_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
@@ -149,6 +150,7 @@ CREATE TABLE IF NOT EXISTS ips (
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS as_org TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_name TEXT DEFAULT NULL;
+ALTER TABLE ips ADD COLUMN IF NOT EXISTS region_name TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS city_name TEXT DEFAULT NULL;
 
 -- 资产标签独立于扫描执行保存。同一个 IP 的标签会应用到所有任务与历史结果。
@@ -466,6 +468,30 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS network_capabilities_updated_a
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities JSONB NOT NULL
     DEFAULT '{"plan_versions":[],"profiles":["legacy"],"stages":["port_discovery"]}'::jsonb;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS scan_capabilities_updated_at TIMESTAMPTZ;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_rtt_us BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_network_rtt_us BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_server_processing_us BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_measured_at TIMESTAMPTZ;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_probe_id UUID;
+
+-- 扫描器到服务端的 HTTPS 心跳延迟历史。最新值同时冗余在 scanner_info，
+-- 避免扫描器列表查询历史表。
+CREATE TABLE IF NOT EXISTS scanner_latency_sample (
+	id BIGSERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL REFERENCES scanner_info(scanner_id) ON UPDATE CASCADE,
+	probe_id UUID NOT NULL,
+	measured_at TIMESTAMPTZ NOT NULL,
+	reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	rtt_us BIGINT NOT NULL CHECK (rtt_us >= 0),
+	server_processing_us BIGINT NOT NULL CHECK (server_processing_us >= 0),
+	network_rtt_us BIGINT NOT NULL CHECK (network_rtt_us >= 0),
+	UNIQUE(scanner_id, probe_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scanner_latency_scanner_time
+	ON scanner_latency_sample(scanner_id, measured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scanner_latency_time
+	ON scanner_latency_sample(measured_at);
 
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,
@@ -718,6 +744,10 @@ INSERT INTO setting (item_type, key, value)
 VALUES ('scan', 'default_profile', 'legacy')
 ON CONFLICT (item_type, key) DO NOTHING;
 
+INSERT INTO setting (item_type, key, value)
+VALUES ('network', 'trusted_proxies', '{"trustedProxyCidrs":[],"clientIpHeader":"x-forwarded-for"}')
+ON CONFLICT (item_type, key) DO NOTHING;
+
 -- 邮件模板元数据与版本。草稿不会影响正在使用的已发布版本。
 CREATE TABLE IF NOT EXISTS mail_template (
 	template_key TEXT PRIMARY KEY,
@@ -795,3 +825,25 @@ CREATE TABLE IF NOT EXISTS health_alert (
 
 CREATE INDEX IF NOT EXISTS idx_health_alert_key_time
 	ON health_alert (alert_type, alert_key, occurred_at DESC);
+
+-- pgBackRest Web 管理任务。仓库中的 backup.info 仍是备份集的权威数据源；
+-- 本表只保存手动操作的执行状态、日志和审计关联。
+CREATE TABLE IF NOT EXISTS backup_job (
+	id UUID PRIMARY KEY,
+	operation TEXT NOT NULL CHECK (operation IN ('full', 'diff', 'incr', 'check')),
+	source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'scheduled')),
+	status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+	requested_by INT REFERENCES users(id) ON DELETE SET NULL,
+	remark TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	started_at TIMESTAMPTZ,
+	finished_at TIMESTAMPTZ,
+	exit_code INT,
+	stdout TEXT NOT NULL DEFAULT '',
+	stderr TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_job_created_at
+	ON backup_job (created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_job_single_active
+	ON backup_job ((1)) WHERE status IN ('queued', 'running');
