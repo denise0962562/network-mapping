@@ -95,9 +95,46 @@ Authorization: Bearer <runtime_token>
 ```
 
 接口复用扫描器运行令牌校验，只允许已注册、已启用且令牌匹配的扫描器访问，并返回
-`Cache-Control: no-store`。服务端直接终止 TLS 时以 TCP 对端地址为准，不信任客户端可伪造
-的 `Forwarded` 或 `X-Forwarded-For`。如果在反向代理后部署，该接口会观察到代理地址；在
-实现可信代理地址范围校验前，不应为此接口直接启用转发头解析。
+`Cache-Control: no-store`。服务端直接终止 TLS 时以 TCP 对端地址为准，不信任客户端自行
+提交的转发头。
+
+如果服务端位于反向代理后，管理员可以在 Web“系统设置 → 扫描端可信代理”中配置代理的
+IPv4/IPv6 CIDR，并选择由代理维护的 `X-Forwarded-For` 或 `Forwarded` 请求头。配置写入
+数据库并立即生效，无需重启服务。留空表示禁用转发头解析；服务端拒绝 `0.0.0.0/0` 和
+`::/0`，最多允许 32 条 CIDR。
+
+解析遵循以下规则：
+
+1. TCP 直连地址必须命中可信代理 CIDR，否则完全忽略转发头。
+2. 只读取 Web 界面选中的一种请求头。
+3. 从右向左剥离可信代理，取第一个非可信地址作为扫描端地址。
+4. 请求头缺失、无法解析或整条代理链均为可信地址时，安全回退到 TCP 对端地址。
+
+例如 Nginx 与服务端同机部署时，可将 `127.0.0.1/32`（按实际监听方式也可能需要
+`::1/128`）加入可信代理，并使用：
+
+```nginx
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+
+如果还有上游负载均衡器，应逐跳加入实际代理网段，并确保每一层都追加或重写同一个请求头。
+不要把普通客户端可以直接连接的地址范围设为可信代理。
+
+管理员配置接口为：
+
+```http
+GET  /api/config/security/trusted-proxies
+POST /api/config/security/trusted-proxies
+```
+
+POST 请求示例：
+
+```json
+{
+  "trustedProxyCidrs": ["127.0.0.1/32", "10.20.0.0/16"],
+  "clientIpHeader": "x-forwarded-for"
+}
+```
 
 旧版扫描器省略 `network_capabilities` 时，服务端按以下值兼容：
 

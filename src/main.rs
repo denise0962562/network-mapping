@@ -25,6 +25,7 @@ use network_mapping_server::request_log;
 use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
 use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
 use network_mapping_server::tls::build_acceptor;
+use network_mapping_server::trusted_proxy::TrustedProxyState;
 use network_mapping_server::{Systems, TemplatesInit, config, db, insert_system_status};
 
 #[actix_web::main]
@@ -114,6 +115,11 @@ async fn main() -> io::Result<()> {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(e) => panic!("初始化数据库错误{}", e),
     };
+    let trusted_proxy_state = web::Data::new(
+        TrustedProxyState::from_database(&db_pool)
+            .await
+            .map_err(|error| io::Error::other(format!("加载可信代理配置失败：{error}")))?,
+    );
     if let Ok(client) = db_pool.get().await
         && let Err(error_value) = client
             .execute(
@@ -273,6 +279,7 @@ async fn main() -> io::Result<()> {
             .app_data(automatic_target_service.clone())
             .app_data(open_source_catalog.clone())
             .app_data(backup_manager.clone())
+            .app_data(trusted_proxy_state.clone())
             .app_data(security.clone())
             .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())

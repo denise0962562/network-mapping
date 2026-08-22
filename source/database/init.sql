@@ -744,6 +744,10 @@ INSERT INTO setting (item_type, key, value)
 VALUES ('scan', 'default_profile', 'legacy')
 ON CONFLICT (item_type, key) DO NOTHING;
 
+INSERT INTO setting (item_type, key, value)
+VALUES ('network', 'trusted_proxies', '{"trustedProxyCidrs":[],"clientIpHeader":"x-forwarded-for"}')
+ON CONFLICT (item_type, key) DO NOTHING;
+
 -- 邮件模板元数据与版本。草稿不会影响正在使用的已发布版本。
 CREATE TABLE IF NOT EXISTS mail_template (
 	template_key TEXT PRIMARY KEY,

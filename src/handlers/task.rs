@@ -4,6 +4,7 @@ use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
+use crate::trusted_proxy::TrustedProxyState;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
     TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
@@ -234,16 +235,6 @@ struct ScannerPublicIpResponse {
     ip: String,
 }
 
-fn normalize_peer_ip(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(address)),
-        address => address,
-    }
-}
-
 /// Returns the source address observed by the server to an authenticated scanner.
 #[get("/api/scanner/network/public-ip")]
 pub(crate) async fn scanner_public_ip_handler(
@@ -251,6 +242,7 @@ pub(crate) async fn scanner_public_ip_handler(
     query: web::Query<ScannerPublicIpQuery>,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    trusted_proxies: web::Data<TrustedProxyState>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
@@ -279,7 +271,7 @@ pub(crate) async fn scanner_public_ip_handler(
         };
     }
 
-    let Some(peer_address) = req.peer_addr() else {
+    let Some(address) = trusted_proxies.client_ip(&req).await else {
         error!(
             event = "ScannerPublicIpUnavailable",
             scanner_id = %query.scannerid,
@@ -287,7 +279,6 @@ pub(crate) async fn scanner_public_ip_handler(
         );
         return HttpResponse::ServiceUnavailable().body("client address unavailable");
     };
-    let address = normalize_peer_ip(peer_address.ip());
     HttpResponse::Ok()
         .insert_header((header::CACHE_CONTROL, "no-store"))
         .json(ScannerPublicIpResponse {
@@ -1454,13 +1445,12 @@ async fn get_all_task_handler(
 mod tests {
     use super::{
         ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
-        ScannerScanCapabilities, normalize_peer_ip, normalize_task_list_query,
-        task_result_pagination, validate_latency_report, validate_public_ip,
+        ScannerScanCapabilities, normalize_task_list_query, task_result_pagination,
+        validate_latency_report, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
     use chrono::Utc;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use uuid::Uuid;
 
     #[test]
@@ -1539,19 +1529,6 @@ mod tests {
         );
         assert!(validate_public_ip(Some("2001:db8::1"), false).is_err());
         assert!(validate_public_ip(Some("not-an-ip"), true).is_err());
-    }
-
-    #[test]
-    fn peer_ip_normalizes_ipv4_mapped_ipv6_addresses() {
-        let mapped = IpAddr::V6(Ipv6Addr::from([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 64, 81, 116, 137,
-        ]));
-        assert_eq!(
-            normalize_peer_ip(mapped),
-            IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137))
-        );
-        let native_ipv6 = IpAddr::V6("2001:db8::1".parse().unwrap());
-        assert_eq!(normalize_peer_ip(native_ipv6), native_ipv6);
     }
 
     #[test]
