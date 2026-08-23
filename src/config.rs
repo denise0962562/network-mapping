@@ -1277,7 +1277,7 @@ pub struct MailConfig {
 #[derive(Parser, Debug)]
 #[command(
     name = "networkm",
-    version = "0.1.0",
+    version,
     about = "这是一个网络测绘系统的服务端，可用于向扫描器分发扫描任务，并接收扫描器上传的数据，然后存入数据库。"
 )]
 pub struct Clis {

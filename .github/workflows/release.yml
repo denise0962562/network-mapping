@@ -1,0 +1,198 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      frontend_ref:
+        description: 'Frontend tag, branch, or commit (defaults to .github/frontend-ref)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and package Linux x86_64
+    runs-on: ubuntu-24.04
+    env:
+      FRONTEND_REPO_TOKEN: ${{ secrets.FRONTEND_REPO_TOKEN }}
+    steps:
+      - name: Checkout server
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve frontend revision
+        id: frontend_ref
+        env:
+          REQUESTED_REF: ${{ inputs.frontend_ref }}
+        run: |
+          set -euo pipefail
+          frontend_ref="$REQUESTED_REF"
+          if [[ -z "$frontend_ref" ]]; then
+            frontend_ref="$(tr -d '[:space:]' < .github/frontend-ref)"
+          fi
+          if [[ -z "$frontend_ref" || ! "$frontend_ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo 'Invalid frontend revision' >&2
+            exit 1
+          fi
+          echo "ref=$frontend_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout private frontend
+        if: env.FRONTEND_REPO_TOKEN != ''
+        uses: actions/checkout@v5
+        with:
+          repository: wshijiang/network-mapping-vue
+          ref: ${{ steps.frontend_ref.outputs.ref }}
+          token: ${{ env.FRONTEND_REPO_TOKEN }}
+          path: _frontend
+          persist-credentials: false
+
+      - name: Checkout public frontend
+        if: env.FRONTEND_REPO_TOKEN == ''
+        uses: actions/checkout@v5
+        with:
+          repository: wshijiang/network-mapping-vue
+          ref: ${{ steps.frontend_ref.outputs.ref }}
+          path: _frontend
+          persist-credentials: false
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libssl-dev pkg-config
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Build server
+        run: cargo build --locked --release
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: _frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: _frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: _frontend
+        run: pnpm build
+
+      - name: Resolve package metadata
+        id: package
+        run: |
+          set -euo pipefail
+          package_id="$(cargo pkgid)"
+          version="${package_id##*@}"
+          if [[ -z "$version" || "$version" == "$package_id" ]]; then
+            echo 'Unable to read server version from Cargo.toml' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'push' && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version v$version" >&2
+            exit 1
+          fi
+          archive="network-mapping-server-v${version}-x86_64-unknown-linux-gnu"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble release archive
+        env:
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive }}
+          FRONTEND_REF: ${{ steps.frontend_ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          test -x target/release/network_mapping_server
+          for path in index.html login.html search.html asset.html; do
+            test -f "_frontend/dist/$path"
+          done
+          test -d _frontend/dist/assets
+
+          stage_parent="$RUNNER_TEMP/network-mapping-release"
+          package_root="$stage_parent/$ARCHIVE_NAME"
+          server_root="$package_root/network-mapping"
+          frontend_root="$package_root/network-mapping-vue"
+
+          mkdir -p "$server_root/source/maxmind" "$frontend_root" release
+          install -m 0755 target/release/network_mapping_server "$server_root/network_mapping_server"
+          install -m 0644 config.toml "$server_root/config.example.toml"
+          sed -E -i \
+            -e 's/^([[:space:]]*(encrypt_key|scanner_token_pepper|password)[[:space:]]*=).*/\1 ""/' \
+            -e 's/^([[:space:]]*host[[:space:]]*=).*/\1 "127.0.0.1"/' \
+            "$server_root/config.example.toml"
+
+          cp -a README.md LICENSE network-mapping-server.service "$server_root/"
+          cp -a templates deploy docs "$server_root/"
+          mkdir -p "$server_root/source"
+          cp -a source/database "$server_root/source/"
+          cp -a _frontend/dist "$frontend_root/"
+
+          cat > "$package_root/BUILD-INFO" <<EOF
+          server-version=${{ steps.package.outputs.version }}
+          server-commit=$GITHUB_SHA
+          frontend-repository=wshijiang/network-mapping-vue
+          frontend-ref=$FRONTEND_REF
+          frontend-commit=$(git -C _frontend rev-parse HEAD)
+          target=x86_64-unknown-linux-gnu
+          rustc=$(rustc --version)
+          node=$(node --version)
+          pnpm=$(pnpm --version)
+          EOF
+
+          tar -C "$stage_parent" -czf "release/$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
+          (
+            cd release
+            sha256sum "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.tar.gz.sha256"
+          )
+
+          archive_contents="$RUNNER_TEMP/server-archive-contents.txt"
+          tar -tzf "release/$ARCHIVE_NAME.tar.gz" > "$archive_contents"
+          if grep -E '/(src|target|\.git|logs|ssl)(/|$)' "$archive_contents"; then
+            echo 'Archive contains an excluded path' >&2
+            exit 1
+          fi
+
+      - name: Upload manual build artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi
