@@ -17,8 +17,8 @@ use crate::config::{
     ScanSettingsRequest, ServerConfig, SessionSettingsRequest, session_ttl_seconds_from_minutes,
 };
 use crate::trusted_proxy::{
-    MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState, validate_settings,
-    write_settings_to_database,
+    MAX_CLIENT_IP_HEADER_LENGTH, MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState,
+    validate_settings, write_settings_to_database,
 };
 use crate::{
     FrontEndErrorInfo, TemplatesInit, front_end_error_page,
@@ -344,7 +344,9 @@ async fn get_trusted_proxy_settings_h(
         "success": true,
         "data": trusted_proxies.settings().await,
         "limits": {
-            "maximumCidrs": MAX_TRUSTED_PROXY_CIDRS
+            "maximumCidrs": MAX_TRUSTED_PROXY_CIDRS,
+            "maximumHeaderNameLength": MAX_CLIENT_IP_HEADER_LENGTH,
+            "supportsCustomHeader": true
         }
     }))
 }
@@ -411,7 +413,7 @@ async fn save_trusted_proxy_settings_h(
     audit_event.response_status = Some(200);
     audit_event.changes = Some(json!({
         "trusted_proxy_cidrs": &saved_settings.trusted_proxy_cidrs,
-        "client_ip_header": saved_settings.client_ip_header
+        "client_ip_header": &saved_settings.client_ip_header
     }));
     write_standalone(
         pool.get_ref(),
@@ -425,7 +427,9 @@ async fn save_trusted_proxy_settings_h(
         "message": "可信代理配置已保存并立即生效",
         "data": saved_settings,
         "limits": {
-            "maximumCidrs": MAX_TRUSTED_PROXY_CIDRS
+            "maximumCidrs": MAX_TRUSTED_PROXY_CIDRS,
+            "maximumHeaderNameLength": MAX_CLIENT_IP_HEADER_LENGTH,
+            "supportsCustomHeader": true
         }
     }))
 }
