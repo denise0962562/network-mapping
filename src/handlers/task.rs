@@ -1,5 +1,6 @@
 use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::AuditContext;
+use crate::client_ip::normalize_ip;
 use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
@@ -209,9 +210,11 @@ fn validate_public_ip(value: Option<&str>, expect_ipv6: bool) -> Result<Option<S
     let Some(value) = value else {
         return Ok(None);
     };
-    let address: IpAddr = value
-        .parse()
-        .map_err(|_| "network capability contains an invalid public IP".to_owned())?;
+    let address = normalize_ip(
+        value
+            .parse::<IpAddr>()
+            .map_err(|_| "network capability contains an invalid public IP".to_owned())?,
+    );
     if address.is_ipv6() != expect_ipv6 {
         return Err("network capability public IP has the wrong address family".to_owned());
     }
@@ -327,6 +330,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    trusted_proxies: web::Data<TrustedProxyState>,
     latency_history: web::Data<ScannerLatencyHistory>,
     heartbeat: web::Json<ScannerHeartbeat>,
 ) -> impl Responder {
@@ -363,6 +367,10 @@ pub(crate) async fn scanner_heartbeat_handler(
         };
     }
 
+    let ip_address = trusted_proxies
+        .client_ip(&req)
+        .await
+        .map(|address| address.to_string());
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
@@ -395,7 +403,6 @@ pub(crate) async fn scanner_heartbeat_handler(
     let cpu_cores = i32::try_from(heartbeat.system.cpu_cores).unwrap_or(i32::MAX);
     let ram_mb = i32::try_from(heartbeat.system.ram_total_mb).unwrap_or(i32::MAX);
     let uptime = i32::try_from(heartbeat.system.uptime_seconds).unwrap_or(i32::MAX);
-    let ip_address = req.peer_addr().map(|address| address.ip().to_string());
     let public_ipv4 = match validate_public_ip(
         heartbeat.network_capabilities.ipv4.public_ip.as_deref(),
         false,
@@ -1527,7 +1534,12 @@ mod tests {
             validate_public_ip(Some("203.0.113.10"), false).unwrap(),
             Some("203.0.113.10".to_owned())
         );
+        assert_eq!(
+            validate_public_ip(Some("::ffff:64.81.116.137"), false).unwrap(),
+            Some("64.81.116.137".to_owned())
+        );
         assert!(validate_public_ip(Some("2001:db8::1"), false).is_err());
+        assert!(validate_public_ip(Some("::ffff:64.81.116.137"), true).is_err());
         assert!(validate_public_ip(Some("not-an-ip"), true).is_err());
     }
 

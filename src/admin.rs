@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
+use crate::client_ip::display_ip;
 use crate::config::{
     DEFAULT_SESSION_TTL_SECONDS, EmailConfig, MAX_SESSION_TTL_MINUTES, MIN_SESSION_TTL_MINUTES,
     MailSettingsRequest, MailSettingsResponse, NotificationPreferences, PasswordHashConfig,
@@ -1429,7 +1430,7 @@ pub async fn scanner_register(
 
 const SCANNER_INFO_SELECT: &str = "\
     SELECT s.scanner_id, s.name, u.username AS creator, s.location, \
-           host(s.ip_address) AS ip_address, s.system_version, s.scanner_version, \
+           s.ip_address, s.system_version, s.scanner_version, \
            s.cpu_model, s.cpus, s.ram, s.uptime, s.create_time, s.register_time, s.update_time, \
            s.last_seen_at, s.runtime_state, \
            (s.runtime_state <> 'stopping' AND s.last_seen_at IS NOT NULL \
@@ -1439,8 +1440,7 @@ const SCANNER_INFO_SELECT: &str = "\
               AND e.lease_expires_at > (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
               ORDER BY e.task_start_time DESC NULLS LAST LIMIT 1) AS current_task_id, \
            s.is_run, s.is_enable, s.remark, s.tag, s.supports_ipv4, s.supports_ipv6, \
-           s.ipv4_ready, s.ipv6_ready, host(s.public_ipv4) AS public_ipv4, \
-           host(s.public_ipv6) AS public_ipv6, s.network_status_reason, \
+           s.ipv4_ready, s.ipv6_ready, s.public_ipv4, s.public_ipv6, s.network_status_reason, \
            s.network_capabilities_updated_at, s.scan_capabilities, s.scan_capabilities_updated_at, \
            s.latency_rtt_us, s.latency_network_rtt_us, s.latency_server_processing_us, \
            s.latency_measured_at, \
@@ -1472,7 +1472,7 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         name: row.get("name"),
         creator: row.get("creator"),
         location: row.get("location"),
-        ip_address: row.get("ip_address"),
+        ip_address: display_ip(row.get("ip_address")),
         system_version: row.get("system_version"),
         scanner_version: row.get("scanner_version"),
         cpu_model: row.get("cpu_model"),
@@ -1494,8 +1494,8 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         supports_ipv6: row.get("supports_ipv6"),
         ipv4_ready: row.get("ipv4_ready"),
         ipv6_ready: row.get("ipv6_ready"),
-        public_ipv4: row.get("public_ipv4"),
-        public_ipv6: row.get("public_ipv6"),
+        public_ipv4: display_ip(row.get("public_ipv4")),
+        public_ipv6: display_ip(row.get("public_ipv6")),
         network_status_reason: row.get("network_status_reason"),
         network_capabilities_updated_at: row.get("network_capabilities_updated_at"),
         scan_capabilities: row.get("scan_capabilities"),

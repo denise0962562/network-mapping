@@ -7,6 +7,7 @@ use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::admin::UserBaseI;
+use crate::client_ip::display_ip;
 use crate::handlers::system_resources::{Granularity, MAX_BUCKETS};
 use crate::logs::write::error_logs;
 
@@ -183,7 +184,7 @@ fn row_to_value(row: tokio_postgres::Row) -> Value {
         "request_path": row.get::<_, String>("request_path"),
         "status_code": row.get::<_, i16>("status_code"),
         "duration_ms": row.get::<_, Option<i32>>("duration_ms"),
-        "client_ip": row.get::<_, Option<String>>("client_ip"),
+        "client_ip": display_ip(row.get("client_ip")),
         "user_agent": row.get::<_, Option<String>>("user_agent"),
         "actor_id": row.get::<_, Option<i32>>("actor_id"),
         "actor_name": row.get::<_, Option<String>>("actor_name"),
@@ -225,7 +226,7 @@ pub(crate) async fn list_requests(
 
     let list_sql = format!(
         "SELECT id, request_id, occurred_at, http_method, request_path, status_code, duration_ms, \
-         client_ip::TEXT AS client_ip, user_agent, actor_id, actor_name, error_level, error_type \
+         client_ip, user_agent, actor_id, actor_name, error_level, error_type \
          FROM request_log {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $10 OFFSET $11"
     );
     let mut list_params = params;

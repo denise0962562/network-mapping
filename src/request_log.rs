@@ -3,7 +3,7 @@
 //! 与 `audit_event`（安全审计，只记录敏感操作）不同，`request_log` 是访问日志，
 //! 覆盖每一个业务请求，用于请求级别的分析与错误自动识别。
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,10 +57,7 @@ pub fn classify_status(status: u16) -> (&'static str, Option<&'static str>) {
 
 /// 把 `realip_remote_addr` 返回的字符串解析成 `IpAddr`；无法解析时为 `None`（写 NULL）。
 pub fn parse_ip(value: &str) -> Option<IpAddr> {
-    value
-        .parse::<IpAddr>()
-        .ok()
-        .or_else(|| value.parse::<SocketAddr>().ok().map(|address| address.ip()))
+    crate::client_ip::parse_ip(value)
 }
 
 pub const CHANNEL_CAPACITY: usize = 8192;
@@ -282,6 +279,10 @@ mod tests {
         assert_eq!(
             parse_ip("[2001:db8::1]:443"),
             Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
+        );
+        assert_eq!(
+            parse_ip("::ffff:64.81.116.137"),
+            Some(IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137)))
         );
         assert_eq!(parse_ip("unknown"), None);
     }

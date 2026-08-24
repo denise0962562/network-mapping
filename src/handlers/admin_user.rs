@@ -9,6 +9,7 @@ use tracing::error;
 
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
+use crate::client_ip::display_ip;
 use crate::config::PasswordHashConfig;
 use crate::generate_hash_password;
 
@@ -213,7 +214,7 @@ pub async fn list_users(
     let limit = i64::from(page_size);
     let list_sql = format!(
         "SELECT u.id, u.username, u.email, u.role, u.enable_2fa, u.create_time, \
-         u.last_login_at, u.last_login_ip::TEXT AS last_login_ip, u.disabled_at, u.deleted_at, \
+         u.last_login_at, u.last_login_ip, u.disabled_at, u.deleted_at, \
          CASE WHEN u.deleted_at IS NOT NULL THEN 'deleted' \
               WHEN u.disabled_at IS NOT NULL THEN 'disabled' \
               WHEN u.limit_login THEN 'locked' ELSE 'active' END AS status, \
@@ -241,7 +242,7 @@ pub async fn list_users(
             active_session_count: row.get("active_session_count"),
             create_time: row.get("create_time"),
             last_login_at: row.get("last_login_at"),
-            last_login_ip: row.get("last_login_ip"),
+            last_login_ip: display_ip(row.get("last_login_ip")),
             disabled_at: row.get("disabled_at"),
             deleted_at: row.get("deleted_at"),
             is_self: row.get::<_, i32>("id") == user.id,

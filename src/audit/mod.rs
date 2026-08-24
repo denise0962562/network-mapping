@@ -1,6 +1,6 @@
 //! Structured, append-only security audit event support.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use actix_web::{HttpMessage, HttpRequest};
 use deadpool_postgres::{GenericClient, Pool};
@@ -10,6 +10,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::admin::UserBaseI;
+use crate::client_ip::{normalize_ip, parse_ip};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RequestId(pub Uuid);
@@ -39,7 +40,7 @@ impl AuditContext {
 
         let source_ip = req
             .peer_addr()
-            .map(|address| address.ip())
+            .map(|address| normalize_ip(address.ip()))
             .or_else(|| parse_ip(req.connection_info().realip_remote_addr()?));
         let user_agent = req
             .headers()
@@ -55,13 +56,6 @@ impl AuditContext {
             request_path: req.path().to_owned(),
         }
     }
-}
-
-fn parse_ip(value: &str) -> Option<IpAddr> {
-    value
-        .parse::<IpAddr>()
-        .ok()
-        .or_else(|| value.parse::<SocketAddr>().ok().map(|value| value.ip()))
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +200,10 @@ mod tests {
         assert_eq!(
             parse_ip("[2001:db8::1]:443"),
             Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
+        );
+        assert_eq!(
+            parse_ip("::ffff:64.81.116.137"),
+            Some(IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137)))
         );
         assert_eq!(parse_ip("unknown"), None);
     }

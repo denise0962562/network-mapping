@@ -21,7 +21,7 @@ use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
 use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
-use crate::{generate_hash_password, log_out, verify_password};
+use crate::{generate_hash_password, get_conn_ip, log_out, verify_password};
 use uuid::Uuid;
 
 fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Cookie<'static>) {
@@ -42,10 +42,7 @@ fn expired_auth_cookies(session: &str, csrf_token: &str) -> (Cookie<'static>, Co
 }
 
 fn request_source_ip(req: &HttpRequest) -> String {
-    req.connection_info()
-        .realip_remote_addr()
-        .unwrap_or("unknown")
-        .to_owned()
+    get_conn_ip(req)
 }
 
 fn queue_login_notification(

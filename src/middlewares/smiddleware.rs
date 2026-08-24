@@ -16,6 +16,7 @@ use tracing::{debug, error, info};
 
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
+use crate::get_conn_ip;
 use crate::middlewares::{get_pool_from_app_data, is_scanner_api_request};
 use crate::request_log::RequestActor;
 use uuid::Uuid;
@@ -101,10 +102,7 @@ where
 
         info!(
             event = "received_requests",
-            client_ip = &req
-                .connection_info()
-                .realip_remote_addr()
-                .unwrap_or("Unknown IP"),
+            client_ip = get_conn_ip(req.request()),
             method = &req.method().to_string(),
             user_agent = &req
                 .headers()

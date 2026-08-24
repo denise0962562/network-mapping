@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::client_ip::normalize_ip;
+
 const SETTING_TYPE: &str = "network";
 const SETTING_KEY: &str = "trusted_proxies";
 pub const MAX_TRUSTED_PROXY_CIDRS: usize = 32;
@@ -264,16 +266,6 @@ fn parse_forwarded_address(value: &str) -> Option<IpAddr> {
         .map(normalize_ip)
 }
 
-fn normalize_ip(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(address)),
-        address => address,
-    }
-}
-
 fn is_trusted(address: IpAddr, networks: &[IpNet]) -> bool {
     networks.iter().any(|network| network.contains(&address))
 }
@@ -348,6 +340,32 @@ mod tests {
         assert_eq!(
             state.client_ip(&request).await,
             Some("198.51.100.8".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[actix_web::test]
+    async fn mapped_ipv4_proxy_is_normalized_before_trust_and_header_parsing() {
+        let state = TrustedProxyState::new(settings(&["127.0.0.1/32"], "x-forwarded-for")).unwrap();
+        let request = actix_test::TestRequest::default()
+            .peer_addr("[::ffff:127.0.0.1]:443".parse::<SocketAddr>().unwrap())
+            .insert_header(("x-forwarded-for", "::ffff:64.81.116.137"))
+            .to_http_request();
+        assert_eq!(
+            state.client_ip(&request).await,
+            Some("64.81.116.137".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[actix_web::test]
+    async fn mapped_ipv4_untrusted_peer_is_returned_as_canonical_ipv4() {
+        let state = TrustedProxyState::new(settings(&["127.0.0.1/32"], "x-forwarded-for")).unwrap();
+        let request = actix_test::TestRequest::default()
+            .peer_addr("[::ffff:64.81.116.137]:443".parse::<SocketAddr>().unwrap())
+            .insert_header(("x-forwarded-for", "203.0.113.99"))
+            .to_http_request();
+        assert_eq!(
+            state.client_ip(&request).await,
+            Some("64.81.116.137".parse::<IpAddr>().unwrap())
         );
     }
 

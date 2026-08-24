@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod audit;
 pub mod backup;
+pub mod client_ip;
 pub mod config;
 pub mod db;
 pub mod frontend;
@@ -1173,7 +1174,9 @@ pub async fn insert_system_status(
 ///通过该函数获取到访问者的ip，如果失败则会返回一个字符串
 pub fn get_conn_ip(req: &HttpRequest) -> String {
     match req.connection_info().realip_remote_addr() {
-        Some(o) => o.to_string(),
+        Some(value) => crate::client_ip::parse_ip(value)
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| value.to_owned()),
         None => {
             warn!(
                 event = "GetHTTPClientIPError",

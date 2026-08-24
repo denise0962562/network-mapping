@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
+use crate::client_ip::display_ip;
 use crate::get_unix_epoch_ms;
 
 const DEFAULT_PAGE_SIZE: u32 = 10;
@@ -159,7 +160,7 @@ async fn list_login_records(
     let rows = match client
         .query(
             &format!(
-                "SELECT event_id, occurred_at, outcome, source_ip::TEXT AS source_ip, user_agent, \
+                "SELECT event_id, occurred_at, outcome, source_ip, user_agent, \
                  reason_code, COALESCE(metadata->>'auth_method', 'password') AS auth_method \
                  FROM audit_event WHERE {FILTER} ORDER BY occurred_at DESC, id DESC \
                  LIMIT $4 OFFSET $5;"
@@ -181,7 +182,7 @@ async fn list_login_records(
             event_id: row.get("event_id"),
             occurred_at: row.get("occurred_at"),
             outcome: row.get("outcome"),
-            source_ip: row.get("source_ip"),
+            source_ip: display_ip(row.get("source_ip")),
             user_agent: row.get("user_agent"),
             reason_code: row.get("reason_code"),
             auth_method: row.get("auth_method"),
