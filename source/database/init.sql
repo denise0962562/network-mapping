@@ -391,12 +391,37 @@ CREATE TABLE IF NOT EXISTS session (
 	pending_totp_secret TEXT,
 	pending_totp_expires_at BIGINT,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
-	is_enable boolean DEFAULT true
+	is_enable boolean DEFAULT true,
+	deleted_at TIMESTAMPTZ,
+	deletion_reason TEXT,
+	deleted_by_user_id INT
 );
+
+-- Session 使用软删除保留认证历史，便于安全事件回溯。旧库升级时只补充审计字段，
+-- 不物理删除既有失效记录；历史记录的精确失效时间未知，因此明确标记为迁移时间。
+ALTER TABLE session ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE session ADD COLUMN IF NOT EXISTS deletion_reason TEXT;
+ALTER TABLE session ADD COLUMN IF NOT EXISTS deleted_by_user_id INT;
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conrelid = 'session'::regclass AND conname = 'session_deleted_by_user_fk'
+	) THEN
+		ALTER TABLE session ADD CONSTRAINT session_deleted_by_user_fk
+			FOREIGN KEY (deleted_by_user_id) REFERENCES users(id) ON DELETE SET NULL;
+	END IF;
+END $$;
+UPDATE session
+SET deleted_at = NOW(), deletion_reason = 'legacy_inactive_migrated'
+WHERE is_enable = FALSE AND deleted_at IS NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_unique ON session (token, is_enable);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_csrf_token_unique ON session (csrf_token, is_enable);
 CREATE INDEX IF NOT EXISTS idx_session_user_status ON session (user_id, is_enable);
+CREATE INDEX IF NOT EXISTS idx_session_active_expiration
+	ON session ((create_time + ttl::BIGINT * 1000), id)
+	WHERE is_enable = TRUE AND deleted_at IS NULL;
 
 ALTER TABLE session ALTER COLUMN ttl SET DEFAULT 2700;
 

@@ -30,6 +30,7 @@ pub mod test; // 测试模块
 use actix_web::{HttpRequest, web};
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
 use cidr::IpInet;
+use deadpool_postgres::GenericClient;
 use ipnet::{AddrParseError, IpNet};
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
@@ -1304,7 +1305,18 @@ pub async fn validate_scanner_credentials(
 ) -> Result<(), ApplyTaskError> {
     let token_hash = hash_scanner_token(token, token_pepper).map_err(apply_task_database_error)?;
     let p = pool.get().await.map_err(apply_task_database_error)?;
-    let scanner = p.query_opt(
+    validate_scanner_credentials_with_client(&p, scanner_id, &token_hash).await
+}
+
+pub(crate) async fn validate_scanner_credentials_with_client<C>(
+    client: &C,
+    scanner_id: Uuid,
+    token_hash: &str,
+) -> Result<(), ApplyTaskError>
+where
+    C: GenericClient + Sync,
+{
+    let scanner = client.query_opt(
         "SELECT id FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
         &[&scanner_id.to_string(), &token_hash]
     ).await.map_err(apply_task_database_error)?;
@@ -1927,10 +1939,10 @@ pub async fn apply_task(
     token: &str,
     token_pepper: &str,
 ) -> Result<ApplyTask, ApplyTaskError> {
-    validate_scanner_credentials(pool, scanner_id, token, token_pepper).await?;
-
     let mut p = pool.get().await.map_err(apply_task_database_error)?;
     let transaction = p.transaction().await.map_err(apply_task_database_error)?;
+    let token_hash = hash_scanner_token(token, token_pepper).map_err(apply_task_database_error)?;
+    validate_scanner_credentials_with_client(&transaction, scanner_id, &token_hash).await?;
 
     let cancelled = transaction
         .query(
@@ -2036,12 +2048,16 @@ pub struct ApplyTaskQuery {
 pub async fn log_out(
     session: &str,
     pool: &deadpool_postgres::Pool,
+    reason: &str,
+    deleted_by_user_id: Option<i32>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let c = pool.get().await?;
     if let Some(tmp_r) = c
         .query_opt(
-            "UPDATE session SET is_enable = false WHERE token = $1;",
-            &[&session],
+            "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+             deletion_reason = $2, deleted_by_user_id = $3 \
+             WHERE token = $1 AND is_enable = TRUE AND deleted_at IS NULL RETURNING id;",
+            &[&session, &reason, &deleted_by_user_id],
         )
         .await?
     {

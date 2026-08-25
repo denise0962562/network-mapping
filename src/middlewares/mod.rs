@@ -19,6 +19,22 @@ pub mod csrfmiddleware;
 // 该中间件用于限制公开入口请求频率
 pub mod ratelimit;
 
+/// 认证中间件查询出的请求级 CSRF 预期值，由内层 CSRF 中间件直接校验，
+/// 避免为同一请求再次查询 Session。
+#[derive(Clone)]
+pub(crate) struct ExpectedCsrfToken(String);
+
+impl ExpectedCsrfToken {
+    pub(crate) fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    pub(crate) fn matches(&self, candidate: &str) -> bool {
+        self.0.len() == candidate.len()
+            && openssl::memcmp::eq(self.0.as_bytes(), candidate.as_bytes())
+    }
+}
+
 pub(crate) fn is_scanner_api_request(method: &Method, path: &str) -> bool {
     match path {
         "/api/task/apply" | "/api/scanner/network/public-ip" => method == Method::GET,
@@ -118,14 +134,69 @@ impl FromRequest for UserSession {
 
 #[cfg(test)]
 mod tests {
-    use super::is_scanner_api_request;
+    use super::{ExpectedCsrfToken, is_scanner_api_request};
     use super::{
         csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, smiddleware::AuthMiddleware,
     };
     use crate::admin::UserBaseI;
     use crate::frontend::{self, FrontendAssets};
-    use actix_web::{App, HttpResponse, http::Method, http::StatusCode, test as actix_test, web};
+    use actix_web::{
+        App, HttpMessage, HttpResponse, dev::Service, http::Method, http::StatusCode,
+        test as actix_test, web,
+    };
     use uuid::Uuid;
+
+    #[test]
+    fn csrf_expectation_matches_only_exact_token() {
+        let expected = ExpectedCsrfToken::new("csrf-secret".to_owned());
+        assert!(expected.matches("csrf-secret"));
+        assert!(!expected.matches("csrf-secreu"));
+        assert!(!expected.matches("csrf-secret-extra"));
+    }
+
+    #[actix_web::test]
+    async fn csrf_uses_request_authentication_data_without_database_access() {
+        let app = actix_test::init_service(
+            App::new()
+                .wrap(CsrfMiddleware)
+                .wrap_fn(|req, service| {
+                    req.extensions_mut()
+                        .insert(ExpectedCsrfToken::new("csrf-secret".to_owned()));
+                    req.extensions_mut().insert(UserBaseI {
+                        id: 7,
+                        username: "operator".to_owned(),
+                        role: 1,
+                        email: None,
+                        limit_login: false,
+                        enable_2fa: true,
+                    });
+                    service.call(req)
+                })
+                .route(
+                    "/api/write",
+                    web::post().to(|| async { HttpResponse::NoContent().finish() }),
+                ),
+        )
+        .await;
+
+        let valid = actix_test::TestRequest::post()
+            .uri("/api/write")
+            .insert_header(("X-CSRF-Token", "csrf-secret"))
+            .to_request();
+        assert_eq!(
+            actix_test::call_service(&app, valid).await.status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let invalid = actix_test::TestRequest::post()
+            .uri("/api/write")
+            .insert_header(("X-CSRF-Token", "wrong"))
+            .to_request();
+        assert_eq!(
+            actix_test::call_service(&app, invalid).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 
     #[test]
     fn scanner_api_requests_use_exact_method_and_path_matching() {

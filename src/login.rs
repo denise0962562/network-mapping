@@ -1,12 +1,71 @@
 use actix_web::HttpRequest;
 use openssl::base64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::UserLoginInfo;
-use crate::admin::get_session_ttl_seconds_from_database;
+use crate::admin::{UserBaseI, get_session_ttl_seconds_from_database};
 use crate::{get_password_and_id_from_database, get_unix_epoch_ms, verify_password};
+
+const SESSION_EXPIRATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const SESSION_EXPIRATION_BATCH_SIZE: i64 = 5_000;
+
+/// 定期把已过期的活动 Session 标记为软删除，保留记录供安全审计追溯。
+pub async fn run_session_expiration(pool: deadpool_postgres::Pool) {
+    let mut ticker = tokio::time::interval(SESSION_EXPIRATION_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        match soft_delete_expired_sessions(&pool).await {
+            Ok(expired) if expired > 0 => {
+                info!(
+                    event = "SessionExpiration",
+                    expired_sessions = expired,
+                    "已将过期会话标记为软删除"
+                );
+            }
+            Ok(_) => {}
+            Err(error_value) => {
+                error!(
+                    event = "SessionExpirationError",
+                    message = %error_value,
+                    "标记过期会话失败"
+                );
+            }
+        }
+    }
+}
+
+async fn soft_delete_expired_sessions(
+    pool: &deadpool_postgres::Pool,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let client = pool.get().await?;
+    let mut total = 0_u64;
+
+    loop {
+        let affected = client
+            .execute(
+                "WITH expired AS (\
+                 SELECT id FROM session \
+                 WHERE is_enable = TRUE AND deleted_at IS NULL \
+                   AND create_time + ttl::BIGINT * 1000 <= \
+                       (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
+                 ORDER BY (create_time + ttl::BIGINT * 1000) ASC, id ASC \
+                 LIMIT $1 FOR UPDATE SKIP LOCKED) \
+                 UPDATE session AS s SET is_enable = FALSE, deleted_at = NOW(), \
+                     deletion_reason = 'expired', deleted_by_user_id = NULL \
+                 FROM expired WHERE s.id = expired.id;",
+                &[&SESSION_EXPIRATION_BATCH_SIZE],
+            )
+            .await?;
+        total += affected;
+        if affected < SESSION_EXPIRATION_BATCH_SIZE as u64 {
+            return Ok(total);
+        }
+    }
+}
 
 pub struct LoginToken {
     pub pool: deadpool_postgres::Pool,
@@ -18,6 +77,11 @@ pub struct LoginResult {
     pub enable_2fa: bool,
     pub session_ttl_seconds: i32,
     pub user_id: i32,
+}
+
+pub(crate) struct SessionAuthentication {
+    pub(crate) user: UserBaseI,
+    pub(crate) csrf_token: String,
 }
 
 pub struct SessionInfo<'a> {
@@ -78,7 +142,11 @@ impl LoginToken {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
         let stmt = transaction
-            .prepare("UPDATE session SET is_enable = false WHERE token = $1;")
+            .prepare(
+                "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+                 deletion_reason = 'expired', deleted_by_user_id = NULL \
+                 WHERE token = $1 AND is_enable = TRUE AND deleted_at IS NULL;",
+            )
             .await?;
         transaction.execute(&stmt, &[&session]).await?;
         transaction.commit().await?;
@@ -141,45 +209,49 @@ impl LoginToken {
         }
     }
 
-    ///检查token是否有效和存在
-    ///
-    /// 找到token且token还未过期时返回 true ，未找到或已过期时返回当返回值多于一行时返回错误
-    pub async fn check_token(
+    /// 一次只读查询完成 Session、TOTP 与用户状态验证，并返回请求鉴权所需数据。
+    /// 已过期 Session 立即拒绝访问，由后台批处理标记为软删除。
+    pub(crate) async fn check_token(
         &self,
         session: &str,
-        verify_csrf_token: bool,
-    ) -> Result<(bool, i32), Box<dyn std::error::Error>> {
-        const SELECT_STAT: &str = "SELECT user_id, token, ttl, create_time FROM session WHERE token = $1 AND is_enable = true ";
-
-        let select_stat = match verify_csrf_token {
-            true => format!("{} AND totp_verify_successful = true LIMIT 1;", SELECT_STAT),
-            false => format!("{} LIMIT 1;", SELECT_STAT),
-        };
-
+        require_totp: bool,
+    ) -> Result<Option<SessionAuthentication>, Box<dyn std::error::Error>> {
+        let now = get_unix_epoch_ms();
         let client = self.pool.get().await?;
-        let stmt = client.prepare(&select_stat).await?;
+        let row = client
+            .query_opt(
+                "SELECT u.id, u.username, u.role, u.email, u.limit_login, u.enable_2fa, \
+                        s.csrf_token \
+                 FROM session s JOIN users u ON u.id = s.user_id \
+                 WHERE s.token = $1 AND s.is_enable = TRUE AND s.deleted_at IS NULL \
+                   AND s.create_time + s.ttl::BIGINT * 1000 > $2 \
+                   AND (NOT $3::BOOLEAN OR s.totp_verify_successful = TRUE) \
+                   AND u.limit_login = FALSE AND u.disabled_at IS NULL \
+                   AND u.deleted_at IS NULL LIMIT 1;",
+                &[&session, &now, &require_totp],
+            )
+            .await?;
 
-        if let Some(r_s) = client.query_opt(&stmt, &[&session]).await? {
-            let n_t = get_unix_epoch_ms();
-            let r_ttl: i32 = r_s.get("ttl");
-            let r_create_time: i64 = r_s.get("create_time");
-            let end_at = r_create_time + (r_ttl as i64) * 1000;
-
-            if n_t >= end_at {
-                warn!(event = "TokenInvaild", message = "Token 无效");
-                self.delete(session).await?;
-                Ok((false, -1))
-            } else {
-                Ok((true, r_s.get("user_id")))
-            }
-        } else {
+        let Some(row) = row else {
             warn!(
                 event = "TokenInvaild",
                 path = "fn check_token",
                 message = "Token 无效"
             );
-            Ok((false, -1))
-        }
+            return Ok(None);
+        };
+
+        Ok(Some(SessionAuthentication {
+            user: UserBaseI {
+                id: row.get("id"),
+                username: row.get("username"),
+                role: row.get("role"),
+                email: row.get("email"),
+                limit_login: row.get("limit_login"),
+                enable_2fa: row.get("enable_2fa"),
+            },
+            csrf_token: row.get("csrf_token"),
+        }))
     }
 
     // pub async fn update_session_ttl(&self, session: &str) -> Result<(), Box<dyn std::error::Error>> {

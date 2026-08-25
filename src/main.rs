@@ -217,6 +217,9 @@ async fn main() -> io::Result<()> {
     // let delay = (start_time.timestamp_millis() - now.timestamp_millis()) as u64;
 
     // 从整点开始，每隔一段时间 tick 一次，该时间由配置文件指定
+    tokio::spawn(network_mapping_server::login::run_session_expiration(
+        db_pool.clone(),
+    ));
     tokio::spawn(async move {
         let mut ticker = interval_at(
             Instant::now() + Duration::from_millis(0),

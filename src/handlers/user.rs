@@ -137,7 +137,9 @@ async fn user_login_h(
     .await
     {
         error!(event = "RecordCompletedLoginError", message = %error_value);
-        if let Err(logout_error) = log_out(&t_session, p).await {
+        if let Err(logout_error) =
+            log_out(&t_session, p, "login_rollback", Some(login_result.user_id)).await
+        {
             error!(event = "RollbackLoginSessionError", message = %logout_error);
         }
         return HttpResponse::InternalServerError()
@@ -216,7 +218,7 @@ async fn user_logout(
     let p = pool.get_ref();
     let c_s = session.session;
 
-    match log_out(&c_s, p).await {
+    match log_out(&c_s, p, "logout", Some(user.id)).await {
         Ok(_) => {
             let mut audit_event =
                 AuditEvent::user("authentication", "auth.logout", "success", &user);
@@ -410,7 +412,14 @@ async fn verify_totp_h(
                         "RecordCompletedTotpLoginError",
                         &error_value.to_string(),
                     );
-                    if let Err(logout_error) = log_out(&session.session, database_conn).await {
+                    if let Err(logout_error) = log_out(
+                        &session.session,
+                        database_conn,
+                        "login_rollback",
+                        Some(user_base_i.id),
+                    )
+                    .await
+                    {
                         error_logs(
                             &req,
                             "RollbackTotpLoginSessionError",
@@ -488,7 +497,7 @@ async fn unbind_2fa_h(
     if user_base_i.role != 1 {
         return HttpResponse::Forbidden().finish();
     };
-    match unbind_2fa(&unbind_info.username, pool_c).await {
+    match unbind_2fa(&unbind_info.username, pool_c, user_base_i.id).await {
         Ok(true) => {
             let mut audit_event =
                 AuditEvent::user("user_security", "user.totp_unbind", "success", &user_base_i)
@@ -716,7 +725,9 @@ async fn change_password_h(
     }
     if let Err(error_value) = transaction
         .execute(
-            "UPDATE session SET is_enable = false WHERE user_id = $1 AND is_enable = true;",
+            "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+             deletion_reason = 'password_changed', deleted_by_user_id = $1 \
+             WHERE user_id = $1 AND is_enable = TRUE AND deleted_at IS NULL;",
             &[&user_base_i.id],
         )
         .await

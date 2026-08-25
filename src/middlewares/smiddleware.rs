@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use futures::future::LocalBoxFuture;
 
-use crate::admin::{UserSession, get_user_base_info};
+use crate::admin::UserSession;
 use crate::login::LoginToken;
 use crate::login::get_session_from_req;
 use tracing::{debug, error, info};
@@ -17,7 +17,7 @@ use tracing::{debug, error, info};
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
 use crate::get_conn_ip;
-use crate::middlewares::{get_pool_from_app_data, is_scanner_api_request};
+use crate::middlewares::{ExpectedCsrfToken, get_pool_from_app_data, is_scanner_api_request};
 use crate::request_log::RequestActor;
 use uuid::Uuid;
 
@@ -166,23 +166,11 @@ where
                 pool: g_pool.clone(),
             };
 
-            let v_csrf_token = path != "/api/totp/verify" && !scanner_api_request;
+            let require_totp = path != "/api/totp/verify" && !scanner_api_request;
 
-            match login_t.check_token(&session, v_csrf_token).await {
-                Ok((true, uid)) => {
-                    let tmp_info = match get_user_base_info(g_pool, uid).await {
-                        Ok(o) => o,
-                        Err(e) => {
-                            error!(
-                                event = "GetUserBaseInfoError",
-                                path = "fn call",
-                                message = e.to_string()
-                            );
-                            let res = HttpResponse::InternalServerError().finish();
-                            return Ok(req.into_response(res).map_into_right_body());
-                        }
-                    };
-
+            match login_t.check_token(&session, require_totp).await {
+                Ok(Some(authentication)) => {
+                    let user = authentication.user;
                     // 将操作者写入最外层 wrap_fn 预置的槽位，供请求日志采集（request_log）。
                     // 槽位仅在采集开启且未被跳过的请求上存在；匿名/被拒绝请求保持 NULL。
                     if let Some(slot) = req.extensions().get::<RequestActor>() {
@@ -190,19 +178,21 @@ where
                             .0
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            Some((tmp_info.id, tmp_info.username.clone()));
+                            Some((user.id, user.username.clone()));
                     }
 
                     // 向通过检查的请求注入用户基础数据
-                    req.extensions_mut().insert(tmp_info);
+                    req.extensions_mut().insert(user);
 
                     // 向通过检查的请求注入 session ，这样就不需要在每个 handler 中都读取一个 session 了
                     req.extensions_mut()
                         .insert(UserSession { session: session });
+                    req.extensions_mut()
+                        .insert(ExpectedCsrfToken::new(authentication.csrf_token));
 
                     Ok(svc.call(req).await?.map_into_left_body())
                 }
-                Ok((false, _)) => {
+                Ok(None) => {
                     let mut audit_event =
                         AuditEvent::anonymous("authentication", "auth.session_rejected", "denied");
                     audit_event.response_status = Some(401);

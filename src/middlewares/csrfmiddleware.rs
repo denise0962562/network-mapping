@@ -5,19 +5,17 @@ use std::{
 use tracing::error;
 
 use crate::admin::UserBaseI;
-use crate::audit::{AuditContext, AuditEvent, write as write_audit};
+use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::logs::write::warn_logs;
 use crate::{
-    TemplatesInit,
     frontend::is_frontend_resource_path,
-    middlewares::{get_pool_from_app_data, is_scanner_api_request, render_500, render_500_simple},
+    middlewares::{ExpectedCsrfToken, get_pool_from_app_data, is_scanner_api_request},
 };
 
 use actix_web::{
     Error, HttpMessage, HttpResponse,
     body::EitherBody,
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
-    web,
 };
 use futures_util::future::LocalBoxFuture;
 
@@ -92,40 +90,6 @@ where
                 return Ok(svc.call(req).await?.map_into_left_body());
             }
 
-            let page = match req.app_data::<web::Data<TemplatesInit>>() {
-                Some(s) => s.get_ref().clone(),
-                None => {
-                    let res = render_500_simple(req.request(), "模板加载错误");
-                    return Ok(req.into_response(res).map_into_right_body());
-                }
-            };
-
-            let p = match get_pool_from_app_data(&req) {
-                Ok(o) => o,
-                Err(e) => {
-                    let resp = render_500(req.request(), &page, "获取连接池错误");
-                    error!(
-                        event = "GetPoolError",
-                        path = "csrfmiddleware -> fn call",
-                        message = %e
-                    );
-                    return Ok(req.into_response(resp).map_into_right_body());
-                }
-            };
-
-            let client = match p.get().await {
-                Ok(o) => o,
-                Err(e) => {
-                    let resp = render_500(req.request(), &page, "从连接池中获取连接错误");
-                    error!(
-                        event = "GetClienFromPooltError",
-                        path = "csrfmiddleware -> fn call",
-                        message = %e
-                    );
-                    return Ok(req.into_response(resp).map_into_right_body());
-                }
-            };
-
             let tmp_csrf_token_base64 = match req.headers().get("X-CSRF-Token") {
                 Some(t_base64) => t_base64.to_str().unwrap_or(""),
                 None => {
@@ -140,14 +104,15 @@ where
                     };
                     audit_event.response_status = Some(403);
                     audit_event.reason_code = Some("missing_csrf_token".to_owned());
-                    if let Err(error_value) = write_audit(
-                        &client,
-                        &AuditContext::from_request(req.request()),
-                        &audit_event,
-                    )
-                    .await
-                    {
-                        error!(event = "CsrfAuditError", message = %error_value);
+                    if let Ok(pool) = get_pool_from_app_data(&req) {
+                        write_standalone(
+                            pool,
+                            &AuditContext::from_request(req.request()),
+                            &audit_event,
+                        )
+                        .await;
+                    } else {
+                        error!(event = "CsrfAuditError", message = "数据库连接池不可用");
                     }
                     warn_logs(req.request(), "CSRFTokenError", "未获取到 CSRF Token");
                     let resp = HttpResponse::Forbidden().body("403");
@@ -155,56 +120,34 @@ where
                 }
             };
 
-            let tmp_session = req
-                .request()
-                .cookie("session")
-                .map(|t| t.value().to_string())
-                .unwrap_or(format!(""));
-
-            let t = match client.query_opt(
-                "SELECT user_id, id FROM session WHERE is_enable = true AND token = $1 AND csrf_token = $2;",
-                &[&tmp_session, &tmp_csrf_token_base64]
-            ).await {
-                Ok(o) => o,
-                Err(e) => {
-                    error!(
-                        event = "DatabaseSELETEError",
-                        path = "csrfmiddleware -> fn call",
-                        message = %e
-                    );
-                    let resp = HttpResponse::InternalServerError().body("500 Internal Server Error");
-                    return Ok(
-                        req.into_response(resp).map_into_right_body()
-                    )
-                }
-            };
-
-            match t {
-                Some(_) => Ok(svc.call(req).await?.map_into_left_body()),
-                None => {
-                    let user = req.extensions().get::<UserBaseI>().cloned();
-                    let mut audit_event = match user.as_ref() {
-                        Some(user) => {
-                            AuditEvent::user("authorization", "auth.csrf_rejected", "denied", user)
-                        }
-                        None => {
-                            AuditEvent::anonymous("authorization", "auth.csrf_rejected", "denied")
-                        }
-                    };
-                    audit_event.response_status = Some(403);
-                    audit_event.reason_code = Some("invalid_csrf_token".to_owned());
-                    if let Err(error_value) = write_audit(
-                        &client,
+            let csrf_valid = req
+                .extensions()
+                .get::<ExpectedCsrfToken>()
+                .is_some_and(|expected| expected.matches(tmp_csrf_token_base64));
+            if csrf_valid {
+                Ok(svc.call(req).await?.map_into_left_body())
+            } else {
+                let user = req.extensions().get::<UserBaseI>().cloned();
+                let mut audit_event = match user.as_ref() {
+                    Some(user) => {
+                        AuditEvent::user("authorization", "auth.csrf_rejected", "denied", user)
+                    }
+                    None => AuditEvent::anonymous("authorization", "auth.csrf_rejected", "denied"),
+                };
+                audit_event.response_status = Some(403);
+                audit_event.reason_code = Some("invalid_csrf_token".to_owned());
+                if let Ok(pool) = get_pool_from_app_data(&req) {
+                    write_standalone(
+                        pool,
                         &AuditContext::from_request(req.request()),
                         &audit_event,
                     )
-                    .await
-                    {
-                        error!(event = "CsrfAuditError", message = %error_value);
-                    }
-                    let resp = HttpResponse::Forbidden().body("403");
-                    return Ok(req.into_response(resp).map_into_right_body());
+                    .await;
+                } else {
+                    error!(event = "CsrfAuditError", message = "数据库连接池不可用");
                 }
+                let resp = HttpResponse::Forbidden().body("403");
+                Ok(req.into_response(resp).map_into_right_body())
             }
         })
     }

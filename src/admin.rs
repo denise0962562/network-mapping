@@ -172,7 +172,8 @@ pub async fn get_user_id_and_name<'a>(
     let row = client
         .query_one(
             "SELECT s.user_id, u.username, u.role FROM session s JOIN users u ON s.user_id = u.id \
-         WHERE s.token = $1 AND s.is_enable = TRUE AND u.limit_login = FALSE \
+         WHERE s.token = $1 AND s.is_enable = TRUE AND s.deleted_at IS NULL \
+         AND u.limit_login = FALSE \
          AND u.disabled_at IS NULL AND u.deleted_at IS NULL;",
             &[&session],
         )
@@ -325,7 +326,9 @@ pub async fn reset_admin_password(
 
     transaction
         .execute(
-            "UPDATE session SET is_enable = false WHERE user_id = $1 AND is_enable = true;",
+            "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+             deletion_reason = 'password_reset', deleted_by_user_id = NULL \
+             WHERE user_id = $1 AND is_enable = TRUE AND deleted_at IS NULL;",
             &[&admin_id],
         )
         .await?;
@@ -825,7 +828,8 @@ pub async fn bind_twofa(
     let updated = transaction
         .execute(
             "UPDATE session SET pending_totp_secret = $1, pending_totp_expires_at = $2 \
-         WHERE token = $3 AND is_enable = true AND totp_verify_successful = true \
+         WHERE token = $3 AND is_enable = true AND deleted_at IS NULL \
+         AND totp_verify_successful = true \
          AND user_id = (SELECT id FROM users WHERE username = $4 AND enable_2fa = false);",
             &[&encrypted_secret, &expires_at, &session, &username],
         )
@@ -851,7 +855,8 @@ pub async fn confirm_twofa_binding(
         .query_opt(
             "SELECT u.id, s.pending_totp_secret, s.pending_totp_expires_at \
          FROM session s JOIN users u ON u.id = s.user_id \
-         WHERE s.token = $1 AND s.is_enable = true AND s.totp_verify_successful = true \
+         WHERE s.token = $1 AND s.is_enable = true AND s.deleted_at IS NULL \
+         AND s.totp_verify_successful = true \
          AND u.username = $2 AND u.enable_2fa = false FOR UPDATE;",
             &[&session, &username],
         )
@@ -894,7 +899,13 @@ pub async fn confirm_twofa_binding(
     if enabled != 1 {
         return Err("启用 2FA 影响的用户数量异常".into());
     }
-    invalidate_user_sessions_in_transaction(&transaction, Some(username)).await?;
+    invalidate_user_sessions_in_transaction(
+        &transaction,
+        Some(username),
+        "totp_enabled",
+        Some(user_id),
+    )
+    .await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -902,20 +913,31 @@ pub async fn confirm_twofa_binding(
 async fn invalidate_user_sessions_in_transaction(
     transaction: &tokio_postgres::Transaction<'_>,
     username: Option<&str>,
+    reason: &str,
+    deleted_by_user_id: Option<i32>,
 ) -> Result<u64, tokio_postgres::Error> {
     match username {
-        Some(username) => transaction
-            .execute(
-                "UPDATE session SET is_enable = false WHERE is_enable = true AND user_id = (SELECT id FROM users WHERE username = $1);",
-                &[&username],
-            )
-            .await,
-        None => transaction
-            .execute(
-                "UPDATE session SET is_enable = false WHERE is_enable = true;",
-                &[],
-            )
-            .await,
+        Some(username) => {
+            transaction
+                .execute(
+                    "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+                 deletion_reason = $2, deleted_by_user_id = $3 \
+                 WHERE is_enable = TRUE AND deleted_at IS NULL \
+                   AND user_id = (SELECT id FROM users WHERE username = $1);",
+                    &[&username, &reason, &deleted_by_user_id],
+                )
+                .await
+        }
+        None => {
+            transaction
+                .execute(
+                    "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+                 deletion_reason = $1, deleted_by_user_id = $2 \
+                 WHERE is_enable = TRUE AND deleted_at IS NULL;",
+                    &[&reason, &deleted_by_user_id],
+                )
+                .await
+        }
     }
 }
 
@@ -926,7 +948,13 @@ pub async fn invalidate_user_sessions(
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let mut conn = pool.get().await?;
     let transaction = conn.transaction().await?;
-    let affected = invalidate_user_sessions_in_transaction(&transaction, username).await?;
+    let affected = invalidate_user_sessions_in_transaction(
+        &transaction,
+        username,
+        "security_policy_changed",
+        None,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(affected)
 }
@@ -955,7 +983,8 @@ pub async fn totp_verify_status_change(
     let db_transaction = conn.transaction().await?;
     let r = db_transaction
         .execute(
-            "UPDATE session SET totp_verify_successful = true WHERE token = $1;",
+            "UPDATE session SET totp_verify_successful = true \
+             WHERE token = $1 AND is_enable = TRUE AND deleted_at IS NULL;",
             &[&session],
         )
         .await?;
@@ -981,6 +1010,7 @@ pub async fn totp_verify_status_change(
 pub async fn unbind_2fa(
     username: &str,
     pool: &deadpool_postgres::Pool,
+    actor_user_id: i32,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut c = pool.get().await?;
     let db_transaction = c.transaction().await?;
@@ -991,7 +1021,13 @@ pub async fn unbind_2fa(
         )
         .await?;
     if r == 1 {
-        invalidate_user_sessions_in_transaction(&db_transaction, Some(username)).await?;
+        invalidate_user_sessions_in_transaction(
+            &db_transaction,
+            Some(username),
+            "totp_disabled",
+            Some(actor_user_id),
+        )
+        .await?;
         info!(
             event = "Unbind2FASuccessful",
             path = "fn unbind_2fa",
@@ -1317,8 +1353,11 @@ pub async fn write_session_settings_to_database(
     let invalidated_session_count = if settings.invalidate_other_sessions {
         transaction
             .execute(
-                "UPDATE session SET is_enable = false \
-                 WHERE is_enable = true AND token <> $1;",
+                "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+                 deletion_reason = 'session_policy_changed', \
+                 deleted_by_user_id = (SELECT user_id FROM session \
+                                       WHERE token = $1 AND deleted_at IS NULL LIMIT 1) \
+                 WHERE is_enable = TRUE AND deleted_at IS NULL AND token <> $1;",
                 &[&current_session],
             )
             .await?

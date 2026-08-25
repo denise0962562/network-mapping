@@ -169,6 +169,9 @@ repeat_after_seconds = 604800
 注意事项参见
 [健康监控与告警](docs/HEALTH_ALERT.md)。
 
+Session/CSRF 与扫描器认证的 SQL 热路径范围、软删除审计字段和性能对比矩阵参见
+[SQL 热路径优化与对比](docs/SQL_HOT_PATH_OPTIMIZATION.md)。
+
 ## PostgreSQL 备份
 
 服务端可通过管理员页面查询 pgBackRest stanza 和备份集、手动执行全量/差异/增量备份、
