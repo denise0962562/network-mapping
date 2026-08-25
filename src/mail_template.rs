@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use tera::{Context, Tera};
 
 use crate::admin::{
-    get_mail_sender_key_from_database, get_mail_settings_from_database, try_send_email,
+    MailRetryPolicy, get_mail_sender_key_from_database, get_mail_settings_from_database,
+    try_send_email,
 };
 use crate::config::EmailConfig;
 use crate::monitor::HealthEvent;
@@ -661,6 +662,7 @@ async fn send_rendered_mail(
     encryption_key: &str,
     recipient: &str,
     rendered: RenderedMailTemplate,
+    retry_policy: MailRetryPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let settings = get_mail_settings_from_database(pool).await?;
     if settings.smtp_host.trim().is_empty() || settings.sender.trim().is_empty() {
@@ -681,11 +683,13 @@ async fn send_rendered_mail(
         ))
         .to(recipient.parse()?)
         .subject(rendered.subject)
+        .message_id(None)
         .multipart(MultiPart::alternative_plain_html(
             rendered.text_body,
             rendered.html_body,
         ))?;
-    try_send_email(&email_config, settings.smtp_port, message).await
+    try_send_email(&email_config, settings.smtp_port, message, retry_policy).await?;
+    Ok(())
 }
 
 pub async fn send_template_test(
@@ -696,7 +700,14 @@ pub async fn send_template_test(
     source: &MailTemplateSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rendered = validate_template(template_key, source)?;
-    send_rendered_mail(pool, encryption_key, recipient, rendered).await
+    send_rendered_mail(
+        pool,
+        encryption_key,
+        recipient,
+        rendered,
+        MailRetryPolicy::Interactive,
+    )
+    .await
 }
 
 pub async fn send_login_notification(
@@ -718,7 +729,14 @@ pub async fn send_login_notification(
     };
     let context = login_context(username, source_ip)?;
     let rendered = render_template(LOGIN_SUCCESS_TEMPLATE_KEY, &source, &context)?;
-    send_rendered_mail(pool, encryption_key, &recipient, rendered).await?;
+    send_rendered_mail(
+        pool,
+        encryption_key,
+        &recipient,
+        rendered,
+        MailRetryPolicy::Background,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -749,8 +767,36 @@ pub async fn send_health_alert(
     };
     let context = health_alert_context(event)?;
     let rendered = render_template(HEALTH_ALERT_TEMPLATE_KEY, &source, &context)?;
-    for recipient in recipients {
-        send_rendered_mail(pool, encryption_key, &recipient, rendered.clone()).await?;
+    let recipient_count = recipients.len();
+    let mut failure_count = 0_usize;
+    let mut last_error = None;
+    for (recipient_index, recipient) in recipients.into_iter().enumerate() {
+        if let Err(error_value) = send_rendered_mail(
+            pool,
+            encryption_key,
+            &recipient,
+            rendered.clone(),
+            MailRetryPolicy::Background,
+        )
+        .await
+        {
+            failure_count += 1;
+            tracing::error!(
+                event = "HealthAlertRecipientSendError",
+                recipient_index,
+                recipient_count,
+                message = %error_value,
+                "单个健康告警收件人发送失败，继续发送其他收件人"
+            );
+            last_error = Some(error_value.to_string());
+        }
+    }
+    if failure_count > 0 {
+        let last_error = last_error.unwrap_or_else(|| "未知错误".to_owned());
+        return Err(format!(
+            "健康告警邮件有 {failure_count}/{recipient_count} 个收件人发送失败；最后错误: {last_error}"
+        )
+        .into());
     }
     Ok(())
 }

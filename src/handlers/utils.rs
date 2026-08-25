@@ -5,10 +5,10 @@ use tracing::error;
 
 use crate::TEXT_HTML_UTF_8;
 use crate::admin::{
-    UserBaseI, UserSession, get_config_from_database, get_mail_sender_key_from_database,
-    get_mail_settings_from_database, get_scan_settings_from_database,
-    get_session_settings_from_database, smtp_send_error_message, try_send_email,
-    write_mail_settings_to_database, write_scan_settings_to_database,
+    MailRetryPolicy, UserBaseI, UserSession, get_config_from_database,
+    get_mail_sender_key_from_database, get_mail_settings_from_database,
+    get_scan_settings_from_database, get_session_settings_from_database, smtp_send_error_message,
+    try_send_email, write_mail_settings_to_database, write_scan_settings_to_database,
     write_session_settings_to_database,
 };
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
@@ -746,6 +746,7 @@ async fn test_mail_server_h(
             }
         })
         .subject(mail_title)
+        .message_id(None)
         .header(ContentType::TEXT_PLAIN)
         .body(mail_context)
     {
@@ -762,7 +763,14 @@ async fn test_mail_server_h(
             }));
         }
     };
-    match try_send_email(&mail_config, test_data.smtp_port, mail_message).await {
+    match try_send_email(
+        &mail_config,
+        test_data.smtp_port,
+        mail_message,
+        MailRetryPolicy::Interactive,
+    )
+    .await
+    {
         Ok(()) => {
             let mut audit_event = AuditEvent::user(
                 "configuration",
@@ -783,11 +791,13 @@ async fn test_mail_server_h(
             error!(
                 event = "TestMailSendError",
                 path = "fn test_mail_server_h",
+                attempts = error_value.attempts(),
+                retryable = error_value.is_retryable(),
                 message = %error_value
             );
             HttpResponse::BadGateway().json(json!({
                 "success": false,
-                "message": smtp_send_error_message(error_value.as_ref()),
+                "message": smtp_send_error_message(&error_value),
                 "detail": error_value.to_string()
             }))
         }
