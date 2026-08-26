@@ -3,7 +3,7 @@
 //! 与 `audit_event`（安全审计，只记录敏感操作）不同，`request_log` 是访问日志，
 //! 覆盖每一个业务请求，用于请求级别的分析与错误自动识别。
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,8 +28,10 @@ pub struct RequestLogEntry {
     pub occurred_at: DateTime<Utc>,
     pub http_method: String,
     pub request_path: String,
+    pub route_pattern: Option<String>,
     pub status_code: i16,
     pub duration_ms: Option<i32>,
+    pub duration_us: Option<i64>,
     pub client_ip: Option<IpAddr>,
     pub user_agent: Option<String>,
     pub actor_id: Option<i32>,
@@ -57,10 +59,7 @@ pub fn classify_status(status: u16) -> (&'static str, Option<&'static str>) {
 
 /// 把 `realip_remote_addr` 返回的字符串解析成 `IpAddr`；无法解析时为 `None`（写 NULL）。
 pub fn parse_ip(value: &str) -> Option<IpAddr> {
-    value
-        .parse::<IpAddr>()
-        .ok()
-        .or_else(|| value.parse::<SocketAddr>().ok().map(|address| address.ip()))
+    crate::client_ip::parse_ip(value)
 }
 
 pub const CHANNEL_CAPACITY: usize = 8192;
@@ -129,7 +128,7 @@ async fn flush_batch(pool: &Pool, batch: &mut Vec<RequestLogEntry>, dropped: &mu
     }
 }
 
-const COLUMN_COUNT: usize = 12;
+const COLUMN_COUNT: usize = 14;
 
 async fn insert_batch(
     pool: &Pool,
@@ -143,7 +142,7 @@ async fn insert_batch(
 
     let mut sql = String::from(
         "INSERT INTO request_log (request_id, occurred_at, http_method, request_path, \
-         status_code, duration_ms, client_ip, user_agent, actor_id, actor_name, \
+         route_pattern, status_code, duration_ms, duration_us, client_ip, user_agent, actor_id, actor_name, \
          error_level, error_type) VALUES ",
     );
     let mut params: Vec<Box<dyn ToSql + Send + Sync>> =
@@ -154,7 +153,7 @@ async fn insert_batch(
         }
         let base = index * COLUMN_COUNT;
         sql.push_str(&format!(
-            "(${},${},${},${},${},${},${},${},${},${},${},${})",
+            "(${},${},${},${},${},${},${},${},${},${},${},${},${},${})",
             base + 1,
             base + 2,
             base + 3,
@@ -167,13 +166,17 @@ async fn insert_batch(
             base + 10,
             base + 11,
             base + 12,
+            base + 13,
+            base + 14,
         ));
         params.push(Box::new(entry.request_id));
         params.push(Box::new(entry.occurred_at));
         params.push(Box::new(entry.http_method.clone()));
         params.push(Box::new(entry.request_path.clone()));
+        params.push(Box::new(entry.route_pattern.clone()));
         params.push(Box::new(entry.status_code));
         params.push(Box::new(entry.duration_ms));
+        params.push(Box::new(entry.duration_us));
         params.push(Box::new(entry.client_ip));
         params.push(Box::new(entry.user_agent.clone()));
         params.push(Box::new(entry.actor_id));
@@ -282,6 +285,10 @@ mod tests {
         assert_eq!(
             parse_ip("[2001:db8::1]:443"),
             Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
+        );
+        assert_eq!(
+            parse_ip("::ffff:64.81.116.137"),
+            Some(IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137)))
         );
         assert_eq!(parse_ip("unknown"), None);
     }

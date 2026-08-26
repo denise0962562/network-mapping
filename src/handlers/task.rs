@@ -1,5 +1,6 @@
 use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::AuditContext;
+use crate::client_ip::normalize_ip;
 use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
@@ -209,9 +210,11 @@ fn validate_public_ip(value: Option<&str>, expect_ipv6: bool) -> Result<Option<S
     let Some(value) = value else {
         return Ok(None);
     };
-    let address: IpAddr = value
-        .parse()
-        .map_err(|_| "network capability contains an invalid public IP".to_owned())?;
+    let address = normalize_ip(
+        value
+            .parse::<IpAddr>()
+            .map_err(|_| "network capability contains an invalid public IP".to_owned())?,
+    );
     if address.is_ipv6() != expect_ipv6 {
         return Err("network capability public IP has the wrong address family".to_owned());
     }
@@ -327,6 +330,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    trusted_proxies: web::Data<TrustedProxyState>,
     latency_history: web::Data<ScannerLatencyHistory>,
     heartbeat: web::Json<ScannerHeartbeat>,
 ) -> impl Responder {
@@ -339,30 +343,23 @@ pub(crate) async fn scanner_heartbeat_handler(
     if let Err(message) = heartbeat.scan_capabilities.validate() {
         return HttpResponse::BadRequest().body(message);
     }
-    if let Err(error) = validate_scanner_credentials(
-        pool.get_ref(),
-        heartbeat.scanner_id,
-        token,
-        &security.scanner_token_pepper,
-    )
-    .await
-    {
-        return match error {
-            ApplyTaskError::ScannerUnauthorized => {
-                HttpResponse::Unauthorized().body("unauthorized")
-            }
-            error => {
-                error_logs_error(
-                    &req,
-                    "ScannerHeartbeatCredentialCheckError",
-                    "validate_scanner_credentials",
-                    &error,
-                );
-                HttpResponse::InternalServerError().finish()
-            }
-        };
-    }
+    let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerHeartbeatCredentialHashError",
+                "hash_scanner_token",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
 
+    let ip_address = trusted_proxies
+        .client_ip(&req)
+        .await
+        .map(|address| address.to_string());
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
@@ -395,7 +392,6 @@ pub(crate) async fn scanner_heartbeat_handler(
     let cpu_cores = i32::try_from(heartbeat.system.cpu_cores).unwrap_or(i32::MAX);
     let ram_mb = i32::try_from(heartbeat.system.ram_total_mb).unwrap_or(i32::MAX);
     let uptime = i32::try_from(heartbeat.system.uptime_seconds).unwrap_or(i32::MAX);
-    let ip_address = req.peer_addr().map(|address| address.ip().to_string());
     let public_ipv4 = match validate_public_ip(
         heartbeat.network_capabilities.ipv4.public_ip.as_deref(),
         false,
@@ -438,7 +434,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     let latency_measured_at = latency.as_ref().map(|value| value.measured_at);
     let latency_probe_id = latency.as_ref().map(|value| value.probe_id);
     let update = transaction
-        .execute(
+        .query_opt(
             "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
              cpus = $4, ram = $5, uptime = $6, runtime_state = $7, last_seen_at = NOW(), \
              update_time = NOW(), is_run = ($7 <> 'stopping'), \
@@ -462,7 +458,8 @@ pub(crate) async fn scanner_heartbeat_handler(
              latency_measured_at = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
                  AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
                  THEN $20 ELSE latency_measured_at END \
-             WHERE scanner_id = $22;",
+             WHERE scanner_id = $22 AND runtime_token_hash = $23 AND is_enable = TRUE \
+             RETURNING id;",
             &[
                 &system_version,
                 &heartbeat.scanner_version,
@@ -486,17 +483,22 @@ pub(crate) async fn scanner_heartbeat_handler(
                 &latency_measured_at,
                 &latency_probe_id,
                 &scanner_id,
+                &token_hash,
             ],
         )
         .await;
-    if let Err(error) = update {
-        error_logs_error(
-            &req,
-            "ScannerHeartbeatUpdateError",
-            "update_scanner_state",
-            &error,
-        );
-        return HttpResponse::InternalServerError().finish();
+    match update {
+        Ok(Some(_)) => {}
+        Ok(None) => return HttpResponse::Unauthorized().body("unauthorized"),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerHeartbeatUpdateError",
+                "update_scanner_state",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     }
     let mut lease = None;
     let mut cancel_task_id = None;
@@ -593,28 +595,18 @@ pub(crate) async fn scanner_task_failure_handler(
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
-    match validate_scanner_credentials(
-        pool.get_ref(),
-        failure.scanner_id,
-        token,
-        &security.scanner_token_pepper,
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(ApplyTaskError::ScannerUnauthorized) => {
-            return HttpResponse::Unauthorized().body("unauthorized");
-        }
+    let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
+        Ok(value) => value,
         Err(error) => {
             error_logs_error(
                 &req,
-                "ScannerTaskFailureCredentialCheckError",
-                "validate_scanner_credentials",
+                "ScannerTaskFailureCredentialHashError",
+                "hash_scanner_token",
                 &error,
             );
             return HttpResponse::InternalServerError().finish();
         }
-    }
+    };
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
@@ -643,6 +635,27 @@ pub(crate) async fn scanner_task_failure_handler(
             return HttpResponse::InternalServerError().finish();
         }
     };
+    match crate::validate_scanner_credentials_with_client(
+        &transaction,
+        failure.scanner_id,
+        &token_hash,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(ApplyTaskError::ScannerUnauthorized) => {
+            return HttpResponse::Unauthorized().body("unauthorized");
+        }
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerTaskFailureCredentialCheckError",
+                "validate_scanner_credentials",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
     let changed = transaction
         .query(
             "UPDATE scan_task_execution SET execution_status = CASE WHEN $1::boolean OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
@@ -724,28 +737,18 @@ pub(crate) async fn scanner_task_cancelled_handler(
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
-    match validate_scanner_credentials(
-        pool.get_ref(),
-        cancelled.scanner_id,
-        token,
-        &security.scanner_token_pepper,
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(ApplyTaskError::ScannerUnauthorized) => {
-            return HttpResponse::Unauthorized().body("unauthorized");
-        }
+    let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
+        Ok(value) => value,
         Err(error) => {
             error_logs_error(
                 &req,
-                "ScannerTaskCancelledCredentialCheckError",
-                "validate_scanner_credentials",
+                "ScannerTaskCancelledCredentialHashError",
+                "hash_scanner_token",
                 &error,
             );
             return HttpResponse::InternalServerError().finish();
         }
-    }
+    };
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
@@ -770,6 +773,27 @@ pub(crate) async fn scanner_task_cancelled_handler(
             return HttpResponse::InternalServerError().finish();
         }
     };
+    match crate::validate_scanner_credentials_with_client(
+        &transaction,
+        cancelled.scanner_id,
+        &token_hash,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(ApplyTaskError::ScannerUnauthorized) => {
+            return HttpResponse::Unauthorized().body("unauthorized");
+        }
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerTaskCancelledCredentialCheckError",
+                "validate_scanner_credentials",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
     let changed = transaction
         .query(
             "UPDATE scan_task_execution e SET execution_status = 'cancelled', task_end_time = $1, \
@@ -1527,7 +1551,12 @@ mod tests {
             validate_public_ip(Some("203.0.113.10"), false).unwrap(),
             Some("203.0.113.10".to_owned())
         );
+        assert_eq!(
+            validate_public_ip(Some("::ffff:64.81.116.137"), false).unwrap(),
+            Some("64.81.116.137".to_owned())
+        );
         assert!(validate_public_ip(Some("2001:db8::1"), false).is_err());
+        assert!(validate_public_ip(Some("::ffff:64.81.116.137"), true).is_err());
         assert!(validate_public_ip(Some("not-an-ip"), true).is_err());
     }
 

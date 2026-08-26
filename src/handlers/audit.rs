@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
+use crate::client_ip::display_ip;
 use crate::logs::write::error_logs;
 
 #[derive(Deserialize)]
@@ -63,7 +64,7 @@ fn event_from_row(row: tokio_postgres::Row) -> AuditEventResponse {
         resource_type: row.get("resource_type"),
         resource_id: row.get("resource_id"),
         request_id: row.get("request_id"),
-        source_ip: row.get("source_ip"),
+        source_ip: display_ip(row.get("source_ip")),
         user_agent: row.get("user_agent"),
         http_method: row.get("http_method"),
         request_path: row.get("request_path"),
@@ -145,7 +146,7 @@ pub(crate) async fn list_audit_events(
     };
     let list_sql = format!(
         "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
-         actor_name, resource_type, resource_id, request_id, source_ip::TEXT AS source_ip, user_agent, \
+         actor_name, resource_type, resource_id, request_id, source_ip, user_agent, \
          http_method, request_path, response_status, reason_code, changes, metadata \
          FROM audit_event {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $11 OFFSET $12"
     );
@@ -197,7 +198,7 @@ pub(crate) async fn get_audit_event(
     let row = match client
         .query_opt(
             "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
-             actor_name, resource_type, resource_id, request_id, source_ip::TEXT AS source_ip, user_agent, \
+             actor_name, resource_type, resource_id, request_id, source_ip, user_agent, \
              http_method, request_path, response_status, reason_code, changes, metadata \
              FROM audit_event WHERE event_id = $1",
             &[&event_id.into_inner()],
@@ -251,7 +252,7 @@ pub(crate) async fn export_audit_events(
     ];
     let sql = format!(
         "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
-         actor_name, resource_type, resource_id, request_id, source_ip::TEXT AS source_ip, \
+         actor_name, resource_type, resource_id, request_id, source_ip, \
          user_agent, http_method, request_path, response_status, reason_code, changes, metadata \
          FROM audit_event {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT 10000"
     );
@@ -282,8 +283,7 @@ pub(crate) async fn export_audit_events(
             row.get::<_, Option<Uuid>>("request_id")
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
-            row.get::<_, Option<String>>("source_ip")
-                .unwrap_or_default(),
+            display_ip(row.get("source_ip")).unwrap_or_default(),
             row.get::<_, Option<String>>("user_agent")
                 .unwrap_or_default(),
             row.get::<_, Option<String>>("http_method")

@@ -3,10 +3,13 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use tokio_postgres::types::ToSql;
+use tokio_postgres::{Client, Row};
 use uuid::Uuid;
 
 use crate::admin::UserBaseI;
+use crate::client_ip::display_ip;
 use crate::handlers::system_resources::{Granularity, MAX_BUCKETS};
 use crate::logs::write::error_logs;
 
@@ -53,6 +56,62 @@ pub struct RequestSummaryQuery {
     /// 趋势分桶粒度：`auto` / `1m` / `5m` / `15m` / `30m` / `1h` / `2h` / `6h`。
     granularity: Option<String>,
 }
+
+#[derive(Deserialize)]
+pub struct RequestPerformanceQuery {
+    window: Option<String>,
+    granularity: Option<String>,
+    method: Option<String>,
+    route: Option<String>,
+    status_class: Option<String>,
+    limit: Option<i64>,
+}
+
+struct PerformanceFilters {
+    method: Option<String>,
+    route: Option<String>,
+    status_class: Option<String>,
+}
+
+#[derive(Debug)]
+struct PerformanceSummary {
+    sample_count: i64,
+    avg_ms: Option<f64>,
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    max_ms: Option<f64>,
+    error_rate: f64,
+    slow_rate: f64,
+    normalized_coverage: f64,
+}
+
+#[derive(Debug)]
+struct EventPerformance {
+    method: String,
+    route_pattern: String,
+    normalized: bool,
+    sample_count: i64,
+    avg_ms: Option<f64>,
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    max_ms: Option<f64>,
+}
+
+const PERFORMANCE_DURATION_SQL: &str = "COALESCE(duration_us, duration_ms::BIGINT * 1000)";
+const PERFORMANCE_FILTER_SQL: &str = "
+    WHERE ($1::TEXT IS NULL OR http_method = $1)
+      AND ($2::TEXT IS NULL OR COALESCE(route_pattern, '（历史未标准化）') ILIKE '%' || $2 || '%')
+      AND ($3::TEXT IS NULL
+           OR ($3 = 'success' AND status_code < 400)
+           OR ($3 = '4xx' AND status_code BETWEEN 400 AND 499)
+           OR ($3 = '5xx' AND status_code BETWEEN 500 AND 599))
+      AND occurred_at >= $4
+      AND occurred_at < $5
+      AND request_path <> '/api/requests/performance'
+      AND COALESCE(duration_us, duration_ms::BIGINT * 1000) IS NOT NULL";
+const SLOW_REQUEST_US: i64 = 1_000_000;
 
 fn is_admin(user: &UserBaseI) -> bool {
     user.role == 1
@@ -152,6 +211,179 @@ fn window_range(window: Option<&str>) -> Option<(DateTime<Utc>, DateTime<Utc>)> 
     }
 }
 
+fn performance_window(window: Option<&str>) -> Result<chrono::Duration, &'static str> {
+    match window.unwrap_or("24h") {
+        "1h" => Ok(chrono::Duration::hours(1)),
+        "24h" => Ok(chrono::Duration::days(1)),
+        "7d" => Ok(chrono::Duration::days(7)),
+        _ => Err("performance window must be one of: 1h, 24h, 7d"),
+    }
+}
+
+fn clean_filter(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn metric_delta(current: Option<f64>, baseline: Option<f64>) -> (Option<f64>, Option<f64>) {
+    match (current, baseline) {
+        (Some(current), Some(baseline)) if baseline > 0.0 => (
+            Some(current - baseline),
+            Some((current - baseline) / baseline),
+        ),
+        (Some(current), Some(baseline)) => (Some(current - baseline), None),
+        _ => (None, None),
+    }
+}
+
+fn performance_summary_value(summary: &PerformanceSummary) -> Value {
+    json!({
+        "sample_count": summary.sample_count,
+        "avg_ms": summary.avg_ms,
+        "p50_ms": summary.p50_ms,
+        "p95_ms": summary.p95_ms,
+        "p99_ms": summary.p99_ms,
+        "max_ms": summary.max_ms,
+        "error_rate": summary.error_rate,
+        "slow_rate": summary.slow_rate,
+        "normalized_coverage": summary.normalized_coverage,
+    })
+}
+
+fn performance_summary_from_row(row: Row) -> PerformanceSummary {
+    PerformanceSummary {
+        sample_count: row.get("sample_count"),
+        avg_ms: row.get("avg_ms"),
+        p50_ms: row.get("p50_ms"),
+        p95_ms: row.get("p95_ms"),
+        p99_ms: row.get("p99_ms"),
+        max_ms: row.get("max_ms"),
+        error_rate: row.get("error_rate"),
+        slow_rate: row.get("slow_rate"),
+        normalized_coverage: row.get("normalized_coverage"),
+    }
+}
+
+async fn query_performance_summary(
+    client: &Client,
+    filters: &PerformanceFilters,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<PerformanceSummary, tokio_postgres::Error> {
+    let sql = format!(
+        "SELECT COUNT(*)::BIGINT AS sample_count, \
+                AVG(({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS avg_ms, \
+                percentile_cont(0.50) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p50_ms, \
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p95_ms, \
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p99_ms, \
+                MAX({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION / 1000.0 AS max_ms, \
+                COALESCE(COUNT(*) FILTER (WHERE status_code >= 400)::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS error_rate, \
+                COALESCE(COUNT(*) FILTER (WHERE {PERFORMANCE_DURATION_SQL} >= {SLOW_REQUEST_US})::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS slow_rate, \
+                COALESCE(COUNT(*) FILTER (WHERE route_pattern IS NOT NULL)::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS normalized_coverage \
+         FROM request_log {PERFORMANCE_FILTER_SQL}"
+    );
+    let params: [&(dyn ToSql + Sync); 5] = [
+        &filters.method,
+        &filters.route,
+        &filters.status_class,
+        &start,
+        &end,
+    ];
+    client
+        .query_one(&sql, &params)
+        .await
+        .map(performance_summary_from_row)
+}
+
+async fn query_performance_trend(
+    client: &Client,
+    filters: &PerformanceFilters,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    bucket_seconds: i64,
+) -> Result<Vec<Value>, tokio_postgres::Error> {
+    let sql = format!(
+        "SELECT to_timestamp((EXTRACT(EPOCH FROM occurred_at)::BIGINT / $6::BIGINT) * $6::BIGINT) AS bucket, \
+                COUNT(*)::BIGINT AS sample_count, \
+                percentile_cont(0.50) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p50_ms, \
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p95_ms, \
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p99_ms \
+         FROM request_log {PERFORMANCE_FILTER_SQL} \
+         GROUP BY bucket ORDER BY bucket"
+    );
+    let params: [&(dyn ToSql + Sync); 6] = [
+        &filters.method,
+        &filters.route,
+        &filters.status_class,
+        &start,
+        &end,
+        &bucket_seconds,
+    ];
+    client.query(&sql, &params).await.map(|rows| {
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "bucket": row.get::<_, DateTime<Utc>>("bucket"),
+                    "sample_count": row.get::<_, i64>("sample_count"),
+                    "p50_ms": row.get::<_, Option<f64>>("p50_ms"),
+                    "p95_ms": row.get::<_, Option<f64>>("p95_ms"),
+                    "p99_ms": row.get::<_, Option<f64>>("p99_ms"),
+                })
+            })
+            .collect()
+    })
+}
+
+fn event_performance_from_row(row: &Row) -> EventPerformance {
+    EventPerformance {
+        method: row.get("http_method"),
+        route_pattern: row.get("event_route"),
+        normalized: row.get("normalized"),
+        sample_count: row.get("sample_count"),
+        avg_ms: row.get("avg_ms"),
+        p50_ms: row.get("p50_ms"),
+        p95_ms: row.get("p95_ms"),
+        p99_ms: row.get("p99_ms"),
+        max_ms: row.get("max_ms"),
+    }
+}
+
+async fn query_event_performance(
+    client: &Client,
+    filters: &PerformanceFilters,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<EventPerformance>, tokio_postgres::Error> {
+    let sql = format!(
+        "SELECT http_method, COALESCE(route_pattern, '（历史未标准化）') AS event_route, \
+                BOOL_AND(route_pattern IS NOT NULL) AS normalized, \
+                COUNT(*)::BIGINT AS sample_count, \
+                AVG(({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS avg_ms, \
+                percentile_cont(0.50) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p50_ms, \
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p95_ms, \
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p99_ms, \
+                MAX({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION / 1000.0 AS max_ms \
+         FROM request_log {PERFORMANCE_FILTER_SQL} \
+         GROUP BY http_method, event_route \
+         ORDER BY p95_ms DESC NULLS LAST, sample_count DESC LIMIT $6"
+    );
+    let params: [&(dyn ToSql + Sync); 6] = [
+        &filters.method,
+        &filters.route,
+        &filters.status_class,
+        &start,
+        &end,
+        &limit,
+    ];
+    client
+        .query(&sql, &params)
+        .await
+        .map(|rows| rows.iter().map(event_performance_from_row).collect())
+}
+
 fn resolve_granularity(
     granularity: &Option<String>,
     start: Option<DateTime<Utc>>,
@@ -183,7 +415,7 @@ fn row_to_value(row: tokio_postgres::Row) -> Value {
         "request_path": row.get::<_, String>("request_path"),
         "status_code": row.get::<_, i16>("status_code"),
         "duration_ms": row.get::<_, Option<i32>>("duration_ms"),
-        "client_ip": row.get::<_, Option<String>>("client_ip"),
+        "client_ip": display_ip(row.get("client_ip")),
         "user_agent": row.get::<_, Option<String>>("user_agent"),
         "actor_id": row.get::<_, Option<i32>>("actor_id"),
         "actor_name": row.get::<_, Option<String>>("actor_name"),
@@ -225,7 +457,7 @@ pub(crate) async fn list_requests(
 
     let list_sql = format!(
         "SELECT id, request_id, occurred_at, http_method, request_path, status_code, duration_ms, \
-         client_ip::TEXT AS client_ip, user_agent, actor_id, actor_name, error_level, error_type \
+         client_ip, user_agent, actor_id, actor_name, error_level, error_type \
          FROM request_log {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $10 OFFSET $11"
     );
     let mut list_params = params;
@@ -446,9 +678,156 @@ pub(crate) async fn request_summary(
     }))
 }
 
+#[get("/api/requests/performance")]
+pub(crate) async fn request_performance(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    query: web::Query<RequestPerformanceQuery>,
+    user: UserBaseI,
+) -> impl Responder {
+    if !is_admin(&user) {
+        return HttpResponse::Forbidden().json(json!({"success": false, "message": "forbidden"}));
+    }
+
+    let duration = match performance_window(query.window.as_deref()) {
+        Ok(duration) => duration,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
+        }
+    };
+    let status_class = clean_filter(query.status_class.as_deref());
+    if status_class
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "success" | "4xx" | "5xx"))
+    {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": "status_class must be one of: success, 4xx, 5xx"
+        }));
+    }
+
+    let filters = PerformanceFilters {
+        method: clean_filter(query.method.as_deref()).map(|value| value.to_uppercase()),
+        route: clean_filter(query.route.as_deref()),
+        status_class,
+    };
+    let end = Utc::now();
+    let start = end - duration;
+    let baseline_end = start;
+    let baseline_start = baseline_end - duration;
+    let granularity = match resolve_granularity(&query.granularity, Some(start), Some(end)) {
+        Ok(granularity) => granularity,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
+        }
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(error_value) => {
+            error_logs(
+                &req,
+                "RequestPerformancePoolError",
+                &error_value.to_string(),
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    // tokio-postgres 会对同时轮询的查询进行流水线处理，降低六组聚合的总等待时间。
+    let (current_summary, baseline_summary, trend, baseline_trend, current_events, baseline_events) =
+        match tokio::try_join!(
+            query_performance_summary(&client, &filters, start, end),
+            query_performance_summary(&client, &filters, baseline_start, baseline_end),
+            query_performance_trend(&client, &filters, start, end, granularity.seconds()),
+            query_performance_trend(
+                &client,
+                &filters,
+                baseline_start,
+                baseline_end,
+                granularity.seconds(),
+            ),
+            query_event_performance(&client, &filters, start, end, limit),
+            query_event_performance(&client, &filters, baseline_start, baseline_end, 10_000),
+        ) {
+            Ok(result) => result,
+            Err(error_value) => {
+                error_logs(
+                    &req,
+                    "RequestPerformanceQueryError",
+                    &error_value.to_string(),
+                );
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+    let baseline_by_event: HashMap<(String, String), EventPerformance> = baseline_events
+        .into_iter()
+        .map(|event| ((event.method.clone(), event.route_pattern.clone()), event))
+        .collect();
+    let events: Vec<Value> = current_events
+        .into_iter()
+        .map(|event| {
+            let baseline =
+                baseline_by_event.get(&(event.method.clone(), event.route_pattern.clone()));
+            let baseline_p95 = baseline.and_then(|value| value.p95_ms);
+            let (p95_delta_ms, p95_delta_rate) = metric_delta(event.p95_ms, baseline_p95);
+            json!({
+                "method": event.method,
+                "route_pattern": event.route_pattern,
+                "normalized": event.normalized,
+                "sample_count": event.sample_count,
+                "avg_ms": event.avg_ms,
+                "p50_ms": event.p50_ms,
+                "p95_ms": event.p95_ms,
+                "p99_ms": event.p99_ms,
+                "max_ms": event.max_ms,
+                "baseline_sample_count": baseline.map(|value| value.sample_count).unwrap_or(0),
+                "baseline_p95_ms": baseline_p95,
+                "p95_delta_ms": p95_delta_ms,
+                "p95_delta_rate": p95_delta_rate,
+            })
+        })
+        .collect();
+    let (p50_delta_ms, p50_delta_rate) =
+        metric_delta(current_summary.p50_ms, baseline_summary.p50_ms);
+    let (p95_delta_ms, p95_delta_rate) =
+        metric_delta(current_summary.p95_ms, baseline_summary.p95_ms);
+    let (p99_delta_ms, p99_delta_rate) =
+        metric_delta(current_summary.p99_ms, baseline_summary.p99_ms);
+
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "summary": performance_summary_value(&current_summary),
+        "baseline": performance_summary_value(&baseline_summary),
+        "changes": {
+            "p50_delta_ms": p50_delta_ms,
+            "p50_delta_rate": p50_delta_rate,
+            "p95_delta_ms": p95_delta_ms,
+            "p95_delta_rate": p95_delta_rate,
+            "p99_delta_ms": p99_delta_ms,
+            "p99_delta_rate": p99_delta_rate,
+        },
+        "trend": trend,
+        "baseline_trend": baseline_trend,
+        "events": events,
+        "meta": {
+            "window": query.window.as_deref().unwrap_or("24h"),
+            "start": start,
+            "end": end,
+            "baseline_start": baseline_start,
+            "baseline_end": baseline_end,
+            "comparison_shift_seconds": duration.num_seconds(),
+            "granularity": granularity.label(),
+            "slow_threshold_ms": SLOW_REQUEST_US / 1000,
+            "event_limit": limit,
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_granularity, window_range};
+    use super::{metric_delta, performance_window, resolve_granularity, window_range};
     use chrono::{Duration, Utc};
 
     #[test]
@@ -507,5 +886,23 @@ mod tests {
     fn resolve_granularity_rejects_unknown_value() {
         let bad = Some("3m".to_string());
         assert!(resolve_granularity(&bad, None, None).is_err());
+    }
+
+    #[test]
+    fn performance_windows_are_bounded_for_baseline_comparison() {
+        assert_eq!(performance_window(Some("1h")).unwrap(), Duration::hours(1));
+        assert_eq!(performance_window(Some("24h")).unwrap(), Duration::days(1));
+        assert_eq!(performance_window(Some("7d")).unwrap(), Duration::days(7));
+        assert!(performance_window(Some("30d")).is_err());
+    }
+
+    #[test]
+    fn metric_delta_handles_missing_and_zero_baselines() {
+        assert_eq!(
+            metric_delta(Some(120.0), Some(100.0)),
+            (Some(20.0), Some(0.2))
+        );
+        assert_eq!(metric_delta(Some(5.0), Some(0.0)), (Some(5.0), None));
+        assert_eq!(metric_delta(Some(5.0), None), (None, None));
     }
 }

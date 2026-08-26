@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use cidr::IpInet;
 use deadpool_postgres::Pool;
+use lettre::transport::smtp::Error as LettreSmtpError;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use openssl::rand;
@@ -8,13 +9,18 @@ use postgres_from_row::FromRow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::error::Error;
+use std::fmt;
+use std::future::Future;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 use tokio_postgres::Row;
 use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
+use crate::client_ip::display_ip;
 use crate::config::{
     DEFAULT_SESSION_TTL_SECONDS, EmailConfig, MAX_SESSION_TTL_MINUTES, MIN_SESSION_TTL_MINUTES,
     MailSettingsRequest, MailSettingsResponse, NotificationPreferences, PasswordHashConfig,
@@ -37,6 +43,10 @@ const SESSION_TTL_SETTING_KEY: &str = "session_ttl_seconds";
 const SCAN_SETTING_TYPE: &str = "scan";
 const DEFAULT_SCAN_PROFILE_SETTING_KEY: &str = "default_profile";
 const FALLBACK_SCAN_PROFILE: &str = "legacy";
+const MAX_CONCURRENT_SMTP_SENDS: usize = 4;
+const BACKGROUND_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
+const INTERACTIVE_RETRY_DELAYS: [Duration; 1] = [Duration::from_secs(1)];
+static SMTP_SEND_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_SMTP_SENDS);
 
 pub enum UserRole {
     System = 0,
@@ -162,7 +172,8 @@ pub async fn get_user_id_and_name<'a>(
     let row = client
         .query_one(
             "SELECT s.user_id, u.username, u.role FROM session s JOIN users u ON s.user_id = u.id \
-         WHERE s.token = $1 AND s.is_enable = TRUE AND u.limit_login = FALSE \
+         WHERE s.token = $1 AND s.is_enable = TRUE AND s.deleted_at IS NULL \
+         AND u.limit_login = FALSE \
          AND u.disabled_at IS NULL AND u.deleted_at IS NULL;",
             &[&session],
         )
@@ -315,7 +326,9 @@ pub async fn reset_admin_password(
 
     transaction
         .execute(
-            "UPDATE session SET is_enable = false WHERE user_id = $1 AND is_enable = true;",
+            "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+             deletion_reason = 'password_reset', deleted_by_user_id = NULL \
+             WHERE user_id = $1 AND is_enable = TRUE AND deleted_at IS NULL;",
             &[&admin_id],
         )
         .await?;
@@ -404,30 +417,276 @@ pub async fn create_default_admin_user(
     transaction.commit().await.unwrap();
 }
 
-/// 发送邮件并将连接或发送错误返回给调用方。
+/// 区分后台通知和交互式测试，避免测试接口因多次长超时而阻塞过久。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailRetryPolicy {
+    Background,
+    Interactive,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MailRetrySettings {
+    max_attempts: u32,
+    timeout: Duration,
+    retry_delays: &'static [Duration],
+    jitter_ms: u64,
+}
+
+impl MailRetryPolicy {
+    const fn settings(self) -> MailRetrySettings {
+        match self {
+            Self::Background => MailRetrySettings {
+                max_attempts: 3,
+                timeout: Duration::from_secs(15),
+                retry_delays: &BACKGROUND_RETRY_DELAYS,
+                jitter_ms: 250,
+            },
+            Self::Interactive => MailRetrySettings {
+                max_attempts: 2,
+                timeout: Duration::from_secs(8),
+                retry_delays: &INTERACTIVE_RETRY_DELAYS,
+                jitter_ms: 100,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MailFailureKind {
+    TransientResponse,
+    PermanentResponse,
+    Timeout,
+    Tls,
+    Client,
+    InvalidResponse,
+    TransportShutdown,
+    ConnectionOrNetwork,
+    Internal,
+}
+
+impl MailFailureKind {
+    const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::TransientResponse
+                | Self::Timeout
+                | Self::TransportShutdown
+                | Self::ConnectionOrNetwork
+        )
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransientResponse => "transient_response",
+            Self::PermanentResponse => "permanent_response",
+            Self::Timeout => "timeout",
+            Self::Tls => "tls",
+            Self::Client => "client",
+            Self::InvalidResponse => "invalid_response",
+            Self::TransportShutdown => "transport_shutdown",
+            Self::ConnectionOrNetwork => "connection_or_network",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+fn classify_smtp_error(error: &LettreSmtpError) -> MailFailureKind {
+    // 先判定协议级永久错误，避免把响应文本中的 "timeout" 误判成网络超时。
+    if error.is_permanent() {
+        MailFailureKind::PermanentResponse
+    } else if error.is_tls() {
+        MailFailureKind::Tls
+    } else if error.is_client() {
+        MailFailureKind::Client
+    } else if error.is_response() {
+        MailFailureKind::InvalidResponse
+    } else if error.is_transient() {
+        MailFailureKind::TransientResponse
+    } else if error.is_timeout() {
+        MailFailureKind::Timeout
+    } else if error.is_transport_shutdown() {
+        MailFailureKind::TransportShutdown
+    } else {
+        // Lettre 0.11 没有公开 is_connection/is_network；排除上述类型后只剩连接或网络错误。
+        MailFailureKind::ConnectionOrNetwork
+    }
+}
+
+#[derive(Debug)]
+struct RetryFailure<E> {
+    error: E,
+    attempts: u32,
+    kind: MailFailureKind,
+}
+
+async fn retry_operation<E, F, Fut, C>(
+    settings: MailRetrySettings,
+    delivery_id: Uuid,
+    mut operation: F,
+    classify: C,
+) -> Result<u32, RetryFailure<E>>
+where
+    E: fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    C: Fn(&E) -> MailFailureKind,
+{
+    for attempt in 1..=settings.max_attempts {
+        match operation().await {
+            Ok(()) => return Ok(attempt),
+            Err(error_value) => {
+                let kind = classify(&error_value);
+                if !kind.is_retryable() || attempt == settings.max_attempts {
+                    return Err(RetryFailure {
+                        error: error_value,
+                        attempts: attempt,
+                        kind,
+                    });
+                }
+
+                let base_delay = settings
+                    .retry_delays
+                    .get((attempt - 1) as usize)
+                    .copied()
+                    .unwrap_or(Duration::ZERO);
+                let jitter_ms = if settings.jitter_ms == 0 {
+                    0
+                } else {
+                    ::rand::random_range(0..=settings.jitter_ms)
+                };
+                let delay = base_delay + Duration::from_millis(jitter_ms);
+                warn!(
+                    event = "MailSendRetryScheduled",
+                    %delivery_id,
+                    attempt,
+                    max_attempts = settings.max_attempts,
+                    delay_ms = delay.as_millis() as u64,
+                    error_kind = kind.as_str(),
+                    message = %error_value,
+                    "邮件发送失败，等待重试"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
+    unreachable!("邮件重试至少会执行一次")
+}
+
+/// 邮件发送最终失败，保留底层错误供现有接口生成管理员可读提示。
+#[derive(Debug)]
+pub struct MailSendError {
+    source: Box<dyn Error + Send + Sync>,
+    attempts: u32,
+    kind: MailFailureKind,
+}
+
+impl MailSendError {
+    fn new<E>(error_value: E, attempts: u32, kind: MailFailureKind) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self {
+            source: Box::new(error_value),
+            attempts,
+            kind,
+        }
+    }
+
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub const fn is_retryable(&self) -> bool {
+        self.kind.is_retryable()
+    }
+}
+
+impl fmt::Display for MailSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for MailSendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// 按调用场景执行有限重试，并将最终的连接或发送错误返回给调用方。
 pub async fn try_send_email(
     emailconf: &EmailConfig,
     port: u16,
     mail: Message,
-) -> Result<(), Box<dyn std::error::Error>> {
+    retry_policy: MailRetryPolicy,
+) -> Result<(), MailSendError> {
+    let settings = retry_policy.settings();
+    let delivery_id = Uuid::now_v7();
     let creds = Credentials::new(
         emailconf.account_username.to_string(),
         emailconf.account_password.to_string(),
     );
 
-    // relay 使用 SMTPS，并允许设置页指定服务器端口。
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&emailconf.host)
-        .map_err(|error_value| std::io::Error::other(format!("邮件服务器配置无效: {error_value}")))?
+    // relay 使用 SMTPS，并允许设置页指定服务器端口。每次重试重新建立 transport，
+    // 避免复用已处于异常状态的 SMTP 连接。
+    let mailer_builder = AsyncSmtpTransport::<Tokio1Executor>::relay(&emailconf.host)
+        .map_err(|error_value| {
+            MailSendError::new(
+                std::io::Error::other(format!("邮件服务器配置无效: {error_value}")),
+                0,
+                MailFailureKind::Internal,
+            )
+        })?
         .port(port)
         .credentials(creds)
-        .build();
-    mailer.send(mail).await?;
-    info!(
-        event = "SendEmailSuccessfully",
-        path = "fn try_send_email",
-        message = "Email sent successfully!"
-    );
-    Ok(())
+        .timeout(Some(settings.timeout));
+
+    let _permit = SMTP_SEND_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|error_value| MailSendError::new(error_value, 0, MailFailureKind::Internal))?;
+    let result = retry_operation(
+        settings,
+        delivery_id,
+        || {
+            let mailer = mailer_builder.clone().build();
+            let mail = mail.clone();
+            async move { mailer.send(mail).await.map(|_| ()) }
+        },
+        classify_smtp_error,
+    )
+    .await;
+
+    match result {
+        Ok(attempts) => {
+            info!(
+                event = "SendEmailSuccessfully",
+                path = "fn try_send_email",
+                %delivery_id,
+                attempts,
+                message = "Email sent successfully!"
+            );
+            Ok(())
+        }
+        Err(failure) => {
+            error!(
+                event = "SendEmailFailed",
+                path = "fn try_send_email",
+                %delivery_id,
+                attempts = failure.attempts,
+                error_kind = failure.kind.as_str(),
+                retryable = failure.kind.is_retryable(),
+                message = %failure.error,
+                "邮件发送最终失败"
+            );
+            Err(MailSendError::new(
+                failure.error,
+                failure.attempts,
+                failure.kind,
+            ))
+        }
+    }
 }
 
 /// 将 SMTP 发送错误映射为面向管理员的中文提示。
@@ -569,7 +828,8 @@ pub async fn bind_twofa(
     let updated = transaction
         .execute(
             "UPDATE session SET pending_totp_secret = $1, pending_totp_expires_at = $2 \
-         WHERE token = $3 AND is_enable = true AND totp_verify_successful = true \
+         WHERE token = $3 AND is_enable = true AND deleted_at IS NULL \
+         AND totp_verify_successful = true \
          AND user_id = (SELECT id FROM users WHERE username = $4 AND enable_2fa = false);",
             &[&encrypted_secret, &expires_at, &session, &username],
         )
@@ -595,7 +855,8 @@ pub async fn confirm_twofa_binding(
         .query_opt(
             "SELECT u.id, s.pending_totp_secret, s.pending_totp_expires_at \
          FROM session s JOIN users u ON u.id = s.user_id \
-         WHERE s.token = $1 AND s.is_enable = true AND s.totp_verify_successful = true \
+         WHERE s.token = $1 AND s.is_enable = true AND s.deleted_at IS NULL \
+         AND s.totp_verify_successful = true \
          AND u.username = $2 AND u.enable_2fa = false FOR UPDATE;",
             &[&session, &username],
         )
@@ -638,7 +899,13 @@ pub async fn confirm_twofa_binding(
     if enabled != 1 {
         return Err("启用 2FA 影响的用户数量异常".into());
     }
-    invalidate_user_sessions_in_transaction(&transaction, Some(username)).await?;
+    invalidate_user_sessions_in_transaction(
+        &transaction,
+        Some(username),
+        "totp_enabled",
+        Some(user_id),
+    )
+    .await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -646,20 +913,31 @@ pub async fn confirm_twofa_binding(
 async fn invalidate_user_sessions_in_transaction(
     transaction: &tokio_postgres::Transaction<'_>,
     username: Option<&str>,
+    reason: &str,
+    deleted_by_user_id: Option<i32>,
 ) -> Result<u64, tokio_postgres::Error> {
     match username {
-        Some(username) => transaction
-            .execute(
-                "UPDATE session SET is_enable = false WHERE is_enable = true AND user_id = (SELECT id FROM users WHERE username = $1);",
-                &[&username],
-            )
-            .await,
-        None => transaction
-            .execute(
-                "UPDATE session SET is_enable = false WHERE is_enable = true;",
-                &[],
-            )
-            .await,
+        Some(username) => {
+            transaction
+                .execute(
+                    "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+                 deletion_reason = $2, deleted_by_user_id = $3 \
+                 WHERE is_enable = TRUE AND deleted_at IS NULL \
+                   AND user_id = (SELECT id FROM users WHERE username = $1);",
+                    &[&username, &reason, &deleted_by_user_id],
+                )
+                .await
+        }
+        None => {
+            transaction
+                .execute(
+                    "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+                 deletion_reason = $1, deleted_by_user_id = $2 \
+                 WHERE is_enable = TRUE AND deleted_at IS NULL;",
+                    &[&reason, &deleted_by_user_id],
+                )
+                .await
+        }
     }
 }
 
@@ -670,7 +948,13 @@ pub async fn invalidate_user_sessions(
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let mut conn = pool.get().await?;
     let transaction = conn.transaction().await?;
-    let affected = invalidate_user_sessions_in_transaction(&transaction, username).await?;
+    let affected = invalidate_user_sessions_in_transaction(
+        &transaction,
+        username,
+        "security_policy_changed",
+        None,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(affected)
 }
@@ -699,7 +983,8 @@ pub async fn totp_verify_status_change(
     let db_transaction = conn.transaction().await?;
     let r = db_transaction
         .execute(
-            "UPDATE session SET totp_verify_successful = true WHERE token = $1;",
+            "UPDATE session SET totp_verify_successful = true \
+             WHERE token = $1 AND is_enable = TRUE AND deleted_at IS NULL;",
             &[&session],
         )
         .await?;
@@ -725,6 +1010,7 @@ pub async fn totp_verify_status_change(
 pub async fn unbind_2fa(
     username: &str,
     pool: &deadpool_postgres::Pool,
+    actor_user_id: i32,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut c = pool.get().await?;
     let db_transaction = c.transaction().await?;
@@ -735,7 +1021,13 @@ pub async fn unbind_2fa(
         )
         .await?;
     if r == 1 {
-        invalidate_user_sessions_in_transaction(&db_transaction, Some(username)).await?;
+        invalidate_user_sessions_in_transaction(
+            &db_transaction,
+            Some(username),
+            "totp_disabled",
+            Some(actor_user_id),
+        )
+        .await?;
         info!(
             event = "Unbind2FASuccessful",
             path = "fn unbind_2fa",
@@ -1061,8 +1353,11 @@ pub async fn write_session_settings_to_database(
     let invalidated_session_count = if settings.invalidate_other_sessions {
         transaction
             .execute(
-                "UPDATE session SET is_enable = false \
-                 WHERE is_enable = true AND token <> $1;",
+                "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+                 deletion_reason = 'session_policy_changed', \
+                 deleted_by_user_id = (SELECT user_id FROM session \
+                                       WHERE token = $1 AND deleted_at IS NULL LIMIT 1) \
+                 WHERE is_enable = TRUE AND deleted_at IS NULL AND token <> $1;",
                 &[&current_session],
             )
             .await?
@@ -1288,6 +1583,110 @@ mod mail_setting_tests {
     }
 }
 
+#[cfg(test)]
+mod mail_retry_tests {
+    use super::{MailFailureKind, MailRetryPolicy, MailRetrySettings, retry_operation};
+    use std::fmt;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    const TEST_RETRY_DELAYS: [Duration; 2] = [Duration::ZERO, Duration::ZERO];
+
+    #[derive(Clone, Copy, Debug)]
+    struct FakeError;
+
+    impl fmt::Display for FakeError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("fake send error")
+        }
+    }
+
+    fn test_settings(max_attempts: u32) -> MailRetrySettings {
+        MailRetrySettings {
+            max_attempts,
+            timeout: Duration::from_secs(1),
+            retry_delays: &TEST_RETRY_DELAYS,
+            jitter_ms: 0,
+        }
+    }
+
+    #[test]
+    fn retry_policies_bound_attempts_and_timeouts() {
+        let background = MailRetryPolicy::Background.settings();
+        assert_eq!(background.max_attempts, 3);
+        assert_eq!(background.timeout, Duration::from_secs(15));
+
+        let interactive = MailRetryPolicy::Interactive.settings();
+        assert_eq!(interactive.max_attempts, 2);
+        assert_eq!(interactive.timeout, Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn retryable_error_is_retried_until_success() {
+        let mut calls = 0_u32;
+        let attempts = retry_operation(
+            test_settings(3),
+            Uuid::nil(),
+            || {
+                calls += 1;
+                let current_call = calls;
+                async move {
+                    if current_call < 3 {
+                        Err(FakeError)
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |_| MailFailureKind::Timeout,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempts, 3);
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn permanent_error_is_not_retried() {
+        let mut calls = 0_u32;
+        let failure = retry_operation(
+            test_settings(3),
+            Uuid::nil(),
+            || {
+                calls += 1;
+                async { Err(FakeError) }
+            },
+            |_| MailFailureKind::PermanentResponse,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.attempts, 1);
+        assert_eq!(failure.kind, MailFailureKind::PermanentResponse);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn retryable_error_stops_at_attempt_limit() {
+        let mut calls = 0_u32;
+        let failure = retry_operation(
+            test_settings(3),
+            Uuid::nil(),
+            || {
+                calls += 1;
+                async { Err(FakeError) }
+            },
+            |_| MailFailureKind::ConnectionOrNetwork,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.attempts, 3);
+        assert_eq!(calls, 3);
+    }
+}
+
 /// 用户基础信息，主要用于中间件注入
 ///
 /// 只允许存储常用的基础信息，不会存储机密信息
@@ -1429,7 +1828,7 @@ pub async fn scanner_register(
 
 const SCANNER_INFO_SELECT: &str = "\
     SELECT s.scanner_id, s.name, u.username AS creator, s.location, \
-           host(s.ip_address) AS ip_address, s.system_version, s.scanner_version, \
+           s.ip_address, s.system_version, s.scanner_version, \
            s.cpu_model, s.cpus, s.ram, s.uptime, s.create_time, s.register_time, s.update_time, \
            s.last_seen_at, s.runtime_state, \
            (s.runtime_state <> 'stopping' AND s.last_seen_at IS NOT NULL \
@@ -1439,8 +1838,7 @@ const SCANNER_INFO_SELECT: &str = "\
               AND e.lease_expires_at > (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
               ORDER BY e.task_start_time DESC NULLS LAST LIMIT 1) AS current_task_id, \
            s.is_run, s.is_enable, s.remark, s.tag, s.supports_ipv4, s.supports_ipv6, \
-           s.ipv4_ready, s.ipv6_ready, host(s.public_ipv4) AS public_ipv4, \
-           host(s.public_ipv6) AS public_ipv6, s.network_status_reason, \
+           s.ipv4_ready, s.ipv6_ready, s.public_ipv4, s.public_ipv6, s.network_status_reason, \
            s.network_capabilities_updated_at, s.scan_capabilities, s.scan_capabilities_updated_at, \
            s.latency_rtt_us, s.latency_network_rtt_us, s.latency_server_processing_us, \
            s.latency_measured_at, \
@@ -1472,7 +1870,7 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         name: row.get("name"),
         creator: row.get("creator"),
         location: row.get("location"),
-        ip_address: row.get("ip_address"),
+        ip_address: display_ip(row.get("ip_address")),
         system_version: row.get("system_version"),
         scanner_version: row.get("scanner_version"),
         cpu_model: row.get("cpu_model"),
@@ -1494,8 +1892,8 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         supports_ipv6: row.get("supports_ipv6"),
         ipv4_ready: row.get("ipv4_ready"),
         ipv6_ready: row.get("ipv6_ready"),
-        public_ipv4: row.get("public_ipv4"),
-        public_ipv6: row.get("public_ipv6"),
+        public_ipv4: display_ip(row.get("public_ipv4")),
+        public_ipv6: display_ip(row.get("public_ipv6")),
         network_status_reason: row.get("network_status_reason"),
         network_capabilities_updated_at: row.get("network_capabilities_updated_at"),
         scan_capabilities: row.get("scan_capabilities"),

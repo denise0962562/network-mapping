@@ -9,6 +9,7 @@ use tracing::error;
 
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
+use crate::client_ip::display_ip;
 use crate::config::PasswordHashConfig;
 use crate::generate_hash_password;
 
@@ -213,11 +214,12 @@ pub async fn list_users(
     let limit = i64::from(page_size);
     let list_sql = format!(
         "SELECT u.id, u.username, u.email, u.role, u.enable_2fa, u.create_time, \
-         u.last_login_at, u.last_login_ip::TEXT AS last_login_ip, u.disabled_at, u.deleted_at, \
+         u.last_login_at, u.last_login_ip, u.disabled_at, u.deleted_at, \
          CASE WHEN u.deleted_at IS NOT NULL THEN 'deleted' \
               WHEN u.disabled_at IS NOT NULL THEN 'disabled' \
               WHEN u.limit_login THEN 'locked' ELSE 'active' END AS status, \
          (SELECT COUNT(*) FROM session s WHERE s.user_id = u.id AND s.is_enable = TRUE \
+          AND s.deleted_at IS NULL \
           AND s.create_time + s.ttl::BIGINT * 1000 > \
               (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT) AS active_session_count \
          FROM users u WHERE {FILTER} ORDER BY u.id DESC LIMIT $4 OFFSET $5;"
@@ -241,7 +243,7 @@ pub async fn list_users(
             active_session_count: row.get("active_session_count"),
             create_time: row.get("create_time"),
             last_login_at: row.get("last_login_at"),
-            last_login_ip: row.get("last_login_ip"),
+            last_login_ip: display_ip(row.get("last_login_ip")),
             disabled_at: row.get("disabled_at"),
             deleted_at: row.get("deleted_at"),
             is_self: row.get::<_, i32>("id") == user.id,
@@ -254,7 +256,8 @@ pub async fn list_users(
              COUNT(*) FILTER (WHERE disabled_at IS NOT NULL) AS disabled, \
              COUNT(*) FILTER (WHERE disabled_at IS NULL AND limit_login = TRUE) AS locked, \
              (SELECT COUNT(*) FROM session s JOIN users su ON su.id = s.user_id \
-              WHERE s.is_enable = TRUE AND su.role IN (1, 2) AND su.deleted_at IS NULL \
+              WHERE s.is_enable = TRUE AND s.deleted_at IS NULL \
+              AND su.role IN (1, 2) AND su.deleted_at IS NULL \
               AND s.create_time + s.ttl::BIGINT * 1000 > \
                   (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT) AS active_sessions \
              FROM users WHERE role IN (1, 2) AND deleted_at IS NULL;",
@@ -458,11 +461,15 @@ async fn protect_last_admin(
 async fn invalidate_target_sessions(
     transaction: &tokio_postgres::Transaction<'_>,
     user_id: i32,
+    reason: &str,
+    deleted_by_user_id: i32,
 ) -> Result<u64, ManagementError> {
     Ok(transaction
         .execute(
-            "UPDATE session SET is_enable = FALSE WHERE user_id = $1 AND is_enable = TRUE;",
-            &[&user_id],
+            "UPDATE session SET is_enable = FALSE, deleted_at = NOW(), \
+             deletion_reason = $2, deleted_by_user_id = $3 \
+             WHERE user_id = $1 AND is_enable = TRUE AND deleted_at IS NULL;",
+            &[&user_id, &reason, &deleted_by_user_id],
         )
         .await?)
 }
@@ -528,7 +535,7 @@ pub async fn set_user_enabled(
     let invalidated_session_count = if body.enabled {
         0
     } else {
-        match invalidate_target_sessions(&transaction, target.id).await {
+        match invalidate_target_sessions(&transaction, target.id, "user_disabled", user.id).await {
             Ok(value) => value,
             Err(value) => return error_response("SetManagedUserStatusSessionError", value),
         }
@@ -595,10 +602,11 @@ pub async fn kick_user(
         Ok(value) => value,
         Err(value) => return error_response("KickManagedUserTargetError", value),
     };
-    let count = match invalidate_target_sessions(&transaction, target.id).await {
-        Ok(value) => value,
-        Err(value) => return error_response("KickManagedUserSessionError", value),
-    };
+    let count =
+        match invalidate_target_sessions(&transaction, target.id, "admin_kick", user.id).await {
+            Ok(value) => value,
+            Err(value) => return error_response("KickManagedUserSessionError", value),
+        };
     let mut event = AuditEvent::user("user_security", "user.kick", "success", &user)
         .resource("user", target.id.to_string());
     event.response_status = Some(200);
@@ -665,10 +673,11 @@ pub async fn delete_user(
     {
         return error_response("DeleteManagedUserError", error_value.into());
     }
-    let count = match invalidate_target_sessions(&transaction, target.id).await {
-        Ok(value) => value,
-        Err(value) => return error_response("DeleteManagedUserSessionError", value),
-    };
+    let count =
+        match invalidate_target_sessions(&transaction, target.id, "user_deleted", user.id).await {
+            Ok(value) => value,
+            Err(value) => return error_response("DeleteManagedUserSessionError", value),
+        };
     let mut event = AuditEvent::user("user_security", "user.delete", "success", &user)
         .resource("user", target.id.to_string());
     event.response_status = Some(200);

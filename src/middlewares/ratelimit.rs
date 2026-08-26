@@ -218,8 +218,9 @@ fn rate_limit_key(req: &ServiceRequest, path: &str, client: &str) -> String {
 fn client_identifier(req: &ServiceRequest) -> String {
     req.connection_info()
         .realip_remote_addr()
-        .unwrap_or("unknown")
-        .to_owned()
+        .and_then(crate::client_ip::parse_ip)
+        .map(|address| address.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn bearer_fingerprint(req: &ServiceRequest) -> Option<u64> {
