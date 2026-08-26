@@ -1152,6 +1152,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::audit::get_audit_event)
         .service(handlers::requests::list_requests)
         .service(handlers::requests::request_summary)
+        .service(handlers::requests::request_performance)
         .service(handlers::health::list_health_alerts)
         .service(handlers::backup::backup_summary)
         .service(handlers::backup::list_backup_jobs)

@@ -377,7 +377,10 @@ async fn main() -> io::Result<()> {
                     if capture {
                         let status = response.status().as_u16();
                         let (error_level, error_type) = request_log::classify_status(status);
-                        let duration_ms = i32::try_from(started.elapsed().as_millis()).ok();
+                        let elapsed = started.elapsed();
+                        let duration_ms = i32::try_from(elapsed.as_millis()).ok();
+                        let duration_us = i64::try_from(elapsed.as_micros()).ok();
+                        let route_pattern = response.request().match_pattern();
                         let actor = actor
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -426,8 +429,10 @@ async fn main() -> io::Result<()> {
                             occurred_at: chrono::Utc::now(),
                             http_method: method,
                             request_path: path,
+                            route_pattern,
                             status_code: status as i16,
                             duration_ms,
+                            duration_us,
                             client_ip,
                             user_agent,
                             actor_id,

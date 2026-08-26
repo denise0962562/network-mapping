@@ -821,6 +821,8 @@ CREATE TABLE IF NOT EXISTS request_log (
 	request_path TEXT NOT NULL,
 	status_code SMALLINT NOT NULL,
 	duration_ms INTEGER,
+	duration_us BIGINT,
+	route_pattern TEXT,
 	client_ip INET,
 	user_agent TEXT,
 	actor_id INT,                        -- 已认证用户 id；匿名/扫描器请求为 NULL
@@ -829,6 +831,10 @@ CREATE TABLE IF NOT EXISTS request_log (
 		CHECK (error_level IN ('ok', 'client_error', 'server_error')),
 	error_type TEXT                      -- bad_request / unauthorized / not_found / ...
 );
+
+-- 兼容已经创建 request_log 的部署：保留 duration_ms，新增微秒精度和标准化路由。
+ALTER TABLE request_log ADD COLUMN IF NOT EXISTS duration_us BIGINT;
+ALTER TABLE request_log ADD COLUMN IF NOT EXISTS route_pattern TEXT;
 
 -- 只保留 2 个索引：分页/趋势/保留清理走 time 索引，错误查询与错误率趋势走 error 索引。
 CREATE INDEX IF NOT EXISTS idx_request_log_time

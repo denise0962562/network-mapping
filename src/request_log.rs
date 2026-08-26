@@ -28,8 +28,10 @@ pub struct RequestLogEntry {
     pub occurred_at: DateTime<Utc>,
     pub http_method: String,
     pub request_path: String,
+    pub route_pattern: Option<String>,
     pub status_code: i16,
     pub duration_ms: Option<i32>,
+    pub duration_us: Option<i64>,
     pub client_ip: Option<IpAddr>,
     pub user_agent: Option<String>,
     pub actor_id: Option<i32>,
@@ -126,7 +128,7 @@ async fn flush_batch(pool: &Pool, batch: &mut Vec<RequestLogEntry>, dropped: &mu
     }
 }
 
-const COLUMN_COUNT: usize = 12;
+const COLUMN_COUNT: usize = 14;
 
 async fn insert_batch(
     pool: &Pool,
@@ -140,7 +142,7 @@ async fn insert_batch(
 
     let mut sql = String::from(
         "INSERT INTO request_log (request_id, occurred_at, http_method, request_path, \
-         status_code, duration_ms, client_ip, user_agent, actor_id, actor_name, \
+         route_pattern, status_code, duration_ms, duration_us, client_ip, user_agent, actor_id, actor_name, \
          error_level, error_type) VALUES ",
     );
     let mut params: Vec<Box<dyn ToSql + Send + Sync>> =
@@ -151,7 +153,7 @@ async fn insert_batch(
         }
         let base = index * COLUMN_COUNT;
         sql.push_str(&format!(
-            "(${},${},${},${},${},${},${},${},${},${},${},${})",
+            "(${},${},${},${},${},${},${},${},${},${},${},${},${},${})",
             base + 1,
             base + 2,
             base + 3,
@@ -164,13 +166,17 @@ async fn insert_batch(
             base + 10,
             base + 11,
             base + 12,
+            base + 13,
+            base + 14,
         ));
         params.push(Box::new(entry.request_id));
         params.push(Box::new(entry.occurred_at));
         params.push(Box::new(entry.http_method.clone()));
         params.push(Box::new(entry.request_path.clone()));
+        params.push(Box::new(entry.route_pattern.clone()));
         params.push(Box::new(entry.status_code));
         params.push(Box::new(entry.duration_ms));
+        params.push(Box::new(entry.duration_us));
         params.push(Box::new(entry.client_ip));
         params.push(Box::new(entry.user_agent.clone()));
         params.push(Box::new(entry.actor_id));
