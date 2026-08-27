@@ -536,7 +536,7 @@ CREATE TABLE IF NOT EXISTS audit_event (
 	occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	category TEXT NOT NULL CONSTRAINT audit_event_category_check CHECK (category IN (
 		'authentication', 'authorization', 'user_security', 'task', 'scanner',
-		'automatic_target', 'configuration', 'data_access', 'audit'
+		'automatic_target', 'configuration', 'data_access', 'audit', 'backup'
 	)),
 	action TEXT NOT NULL,
 	outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied')),
@@ -557,7 +557,7 @@ CREATE TABLE IF NOT EXISTS audit_event (
 	metadata JSONB NOT NULL DEFAULT '{}'::JSONB
 );
 
--- 兼容尚未包含系统生成目标分类的已有审计表。
+-- 兼容尚未包含新审计分类的已有审计表。
 DO $$
 BEGIN
     IF EXISTS (
@@ -565,7 +565,10 @@ BEGIN
         FROM pg_constraint
         WHERE conrelid = 'audit_event'::regclass
           AND conname = 'audit_event_category_check'
-          AND POSITION('automatic_target' IN pg_get_constraintdef(oid)) = 0
+          AND (
+              POSITION('automatic_target' IN pg_get_constraintdef(oid)) = 0
+              OR POSITION('backup' IN pg_get_constraintdef(oid)) = 0
+          )
     ) THEN
         ALTER TABLE audit_event DROP CONSTRAINT audit_event_category_check;
     END IF;
@@ -578,7 +581,7 @@ BEGIN
     ) THEN
         ALTER TABLE audit_event ADD CONSTRAINT audit_event_category_check CHECK (category IN (
             'authentication', 'authorization', 'user_security', 'task', 'scanner',
-            'automatic_target', 'configuration', 'data_access', 'audit'
+            'automatic_target', 'configuration', 'data_access', 'audit', 'backup'
         ));
     END IF;
 END $$;

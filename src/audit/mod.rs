@@ -176,7 +176,26 @@ pub async fn write_standalone(pool: &Pool, context: &AuditContext, event: &Audit
         }
     };
     if let Err(error_value) = write(&client, context, event).await {
-        error!(event = "AuditWriteError", request_id = %context.request_id, message = %error_value);
+        if let Some(database_error) = error_value.as_db_error() {
+            error!(
+                event = "AuditWriteError",
+                request_id = %context.request_id,
+                category = %event.category,
+                action = %event.action,
+                sqlstate = database_error.code().code(),
+                constraint = database_error.constraint().unwrap_or(""),
+                detail = database_error.detail().unwrap_or(""),
+                message = database_error.message(),
+            );
+        } else {
+            error!(
+                event = "AuditWriteError",
+                request_id = %context.request_id,
+                category = %event.category,
+                action = %event.action,
+                message = %error_value,
+            );
+        }
         return false;
     }
     true
@@ -206,5 +225,16 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137)))
         );
         assert_eq!(parse_ip("unknown"), None);
+    }
+
+    #[test]
+    fn database_schema_allows_backup_audit_events_and_migrates_existing_constraints() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+
+        assert!(initialization_sql.contains("'data_access', 'audit', 'backup'\n\t))"));
+        assert!(initialization_sql.contains("'data_access', 'audit', 'backup'\n        ))"));
+        assert!(
+            initialization_sql.contains("OR POSITION('backup' IN pg_get_constraintdef(oid)) = 0")
+        );
     }
 }
