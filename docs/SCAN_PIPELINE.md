@@ -24,15 +24,22 @@
 - `upload_id`：一个任务缓存周期内保持稳定；
 - `batch_index`：从 0 开始的批次序号；
 - `is_final`：是否为最后一批。
+- `observed_at`：观察产生时的 Unix epoch 毫秒时间，重试时保持不变。
 
-服务端通过 `(execution_id, upload_id, batch_index)` 唯一约束实现批次幂等。观察结果写入
-`scan_observation`，并投影到 `ips`、`ports` 供资产索引与地理信息查询使用，不再写入
-`scaninfo`。服务端以单条集合化 SQL 写入整批观察结果，并按 IP 和 `(IP, port)` 去重后更新
-资产投影；同一端点的端口观察和服务观察不会重复执行资产 UPSERT。
+扫描器将任务、稳定上传身份、观察和已确认批次序号持久化到本地状态文件，重启后先恢复
+未完成上传。服务端通过 `(execution_id, upload_id, batch_index)` 回执和 payload SHA-256
+实现批次幂等，并要求最终批形成从 0 开始的连续序列。
+
+`elasticsearch.scan_storage=postgres` 时，观察写入 `scan_observation` 并投影到 `ips`、
+`ports`；`dual` 同时写入 ES；`elasticsearch` 时 PostgreSQL 只保存控制面和上传回执，原始
+观察及执行/当前端点投影均由 ES 保存。迁移和恢复流程参见
+[`ELASTICSEARCH.md`](ELASTICSEARCH.md)。
 只有最终批提交后任务执行才进入 `succeeded`。协议版本 1 的 `results` 请求继续支持，便于
 滚动升级旧扫描器。
 
-`scan_observation` 是扫描结果的事实来源；`ips`、`ports` 是资产与端口索引。读取接口按
+PostgreSQL 模式下 `scan_observation` 是事实来源，`ips`、`ports` 是资产与端口索引；ES
+权威模式下对应角色分别由月度 observation 索引和 execution/current endpoint 索引承担。
+读取接口按
 `scan_execution_endpoint_latest` 定义的顺序选择一次执行内的展示结果：服务观察优先于端口观察，
 再按观察时间和记录 ID 排序。端点列表使用参数化查询，仅检查当前端点的观察记录，避免为分页
 结果计算全表窗口。任务详情、搜索、导出和分析查询均不依赖 `scaninfo`。协议版本

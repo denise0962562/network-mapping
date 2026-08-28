@@ -100,11 +100,18 @@ command_timeout_seconds = 21600
 max_output_bytes = 1048576
 
 [elasticsearch]
-# Elasticsearch 9.5.2 搜索读模型。首次接入先只开启写入，完成全量回填和校验后再开启读取。
+# Elasticsearch 9.5.2 搜索和扫描事实存储。首次接入使用 dual，完成迁移校验后再切换读取。
 enabled = false
 read_enabled = false
+# postgres: 仅 PostgreSQL；dual: 双写核对；elasticsearch: ES 保存扫描事实，PG 仅保存控制面和上传回执。
+scan_storage = "postgres"
 url = "https://127.0.0.1:9200"
 index = "network-mapping-assets-v1"
+observation_index_prefix = "network-mapping-scan-observations-v1"
+execution_endpoint_index = "network-mapping-execution-endpoints-v1"
+current_endpoint_index = "network-mapping-endpoints-current-v2"
+# dual 模式的单节点开发环境可设为 0；正式切换为 elasticsearch 时必须至少为 1。
+scan_number_of_replicas = 1
 expected_version = "9.5.2"
 # 认证二选一；生产环境不要把真实密钥提交到仓库。
 # api_key = "base64-encoded-api-key"
@@ -115,7 +122,7 @@ expected_version = "9.5.2"
 request_timeout_seconds = 30
 poll_interval_ms = 500
 bulk_batch_size = 500
-# ES 不可用、尚未完成全量同步或查询包含 has_endpoint/NOT 时回退 PostgreSQL 当前投影。
+# 只影响 postgres/dual 的旧搜索副本；elasticsearch 权威模式始终失败关闭，不回退陈旧事实。
 fallback_to_postgres = true
 
 [database]

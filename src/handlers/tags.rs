@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
+use crate::elasticsearch::ElasticsearchService;
 use crate::logs::write::error_logs;
 use crate::search_projection;
 use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, patch, post, web};
@@ -269,6 +270,7 @@ pub(crate) async fn create_tag(
 pub(crate) async fn update_tag(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     user: UserBaseI,
     tag_id: web::Path<i64>,
     payload: web::Json<UpdateTagRequest>,
@@ -298,6 +300,21 @@ pub(crate) async fn update_tag(
                 .json(json!({"success": false, "message": "标签不存在"}));
         }
         Err(error_value) => return database_error(&req, "UpdateTagLookupError", &error_value),
+    };
+    let assigned_ips = match transaction
+        .query(
+            "SELECT host(ip_address) AS ip FROM asset_ip_tag WHERE tag_id = $1;",
+            &[&tag_id],
+        )
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| row.get::<_, String>("ip"))
+            .collect::<Vec<_>>(),
+        Err(error_value) => {
+            return database_error(&req, "UpdateTagAssignmentsLookupError", &error_value);
+        }
     };
     let duplicate: bool = match transaction
         .query_one(
@@ -365,6 +382,15 @@ pub(crate) async fn update_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "UpdateTagCommitError", &error_value);
     }
+    if elasticsearch.scan_storage_mode().writes_elasticsearch()
+        && let Err(error) =
+            refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &assigned_ips)
+                .await
+    {
+        error_logs(&req, "UpdateTagElasticsearchProjectionError", &error);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"success": false, "message": "标签已更新，但搜索投影更新失败"}));
+    }
     HttpResponse::Ok().json(json!({"success": true, "data": {"tag": updated}}))
 }
 
@@ -372,6 +398,7 @@ pub(crate) async fn update_tag(
 pub(crate) async fn delete_tag(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     user: UserBaseI,
     tag_id: web::Path<i64>,
 ) -> impl Responder {
@@ -394,6 +421,21 @@ pub(crate) async fn delete_tag(
                 .json(json!({"success": false, "message": "标签不存在"}));
         }
         Err(error_value) => return database_error(&req, "DeleteTagLookupError", &error_value),
+    };
+    let assigned_ips = match transaction
+        .query(
+            "SELECT host(ip_address) AS ip FROM asset_ip_tag WHERE tag_id = $1;",
+            &[&tag_id],
+        )
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| row.get::<_, String>("ip"))
+            .collect::<Vec<_>>(),
+        Err(error_value) => {
+            return database_error(&req, "DeleteTagAssignmentsLookupError", &error_value);
+        }
     };
     if let Err(error_value) = search_projection::enqueue_tag_assignments(&transaction, tag_id).await
     {
@@ -431,6 +473,15 @@ pub(crate) async fn delete_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "DeleteTagCommitError", &error_value);
     }
+    if elasticsearch.scan_storage_mode().writes_elasticsearch()
+        && let Err(error) =
+            refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &assigned_ips)
+                .await
+    {
+        error_logs(&req, "DeleteTagElasticsearchProjectionError", &error);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"success": false, "message": "标签已删除，但搜索投影更新失败"}));
+    }
     HttpResponse::Ok().json(json!({"success": true}))
 }
 
@@ -438,6 +489,7 @@ pub(crate) async fn delete_tag(
 pub(crate) async fn assign_tag(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     user: UserBaseI,
     payload: web::Json<AssignTagRequest>,
 ) -> impl Responder {
@@ -458,17 +510,28 @@ pub(crate) async fn assign_tag(
         Ok(value) => value,
         Err(error_value) => return database_error(&req, "AssignTagTransactionError", &error_value),
     };
-    let exists: bool = match transaction
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM scan_observation observation \
-             JOIN scan_task_execution execution ON execution.id = observation.execution_id \
-             WHERE observation.ip_address = $1::TEXT::INET AND execution.execution_status = 'succeeded') AS exists;",
-            &[&ip],
-        )
-        .await
-    {
-        Ok(row) => row.get("exists"),
-        Err(error_value) => return database_error(&req, "AssignTagAssetLookupError", &error_value),
+    let exists = if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        match elasticsearch.scan_asset_exists(&ip).await {
+            Ok(value) => value,
+            Err(error) => {
+                error_logs(&req, "AssignTagAssetElasticsearchError", &error);
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"success": false, "message": "扫描结果索引暂时不可用"}));
+            }
+        }
+    } else {
+        match transaction
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM scan_observation observation \
+                 JOIN scan_task_execution execution ON execution.id = observation.execution_id \
+                 WHERE observation.ip_address = $1::TEXT::INET AND execution.execution_status = 'succeeded') AS exists;",
+                &[&ip],
+            )
+            .await
+        {
+            Ok(row) => row.get("exists"),
+            Err(error_value) => return database_error(&req, "AssignTagAssetLookupError", &error_value),
+        }
     };
     if !exists {
         return HttpResponse::NotFound().json(json!({"success": false, "message": "资产不存在"}));
@@ -556,6 +619,14 @@ pub(crate) async fn assign_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "AssignTagCommitError", &error_value);
     }
+    if elasticsearch.scan_storage_mode().writes_elasticsearch()
+        && let Err(error) =
+            refresh_elasticsearch_tags(pool.get_ref(), elasticsearch.get_ref(), &ip).await
+    {
+        error_logs(&req, "AssignTagElasticsearchProjectionError", &error);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"success": false, "message": "标签已保存，但搜索投影更新失败"}));
+    }
     HttpResponse::Created().json(json!({"success": true, "data": {"tag": tag, "created": true}}))
 }
 
@@ -563,6 +634,7 @@ pub(crate) async fn assign_tag(
 pub(crate) async fn remove_tag(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     user: UserBaseI,
     tag_id: web::Path<i64>,
     query: web::Query<RemoveTagQuery>,
@@ -626,7 +698,45 @@ pub(crate) async fn remove_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "RemoveTagCommitError", &error_value);
     }
+    if elasticsearch.scan_storage_mode().writes_elasticsearch()
+        && let Err(error) =
+            refresh_elasticsearch_tags(pool.get_ref(), elasticsearch.get_ref(), &ip).await
+    {
+        error_logs(&req, "RemoveTagElasticsearchProjectionError", &error);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"success": false, "message": "标签已删除，但搜索投影更新失败"}));
+    }
     HttpResponse::Ok().json(json!({"success": true}))
+}
+
+async fn refresh_elasticsearch_tags(
+    pool: &Pool,
+    elasticsearch: &ElasticsearchService,
+    ip: &str,
+) -> Result<(), String> {
+    let connection = pool.get().await.map_err(|error| error.to_string())?;
+    let rows = connection
+        .query(
+            "SELECT tag.id, tag.name, tag.kind, tag.description \
+             FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
+             WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active ORDER BY tag.id;",
+            &[&ip],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let tags = rows.iter().map(tag_from_row).collect::<Vec<_>>();
+    elasticsearch.refresh_scan_asset_tags(ip, &tags).await
+}
+
+async fn refresh_elasticsearch_tag_ips(
+    pool: &Pool,
+    elasticsearch: &ElasticsearchService,
+    ips: &[String],
+) -> Result<(), String> {
+    for ip in ips {
+        refresh_elasticsearch_tags(pool, elasticsearch, ip).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

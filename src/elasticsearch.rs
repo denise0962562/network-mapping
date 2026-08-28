@@ -2,18 +2,59 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use deadpool_postgres::Pool;
+use deadpool_postgres::{GenericClient, Pool};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::interval;
 use tracing::{error, info, warn};
 
-use crate::config::ElasticsearchConfig;
+use crate::config::{ElasticsearchConfig, ScanStorageMode};
 use crate::handlers::tags::{AssetTag, tags_from_json};
 
 const INDEX_SCHEMA_VERSION: &str = "1";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
+const SCAN_INDEX_SCHEMA_VERSION: &str = "1";
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScanBatchContext {
+    pub(crate) task_id: String,
+    pub(crate) execution_id: String,
+    pub(crate) user_id: i32,
+    pub(crate) task_source: String,
+    pub(crate) scanner_id: String,
+    pub(crate) scanner_name: Option<String>,
+    pub(crate) upload_id: String,
+    pub(crate) batch_index: i32,
+    pub(crate) is_final: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScanBatchWriteResult {
+    pub(crate) payload_checksum: String,
+    pub(crate) indices: Vec<String>,
+    pub(crate) execution_summary: Option<ScanExecutionSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ScanExecutionSummary {
+    pub(crate) ip_count: i64,
+    pub(crate) port_count: i64,
+    pub(crate) observation_count: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanMigrationReport {
+    pub batches: u64,
+    pub observations: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ScanQueryIndex {
+    Observations,
+    ExecutionEndpoints,
+    CurrentEndpoints,
+}
 
 #[derive(Clone)]
 pub struct ElasticsearchService {
@@ -42,6 +83,10 @@ pub(crate) struct ElasticsearchStatus {
     pub fallback_to_postgres: bool,
     pub url: String,
     pub index: String,
+    pub scan_storage: ScanStorageMode,
+    pub observation_index_prefix: String,
+    pub execution_endpoint_index: String,
+    pub current_endpoint_index: String,
     pub expected_version: String,
     #[serde(flatten)]
     pub runtime: ElasticsearchRuntime,
@@ -186,6 +231,105 @@ impl ElasticsearchService {
         self.inner.config.fallback_to_postgres
     }
 
+    pub fn scan_storage_mode(&self) -> ScanStorageMode {
+        self.inner.config.scan_storage
+    }
+
+    pub(crate) async fn scan_query(
+        &self,
+        index: ScanQueryIndex,
+        body: &Value,
+    ) -> Result<Value, String> {
+        if !self.inner.config.scan_storage.reads_elasticsearch() || !self.can_read() {
+            return Err("Elasticsearch 扫描事实读路径尚未就绪".to_owned());
+        }
+        let index = match index {
+            ScanQueryIndex::Observations => {
+                format!(
+                    "{}-*/_search?allow_no_indices=true&ignore_unavailable=true",
+                    self.inner.config.observation_index_prefix
+                )
+            }
+            ScanQueryIndex::ExecutionEndpoints => {
+                format!("{}/_search", self.inner.config.execution_endpoint_index)
+            }
+            ScanQueryIndex::CurrentEndpoints => {
+                format!("{}/_search", self.inner.config.current_endpoint_index)
+            }
+        };
+        let response = self
+            .request(Method::POST, &format!("/{index}"))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = response_json(response).await?;
+        self.mark_success();
+        Ok(result)
+    }
+
+    pub(crate) async fn scan_asset_exists(&self, ip: &str) -> Result<bool, String> {
+        let result = self
+            .scan_query(
+                ScanQueryIndex::CurrentEndpoints,
+                &json!({
+                    "size": 0, "track_total_hits": true,
+                    "query": {"bool": {"filter": [
+                        {"term": {"scope_type": "global"}},
+                        {"term": {"scope_id": 0}},
+                        {"term": {"ip": ip}}
+                    ]}}
+                }),
+            )
+            .await?;
+        Ok(result
+            .pointer("/hits/total/value")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            > 0)
+    }
+
+    pub(crate) async fn refresh_scan_asset_tags(
+        &self,
+        ip: &str,
+        tags: &[AssetTag],
+    ) -> Result<(), String> {
+        if !self.inner.config.scan_storage.writes_elasticsearch() {
+            return Ok(());
+        }
+        let tag_names = tags.iter().map(|tag| tag.name.clone()).collect::<Vec<_>>();
+        let tag_ids = tags.iter().map(|tag| tag.id).collect::<Vec<_>>();
+        let tag_kinds = tags.iter().map(|tag| tag.kind.clone()).collect::<Vec<_>>();
+        let response = self
+            .request(
+                Method::POST,
+                &format!(
+                    "/{}/_update_by_query?conflicts=proceed&refresh=true&wait_for_completion=true",
+                    self.inner.config.current_endpoint_index
+                ),
+            )
+            .json(&json!({
+                "query": {"term": {"ip": ip}},
+                "script": {"lang": "painless", "source":
+                    "ctx._source.tags=params.tags; ctx._source.tag_names=params.names; ctx._source.tag_ids=params.ids; ctx._source.tag_kinds=params.kinds;",
+                    "params": {"tags": tags, "names": tag_names, "ids": tag_ids, "kinds": tag_kinds}}
+            }))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = response_json(response).await?;
+        let failures = result
+            .get("failures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("Elasticsearch 标签投影更新失败：{}", failures[0]))
+        }
+    }
+
     pub fn runtime(&self) -> ElasticsearchRuntime {
         self.inner
             .runtime
@@ -236,7 +380,12 @@ impl ElasticsearchService {
                 self.inner.config.expected_version
             ));
         }
-        let state = self.ensure_index().await?;
+        self.ensure_scan_indices().await?;
+        let state = if self.inner.config.scan_storage.reads_elasticsearch() {
+            IndexState::Existing
+        } else {
+            self.ensure_index().await?
+        };
         if state == IndexState::Created {
             let mut connection = pool.get().await.map_err(|error| error.to_string())?;
             let transaction = connection
@@ -270,16 +419,20 @@ impl ElasticsearchService {
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        let connection = pool.get().await.map_err(|error| error.to_string())?;
-        let synced: bool = connection
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM search_projection_state \
-                 WHERE state_key = 'elasticsearch_full_sync_index' AND state_value = $1) AS synced;",
-                &[&self.inner.config.index],
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .get("synced");
+        let synced = if self.inner.config.scan_storage.reads_elasticsearch() {
+            true
+        } else {
+            let connection = pool.get().await.map_err(|error| error.to_string())?;
+            connection
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM search_projection_state \
+                     WHERE state_key = 'elasticsearch_full_sync_index' AND state_value = $1) AS synced;",
+                    &[&self.inner.config.index],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .get("synced")
+        };
         self.update_runtime(|runtime| {
             runtime.connected = true;
             runtime.read_ready = synced;
@@ -304,6 +457,541 @@ impl ElasticsearchService {
         }
         self.create_index().await?;
         Ok(IndexState::Created)
+    }
+
+    async fn ensure_scan_indices(&self) -> Result<(), String> {
+        if !self.inner.config.scan_storage.writes_elasticsearch() {
+            return Ok(());
+        }
+        let template_name = format!("{}-template", self.inner.config.observation_index_prefix);
+        let response = self
+            .request(Method::PUT, &format!("/_index_template/{template_name}"))
+            .json(&scan_observation_template(
+                &self.inner.config.observation_index_prefix,
+                self.inner.config.scan_number_of_replicas,
+            ))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        response_json(response).await?;
+        self.ensure_named_index(
+            &self.inner.config.execution_endpoint_index,
+            &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
+        )
+        .await?;
+        self.ensure_named_index(
+            &self.inner.config.current_endpoint_index,
+            &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
+        )
+        .await
+    }
+
+    async fn ensure_named_index(&self, index: &str, definition: &Value) -> Result<(), String> {
+        let response = self
+            .request(Method::HEAD, index)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        if response.status() != StatusCode::NOT_FOUND {
+            return Err(response_error(response).await);
+        }
+        let response = self
+            .request(Method::PUT, index)
+            .json(definition)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        response_json(response).await.map(|_| ())
+    }
+
+    pub(crate) async fn persist_scan_batch(
+        &self,
+        context: &ScanBatchContext,
+        observations: &[Value],
+    ) -> Result<ScanBatchWriteResult, String> {
+        if !self.inner.config.scan_storage.writes_elasticsearch() {
+            return Err("当前配置未启用 Elasticsearch 扫描事实写入".to_owned());
+        }
+        self.ensure_scan_indices().await?;
+
+        let payload_checksum = scan_batch_payload_checksum(context, observations)?;
+        let mut body = String::new();
+        let mut expected = Vec::with_capacity(observations.len());
+        let mut indices = std::collections::BTreeSet::new();
+        for observation in observations {
+            let observed_at_ms = observation
+                .get("observed_at")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "扫描观察缺少 observed_at".to_owned())?;
+            let observation_key = observation
+                .get("observation_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "扫描观察缺少 observation_key".to_owned())?;
+            let index = scan_observation_index(
+                &self.inner.config.observation_index_prefix,
+                observed_at_ms,
+            )?;
+            let document_id =
+                sha256_hex(format!("{}\0{observation_key}", context.execution_id).as_bytes());
+            let mut document = observation.clone();
+            {
+                let object = document
+                    .as_object_mut()
+                    .ok_or_else(|| "扫描观察必须是 JSON object".to_owned())?;
+                object.insert("task_id".to_owned(), json!(context.task_id));
+                object.insert("execution_id".to_owned(), json!(context.execution_id));
+                object.insert("user_id".to_owned(), json!(context.user_id));
+                object.insert("task_source".to_owned(), json!(context.task_source));
+                object.insert("scanner_id".to_owned(), json!(context.scanner_id));
+                object.insert("scanner_name".to_owned(), json!(context.scanner_name));
+                object.insert("upload_id".to_owned(), json!(context.upload_id));
+                object.insert("batch_index".to_owned(), json!(context.batch_index));
+                object.insert("payload_checksum".to_owned(), json!(payload_checksum));
+            }
+            let document_checksum = sha256_hex(
+                &serde_json::to_vec(&immutable_scan_observation(observation))
+                    .map_err(|error| error.to_string())?,
+            );
+            document
+                .as_object_mut()
+                .expect("scan observation is an object")
+                .insert("document_checksum".to_owned(), json!(document_checksum));
+            body.push_str(
+                &serde_json::to_string(&json!({"create": {"_index": index, "_id": document_id}}))
+                    .map_err(|error| error.to_string())?,
+            );
+            body.push('\n');
+            body.push_str(&serde_json::to_string(&document).map_err(|error| error.to_string())?);
+            body.push('\n');
+            expected.push((
+                index.clone(),
+                document_id,
+                document_checksum,
+                payload_checksum.clone(),
+            ));
+            indices.insert(index);
+        }
+
+        if !body.is_empty() {
+            let refresh = if context.is_final {
+                "&refresh=wait_for"
+            } else {
+                ""
+            };
+            let response = self
+                .request(
+                    Method::POST,
+                    &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+                )
+                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                .body(body)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let result = response_json(response).await?;
+            self.validate_scan_bulk_result(&result, &expected).await?;
+        }
+
+        self.update_scan_endpoint_projections(context, observations)
+            .await?;
+        self.mark_success();
+        let execution_summary = if context.is_final {
+            Some(self.execution_summary(&context.execution_id).await?)
+        } else {
+            None
+        };
+        Ok(ScanBatchWriteResult {
+            payload_checksum,
+            indices: indices.into_iter().collect(),
+            execution_summary,
+        })
+    }
+
+    async fn execution_summary(&self, execution_id: &str) -> Result<ScanExecutionSummary, String> {
+        let mut after = None;
+        let mut ip_count = 0_i64;
+        let mut port_count = 0_i64;
+        loop {
+            let mut composite = json!({
+                "size": 1000,
+                "sources": [{"ip": {"terms": {"field": "ip"}}}]
+            });
+            if let Some(after) = after.take() {
+                composite
+                    .as_object_mut()
+                    .expect("composite aggregation is an object")
+                    .insert("after".to_owned(), after);
+            }
+            let endpoints = self
+                .request(
+                    Method::POST,
+                    &format!("/{}/_search", self.inner.config.execution_endpoint_index),
+                )
+                .json(&json!({
+                    "size": 0, "track_total_hits": true,
+                    "query": {"term": {"execution_id": execution_id}},
+                    "aggs": {"ips": {"composite": composite}}
+                }))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let endpoints = response_json(endpoints).await?;
+            port_count = endpoints
+                .pointer("/hits/total/value")
+                .and_then(Value::as_i64)
+                .unwrap_or(port_count);
+            let buckets = endpoints
+                .pointer("/aggregations/ips/buckets")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "Elasticsearch 执行 IP 聚合缺少 buckets".to_owned())?;
+            ip_count += i64::try_from(buckets.len()).map_err(|error| error.to_string())?;
+            after = endpoints.pointer("/aggregations/ips/after_key").cloned();
+            if buckets.len() < 1000 || after.is_none() {
+                break;
+            }
+        }
+        let observations = self
+            .request(
+                Method::POST,
+                &format!(
+                    "/{}-*/_count?allow_no_indices=true&ignore_unavailable=true",
+                    self.inner.config.observation_index_prefix
+                ),
+            )
+            .json(&json!({"query": {"term": {"execution_id": execution_id}}}))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let observations = response_json(observations).await?;
+        Ok(ScanExecutionSummary {
+            ip_count,
+            port_count,
+            observation_count: observations
+                .get("count")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        })
+    }
+
+    async fn validate_scan_bulk_result(
+        &self,
+        result: &Value,
+        expected: &[(String, String, String, String)],
+    ) -> Result<(), String> {
+        if result.get("errors").and_then(Value::as_bool) != Some(true) {
+            return Ok(());
+        }
+        let items = result
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Elasticsearch Bulk 响应缺少 items".to_owned())?;
+        if items.len() != expected.len() {
+            return Err("Elasticsearch Bulk 响应条目数不匹配".to_owned());
+        }
+        let mut conflicts = Vec::new();
+        let mut failures = Vec::new();
+        for (item, (index, id, checksum, payload_checksum)) in items.iter().zip(expected) {
+            let action = item
+                .get("create")
+                .ok_or_else(|| "Elasticsearch Bulk 响应缺少 create".to_owned())?;
+            match action.get("status").and_then(Value::as_u64) {
+                Some(200..=299) => {}
+                Some(409) => conflicts.push((index, id, checksum, payload_checksum)),
+                _ => failures.push(action.to_string()),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "Elasticsearch 扫描事实 Bulk 部分失败：{}",
+                failures.into_iter().take(3).collect::<Vec<_>>().join("; ")
+            ));
+        }
+        if conflicts.is_empty() {
+            return Ok(());
+        }
+        let docs = conflicts
+            .iter()
+            .map(|(index, id, _, _)| json!({"_index": index, "_id": id}))
+            .collect::<Vec<_>>();
+        let response = self
+            .request(Method::POST, "/_mget")
+            .json(&json!({"docs": docs}))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = response_json(response).await?;
+        let actual = result
+            .get("docs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Elasticsearch _mget 响应缺少 docs".to_owned())?;
+        if actual.len() != conflicts.len() {
+            return Err("Elasticsearch _mget 响应条目数不匹配".to_owned());
+        }
+        for (document, (_, id, checksum, payload_checksum)) in actual.iter().zip(conflicts) {
+            let actual_checksum = document
+                .pointer("/_source/document_checksum")
+                .and_then(Value::as_str);
+            let actual_payload_checksum = document
+                .pointer("/_source/payload_checksum")
+                .and_then(Value::as_str);
+            if document.get("found").and_then(Value::as_bool) != Some(true)
+                || actual_checksum != Some(checksum)
+                || actual_payload_checksum != Some(payload_checksum)
+            {
+                return Err(format!("扫描批次重试内容与已写入事实不一致：{id}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_scan_endpoint_projections(
+        &self,
+        context: &ScanBatchContext,
+        observations: &[Value],
+    ) -> Result<(), String> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+        let mut body = String::new();
+        for observation in observations {
+            let ip = observation
+                .get("ip_address")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let port = observation
+                .get("port")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let observed_at_ms = observation
+                .get("observed_at")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "扫描观察缺少 observed_at".to_owned())?;
+            let event = endpoint_projection_document(context, observation, observed_at_ms);
+            let execution_id =
+                sha256_hex(format!("{}\0{ip}\0{port}", context.execution_id).as_bytes());
+            append_projection_update(
+                &mut body,
+                &self.inner.config.execution_endpoint_index,
+                &execution_id,
+                &event,
+            )?;
+        }
+        let refresh = if context.is_final {
+            "&refresh=wait_for"
+        } else {
+            ""
+        };
+        let response = self
+            .request(
+                Method::POST,
+                &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = response_json(response).await?;
+        let failures = result
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("update"))
+            .filter(|item| {
+                item.get("status")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|status| status >= 300)
+            })
+            .take(3)
+            .map(Value::to_string)
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Elasticsearch 端点投影 Bulk 部分失败：{}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    pub(crate) async fn finalize_scan_projection(
+        &self,
+        pool: &Pool,
+        execution_db_id: i32,
+        context: &ScanBatchContext,
+    ) -> Result<(), String> {
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let pending: bool = connection
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM scan_projection_outbox \
+                 WHERE execution_id = $1 AND processed_at IS NULL) AS pending;",
+                &[&execution_db_id],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get("pending");
+        if !pending {
+            return Ok(());
+        }
+        self.promote_execution(context).await?;
+        connection
+            .execute(
+                "UPDATE scan_projection_outbox SET processed_at = NOW(), last_error = NULL \
+                 WHERE execution_id = $1;",
+                &[&execution_db_id],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn promote_execution(&self, context: &ScanBatchContext) -> Result<(), String> {
+        let mut search_after = None;
+        loop {
+            let mut query = json!({
+                "size": 1000,
+                "query": {"term": {"execution_id": context.execution_id}},
+                "sort": [{"ip": "asc"}, {"port": "asc"}]
+            });
+            if let Some(value) = search_after.take() {
+                query
+                    .as_object_mut()
+                    .expect("query body is object")
+                    .insert("search_after".to_owned(), value);
+            }
+            let response = self
+                .request(
+                    Method::POST,
+                    &format!("/{}/_search", self.inner.config.execution_endpoint_index),
+                )
+                .json(&query)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let response = response_json(response).await?;
+            let hits = response
+                .pointer("/hits/hits")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if hits.is_empty() {
+                break;
+            }
+            let mut body = String::new();
+            for hit in &hits {
+                let source = hit
+                    .get("_source")
+                    .cloned()
+                    .ok_or_else(|| "执行端点投影缺少 _source".to_owned())?;
+                let ip = source.get("ip").and_then(Value::as_str).unwrap_or_default();
+                let port = source
+                    .get("port")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                for (scope_type, scope_id) in [("global", 0), ("user", context.user_id)] {
+                    let mut scoped = source.clone();
+                    let object = scoped
+                        .as_object_mut()
+                        .ok_or_else(|| "执行端点投影必须是 object".to_owned())?;
+                    object.insert("scope_type".to_owned(), json!(scope_type));
+                    object.insert("scope_id".to_owned(), json!(scope_id));
+                    let current_id =
+                        sha256_hex(format!("{scope_type}\0{scope_id}\0{ip}\0{port}").as_bytes());
+                    append_projection_update(
+                        &mut body,
+                        &self.inner.config.current_endpoint_index,
+                        &current_id,
+                        &scoped,
+                    )?;
+                }
+            }
+            let bulk = self
+                .request(
+                    Method::POST,
+                    "/_bulk?wait_for_active_shards=all&refresh=wait_for",
+                )
+                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                .body(body)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let bulk = response_json(bulk).await?;
+            if bulk.get("errors").and_then(Value::as_bool) == Some(true) {
+                let failure = bulk
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("update"))
+                    .find(|item| {
+                        item.get("status")
+                            .and_then(Value::as_u64)
+                            .is_none_or(|v| v >= 300)
+                    });
+                if let Some(failure) = failure {
+                    return Err(format!("发布当前端点投影失败：{failure}"));
+                }
+            }
+            search_after = hits.last().and_then(|hit| hit.get("sort")).cloned();
+            if hits.len() < 1000 || search_after.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_scan_projection_outbox(&self, pool: &Pool) -> Result<bool, String> {
+        if !self.inner.config.scan_storage.writes_elasticsearch() {
+            return Ok(false);
+        }
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let row = connection
+            .query_opt(
+                "WITH candidate AS (SELECT execution_id FROM scan_projection_outbox \
+                    WHERE processed_at IS NULL AND available_at <= NOW() \
+                    ORDER BY available_at, execution_id FOR UPDATE SKIP LOCKED LIMIT 1) \
+                 UPDATE scan_projection_outbox outbox SET attempts = attempts + 1, \
+                    available_at = NOW() + INTERVAL '5 minutes' FROM candidate \
+                 WHERE outbox.execution_id = candidate.execution_id \
+                 RETURNING outbox.execution_id, outbox.attempts;",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let execution_db_id: i32 = row.get("execution_id");
+        let attempts: i32 = row.get("attempts");
+        let context = load_scan_batch_context(&connection, execution_db_id).await?;
+        match self.promote_execution(&context).await {
+            Ok(()) => {
+                connection
+                    .execute(
+                        "UPDATE scan_projection_outbox SET processed_at = NOW(), last_error = NULL \
+                     WHERE execution_id = $1;",
+                        &[&execution_db_id],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(true)
+            }
+            Err(error) => {
+                let delay = i64::from(2_i32.saturating_pow(attempts.clamp(1, 8) as u32));
+                let last_error = error.chars().take(2000).collect::<String>();
+                connection.execute(
+                    "UPDATE scan_projection_outbox SET available_at = NOW() + ($2 * INTERVAL '1 second'), \
+                        last_error = $3 WHERE execution_id = $1;",
+                    &[&execution_db_id, &delay, &last_error],
+                ).await.map_err(|error| error.to_string())?;
+                Err(error)
+            }
+        }
     }
 
     async fn create_index(&self) -> Result<(), String> {
@@ -408,6 +1096,9 @@ impl ElasticsearchService {
         } else {
             ("user", user_id)
         };
+        let filter = self
+            .resolve_has_endpoint_filters(scope_type, scope_id, filter)
+            .await?;
         let body = json!({
             "from": offset,
             "size": limit,
@@ -428,11 +1119,13 @@ impl ElasticsearchService {
                 {"port": {"order": "asc"}}
             ]
         });
+        let search_index = if self.inner.config.scan_storage.reads_elasticsearch() {
+            &self.inner.config.current_endpoint_index
+        } else {
+            &self.inner.config.index
+        };
         let response = match self
-            .request(
-                Method::POST,
-                &format!("{}/_search", self.inner.config.index),
-            )
+            .request(Method::POST, &format!("{search_index}/_search"))
             .json(&body)
             .send()
             .await
@@ -491,6 +1184,77 @@ impl ElasticsearchService {
         Ok(ElasticsearchSearchPage { items, total })
     }
 
+    async fn resolve_has_endpoint_filters(
+        &self,
+        scope_type: &str,
+        scope_id: i32,
+        filter: Value,
+    ) -> Result<Value, String> {
+        let mut endpoint_filters = Vec::new();
+        collect_has_endpoint_filters(&filter, &mut endpoint_filters);
+        if endpoint_filters.is_empty() {
+            return Ok(filter);
+        }
+        let mut address_sets = Vec::with_capacity(endpoint_filters.len());
+        for endpoint_filter in endpoint_filters {
+            let mut addresses = Vec::new();
+            let mut after: Option<Value> = None;
+            loop {
+                let mut composite = json!({
+                    "size": 1000,
+                    "sources": [{"ip": {"terms": {"field": "ip"}}}]
+                });
+                if let Some(after) = after.take() {
+                    composite
+                        .as_object_mut()
+                        .expect("composite is object")
+                        .insert("after".to_owned(), after);
+                }
+                let response = self
+                    .request(
+                        Method::POST,
+                        &format!("/{}/_search", self.inner.config.current_endpoint_index),
+                    )
+                    .json(&json!({
+                        "size": 0,
+                        "query": {"bool": {"filter": [
+                            {"term": {"scope_type": scope_type}},
+                            {"term": {"scope_id": scope_id}},
+                            endpoint_filter
+                        ]}},
+                        "aggs": {"addresses": {"composite": composite}}
+                    }))
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = response_json(response).await?;
+                let buckets = response
+                    .pointer("/aggregations/addresses/buckets")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                addresses.extend(buckets.iter().filter_map(|bucket| {
+                    bucket
+                        .pointer("/key/ip")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                }));
+                if addresses.len() > 65_536 {
+                    return Err("has_endpoint 匹配的资产超过 65536 个，请增加限定条件".to_owned());
+                }
+                after = response
+                    .pointer("/aggregations/addresses/after_key")
+                    .cloned();
+                if buckets.len() < 1000 || after.is_none() {
+                    break;
+                }
+            }
+            address_sets.push(addresses);
+        }
+        let mut iterator = address_sets.into_iter();
+        Ok(replace_has_endpoint_filters(filter, &mut iterator))
+    }
+
     fn update_runtime(&self, update: impl FnOnce(&mut ElasticsearchRuntime)) {
         let mut runtime = self
             .inner
@@ -532,6 +1296,10 @@ impl ElasticsearchService {
             fallback_to_postgres: self.inner.config.fallback_to_postgres,
             url: self.inner.config.url.clone(),
             index: self.inner.config.index.clone(),
+            scan_storage: self.inner.config.scan_storage,
+            observation_index_prefix: self.inner.config.observation_index_prefix.clone(),
+            execution_endpoint_index: self.inner.config.execution_endpoint_index.clone(),
+            current_endpoint_index: self.inner.config.current_endpoint_index.clone(),
             expected_version: self.inner.config.expected_version.clone(),
             runtime: self.runtime(),
             pending_events: row.get("pending"),
@@ -589,6 +1357,198 @@ impl ElasticsearchService {
         self.update_runtime(|runtime| runtime.read_ready = true);
         Ok(indexed)
     }
+
+    pub async fn migrate_scan_data(&self, pool: &Pool) -> Result<ScanMigrationReport, String> {
+        if !self.inner.config.scan_storage.writes_elasticsearch() {
+            return Err(
+                "扫描数据迁移要求 elasticsearch.scan_storage=dual 或 elasticsearch".to_owned(),
+            );
+        }
+        self.initialize(pool).await?;
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let mut cursor = 0_i64;
+        let mut report = ScanMigrationReport::default();
+        loop {
+            let batches = connection
+                .query(
+                    "SELECT b.id, b.upload_id, b.batch_index, b.is_final, t.task_id, t.user_id, \
+                        t.task_source, e.id AS execution_pk, e.execution_id, \
+                        COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
+                        COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name \
+                     FROM scan_result_batch b JOIN scan_task_execution e ON e.id = b.execution_id \
+                     JOIN scan_task t ON t.id = e.task_id \
+                     LEFT JOIN scanner_info scanner ON scanner.scanner_id = \
+                        COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
+                     WHERE b.id > $1 ORDER BY b.id LIMIT 100;",
+                    &[&cursor],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if batches.is_empty() {
+                break;
+            }
+            for batch in batches {
+                let batch_id: i64 = batch.get("id");
+                cursor = batch_id;
+                let execution_id: String = batch.get("execution_id");
+                let rows = connection
+                    .query(
+                        "SELECT o.observation_key, o.kind, host(o.ip_address) AS ip_address, o.port, \
+                            o.protocol, o.service, o.banner, o.title, o.http_body, o.http_body_truncated, \
+                            o.tls_subject, o.search_content_extracted, o.source, o.data, \
+                            FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS observed_at, \
+                            i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.region_name, i.city_name, \
+                            COALESCE(tags.tags, '[]'::JSONB) AS tags \
+                         FROM scan_observation o \
+                         LEFT JOIN ips i ON i.execution_id = o.execution_id AND i.ip_address = o.ip_address \
+                         LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT( \
+                            'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description) \
+                            ORDER BY tag.id) AS tags FROM asset_ip_tag assignment \
+                            JOIN asset_tag tag ON tag.id = assignment.tag_id \
+                            WHERE assignment.ip_address = o.ip_address AND tag.is_active) tags ON true \
+                         WHERE o.batch_id = $1 ORDER BY o.id;",
+                        &[&batch_id],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let observations = rows.into_iter().map(|row| {
+                    let ip: String = row.get("ip_address");
+                    let port: i32 = row.get("port");
+                    let endpoint_id = sha256_hex(
+                        format!("{execution_id}\0{ip}\0{port}").as_bytes(),
+                    );
+                    json!({
+                        "observation_key": row.get::<_, String>("observation_key"),
+                        "endpoint_id": endpoint_id,
+                        "kind": row.get::<_, String>("kind"), "ip_address": ip, "port": port,
+                        "protocol": row.get::<_, Option<String>>("protocol"),
+                        "service": row.get::<_, Option<String>>("service"),
+                        "banner": row.get::<_, Option<String>>("banner"),
+                        "title": row.get::<_, Option<String>>("title"),
+                        "http_body": row.get::<_, Option<String>>("http_body"),
+                        "http_body_truncated": row.get::<_, bool>("http_body_truncated"),
+                        "tls_subject": row.get::<_, Option<String>>("tls_subject"),
+                        "search_content_extracted": row.get::<_, bool>("search_content_extracted"),
+                        "source": row.get::<_, String>("source"), "data": row.get::<_, Option<Value>>("data"),
+                        "observed_at": row.get::<_, i64>("observed_at"),
+                        "asn": row.get::<_, Option<String>>("asn"), "isp": row.get::<_, Option<String>>("isp"),
+                        "as_org": row.get::<_, Option<String>>("as_org"),
+                        "country_code": row.get::<_, Option<String>>("country_code"),
+                        "country_name": row.get::<_, Option<String>>("country_name"),
+                        "region_name": row.get::<_, Option<String>>("region_name"),
+                        "city_name": row.get::<_, Option<String>>("city_name"),
+                        "tags": row.get::<_, Value>("tags")
+                    })
+                }).collect::<Vec<_>>();
+                let context = ScanBatchContext {
+                    task_id: batch.get("task_id"),
+                    execution_id: execution_id.clone(),
+                    user_id: batch.get("user_id"),
+                    task_source: batch.get("task_source"),
+                    scanner_id: batch.get("scanner_id"),
+                    scanner_name: batch.get("scanner_name"),
+                    upload_id: batch.get("upload_id"),
+                    batch_index: batch.get("batch_index"),
+                    is_final: batch.get("is_final"),
+                };
+                let result = self.persist_scan_batch(&context, &observations).await?;
+                let storage_references = json!(result.indices);
+                connection.execute(
+                    "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'dual', \
+                        storage_references = $3 WHERE id = $1;",
+                    &[&batch_id, &result.payload_checksum, &storage_references],
+                ).await.map_err(|error| error.to_string())?;
+                if let Some(summary) = result.execution_summary {
+                    let execution_pk: i32 = batch.get("execution_pk");
+                    connection.execute(
+                        "UPDATE scan_task_execution SET result_ip_count = $2, result_port_count = $3, \
+                            result_observation_count = $4 WHERE id = $1;",
+                        &[&execution_pk, &summary.ip_count, &summary.port_count, &summary.observation_count],
+                    ).await.map_err(|error| error.to_string())?;
+                }
+                if context.is_final {
+                    self.promote_execution(&context).await?;
+                }
+                report.batches += 1;
+                report.observations += observations.len() as u64;
+            }
+        }
+        connection.execute(
+            "INSERT INTO scan_storage_state (state_key, state_value, updated_at) \
+             VALUES ('elasticsearch_scan_migration', $1, NOW()) \
+             ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = NOW();",
+            &[&json!({
+                "observation_index_prefix": self.inner.config.observation_index_prefix,
+                "execution_endpoint_index": self.inner.config.execution_endpoint_index,
+                "current_endpoint_index": self.inner.config.current_endpoint_index,
+                "last_batch_id": cursor,
+                "batches": report.batches,
+                "observations": report.observations
+            })],
+        ).await.map_err(|error| error.to_string())?;
+        Ok(report)
+    }
+
+    pub async fn validate_scan_cutover(&self, pool: &Pool) -> Result<(), String> {
+        if !self.inner.config.scan_storage.reads_elasticsearch() {
+            return Ok(());
+        }
+        self.initialize(pool).await?;
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let row = connection.query_one(
+            "SELECT EXISTS (SELECT 1 FROM scan_storage_state \
+                WHERE state_key = 'elasticsearch_scan_migration' \
+                  AND state_value->>'observation_index_prefix' = $1 \
+                  AND state_value->>'execution_endpoint_index' = $2 \
+                  AND state_value->>'current_endpoint_index' = $3) AS migration_ready, \
+                (SELECT COUNT(*)::BIGINT FROM scan_result_batch \
+                    WHERE payload_checksum IS NULL OR storage_backend = 'postgres') AS incomplete_batches, \
+                (SELECT COUNT(*)::BIGINT FROM scan_task_execution \
+                    WHERE execution_status = 'succeeded' AND (result_ip_count IS NULL \
+                        OR result_port_count IS NULL OR result_observation_count IS NULL)) AS incomplete_executions, \
+                (SELECT COUNT(*)::BIGINT FROM scan_projection_outbox \
+                    WHERE processed_at IS NULL) AS pending_projections;",
+            &[
+                &self.inner.config.observation_index_prefix,
+                &self.inner.config.execution_endpoint_index,
+                &self.inner.config.current_endpoint_index,
+            ],
+        ).await.map_err(|error| error.to_string())?;
+        let migration_ready: bool = row.get("migration_ready");
+        let incomplete_batches: i64 = row.get("incomplete_batches");
+        let incomplete_executions: i64 = row.get("incomplete_executions");
+        let pending_projections: i64 = row.get("pending_projections");
+        if !migration_ready
+            || incomplete_batches > 0
+            || incomplete_executions > 0
+            || pending_projections > 0
+        {
+            return Err(format!(
+                "Elasticsearch 扫描存储切换前置检查失败：migration_ready={migration_ready}, \
+                 incomplete_batches={incomplete_batches}, incomplete_executions={incomplete_executions}, \
+                 pending_projections={pending_projections}；\
+                 请先使用 scan_storage=dual 运行 --migrate-scan-data-to-elasticsearch"
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn scan_batch_payload_checksum(
+    context: &ScanBatchContext,
+    observations: &[Value],
+) -> Result<String, String> {
+    let checksum_input = json!({
+        "task_id": context.task_id,
+        "execution_id": context.execution_id,
+        "upload_id": context.upload_id,
+        "batch_index": context.batch_index,
+        "is_final": context.is_final,
+        "observations": observations.iter().map(immutable_scan_observation).collect::<Vec<_>>(),
+    });
+    Ok(sha256_hex(
+        &serde_json::to_vec(&checksum_input).map_err(|error| error.to_string())?,
+    ))
 }
 
 pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
@@ -605,6 +1565,43 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
             warn!(event = "ElasticsearchInitializeError", message = %message);
             continue;
         }
+        match service.process_scan_projection_outbox(&pool).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(message) => {
+                service.mark_error(&message);
+                warn!(event = "ScanProjectionOutboxError", message = %message);
+                continue;
+            }
+        }
+        if service.inner.config.scan_storage.reads_elasticsearch() {
+            let event = match claim_ip_event(&pool).await {
+                Ok(value) => value,
+                Err(message) => {
+                    service.mark_error(&message);
+                    error!(event = "ElasticsearchTagOutboxClaimError", message = %message);
+                    continue;
+                }
+            };
+            let Some(event) = event else {
+                continue;
+            };
+            match process_scan_tag_event(&service, &pool, &event).await {
+                Ok(()) => {
+                    if let Err(message) = complete_event(&pool, event.id).await {
+                        error!(event = "ElasticsearchTagOutboxCompleteError", outbox_id = event.id, message = %message);
+                    }
+                }
+                Err(message) => {
+                    service.mark_error(&message);
+                    warn!(event = "ElasticsearchTagOutboxProcessError", outbox_id = event.id, message = %message);
+                    if let Err(mark_error) = retry_event(&pool, &event, &message).await {
+                        error!(event = "ElasticsearchTagOutboxRetryError", outbox_id = event.id, message = %mark_error);
+                    }
+                }
+            }
+            continue;
+        }
         let event = match claim_event(&pool).await {
             Ok(value) => value,
             Err(message) => {
@@ -616,7 +1613,16 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
         let Some(event) = event else {
             continue;
         };
-        match process_event(&service, &pool, &event).await {
+        let result = match process_event(&service, &pool, &event).await {
+            Ok(())
+                if event.event_kind == "ip"
+                    && service.inner.config.scan_storage.writes_elasticsearch() =>
+            {
+                process_scan_tag_event(&service, &pool, &event).await
+            }
+            result => result,
+        };
+        match result {
             Ok(()) => {
                 if let Err(message) = complete_event(&pool, event.id).await {
                     error!(event = "ElasticsearchOutboxCompleteError", outbox_id = event.id, message = %message);
@@ -631,6 +1637,57 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
             }
         }
     }
+}
+
+async fn claim_ip_event(pool: &Pool) -> Result<Option<OutboxEvent>, String> {
+    let connection = pool.get().await.map_err(|error| error.to_string())?;
+    let row = connection
+        .query_opt(
+            "UPDATE search_index_outbox SET locked_at = NOW(), attempts = attempts + 1 \
+             WHERE id = (SELECT id FROM search_index_outbox \
+                 WHERE event_kind = 'ip' AND processed_at IS NULL AND available_at <= NOW() \
+                   AND (locked_at IS NULL OR locked_at < NOW() - ($1 * INTERVAL '1 minute')) \
+                 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) \
+             RETURNING id, event_kind, aggregate_key, attempts;",
+            &[&OUTBOX_LOCK_TIMEOUT_MINUTES],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(row.map(|row| OutboxEvent {
+        id: row.get("id"),
+        event_kind: row.get("event_kind"),
+        aggregate_key: row.get("aggregate_key"),
+        attempts: row.get("attempts"),
+    }))
+}
+
+async fn process_scan_tag_event(
+    service: &ElasticsearchService,
+    pool: &Pool,
+    event: &OutboxEvent,
+) -> Result<(), String> {
+    let connection = pool.get().await.map_err(|error| error.to_string())?;
+    let rows = connection
+        .query(
+            "SELECT tag.id, tag.name, tag.kind, tag.description \
+             FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
+             WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active ORDER BY tag.id;",
+            &[&event.aggregate_key],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let tags = rows
+        .into_iter()
+        .map(|row| AssetTag {
+            id: row.get("id"),
+            name: row.get("name"),
+            kind: row.get("kind"),
+            description: row.get("description"),
+        })
+        .collect::<Vec<_>>();
+    service
+        .refresh_scan_asset_tags(&event.aggregate_key, &tags)
+        .await
 }
 
 async fn claim_event(pool: &Pool) -> Result<Option<OutboxEvent>, String> {
@@ -813,6 +1870,39 @@ fn canonical_asn(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+async fn load_scan_batch_context<C>(
+    connection: &C,
+    execution_db_id: i32,
+) -> Result<ScanBatchContext, String>
+where
+    C: GenericClient + Sync,
+{
+    let row = connection.query_one(
+        "SELECT t.task_id, t.user_id, t.task_source, e.execution_id, \
+            COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
+            COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, \
+            batch.upload_id, batch.batch_index \
+         FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+         LEFT JOIN scanner_info scanner ON scanner.scanner_id = \
+            COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
+         JOIN LATERAL (SELECT upload_id, batch_index FROM scan_result_batch \
+            WHERE execution_id = e.id AND is_final ORDER BY batch_index DESC LIMIT 1) batch ON true \
+         WHERE e.id = $1;",
+        &[&execution_db_id],
+    ).await.map_err(|error| error.to_string())?;
+    Ok(ScanBatchContext {
+        task_id: row.get("task_id"),
+        execution_id: row.get("execution_id"),
+        user_id: row.get("user_id"),
+        task_source: row.get("task_source"),
+        scanner_id: row.get("scanner_id"),
+        scanner_name: row.get("scanner_name"),
+        upload_id: row.get("upload_id"),
+        batch_index: row.get("batch_index"),
+        is_final: true,
+    })
+}
+
 async fn complete_event(pool: &Pool, id: i64) -> Result<(), String> {
     let connection = pool.get().await.map_err(|error| error.to_string())?;
     connection
@@ -865,6 +1955,352 @@ async fn response_error(response: reqwest::Response) -> String {
         "Elasticsearch HTTP {status}: {}",
         body.chars().take(2_000).collect::<String>()
     )
+}
+
+fn collect_has_endpoint_filters(value: &Value, filters: &mut Vec<Value>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(filter) = object.get("network_mapping_has_endpoint") {
+                filters.push(filter.clone());
+                return;
+            }
+            for child in object.values() {
+                collect_has_endpoint_filters(child, filters);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_has_endpoint_filters(child, filters);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_has_endpoint_filters(
+    value: Value,
+    addresses: &mut impl Iterator<Item = Vec<String>>,
+) -> Value {
+    match value {
+        Value::Object(mut object) => {
+            if object.contains_key("network_mapping_has_endpoint") {
+                return json!({"terms": {"ip": addresses.next().unwrap_or_default()}});
+            }
+            for child in object.values_mut() {
+                *child = replace_has_endpoint_filters(child.take(), addresses);
+            }
+            Value::Object(object)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|child| replace_has_endpoint_filters(child, addresses))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn immutable_scan_observation(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        for field in [
+            "asn",
+            "isp",
+            "as_org",
+            "country_code",
+            "country_name",
+            "region_name",
+            "city_name",
+            "tags",
+        ] {
+            object.remove(field);
+        }
+    }
+    value
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    openssl::sha::sha256(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn scan_observation_index(prefix: &str, observed_at_ms: i64) -> Result<String, String> {
+    let observed_at = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
+        .ok_or_else(|| format!("无效 observed_at：{observed_at_ms}"))?;
+    Ok(format!("{}-{}", prefix, observed_at.format("%Y.%m")))
+}
+
+fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
+    json!({
+        "index_patterns": [format!("{prefix}-*")],
+        "priority": 500,
+        "_meta": {
+            "application": "network-mapping",
+            "schema_version": SCAN_INDEX_SCHEMA_VERSION,
+            "purpose": "append-only scan observations"
+        },
+        "template": {
+            "settings": scan_index_settings(replicas),
+            "mappings": {
+                "dynamic": "strict",
+                "properties": {
+                    "task_id": {"type": "keyword"},
+                    "execution_id": {"type": "keyword"},
+                    "user_id": {"type": "integer"},
+                    "task_source": {"type": "keyword"},
+                    "scanner_id": {"type": "keyword"},
+                    "scanner_name": {"type": "keyword"},
+                    "upload_id": {"type": "keyword"},
+                    "batch_index": {"type": "integer"},
+                    "payload_checksum": {"type": "keyword", "index": false},
+                    "document_checksum": {"type": "keyword", "index": false},
+                    "observation_key": {"type": "keyword", "ignore_above": 2048},
+                    "endpoint_id": {"type": "keyword"},
+                    "kind": {"type": "keyword"},
+                    "ip_address": {"type": "ip"},
+                    "port": {"type": "integer"},
+                    "protocol": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                    "service": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                    "banner": {"type": "wildcard"},
+                    "title": {"type": "text", "fields": {"raw": {"type": "keyword", "ignore_above": 512}}},
+                    "http_body": {"type": "match_only_text"},
+                    "http_body_truncated": {"type": "boolean"},
+                    "tls_subject": {"type": "wildcard"},
+                    "search_content_extracted": {"type": "boolean", "index": false},
+                    "source": {"type": "keyword"},
+                    "data": {"type": "object", "enabled": false},
+                    "observed_at": {"type": "date", "format": "epoch_millis||strict_date_optional_time"},
+                    "asn": {"type": "keyword"},
+                    "isp": {"type": "keyword"},
+                    "as_org": {"type": "keyword"},
+                    "country_code": {"type": "keyword"},
+                    "country_name": {"type": "keyword"},
+                    "region_name": {"type": "keyword"},
+                    "city_name": {"type": "keyword"},
+                    "tags": {"type": "object", "properties": {
+                        "id": {"type": "long"}, "name": {"type": "keyword"},
+                        "kind": {"type": "keyword"}, "description": {"type": "text", "index": false}
+                    }}
+                }
+            }
+        }
+    })
+}
+
+fn scan_index_settings(replicas: u32) -> Value {
+    json!({
+        "number_of_replicas": replicas,
+        "translog.durability": "request",
+        "analysis": {"normalizer": {"lowercase_normalizer": {
+            "type": "custom", "filter": ["lowercase"]
+        }}}
+    })
+}
+
+fn scan_endpoint_index_definition(replicas: u32) -> Value {
+    json!({
+        "settings": scan_index_settings(replicas),
+        "mappings": {
+            "dynamic": "strict",
+            "_meta": {
+                "application": "network-mapping",
+                "schema_version": SCAN_INDEX_SCHEMA_VERSION,
+                "purpose": "scan endpoint projection"
+            },
+            "properties": {
+                "scope_type": {"type": "keyword"},
+                "scope_id": {"type": "integer"},
+                "endpoint_key": {"type": "keyword"},
+                "task_id": {"type": "keyword"},
+                "execution_id": {"type": "keyword"},
+                "user_id": {"type": "integer"},
+                "task_source": {"type": "keyword"},
+                "scanner_id": {"type": "keyword"},
+                "scanner_name": {"type": "wildcard"},
+                "ip": {"type": "ip"},
+                "port": {"type": "integer"},
+                "protocol": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "service": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "banner": {"type": "wildcard", "copy_to": "banner_text"},
+                "banner_text": {"type": "text"},
+                "title": {"type": "text", "copy_to": "title_contains", "fields": {"raw": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512}}},
+                "title_contains": {"type": "wildcard"},
+                "http_body": {"type": "match_only_text", "copy_to": "http_body_contains"},
+                "http_body_contains": {"type": "wildcard"},
+                "http_body_truncated": {"type": "boolean"},
+                "tls_subject": {"type": "wildcard", "copy_to": "tls_subject_text"},
+                "tls_subject_text": {"type": "text"},
+                "source": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "kind": {"type": "keyword"},
+                "first_seen": {"type": "date"},
+                "first_seen_ms": {"type": "long"},
+                "last_seen": {"type": "date"},
+                "observed_at_ms": {"type": "long"},
+                "service_observed_at_ms": {"type": "long"},
+                "asn": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "asn_number": {"type": "long"},
+                "isp": {"type": "wildcard"},
+                "as_org": {"type": "wildcard"},
+                "country_code": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "country_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "region_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "city_name": {"type": "wildcard"},
+                "tags": {"type": "object", "properties": {
+                    "id": {"type": "long"}, "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                    "kind": {"type": "keyword"}, "description": {"type": "text", "index": false}
+                }},
+                "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "tag_ids": {"type": "long"},
+                "tag_kinds": {"type": "keyword"},
+                "data": {"type": "object", "enabled": false}
+            }
+        }
+    })
+}
+
+fn endpoint_projection_document(
+    context: &ScanBatchContext,
+    observation: &Value,
+    observed_at_ms: i64,
+) -> Value {
+    let ip = observation
+        .get("ip_address")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let port = observation.get("port").cloned().unwrap_or(Value::Null);
+    let kind = observation.get("kind").cloned().unwrap_or(Value::Null);
+    let is_service = kind.as_str() == Some("service");
+    let observed_at = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
+        .expect("observed_at was validated")
+        .to_rfc3339();
+    let asn = observation.get("asn").cloned().unwrap_or(Value::Null);
+    let asn_number = asn.as_str().and_then(parse_asn);
+    let tags = observation
+        .get("tags")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tag_names = tags
+        .iter()
+        .filter_map(|tag| tag.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let tag_ids = tags
+        .iter()
+        .filter_map(|tag| tag.get("id").and_then(Value::as_i64))
+        .collect::<Vec<_>>();
+    let tag_kinds = tags
+        .iter()
+        .filter_map(|tag| tag.get("kind").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    json!({
+        "scope_type": "execution",
+        "scope_id": 0,
+        "endpoint_key": format!("{}|{}", ip.as_str().unwrap_or_default(), port.as_i64().unwrap_or_default()),
+        "task_id": context.task_id,
+        "execution_id": context.execution_id,
+        "user_id": context.user_id,
+        "task_source": context.task_source,
+        "scanner_id": context.scanner_id,
+        "scanner_name": context.scanner_name,
+        "ip": ip,
+        "port": port,
+        "protocol": observation.get("protocol").cloned().unwrap_or(Value::Null),
+        "service": observation.get("service").cloned().unwrap_or(Value::Null),
+        "banner": observation.get("banner").cloned().unwrap_or(Value::Null),
+        "title": observation.get("title").cloned().unwrap_or(Value::Null),
+        "http_body": observation.get("http_body").cloned().unwrap_or(Value::Null),
+        "http_body_truncated": observation.get("http_body_truncated").cloned().unwrap_or(json!(false)),
+        "tls_subject": observation.get("tls_subject").cloned().unwrap_or(Value::Null),
+        "source": observation.get("source").cloned().unwrap_or(Value::Null),
+        "kind": kind,
+        "first_seen": observed_at,
+        "first_seen_ms": observed_at_ms,
+        "last_seen": observed_at,
+        "observed_at_ms": observed_at_ms,
+        "service_observed_at_ms": if is_service { json!(observed_at_ms) } else { Value::Null },
+        "asn": asn,
+        "asn_number": asn_number,
+        "isp": observation.get("isp").cloned().unwrap_or(Value::Null),
+        "as_org": observation.get("as_org").cloned().unwrap_or(Value::Null),
+        "country_code": observation.get("country_code").cloned().unwrap_or(Value::Null),
+        "country_name": observation.get("country_name").cloned().unwrap_or(Value::Null),
+        "region_name": observation.get("region_name").cloned().unwrap_or(Value::Null),
+        "city_name": observation.get("city_name").cloned().unwrap_or(Value::Null),
+        "tags": tags, "tag_names": tag_names, "tag_ids": tag_ids, "tag_kinds": tag_kinds,
+        "data": observation.get("data").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn append_projection_update(
+    body: &mut String,
+    index: &str,
+    document_id: &str,
+    document: &Value,
+) -> Result<(), String> {
+    const SCRIPT: &str = r#"
+        if (ctx._source.observed_at_ms == null) {
+            ctx._source.putAll(params.doc);
+        } else {
+            def firstSeen = ctx._source.first_seen;
+            def firstSeenMs = ctx._source.first_seen_ms;
+            def service = ctx._source.service;
+            def banner = ctx._source.banner;
+            def title = ctx._source.title;
+            def httpBody = ctx._source.http_body;
+            def httpBodyTruncated = ctx._source.http_body_truncated;
+            def tlsSubject = ctx._source.tls_subject;
+            def serviceObserved = ctx._source.service_observed_at_ms;
+            if (params.doc.observed_at_ms < ctx._source.observed_at_ms) {
+                if (firstSeenMs == null || params.doc.observed_at_ms < firstSeenMs) {
+                    ctx._source.first_seen = params.doc.first_seen;
+                    ctx._source.first_seen_ms = params.doc.first_seen_ms;
+                }
+            } else {
+                ctx._source.putAll(params.doc);
+                ctx._source.first_seen = firstSeen;
+                ctx._source.first_seen_ms = firstSeenMs;
+                if (params.doc.kind != 'service') {
+                    ctx._source.service = service;
+                    ctx._source.banner = banner;
+                    ctx._source.title = title;
+                    ctx._source.http_body = httpBody;
+                    ctx._source.http_body_truncated = httpBodyTruncated;
+                    ctx._source.tls_subject = tlsSubject;
+                    ctx._source.service_observed_at_ms = serviceObserved;
+                }
+            }
+            if (params.doc.kind == 'service' &&
+                (serviceObserved == null || params.doc.observed_at_ms >= serviceObserved)) {
+                ctx._source.service = params.doc.service;
+                ctx._source.banner = params.doc.banner;
+                ctx._source.title = params.doc.title;
+                ctx._source.http_body = params.doc.http_body;
+                ctx._source.http_body_truncated = params.doc.http_body_truncated;
+                ctx._source.tls_subject = params.doc.tls_subject;
+                ctx._source.service_observed_at_ms = params.doc.observed_at_ms;
+            }
+        }
+    "#;
+    body.push_str(
+        &serde_json::to_string(&json!({"update": {
+            "_index": index, "_id": document_id, "retry_on_conflict": 5
+        }}))
+        .map_err(|error| error.to_string())?,
+    );
+    body.push('\n');
+    body.push_str(
+        &serde_json::to_string(&json!({
+            "scripted_upsert": true,
+            "script": {"lang": "painless", "source": SCRIPT, "params": {"doc": document}},
+            "upsert": document
+        }))
+        .map_err(|error| error.to_string())?,
+    );
+    body.push('\n');
+    Ok(())
 }
 
 fn index_definition() -> Value {
@@ -939,7 +2375,10 @@ fn index_definition() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_definition, parse_asn};
+    use super::{
+        ScanBatchContext, index_definition, parse_asn, scan_batch_payload_checksum,
+        scan_endpoint_index_definition,
+    };
 
     #[test]
     fn index_mapping_targets_elasticsearch_9_5_2_and_expected_field_types() {
@@ -967,5 +2406,46 @@ mod tests {
         assert_eq!(parse_asn("AS4134"), Some(4134));
         assert_eq!(parse_asn("4134"), Some(4134));
         assert_eq!(parse_asn("unknown"), None);
+    }
+
+    #[test]
+    fn scan_batch_checksum_ignores_mutable_enrichment_but_not_evidence() {
+        let context = ScanBatchContext {
+            task_id: "task".into(),
+            execution_id: "execution".into(),
+            user_id: 7,
+            task_source: "user".into(),
+            scanner_id: "scanner".into(),
+            scanner_name: Some("node".into()),
+            upload_id: "upload".into(),
+            batch_index: 0,
+            is_final: true,
+        };
+        let original = serde_json::json!({
+            "observation_key": "key", "ip_address": "192.0.2.1", "port": 443,
+            "banner": "first", "observed_at": 1, "asn": "4134", "tags": []
+        });
+        let mut enriched = original.clone();
+        enriched["asn"] = serde_json::json!("AS4134");
+        enriched["tags"] = serde_json::json!([{"id": 1, "name": "prod"}]);
+        assert_eq!(
+            scan_batch_payload_checksum(&context, std::slice::from_ref(&original)).unwrap(),
+            scan_batch_payload_checksum(&context, &[enriched]).unwrap()
+        );
+        let mut changed = original.clone();
+        changed["banner"] = serde_json::json!("different");
+        assert_ne!(
+            scan_batch_payload_checksum(&context, &[original]).unwrap(),
+            scan_batch_payload_checksum(&context, &[changed]).unwrap()
+        );
+    }
+
+    #[test]
+    fn scan_endpoint_mapping_tracks_exact_first_seen_time() {
+        let mapping = scan_endpoint_index_definition(1);
+        assert_eq!(
+            mapping.pointer("/mappings/properties/first_seen_ms/type"),
+            Some(&serde_json::json!("long"))
+        );
     }
 }

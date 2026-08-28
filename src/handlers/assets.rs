@@ -4,9 +4,10 @@ use std::str::FromStr;
 use actix_web::{HttpRequest, HttpResponse, Responder, get, web};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::admin::UserBaseI;
+use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::handlers::tags::{AssetTag, tags_from_json};
 use crate::logs::write::error_logs;
 
@@ -133,6 +134,7 @@ fn bad_request(message: &'static str) -> HttpResponse {
 pub(crate) async fn get_asset_summary(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<AssetQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -140,6 +142,16 @@ pub(crate) async fn get_asset_summary(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return get_asset_summary_from_elasticsearch(
+            &req,
+            pool.get_ref(),
+            elasticsearch.get_ref(),
+            &ip,
+            &user,
+        )
+        .await;
+    }
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
@@ -246,6 +258,7 @@ pub(crate) async fn get_asset_summary(
 pub(crate) async fn get_asset_ports(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<AssetPortsQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -257,6 +270,17 @@ pub(crate) async fn get_asset_ports(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return get_asset_ports_from_elasticsearch(
+            &req,
+            elasticsearch.get_ref(),
+            &ip,
+            limit,
+            offset,
+            &user,
+        )
+        .await;
+    }
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
@@ -351,6 +375,7 @@ pub(crate) async fn get_asset_ports(
 pub(crate) async fn get_asset_port_history(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<AssetPortHistoryQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -366,6 +391,18 @@ pub(crate) async fn get_asset_port_history(
         Err(message) => return bad_request(message),
     };
     let port = i32::from(query.port);
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return get_asset_history_from_elasticsearch(
+            &req,
+            elasticsearch.get_ref(),
+            &ip,
+            port,
+            limit,
+            offset,
+            &user,
+        )
+        .await;
+    }
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
@@ -434,6 +471,339 @@ pub(crate) async fn get_asset_port_history(
             "offset": offset,
         }
     }))
+}
+
+fn current_scope_filters(user: &UserBaseI) -> Vec<Value> {
+    if user.role == 1 {
+        vec![
+            json!({"term": {"scope_type": "global"}}),
+            json!({"term": {"scope_id": 0}}),
+        ]
+    } else {
+        vec![
+            json!({"term": {"scope_type": "user"}}),
+            json!({"term": {"scope_id": user.id}}),
+        ]
+    }
+}
+
+fn observation_access_filters(user: &UserBaseI) -> Vec<Value> {
+    if user.role == 1 {
+        Vec::new()
+    } else {
+        vec![json!({"term": {"user_id": user.id}})]
+    }
+}
+
+fn es_total(result: &Value) -> i64 {
+    result
+        .pointer("/hits/total/value")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn es_time_ms(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value.as_i64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|time| time.timestamp_millis())
+        })
+    })
+}
+
+async fn get_asset_summary_from_elasticsearch(
+    req: &HttpRequest,
+    pool: &Pool,
+    elasticsearch: &ElasticsearchService,
+    ip: &str,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let mut current_filters = current_scope_filters(user);
+    current_filters.push(json!({"term": {"ip": ip}}));
+    let current = elasticsearch
+        .scan_query(
+            ScanQueryIndex::CurrentEndpoints,
+            &json!({
+                "size": 0, "track_total_hits": true,
+                "query": {"bool": {"filter": current_filters}},
+                "aggs": {
+                    "services": {"cardinality": {"field": "service", "precision_threshold": 40000}},
+                    "scanners": {"cardinality": {"field": "scanner_id", "precision_threshold": 40000}},
+                    "latest": {"top_hits": {"size": 1, "sort": [{"observed_at_ms": "desc"}],
+                        "_source": ["asn", "isp", "as_org", "country_code", "country_name", "region_name", "city_name"]}}
+                }
+            }),
+        )
+        .await;
+    let mut observation_filters = observation_access_filters(user);
+    observation_filters.push(json!({"term": {"ip_address": ip}}));
+    let observations = elasticsearch
+        .scan_query(
+            ScanQueryIndex::Observations,
+            &json!({
+                "size": 0, "track_total_hits": true,
+                "query": {"bool": {"filter": observation_filters}},
+                "aggs": {"first": {"min": {"field": "observed_at"}}, "last": {"max": {"field": "observed_at"}}}
+            }),
+        )
+        .await;
+    let (current, observations) = match (current, observations) {
+        (Ok(current), Ok(observations)) => (current, observations),
+        (Err(error), _) | (_, Err(error)) => {
+            error_logs(req, "AssetSummaryElasticsearchError", &error);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"message": "扫描结果索引暂时不可用"}));
+        }
+    };
+    let observation_count = es_total(&observations);
+    if observation_count == 0 {
+        return HttpResponse::NotFound().json(json!({"message": "没有可访问的资产观察记录"}));
+    }
+    let latest = current.pointer("/aggregations/latest/hits/hits/0/_source");
+    let tags = match pool.get().await {
+        Ok(connection) => connection
+            .query_one(
+                "SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT('id', tag.id, 'name', tag.name, \
+                    'kind', tag.kind, 'description', tag.description) ORDER BY tag.id) \
+                    FILTER (WHERE tag.id IS NOT NULL), '[]'::JSONB) AS tags \
+                 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
+                 WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active;",
+                &[&ip],
+            )
+            .await
+            .map(|row| tags_from_json(row.get("tags")))
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let text = |field: &str| {
+        latest
+            .and_then(|source| source.get(field))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let summary = AssetSummary {
+        ip: ip.to_owned(),
+        asn: text("asn"),
+        isp: text("isp"),
+        as_org: text("as_org"),
+        country_code: text("country_code"),
+        country_name: text("country_name"),
+        region_name: text("region_name"),
+        city_name: text("city_name"),
+        port_count: es_total(&current),
+        service_count: current
+            .pointer("/aggregations/services/value")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as i64,
+        scanner_count: current
+            .pointer("/aggregations/scanners/value")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as i64,
+        observation_count,
+        first_seen_at: observations
+            .pointer("/aggregations/first/value")
+            .and_then(Value::as_f64)
+            .map(|v| v as i64),
+        last_seen_at: observations
+            .pointer("/aggregations/last/value")
+            .and_then(Value::as_f64)
+            .map(|v| v as i64),
+        tags,
+        can_manage_tags: user.role == 1,
+    };
+    HttpResponse::Ok().json(json!({"success": true, "data": {"summary": summary}}))
+}
+
+async fn get_asset_ports_from_elasticsearch(
+    req: &HttpRequest,
+    elasticsearch: &ElasticsearchService,
+    ip: &str,
+    limit: i64,
+    offset: i64,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let mut filters = current_scope_filters(user);
+    filters.push(json!({"term": {"ip": ip}}));
+    let result = match elasticsearch
+        .scan_query(
+            ScanQueryIndex::CurrentEndpoints,
+            &json!({
+                "from": offset, "size": limit, "track_total_hits": true,
+                "query": {"bool": {"filter": filters}},
+                "sort": [{"port": "asc"}]
+            }),
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(req, "AssetPortsElasticsearchError", &error);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"message": "扫描结果索引暂时不可用"}));
+        }
+    };
+    let total = es_total(&result);
+    if total == 0 {
+        return HttpResponse::NotFound().json(json!({"message": "没有可访问的资产观察记录"}));
+    }
+    let items = result
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| hit.get("_source"))
+        .map(|source| {
+            let last_seen_at = source
+                .get("observed_at_ms")
+                .and_then(Value::as_i64)
+                .or_else(|| es_time_ms(source.get("last_seen")))
+                .unwrap_or(0);
+            let service_observed_at = source.get("service_observed_at_ms").and_then(Value::as_i64);
+            AssetPortCurrent {
+                port: source.get("port").and_then(Value::as_i64).unwrap_or(0) as i32,
+                protocol: source
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                service: source
+                    .get("service")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                banner: source
+                    .get("banner")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                source: source
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                service_source: source
+                    .get("service")
+                    .and_then(Value::as_str)
+                    .and_then(|_| source.get("source"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                first_seen_at: es_time_ms(source.get("first_seen")).unwrap_or(last_seen_at),
+                last_seen_at,
+                service_observed_at,
+                service_stale: service_observed_at.is_some_and(|time| time < last_seen_at),
+                execution_id: source
+                    .get("execution_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                task_id: source
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    HttpResponse::Ok().json(json!({"success": true, "data": {
+        "ip": ip, "items": items, "total": total, "limit": limit, "offset": offset
+    }}))
+}
+
+async fn get_asset_history_from_elasticsearch(
+    req: &HttpRequest,
+    elasticsearch: &ElasticsearchService,
+    ip: &str,
+    port: i32,
+    limit: i64,
+    offset: i64,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let mut filters = observation_access_filters(user);
+    filters.push(json!({"term": {"ip_address": ip}}));
+    filters.push(json!({"term": {"port": port}}));
+    let result = match elasticsearch
+        .scan_query(
+            ScanQueryIndex::Observations,
+            &json!({
+                "from": offset, "size": limit, "track_total_hits": true,
+                "query": {"bool": {"filter": filters}},
+                "sort": [{"observed_at": "desc"}, {"_id": "desc"}]
+            }),
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(req, "AssetHistoryElasticsearchError", &error);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"message": "扫描结果索引暂时不可用"}));
+        }
+    };
+    let total = es_total(&result);
+    let items = result
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| Some((hit.get("_id")?.as_str()?, hit.get("_source")?)))
+        .map(|(id, source)| AssetObservationHistoryItem {
+            id: i64::from_str_radix(&id[..id.len().min(15)], 16).unwrap_or_default(),
+            kind: source
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            state: source
+                .pointer("/data/state")
+                .and_then(Value::as_str)
+                .unwrap_or("open")
+                .to_owned(),
+            protocol: source
+                .get("protocol")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            service: source
+                .get("service")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            banner: source
+                .get("banner")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            source: source
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            data: source.get("data").cloned().filter(|value| !value.is_null()),
+            observed_at: es_time_ms(source.get("observed_at")).unwrap_or_default(),
+            execution_id: source
+                .get("execution_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            task_id: source
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            scanner_name: source
+                .get("scanner_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            upload_id: source
+                .get("upload_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            batch_index: source
+                .get("batch_index")
+                .and_then(Value::as_i64)
+                .unwrap_or_default() as i32,
+        })
+        .collect::<Vec<_>>();
+    HttpResponse::Ok().json(json!({"success": true, "data": {
+        "ip": ip, "port": port, "items": items, "total": total, "limit": limit, "offset": offset
+    }}))
 }
 
 #[cfg(test)]

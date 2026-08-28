@@ -120,7 +120,11 @@ async fn main() -> io::Result<()> {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(e) => panic!("初始化数据库错误{}", e),
     };
-    if !args.rebuild_elasticsearch && !args.refresh_ip_intel {
+    if !args.rebuild_elasticsearch
+        && !args.refresh_ip_intel
+        && !args.migrate_scan_data_to_elasticsearch
+        && !elasticsearch_config.scan_storage.reads_elasticsearch()
+    {
         match network_mapping_server::search_projection::ensure_initialized(&db_pool).await {
             Ok(true) => info!(target: "server::startup", "历史数据已生成 PostgreSQL 当前端点投影"),
             Ok(false) => {}
@@ -131,6 +135,19 @@ async fn main() -> io::Result<()> {
     }
     let elasticsearch_service = ElasticsearchService::new(elasticsearch_config)
         .map_err(|error| io::Error::other(format!("创建 Elasticsearch 客户端失败：{error}")))?;
+    if args.migrate_scan_data_to_elasticsearch {
+        let report = elasticsearch_service
+            .migrate_scan_data(&db_pool)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("迁移扫描数据到 Elasticsearch 失败：{error}"))
+            })?;
+        println!(
+            "扫描数据迁移完成：批次 {} 个，观察 {} 条",
+            report.batches, report.observations
+        );
+        return Ok(());
+    }
     if args.rebuild_elasticsearch {
         if !elasticsearch_service.enabled() {
             return Err(io::Error::other(
@@ -147,6 +164,10 @@ async fn main() -> io::Result<()> {
         println!("Elasticsearch 重建完成：PostgreSQL 投影 {projected} 条，索引 {indexed} 条");
         return Ok(());
     }
+    elasticsearch_service
+        .validate_scan_cutover(&db_pool)
+        .await
+        .map_err(|error| io::Error::other(format!("扫描存储切换检查失败：{error}")))?;
     let trusted_proxy_state = web::Data::new(
         TrustedProxyState::from_database(&db_pool)
             .await

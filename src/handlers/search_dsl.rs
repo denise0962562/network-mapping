@@ -167,9 +167,62 @@ impl ElasticsearchCompiler {
                     "bool": {"should": [left, right], "minimum_should_match": 1}
                 })))
             }
-            // SQL 的三值逻辑会让 NOT 对缺失字段的行为不同于 ES must_not。
-            // 复杂 NOT 和跨端点条件继续走 PostgreSQL，以保证结果语义完全一致。
-            Expr::Not(_) | Expr::HasEndpoint(_) => Ok(None),
+            Expr::Not(inner) => self.compile_negated_expr(inner),
+            Expr::HasEndpoint(inner) => {
+                let Some(compiled) = self.compile_expr(inner)? else {
+                    return Ok(None);
+                };
+                Ok(Some(json!({"network_mapping_has_endpoint": compiled})))
+            }
+        }
+    }
+
+    fn compile_negated_expr(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<Value>, SearchSyntaxError> {
+        match expression {
+            Expr::Predicate(predicate) => {
+                self.predicate_count += 1;
+                let compiled = self.compile_predicate(predicate)?;
+                if predicate.operator == Operator::Exists {
+                    Ok(Some(json!({"bool": {"must_not": [compiled]}})))
+                } else {
+                    Ok(Some(json!({"bool": {
+                        "filter": [{"exists": {"field": es_field(predicate.field)}}],
+                        "must_not": [compiled]
+                    }})))
+                }
+            }
+            Expr::And(left, right) => {
+                let (Some(left), Some(right)) = (
+                    self.compile_negated_expr(left)?,
+                    self.compile_negated_expr(right)?,
+                ) else {
+                    return Ok(None);
+                };
+                Ok(Some(json!({
+                    "bool": {"should": [left, right], "minimum_should_match": 1}
+                })))
+            }
+            Expr::Or(left, right) => {
+                let (Some(left), Some(right)) = (
+                    self.compile_negated_expr(left)?,
+                    self.compile_negated_expr(right)?,
+                ) else {
+                    return Ok(None);
+                };
+                Ok(Some(json!({"bool": {"filter": [left, right]}})))
+            }
+            Expr::Not(inner) => self.compile_expr(inner),
+            Expr::HasEndpoint(inner) => {
+                let Some(compiled) = self.compile_expr(inner)? else {
+                    return Ok(None);
+                };
+                Ok(Some(json!({"bool": {
+                    "must_not": [{"network_mapping_has_endpoint": compiled}]
+                }})))
+            }
         }
     }
 
@@ -1604,15 +1657,29 @@ mod tests {
     }
 
     #[test]
-    fn routes_cross_endpoint_and_complex_not_queries_to_postgres() {
-        assert!(matches!(
-            parse_and_compile_elasticsearch("has_endpoint(port = 443)").unwrap(),
-            ElasticsearchCompilation::RequiresPostgres
-        ));
-        assert!(matches!(
-            parse_and_compile_elasticsearch("NOT EXISTS(banner)").unwrap(),
-            ElasticsearchCompilation::RequiresPostgres
-        ));
+    fn compiles_cross_endpoint_and_not_queries_for_elasticsearch() {
+        let ElasticsearchCompilation::Supported(has_endpoint) =
+            parse_and_compile_elasticsearch("has_endpoint(port = 443)").unwrap()
+        else {
+            panic!("has_endpoint should be resolved by the Elasticsearch search service");
+        };
+        assert!(has_endpoint.get("network_mapping_has_endpoint").is_some());
+
+        let ElasticsearchCompilation::Supported(not_exists) =
+            parse_and_compile_elasticsearch("NOT EXISTS(banner)").unwrap()
+        else {
+            panic!("NOT EXISTS should compile to must_not");
+        };
+        assert!(not_exists.to_string().contains("must_not"));
+
+        let ElasticsearchCompilation::Supported(complex_not) =
+            parse_and_compile_elasticsearch("NOT (service = http AND port = 80)").unwrap()
+        else {
+            panic!("complex NOT should compile with De Morgan semantics");
+        };
+        let complex_not = complex_not.to_string();
+        assert!(complex_not.contains("minimum_should_match"));
+        assert!(complex_not.matches("must_not").count() >= 2);
     }
 
     #[test]

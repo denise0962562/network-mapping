@@ -167,8 +167,20 @@ pub async fn search_v2(
         }
     };
 
-    if let Ok(ElasticsearchCompilation::Supported(filter)) = parse_and_compile_elasticsearch(query)
-    {
+    let elasticsearch_compilation = parse_and_compile_elasticsearch(query)
+        .expect("PostgreSQL and Elasticsearch parsers share the validated syntax tree");
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return match elasticsearch_compilation {
+            ElasticsearchCompilation::Supported(filter) => respond_search_elasticsearch(
+                elasticsearch.get_ref(), &user, "advanced", query.to_owned(), filter, (limit, offset),
+            ).await,
+            ElasticsearchCompilation::RequiresPostgres => HttpResponse::UnprocessableEntity().json(
+                serde_json::json!({"code": "SEARCH_ES_UNSUPPORTED", "message": "该查询暂不支持 Elasticsearch 读路径"}),
+            ),
+        };
+    }
+
+    if let ElasticsearchCompilation::Supported(filter) = elasticsearch_compilation {
         if elasticsearch.can_read() {
             match elasticsearch
                 .search(user.role, user.id, filter, limit, offset)
@@ -414,9 +426,61 @@ async fn respond_search(
     }
 }
 
+async fn respond_search_elasticsearch(
+    elasticsearch: &ElasticsearchService,
+    user: &UserBaseI,
+    query_type: &'static str,
+    query: String,
+    filter: serde_json::Value,
+    pagination: (i64, i64),
+) -> HttpResponse {
+    let (limit, offset) = pagination;
+    match elasticsearch
+        .search(user.role, user.id, filter, limit, offset)
+        .await
+    {
+        Ok(page) => HttpResponse::Ok().json(SearchResponse {
+            query_type,
+            query,
+            items: page
+                .items
+                .into_iter()
+                .map(|item| SearchItem {
+                    ip_address: item.ip_address,
+                    port: Some(item.port),
+                    protocol: item.protocol,
+                    service: item.service,
+                    banner: item.banner,
+                    title: item.title,
+                    tls_subject: item.tls_subject,
+                    scanner_name: item.scanner_name,
+                    scan_time: Some(item.scan_time),
+                    asn: item.asn,
+                    isp: item.isp,
+                    as_org: item.as_org,
+                    country_code: item.country_code,
+                    country_name: item.country_name,
+                    region_name: item.region_name,
+                    city_name: item.city_name,
+                    tags: item.tags,
+                })
+                .collect(),
+            total: page.total,
+            limit,
+            offset,
+        }),
+        Err(error_value) => {
+            error!(event = "SearchElasticsearchError", query_type, message = %error_value);
+            HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"message": "搜索索引暂时不可用"}))
+        }
+    }
+}
+
 #[get("/api/search/ip")]
 pub async fn search_ip(
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<SearchQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -428,6 +492,17 @@ pub async fn search_ip(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return respond_search_elasticsearch(
+            elasticsearch.get_ref(),
+            &user,
+            "ip",
+            q.to_owned(),
+            serde_json::json!({"term": {"ip": q}}),
+            (limit, offset),
+        )
+        .await;
+    }
     respond_search(
         pool.get_ref(),
         &user,
@@ -443,6 +518,7 @@ pub async fn search_ip(
 #[get("/api/search/network")]
 pub async fn search_network(
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<SearchQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -455,6 +531,17 @@ pub async fn search_network(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return respond_search_elasticsearch(
+            elasticsearch.get_ref(),
+            &user,
+            "network",
+            q.to_owned(),
+            serde_json::json!({"term": {"ip": normalized_cidr}}),
+            (limit, offset),
+        )
+        .await;
+    }
     respond_search(
         pool.get_ref(),
         &user,
@@ -500,6 +587,7 @@ mod tests {
 #[get("/api/search/port")]
 pub async fn search_port(
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<PortSearchQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -511,6 +599,17 @@ pub async fn search_port(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return respond_search_elasticsearch(
+            elasticsearch.get_ref(),
+            &user,
+            "port",
+            port.to_string(),
+            serde_json::json!({"term": {"port": port}}),
+            (limit, offset),
+        )
+        .await;
+    }
     let port = port.to_string();
     respond_search(
         pool.get_ref(),
@@ -527,6 +626,7 @@ pub async fn search_port(
 #[get("/api/search/service")]
 pub async fn search_service(
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<SearchQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -538,6 +638,17 @@ pub async fn search_service(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('*', "\\*")
+            .replace('?', "\\?");
+        return respond_search_elasticsearch(
+            elasticsearch.get_ref(), &user, "service", q.to_owned(),
+            serde_json::json!({"wildcard": {"service": {"value": format!("*{escaped}*"), "case_insensitive": true}}}),
+            (limit, offset),
+        ).await;
+    }
     respond_search(
         pool.get_ref(),
         &user,
@@ -553,6 +664,7 @@ pub async fn search_service(
 #[get("/api/search/banner")]
 pub async fn search_banner(
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<SearchQuery>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -564,6 +676,17 @@ pub async fn search_banner(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('*', "\\*")
+            .replace('?', "\\?");
+        return respond_search_elasticsearch(
+            elasticsearch.get_ref(), &user, "banner", q.to_owned(),
+            serde_json::json!({"wildcard": {"banner": {"value": format!("*{escaped}*"), "case_insensitive": true}}}),
+            (limit, offset),
+        ).await;
+    }
     respond_search(
         pool.get_ref(),
         &user,

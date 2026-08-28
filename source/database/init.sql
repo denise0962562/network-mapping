@@ -108,8 +108,15 @@ CREATE TABLE IF NOT EXISTS scan_task_execution (
 	lease_expires_at BIGINT,
 	failure_reason TEXT,
 	cancel_requested BOOLEAN NOT NULL DEFAULT false,
+	result_ip_count BIGINT,
+	result_port_count BIGINT,
+	result_observation_count BIGINT,
 	CONSTRAINT uk_task_execution_scanner UNIQUE(task_id, requested_scanner_id)
 );
+
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_ip_count BIGINT;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_port_count BIGINT;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_observation_count BIGINT;
 
 CREATE TABLE IF NOT EXISTS automatic_target_state (
 	strategy TEXT PRIMARY KEY,
@@ -211,11 +218,35 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	is_final BOOLEAN NOT NULL,
 	observation_count INT NOT NULL CHECK (observation_count >= 0),
 	protocol_version SMALLINT NOT NULL DEFAULT 2 CHECK (protocol_version IN (1, 2)),
+	payload_checksum VARCHAR(64),
+	storage_backend TEXT NOT NULL DEFAULT 'postgres',
+	storage_references JSONB NOT NULL DEFAULT '[]'::JSONB,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	UNIQUE(execution_id, upload_id, batch_index)
 );
 
+CREATE TABLE IF NOT EXISTS scan_storage_state (
+	state_key TEXT PRIMARY KEY,
+	state_value JSONB NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scan_projection_outbox (
+	execution_id INT PRIMARY KEY REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	last_error TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_projection_outbox_pending
+	ON scan_projection_outbox(available_at, execution_id) WHERE processed_at IS NULL;
+
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT NOT NULL DEFAULT 2;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS payload_checksum VARCHAR(64);
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_references JSONB NOT NULL DEFAULT '[]'::JSONB;
 DO $$
 BEGIN
 	IF NOT EXISTS (
@@ -268,6 +299,16 @@ CREATE INDEX IF NOT EXISTS idx_scan_observation_observed_at
 CREATE INDEX IF NOT EXISTS idx_scan_observation_service
 	ON scan_observation(service)
 	WHERE kind = 'service' AND service IS NOT NULL;
+
+-- One-time compatibility backfill. These are execution-level control-plane counters;
+-- scan facts remain in scan_observation for PostgreSQL/dual mode or Elasticsearch after cutover.
+UPDATE scan_task_execution execution SET
+	result_ip_count = (SELECT COUNT(*) FROM ips WHERE execution_id = execution.id),
+	result_port_count = (SELECT COUNT(*) FROM ports p JOIN ips i ON i.ip_id = p.ip_id WHERE i.execution_id = execution.id),
+	result_observation_count = (SELECT COUNT(*) FROM scan_observation WHERE execution_id = execution.id)
+WHERE execution.result_ip_count IS NULL
+	OR execution.result_port_count IS NULL
+	OR execution.result_observation_count IS NULL;
 CREATE INDEX IF NOT EXISTS idx_scan_observation_asset_endpoint_latest
 	ON scan_observation(ip_address, port, observed_at DESC, id DESC)
 	WHERE port > 0;

@@ -2,6 +2,7 @@ use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::AuditContext;
 use crate::client_ip::{normalize_ip, request_ip};
 use crate::config::SecurityConfig;
+use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
@@ -16,7 +17,7 @@ use actix_web::{HttpRequest, HttpResponse, Responder, get, http::header, post, w
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use tracing::error;
@@ -321,6 +322,116 @@ fn task_result_pagination(page: Option<i64>, page_size: Option<i64>) -> (i64, i6
     let page = page.unwrap_or(1).max(1);
     let page_size = page_size.unwrap_or(20).clamp(1, 100);
     (page, page_size, (page - 1) * page_size)
+}
+
+async fn load_execution_results_from_elasticsearch(
+    elasticsearch: &ElasticsearchService,
+    execution_id: &str,
+    offset: i64,
+    page_size: i64,
+) -> Result<Vec<TaskResultIp>, String> {
+    let mut search_after: Option<Value> = None;
+    let mut skipped_ips = 0_i64;
+    let mut results: Vec<TaskResultIp> = Vec::new();
+    let mut current_ip: Option<String> = None;
+    let mut collect_current = false;
+    loop {
+        let mut body = json!({
+            "size": 1000,
+            "query": {"term": {"execution_id": execution_id}},
+            "sort": [{"ip": "asc"}, {"port": "asc"}]
+        });
+        if let Some(value) = search_after.clone() {
+            body.as_object_mut()
+                .expect("query body is object")
+                .insert("search_after".to_owned(), value);
+        }
+        let response = elasticsearch
+            .scan_query(ScanQueryIndex::ExecutionEndpoints, &body)
+            .await?;
+        let hits = response
+            .pointer("/hits/hits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Elasticsearch execution query response is missing hits".to_owned())?;
+        if hits.is_empty() {
+            break;
+        }
+        for hit in hits {
+            let source = hit
+                .get("_source")
+                .ok_or_else(|| "Elasticsearch execution hit is missing _source".to_owned())?;
+            let ip = source
+                .get("ip")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Elasticsearch execution hit is missing ip".to_owned())?;
+            let is_new_ip = current_ip.as_deref() != Some(ip);
+            if is_new_ip {
+                current_ip = Some(ip.to_owned());
+                if skipped_ips < offset {
+                    skipped_ips += 1;
+                    collect_current = false;
+                    continue;
+                }
+                if results.len() >= page_size as usize {
+                    return Ok(results);
+                }
+                collect_current = true;
+                let text =
+                    |field: &str| source.get(field).and_then(Value::as_str).map(str::to_owned);
+                results.push(TaskResultIp {
+                    ip: ip.to_owned(),
+                    asn: text("asn"),
+                    isp: text("isp"),
+                    as_org: text("as_org"),
+                    country_code: text("country_code"),
+                    country_name: text("country_name"),
+                    region_name: text("region_name"),
+                    city_name: text("city_name"),
+                    ports: Vec::new(),
+                });
+            } else if !collect_current {
+                continue;
+            }
+            if let Some(asset) = results.last_mut().filter(|asset| asset.ip == ip) {
+                let kind = source.get("kind").and_then(Value::as_str).unwrap_or("port");
+                let other = if kind == "service" {
+                    json!({
+                        "observation_kind": kind,
+                        "source": source.get("source"),
+                        "data": source.get("data")
+                    })
+                } else {
+                    json!({
+                        "observation_kind": kind,
+                        "state": source.pointer("/data/state").and_then(Value::as_str).unwrap_or("open"),
+                        "source": source.get("source")
+                    })
+                };
+                asset.ports.push(TaskResultPort {
+                    port: source.get("port").and_then(Value::as_i64).unwrap_or(0) as i32,
+                    protocol: source
+                        .get("protocol")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    service: source
+                        .get("service")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    banner: source
+                        .get("banner")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    other: Some(other),
+                    scan_time: source.get("observed_at_ms").and_then(Value::as_i64),
+                });
+            }
+        }
+        search_after = hits.last().and_then(|hit| hit.get("sort")).cloned();
+        if hits.len() < 1000 || search_after.is_none() {
+            break;
+        }
+    }
+    Ok(results)
 }
 
 #[post("/api/scanner/heartbeat")]
@@ -838,6 +949,7 @@ pub(crate) async fn scanner_task_cancelled_handler(
 async fn get_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     task_id: web::Path<Uuid>,
     query: web::Query<TaskDetailQuery>,
     user: UserBaseI,
@@ -881,14 +993,10 @@ async fn get_task(
         "SELECT e.id, e.execution_id, e.requested_scanner_id, e.assigned_scanner_id, \
          COALESCE(s.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, s.location, \
          e.execution_status, e.attempt_count, e.task_start_time, e.task_end_time, e.lease_expires_at, \
-         e.failure_reason, e.cancel_requested, COALESCE(assets.ip_count, 0)::BIGINT AS ip_count, \
-         COALESCE(assets.port_count, 0)::BIGINT AS port_count, COALESCE(observations.result_count, 0)::BIGINT AS result_count \
+         e.failure_reason, e.cancel_requested, COALESCE(e.result_ip_count, 0)::BIGINT AS ip_count, \
+         COALESCE(e.result_port_count, 0)::BIGINT AS port_count, COALESCE(e.result_observation_count, 0)::BIGINT AS result_count \
          FROM scan_task_execution e \
          LEFT JOIN scanner_info s ON s.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
-         LEFT JOIN LATERAL (SELECT COUNT(DISTINCT i.ip_id) AS ip_count, COUNT(DISTINCT p.port_id) AS port_count \
-             FROM ips i LEFT JOIN ports p ON p.ip_id = i.ip_id WHERE i.execution_id = e.id) assets ON true \
-         LEFT JOIN LATERAL (SELECT COUNT(*) AS result_count FROM scan_observation o \
-             WHERE o.execution_id = e.id) observations ON true \
          WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
          ORDER BY e.id;", &[&task_pk]).await {
         Ok(rows) => rows,
@@ -927,102 +1035,106 @@ async fn get_task(
         "summary": {"ip_count": row.get::<_, i64>("ip_count"), "port_count": row.get::<_, i64>("port_count"), "result_count": row.get::<_, i64>("result_count")}
     })).collect();
     let (page, page_size, offset) = task_result_pagination(query.page, query.page_size);
-    let summary = match connection
-        .query_one(
-            "SELECT \
-             (SELECT COUNT(*)::BIGINT FROM ips WHERE execution_id = $1) AS ip_count, \
-             (SELECT COUNT(*)::BIGINT FROM ports p JOIN ips i ON i.ip_id = p.ip_id WHERE i.execution_id = $1) AS port_count, \
-             (SELECT COUNT(*)::BIGINT FROM scan_observation WHERE execution_id = $1) AS result_count;",
-            &[&selected_execution_pk],
+    let ip_count = selected_execution.get::<_, i64>("ip_count");
+    let port_count = selected_execution.get::<_, i64>("port_count");
+    let result_count = selected_execution.get::<_, i64>("result_count");
+    let results = if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        match load_execution_results_from_elasticsearch(
+            elasticsearch.get_ref(),
+            selected_execution.get::<_, String>("execution_id").as_str(),
+            offset,
+            page_size,
         )
         .await
-    {
-        Ok(summary) => summary,
-        Err(error) => {
-            error_logs(&req, "GetTaskSummaryError", &error.to_string());
-            return HttpResponse::InternalServerError().finish();
+        {
+            Ok(results) => results,
+            Err(error) => {
+                error_logs(&req, "GetTaskResultsElasticsearchError", &error);
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"message": "扫描结果索引暂时不可用"}));
+            }
         }
-    };
-    let ip_rows = match connection
-        .query(
-            "SELECT ip_id, ip_address::text AS ip, asn, isp, as_org, \
-             country_code, country_name, region_name, city_name FROM ips \
-             WHERE execution_id = $1 ORDER BY ip_address LIMIT $2 OFFSET $3;",
-            &[&selected_execution_pk, &page_size, &offset],
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            error_logs(&req, "GetTaskResultsError", &error.to_string());
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-    let ip_ids: Vec<i32> = ip_rows.iter().map(|row| row.get("ip_id")).collect();
-    let mut ports_by_ip: HashMap<i32, Vec<TaskResultPort>> = HashMap::new();
-    if !ip_ids.is_empty() {
-        let port_rows = match connection
+    } else {
+        let ip_rows = match connection
             .query(
-                "SELECT p.ip_id, p.port, latest.protocol, latest.service, latest.banner, \
-                 CASE WHEN latest.kind IS NULL THEN NULL \
-                 WHEN latest.kind = 'port' THEN jsonb_strip_nulls(jsonb_build_object( \
-                    'observation_kind', latest.kind, 'state', latest.data->>'state', 'source', latest.source)) \
-                 ELSE jsonb_strip_nulls(jsonb_build_object('observation_kind', latest.kind, \
-                    'source', latest.source, 'data', latest.data)) END AS other, \
-                 latest.scan_time FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
-                 LEFT JOIN LATERAL ( \
-                    SELECT o.kind, o.protocol, o.service, o.banner, o.source, o.data, \
-                        FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
-                    FROM scan_observation o \
-                    WHERE o.execution_id = i.execution_id \
-                        AND o.ip_address = i.ip_address AND o.port = p.port \
-                    ORDER BY (o.kind = 'service') DESC, \
-                        (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
-                        o.observed_at DESC, o.id DESC LIMIT 1 \
-                 ) latest ON true \
-                 WHERE p.ip_id = ANY($1) ORDER BY p.ip_id, p.port;",
-                &[&ip_ids],
+                "SELECT ip_id, ip_address::text AS ip, asn, isp, as_org, \
+                 country_code, country_name, region_name, city_name FROM ips \
+                 WHERE execution_id = $1 ORDER BY ip_address LIMIT $2 OFFSET $3;",
+                &[&selected_execution_pk, &page_size, &offset],
             )
             .await
         {
             Ok(rows) => rows,
             Err(error) => {
-                error_logs(&req, "GetTaskPortsError", &error.to_string());
+                error_logs(&req, "GetTaskResultsError", &error.to_string());
                 return HttpResponse::InternalServerError().finish();
             }
         };
-        for row in port_rows {
-            ports_by_ip
-                .entry(row.get("ip_id"))
-                .or_default()
-                .push(TaskResultPort {
-                    port: row.get("port"),
-                    protocol: row.get("protocol"),
-                    service: row.get("service"),
-                    banner: row.get("banner"),
-                    other: row.get("other"),
-                    scan_time: row.get("scan_time"),
-                });
-        }
-    }
-    let results: Vec<TaskResultIp> = ip_rows
-        .into_iter()
-        .map(|row| {
-            let ip_id: i32 = row.get("ip_id");
-            TaskResultIp {
-                ip: row.get("ip"),
-                asn: row.get("asn"),
-                isp: row.get("isp"),
-                as_org: row.get("as_org"),
-                country_code: row.get("country_code"),
-                country_name: row.get("country_name"),
-                region_name: row.get("region_name"),
-                city_name: row.get("city_name"),
-                ports: ports_by_ip.remove(&ip_id).unwrap_or_default(),
+        let ip_ids: Vec<i32> = ip_rows.iter().map(|row| row.get("ip_id")).collect();
+        let mut ports_by_ip: HashMap<i32, Vec<TaskResultPort>> = HashMap::new();
+        if !ip_ids.is_empty() {
+            let port_rows = match connection
+                .query(
+                    "SELECT p.ip_id, p.port, latest.protocol, latest.service, latest.banner, \
+                     CASE WHEN latest.kind IS NULL THEN NULL \
+                     WHEN latest.kind = 'port' THEN jsonb_strip_nulls(jsonb_build_object( \
+                        'observation_kind', latest.kind, 'state', latest.data->>'state', 'source', latest.source)) \
+                     ELSE jsonb_strip_nulls(jsonb_build_object('observation_kind', latest.kind, \
+                        'source', latest.source, 'data', latest.data)) END AS other, \
+                     latest.scan_time FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
+                     LEFT JOIN LATERAL ( \
+                        SELECT o.kind, o.protocol, o.service, o.banner, o.source, o.data, \
+                            FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
+                        FROM scan_observation o \
+                        WHERE o.execution_id = i.execution_id \
+                            AND o.ip_address = i.ip_address AND o.port = p.port \
+                        ORDER BY (o.kind = 'service') DESC, \
+                            (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
+                            o.observed_at DESC, o.id DESC LIMIT 1 \
+                     ) latest ON true \
+                     WHERE p.ip_id = ANY($1) ORDER BY p.ip_id, p.port;",
+                    &[&ip_ids],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    error_logs(&req, "GetTaskPortsError", &error.to_string());
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+            for row in port_rows {
+                ports_by_ip
+                    .entry(row.get("ip_id"))
+                    .or_default()
+                    .push(TaskResultPort {
+                        port: row.get("port"),
+                        protocol: row.get("protocol"),
+                        service: row.get("service"),
+                        banner: row.get("banner"),
+                        other: row.get("other"),
+                        scan_time: row.get("scan_time"),
+                    });
             }
-        })
-        .collect();
-    let ip_count: i64 = summary.get("ip_count");
+        }
+        ip_rows
+            .into_iter()
+            .map(|row| {
+                let ip_id: i32 = row.get("ip_id");
+                TaskResultIp {
+                    ip: row.get("ip"),
+                    asn: row.get("asn"),
+                    isp: row.get("isp"),
+                    as_org: row.get("as_org"),
+                    country_code: row.get("country_code"),
+                    country_name: row.get("country_name"),
+                    region_name: row.get("region_name"),
+                    city_name: row.get("city_name"),
+                    ports: ports_by_ip.remove(&ip_id).unwrap_or_default(),
+                }
+            })
+            .collect()
+    };
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "data": {
@@ -1054,8 +1166,8 @@ async fn get_task(
             "remarks": task.get::<_, Option<String>>("remarks"),
             "summary": {
                 "ip_count": ip_count,
-                "port_count": summary.get::<_, i64>("port_count"),
-                "result_count": summary.get::<_, i64>("result_count"),
+                "port_count": port_count,
+                "result_count": result_count,
             },
             "results": results,
             "pagination": {
@@ -1293,6 +1405,7 @@ async fn upload_scanner_result_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     maxmind: web::Data<MaxMindState>,
+    elasticsearch: web::Data<crate::elasticsearch::ElasticsearchService>,
     security: web::Data<SecurityConfig>,
     upload_data: web::Json<ScannerResultUpload>,
 ) -> impl Responder {
@@ -1309,6 +1422,7 @@ async fn upload_scanner_result_handler(
     match save_scanner_results(
         pool.get_ref(),
         maxmind.get_ref(),
+        elasticsearch.get_ref(),
         &upload_data,
         token,
         &security.scanner_token_pepper,
@@ -1339,6 +1453,9 @@ async fn upload_scanner_result_handler(
                 }
                 SaveScannerResultsError::Database(_) => {
                     HttpResponse::InternalServerError().body("500")
+                }
+                SaveScannerResultsError::Storage(_) => {
+                    HttpResponse::ServiceUnavailable().body("scan storage unavailable")
                 }
             }
         }
