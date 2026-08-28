@@ -985,7 +985,7 @@ impl ElasticsearchService {
                 let delay = i64::from(2_i32.saturating_pow(attempts.clamp(1, 8) as u32));
                 let last_error = error.chars().take(2000).collect::<String>();
                 connection.execute(
-                    "UPDATE scan_projection_outbox SET available_at = NOW() + ($2 * INTERVAL '1 second'), \
+                    "UPDATE scan_projection_outbox SET available_at = NOW() + ($2::BIGINT * INTERVAL '1 second'), \
                         last_error = $3 WHERE execution_id = $1;",
                     &[&execution_db_id, &delay, &last_error],
                 ).await.map_err(|error| error.to_string())?;
@@ -1646,7 +1646,7 @@ async fn claim_ip_event(pool: &Pool) -> Result<Option<OutboxEvent>, String> {
             "UPDATE search_index_outbox SET locked_at = NOW(), attempts = attempts + 1 \
              WHERE id = (SELECT id FROM search_index_outbox \
                  WHERE event_kind = 'ip' AND processed_at IS NULL AND available_at <= NOW() \
-                   AND (locked_at IS NULL OR locked_at < NOW() - ($1 * INTERVAL '1 minute')) \
+                   AND (locked_at IS NULL OR locked_at < NOW() - ($1::BIGINT * INTERVAL '1 minute')) \
                  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) \
              RETURNING id, event_kind, aggregate_key, attempts;",
             &[&OUTBOX_LOCK_TIMEOUT_MINUTES],
@@ -1697,7 +1697,7 @@ async fn claim_event(pool: &Pool) -> Result<Option<OutboxEvent>, String> {
             "UPDATE search_index_outbox SET locked_at = NOW(), attempts = attempts + 1 \
              WHERE id = (SELECT id FROM search_index_outbox \
                  WHERE processed_at IS NULL AND available_at <= NOW() \
-                   AND (locked_at IS NULL OR locked_at < NOW() - ($1 * INTERVAL '1 minute')) \
+                   AND (locked_at IS NULL OR locked_at < NOW() - ($1::BIGINT * INTERVAL '1 minute')) \
                  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) \
              RETURNING id, event_kind, aggregate_key, attempts;",
             &[&OUTBOX_LOCK_TIMEOUT_MINUTES],
@@ -1930,7 +1930,7 @@ async fn retry_event(pool: &Pool, event: &OutboxEvent, message: &str) -> Result<
     connection
         .execute(
             "UPDATE search_index_outbox SET locked_at = NULL, last_error = $2, \
-             available_at = NOW() + ($3 * INTERVAL '1 second') WHERE id = $1;",
+             available_at = NOW() + ($3::BIGINT * INTERVAL '1 second') WHERE id = $1;",
             &[&event.id, &last_error, &delay_seconds],
         )
         .await
