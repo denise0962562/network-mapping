@@ -77,6 +77,19 @@ WITH bucket_range AS (
         CASE WHEN jsonb_typeof(db_postgresql->'db_table_size') = 'object'
              THEN db_postgresql->'db_table_size'
              ELSE '{}'::JSONB END AS tables,
+        CASE WHEN jsonb_typeof(db_elasticsearch->'enabled') = 'boolean'
+             THEN (db_elasticsearch->>'enabled')::BOOLEAN ELSE FALSE END AS elasticsearch_enabled,
+        CASE WHEN jsonb_typeof(db_elasticsearch->'available') = 'boolean'
+             THEN (db_elasticsearch->>'available')::BOOLEAN ELSE FALSE END AS elasticsearch_available,
+        CASE WHEN db_elasticsearch->>'primary_size' ~ '^[0-9]+$'
+             THEN (db_elasticsearch->>'primary_size')::BIGINT END AS elasticsearch_primary_size,
+        CASE WHEN db_elasticsearch->>'replica_size' ~ '^[0-9]+$'
+             THEN (db_elasticsearch->>'replica_size')::BIGINT END AS elasticsearch_replica_size,
+        CASE WHEN db_elasticsearch->>'total_size' ~ '^[0-9]+$'
+             THEN (db_elasticsearch->>'total_size')::BIGINT END AS elasticsearch_total_size,
+        CASE WHEN jsonb_typeof(db_elasticsearch->'indices') = 'object'
+             THEN db_elasticsearch->'indices'
+             ELSE '{}'::JSONB END AS elasticsearch_indices,
         COUNT(*) OVER (
             PARTITION BY (create_time / $3::BIGINT) * $3::BIGINT
         )::BIGINT AS sample_count,
@@ -91,7 +104,13 @@ SELECT b.bucket_start,
        COALESCE(r.sample_count, 0)::BIGINT AS sample_count,
        r.database_size,
        r.connection_count,
-       COALESCE(r.tables, '{}'::JSONB) AS tables
+       COALESCE(r.tables, '{}'::JSONB) AS tables,
+       COALESCE(r.elasticsearch_enabled, FALSE) AS elasticsearch_enabled,
+       COALESCE(r.elasticsearch_available, FALSE) AS elasticsearch_available,
+       r.elasticsearch_primary_size,
+       r.elasticsearch_replica_size,
+       r.elasticsearch_total_size,
+       COALESCE(r.elasticsearch_indices, '{}'::JSONB) AS elasticsearch_indices
 FROM bucket_range b
 LEFT JOIN ranked r
        ON r.bucket_start = b.bucket_start
@@ -254,17 +273,31 @@ struct DatabaseTableSize {
 }
 
 #[derive(Serialize)]
+struct ElasticsearchIndexSize {
+    primary: i64,
+    replica: i64,
+    total: i64,
+}
+
+#[derive(Serialize)]
 struct DatabaseHistoryPoint {
     timestamp_ms: i64,
     sample_count: i64,
     database_size: Option<i64>,
     connection_count: Option<i64>,
     tables: BTreeMap<String, DatabaseTableSize>,
+    elasticsearch_enabled: bool,
+    elasticsearch_available: bool,
+    elasticsearch_primary_size: Option<i64>,
+    elasticsearch_replica_size: Option<i64>,
+    elasticsearch_total_size: Option<i64>,
+    elasticsearch_indices: BTreeMap<String, ElasticsearchIndexSize>,
 }
 
 #[derive(Serialize)]
 struct DatabaseHistoryData {
     table_names: Vec<String>,
+    elasticsearch_index_names: Vec<String>,
     points: Vec<DatabaseHistoryPoint>,
 }
 
@@ -340,6 +373,37 @@ fn table_sizes_from_json(value: serde_json::Value) -> BTreeMap<String, DatabaseT
             let index = metrics.get("index")?.as_i64()?;
             (total >= 0 && data >= 0 && index >= 0)
                 .then(|| (name.clone(), DatabaseTableSize { total, data, index }))
+        })
+        .collect()
+}
+
+fn elasticsearch_sizes_from_json(
+    value: serde_json::Value,
+) -> BTreeMap<String, ElasticsearchIndexSize> {
+    let Some(indices) = value.as_object() else {
+        return BTreeMap::new();
+    };
+
+    indices
+        .iter()
+        .filter_map(|(name, metrics)| {
+            let primary = metrics.get("primary")?.as_i64()?;
+            let replica = metrics.get("replica")?.as_i64()?;
+            let total = metrics.get("total")?.as_i64()?;
+            (primary >= 0
+                && replica >= 0
+                && total >= 0
+                && primary.checked_add(replica) == Some(total))
+            .then(|| {
+                (
+                    name.clone(),
+                    ElasticsearchIndexSize {
+                        primary,
+                        replica,
+                        total,
+                    },
+                )
+            })
         })
         .collect()
 }
@@ -462,17 +526,27 @@ pub(crate) async fn get_database_size_history(
     };
 
     let mut table_names = BTreeSet::new();
+    let mut elasticsearch_index_names = BTreeSet::new();
     let points: Vec<DatabaseHistoryPoint> = rows
         .into_iter()
         .map(|row| {
             let tables = table_sizes_from_json(row.get("tables"));
+            let elasticsearch_indices =
+                elasticsearch_sizes_from_json(row.get("elasticsearch_indices"));
             table_names.extend(tables.keys().cloned());
+            elasticsearch_index_names.extend(elasticsearch_indices.keys().cloned());
             DatabaseHistoryPoint {
                 timestamp_ms: row.get::<_, i64>("bucket_start") * 1_000,
                 sample_count: row.get("sample_count"),
                 database_size: row.get("database_size"),
                 connection_count: row.get("connection_count"),
                 tables,
+                elasticsearch_enabled: row.get("elasticsearch_enabled"),
+                elasticsearch_available: row.get("elasticsearch_available"),
+                elasticsearch_primary_size: row.get("elasticsearch_primary_size"),
+                elasticsearch_replica_size: row.get("elasticsearch_replica_size"),
+                elasticsearch_total_size: row.get("elasticsearch_total_size"),
+                elasticsearch_indices,
             }
         })
         .collect();
@@ -482,6 +556,7 @@ pub(crate) async fn get_database_size_history(
         success: true,
         data: DatabaseHistoryData {
             table_names: table_names.into_iter().collect(),
+            elasticsearch_index_names: elasticsearch_index_names.into_iter().collect(),
             points,
         },
         meta: ResourceHistoryMeta {
@@ -501,7 +576,8 @@ mod tests {
 
     use super::{
         DATABASE_HISTORY_SQL, Granularity, RESOURCE_HISTORY_SQL, ResourceHistoryQuery,
-        normalize_database_query, normalize_query, rounded, table_sizes_from_json,
+        elasticsearch_sizes_from_json, normalize_database_query, normalize_query, rounded,
+        table_sizes_from_json,
     };
 
     fn query(duration: Duration, granularity: &str) -> ResourceHistoryQuery {
@@ -600,6 +676,20 @@ mod tests {
     }
 
     #[test]
+    fn database_schema_and_status_insert_include_elasticsearch_metrics() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+        let insert_sql = include_str!("../../source/database/insert_system_status.sql");
+        assert!(initialization_sql.contains("db_elasticsearch JSONB DEFAULT NULL"));
+        assert!(
+            initialization_sql.contains(
+                "ALTER TABLE system_status ADD COLUMN IF NOT EXISTS db_elasticsearch JSONB"
+            )
+        );
+        assert!(insert_sql.contains("db_postgresql, db_elasticsearch, network"));
+        assert!(insert_sql.contains("$1, $2, $3, $4, $5, $6, $7"));
+    }
+
+    #[test]
     fn table_sizes_are_sorted_and_invalid_entries_are_ignored() {
         let tables = table_sizes_from_json(serde_json::json!({
             "z_table": {"total": 30, "data": 20, "index": 10},
@@ -611,5 +701,20 @@ mod tests {
             vec!["a_table", "z_table"]
         );
         assert_eq!(tables["a_table"].total, 15);
+    }
+
+    #[test]
+    fn elasticsearch_sizes_are_sorted_and_invalid_entries_are_ignored() {
+        let indices = elasticsearch_sizes_from_json(serde_json::json!({
+            "z-index": {"primary": 20, "replica": 10, "total": 30},
+            "a-index": {"primary": 10, "replica": 5, "total": 15},
+            "broken": {"primary": 10, "replica": 10, "total": 99}
+        }));
+        assert_eq!(
+            indices.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a-index", "z-index"]
+        );
+        assert_eq!(indices["a-index"].replica, 5);
+        assert_eq!(indices["z-index"].total, 30);
     }
 }

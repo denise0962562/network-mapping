@@ -210,7 +210,7 @@ async fn main() -> io::Result<()> {
     let elasticsearch_data = web::Data::new(elasticsearch_service.clone());
     if elasticsearch_service.enabled() {
         tokio::spawn(run_elasticsearch_worker(
-            elasticsearch_service,
+            elasticsearch_service.clone(),
             db_pool.clone(),
         ));
     }
@@ -293,7 +293,14 @@ async fn main() -> io::Result<()> {
 
         loop {
             ticker.tick().await;
-            match insert_system_status(&db_pool, database_c.db_name.clone(), sys.clone()).await {
+            match insert_system_status(
+                &db_pool,
+                database_c.db_name.clone(),
+                sys.clone(),
+                &elasticsearch_service,
+            )
+            .await
+            {
                 Ok(_) => (),
                 Err(e) => {
                     error!(

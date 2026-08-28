@@ -1138,9 +1138,13 @@ pub async fn insert_system_status(
     pool: &deadpool_postgres::Pool,
     db_name: String,
     sys: Systems,
+    elasticsearch: &ElasticsearchService,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (s, elasticsearch_metrics) = tokio::join!(
+        SystemResource::new(sys, pool, &db_name),
+        elasticsearch.storage_metrics()
+    );
     let mut client = pool.get().await?;
-    let s = SystemResource::new(sys, pool, &db_name).await;
     let transaction = client.transaction().await?;
     let sql = get_sql_from_file("source/database/", "insert_system_status.sql").await?;
     let statement = transaction.prepare(&sql).await?;
@@ -1149,6 +1153,7 @@ pub async fn insert_system_status(
     let ram = serde_json::to_value(s.ram).unwrap();
     let disk = serde_json::to_value(s.disk).unwrap();
     let db_postgresql = serde_json::to_value(s.db_postgresql).unwrap();
+    let db_elasticsearch = serde_json::to_value(elasticsearch_metrics).unwrap();
     let network = serde_json::to_value(s.network).unwrap();
     let raw = transaction
         .execute(
@@ -1159,6 +1164,7 @@ pub async fn insert_system_status(
                 &ram,
                 &disk,
                 &db_postgresql,
+                &db_elasticsearch,
                 &network,
             ],
         )

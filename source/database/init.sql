@@ -486,8 +486,11 @@ CREATE TABLE IF NOT EXISTS system_status (
 	ram JSONB DEFAULT NULL,
 	disk JSONB DEFAULT NULL,
 	db_postgresql JSONB DEFAULT NULL,
+	db_elasticsearch JSONB DEFAULT NULL,
 	network JSONB DEFAULT NULL
 );
+
+ALTER TABLE system_status ADD COLUMN IF NOT EXISTS db_elasticsearch JSONB DEFAULT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_system_status_create_time
 	ON system_status(create_time);

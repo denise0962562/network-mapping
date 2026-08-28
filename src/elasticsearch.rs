@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -92,6 +93,36 @@ pub(crate) struct ElasticsearchStatus {
     pub runtime: ElasticsearchRuntime,
     pub pending_events: i64,
     pub oldest_pending_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ElasticsearchIndexStorage {
+    pub(crate) primary: i64,
+    pub(crate) replica: i64,
+    pub(crate) total: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ElasticsearchStorageMetrics {
+    pub(crate) enabled: bool,
+    pub(crate) available: bool,
+    pub(crate) primary_size: Option<i64>,
+    pub(crate) replica_size: Option<i64>,
+    pub(crate) total_size: Option<i64>,
+    pub(crate) indices: BTreeMap<String, ElasticsearchIndexStorage>,
+}
+
+impl ElasticsearchStorageMetrics {
+    fn unavailable(enabled: bool) -> Self {
+        Self {
+            enabled,
+            available: false,
+            primary_size: None,
+            replica_size: None,
+            total_size: None,
+            indices: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -233,6 +264,56 @@ impl ElasticsearchService {
 
     pub fn scan_storage_mode(&self) -> ScanStorageMode {
         self.inner.config.scan_storage
+    }
+
+    pub(crate) async fn storage_metrics(&self) -> ElasticsearchStorageMetrics {
+        if !self.enabled() {
+            return ElasticsearchStorageMetrics::unavailable(false);
+        }
+
+        let mut targets = vec![
+            self.inner.config.index.clone(),
+            format!("{}-*", self.inner.config.observation_index_prefix),
+            self.inner.config.execution_endpoint_index.clone(),
+            self.inner.config.current_endpoint_index.clone(),
+        ];
+        targets.sort();
+        targets.dedup();
+        let response = match self
+            .request(Method::GET, &format!("/{}/_stats/store", targets.join(",")))
+            .query(&[
+                ("level", "indices"),
+                ("ignore_unavailable", "true"),
+                ("allow_no_indices", "true"),
+                ("expand_wildcards", "open"),
+                (
+                    "filter_path",
+                    "indices.*.primaries.store.size_in_bytes,indices.*.total.store.size_in_bytes",
+                ),
+            ])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(event = "ElasticsearchStorageMetricsRequestError", message = %error);
+                return ElasticsearchStorageMetrics::unavailable(true);
+            }
+        };
+        let response = match response_json(response).await {
+            Ok(value) => value,
+            Err(message) => {
+                warn!(event = "ElasticsearchStorageMetricsResponseError", message = %message);
+                return ElasticsearchStorageMetrics::unavailable(true);
+            }
+        };
+        match parse_storage_metrics(&response) {
+            Ok(metrics) => metrics,
+            Err(message) => {
+                warn!(event = "ElasticsearchStorageMetricsParseError", message = %message);
+                ElasticsearchStorageMetrics::unavailable(true)
+            }
+        }
     }
 
     pub(crate) async fn scan_query(
@@ -1938,6 +2019,85 @@ async fn retry_event(pool: &Pool, event: &OutboxEvent, message: &str) -> Result<
     Ok(())
 }
 
+fn parse_storage_metrics(response: &Value) -> Result<ElasticsearchStorageMetrics, String> {
+    let response = response
+        .as_object()
+        .ok_or_else(|| "Elasticsearch 索引统计响应不是对象".to_owned())?;
+    let empty_indices = serde_json::Map::new();
+    let indices = match response.get("indices") {
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| "Elasticsearch 索引统计响应的 indices 不是对象".to_owned())?,
+        None => &empty_indices,
+    };
+    let mut parsed_indices = BTreeMap::new();
+    let mut primary_size = 0_i64;
+    let mut total_size = 0_i64;
+
+    for (name, value) in indices {
+        let Some(primary) = value
+            .pointer("/primaries/store/size_in_bytes")
+            .and_then(Value::as_u64)
+            .and_then(|size| i64::try_from(size).ok())
+        else {
+            warn!(
+                event = "ElasticsearchStorageMetricIndexSkipped",
+                index = %name,
+                reason = "missing_or_invalid_primary_size"
+            );
+            continue;
+        };
+        let Some(total) = value
+            .pointer("/total/store/size_in_bytes")
+            .and_then(Value::as_u64)
+            .and_then(|size| i64::try_from(size).ok())
+        else {
+            warn!(
+                event = "ElasticsearchStorageMetricIndexSkipped",
+                index = %name,
+                reason = "missing_or_invalid_total_size"
+            );
+            continue;
+        };
+        if total < primary {
+            warn!(
+                event = "ElasticsearchStorageMetricIndexSkipped",
+                index = %name,
+                primary,
+                total,
+                reason = "total_smaller_than_primary"
+            );
+            continue;
+        }
+        primary_size = primary_size
+            .checked_add(primary)
+            .ok_or_else(|| "Elasticsearch 主分片容量汇总溢出".to_owned())?;
+        total_size = total_size
+            .checked_add(total)
+            .ok_or_else(|| "Elasticsearch 总容量汇总溢出".to_owned())?;
+        parsed_indices.insert(
+            name.clone(),
+            ElasticsearchIndexStorage {
+                primary,
+                replica: total - primary,
+                total,
+            },
+        );
+    }
+
+    if !indices.is_empty() && parsed_indices.is_empty() {
+        return Err("Elasticsearch 索引统计不包含有效容量数据".to_owned());
+    }
+    Ok(ElasticsearchStorageMetrics {
+        enabled: true,
+        available: true,
+        primary_size: Some(primary_size),
+        replica_size: Some(total_size - primary_size),
+        total_size: Some(total_size),
+        indices: parsed_indices,
+    })
+}
+
 async fn response_json(response: reqwest::Response) -> Result<Value, String> {
     if !response.status().is_success() {
         return Err(response_error(response).await);
@@ -2376,8 +2536,8 @@ fn index_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScanBatchContext, index_definition, parse_asn, scan_batch_payload_checksum,
-        scan_endpoint_index_definition,
+        ScanBatchContext, index_definition, parse_asn, parse_storage_metrics,
+        scan_batch_payload_checksum, scan_endpoint_index_definition,
     };
 
     #[test]
@@ -2446,6 +2606,44 @@ mod tests {
         assert_eq!(
             mapping.pointer("/mappings/properties/first_seen_ms/type"),
             Some(&serde_json::json!("long"))
+        );
+    }
+
+    #[test]
+    fn storage_metrics_aggregate_primary_and_replica_sizes() {
+        let metrics = parse_storage_metrics(&serde_json::json!({
+            "indices": {
+                "network-mapping-assets-v1": {
+                    "primaries": {"store": {"size_in_bytes": 100}},
+                    "total": {"store": {"size_in_bytes": 200}}
+                },
+                "network-mapping-scan-observations-v1-2026.08": {
+                    "primaries": {"store": {"size_in_bytes": 300}},
+                    "total": {"store": {"size_in_bytes": 450}}
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(metrics.enabled);
+        assert!(metrics.available);
+        assert_eq!(metrics.primary_size, Some(400));
+        assert_eq!(metrics.replica_size, Some(250));
+        assert_eq!(metrics.total_size, Some(650));
+        assert_eq!(metrics.indices["network-mapping-assets-v1"].replica, 100);
+    }
+
+    #[test]
+    fn storage_metrics_accept_empty_index_matches_and_reject_invalid_only_responses() {
+        let empty = parse_storage_metrics(&serde_json::json!({})).unwrap();
+        assert_eq!(empty.total_size, Some(0));
+        assert!(empty.indices.is_empty());
+
+        assert!(
+            parse_storage_metrics(&serde_json::json!({
+                "indices": {"broken": {"primaries": {}, "total": {}}}
+            }))
+            .is_err()
         );
     }
 }
