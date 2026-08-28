@@ -1350,6 +1350,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::operations::delete_scanner)
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
+        .service(utils::get_server_config_h)
         .service(utils::get_mail_settings_h)
         .service(utils::save_mail_settings_h)
         .service(utils::get_session_settings_h)
