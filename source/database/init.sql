@@ -240,6 +240,11 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 	protocol TEXT NOT NULL,
 	service TEXT,
 	banner TEXT,
+	title TEXT,
+	http_body TEXT,
+	http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+	tls_subject TEXT,
+	search_content_extracted BOOLEAN NOT NULL DEFAULT FALSE,
 	source TEXT NOT NULL,
 	data JSONB,
 	observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -248,6 +253,11 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 
 -- 旧版结果允许协议为空；v2 上传仍由应用层要求协议非空。
 ALTER TABLE scan_observation ALTER COLUMN protocol DROP NOT NULL;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS http_body TEXT;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS tls_subject TEXT;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS search_content_extracted BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
 	ON scan_observation(execution_id, kind);
@@ -881,3 +891,130 @@ CREATE INDEX IF NOT EXISTS idx_backup_job_created_at
 	ON backup_job (created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_job_single_active
 	ON backup_job ((1)) WHERE status IN ('queued', 'running');
+
+-- 搜索读模型：按用户权限范围和管理员全局范围预先维护每个 IP:port 的当前状态。
+-- 历史 observation 仍是权威事实；此表和 Elasticsearch 索引均可重建。
+CREATE SEQUENCE IF NOT EXISTS asset_endpoint_projection_version_seq;
+
+CREATE TABLE IF NOT EXISTS asset_endpoint_current (
+	scope_type TEXT NOT NULL CHECK (scope_type IN ('global', 'user')),
+	scope_id INT NOT NULL CHECK (
+		(scope_type = 'global' AND scope_id = 0)
+		OR (scope_type = 'user' AND scope_id > 0)
+	),
+	ip_address INET NOT NULL,
+	port INT NOT NULL CHECK (port > 0 AND port <= 65535),
+	protocol TEXT,
+	service TEXT,
+	banner TEXT,
+	title TEXT,
+	http_body TEXT,
+	http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+	tls_subject TEXT,
+	source TEXT NOT NULL,
+	scanner_name TEXT,
+	first_seen_at TIMESTAMPTZ NOT NULL,
+	last_seen_at TIMESTAMPTZ NOT NULL,
+	asn TEXT,
+	isp TEXT,
+	as_org TEXT,
+	country_code VARCHAR(2),
+	country_name TEXT,
+	region_name TEXT,
+	city_name TEXT,
+	latest_endpoint_observation_id BIGINT NOT NULL,
+	latest_service_observation_id BIGINT,
+	projection_version BIGINT NOT NULL DEFAULT nextval('asset_endpoint_projection_version_seq'),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	PRIMARY KEY (scope_type, scope_id, ip_address, port)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_endpoint_current_scope_latest
+	ON asset_endpoint_current(scope_type, scope_id, last_seen_at DESC, ip_address, port);
+CREATE INDEX IF NOT EXISTS idx_asset_endpoint_current_ip
+	ON asset_endpoint_current(ip_address, scope_type, scope_id);
+
+-- Outbox 与扫描结果或标签变更位于同一 PostgreSQL 事务，ES 故障不会阻塞扫描写入。
+CREATE TABLE IF NOT EXISTS search_index_outbox (
+	id BIGSERIAL PRIMARY KEY,
+	event_kind TEXT NOT NULL CHECK (event_kind IN ('execution', 'ip', 'full')),
+	aggregate_key TEXT NOT NULL,
+	payload JSONB NOT NULL DEFAULT '{}',
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	locked_at TIMESTAMPTZ,
+	processed_at TIMESTAMPTZ,
+	last_error TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_index_outbox_pending
+	ON search_index_outbox(available_at, id)
+	WHERE processed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS search_projection_state (
+	state_key TEXT PRIMARY KEY,
+	state_value TEXT NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 该视图只在投影刷新/全量重建时读取。普通搜索直接读取 asset_endpoint_current，
+-- 避免每个请求都在完整历史上执行窗口函数和聚合。
+CREATE OR REPLACE VIEW asset_endpoint_search_source AS
+WITH eligible AS MATERIALIZED (
+	SELECT scope.scope_type, scope.scope_id, observation.*,
+		COALESCE(scanner.name, execution.assigned_scanner_id, execution.requested_scanner_id) AS scanner_name
+	FROM scan_observation observation
+	JOIN scan_task_execution execution ON execution.id = observation.execution_id
+	JOIN scan_task task ON task.id = execution.task_id
+	LEFT JOIN scanner_info scanner
+		ON scanner.scanner_id = COALESCE(execution.assigned_scanner_id, execution.requested_scanner_id)
+	CROSS JOIN LATERAL (
+		VALUES ('global'::TEXT, 0), ('user'::TEXT, task.user_id)
+	) AS scope(scope_type, scope_id)
+	WHERE execution.execution_status = 'succeeded' AND observation.port > 0
+), endpoint_stats AS (
+	SELECT scope_type, scope_id, ip_address, port,
+		MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at
+	FROM eligible
+	GROUP BY scope_type, scope_id, ip_address, port
+), latest_endpoint AS (
+	SELECT DISTINCT ON (scope_type, scope_id, ip_address, port)
+		scope_type, scope_id, ip_address, port, protocol, source, scanner_name, id
+	FROM eligible
+	ORDER BY scope_type, scope_id, ip_address, port, observed_at DESC, id DESC
+), latest_service AS (
+	SELECT DISTINCT ON (scope_type, scope_id, ip_address, port)
+		scope_type, scope_id, ip_address, port, service, banner, title, http_body,
+		http_body_truncated, tls_subject, source, id
+	FROM eligible
+	WHERE kind = 'service'
+	ORDER BY scope_type, scope_id, ip_address, port, observed_at DESC, id DESC
+), eligible_intel AS MATERIALIZED (
+	SELECT scope.scope_type, scope.scope_id, intel.*
+	FROM ips intel
+	JOIN scan_task_execution execution ON execution.id = intel.execution_id
+	JOIN scan_task task ON task.id = execution.task_id
+	CROSS JOIN LATERAL (
+		VALUES ('global'::TEXT, 0), ('user'::TEXT, task.user_id)
+	) AS scope(scope_type, scope_id)
+	WHERE execution.execution_status = 'succeeded'
+), latest_intel AS (
+	SELECT DISTINCT ON (scope_type, scope_id, ip_address)
+		scope_type, scope_id, ip_address, asn, isp, as_org, country_code,
+		country_name, region_name, city_name
+	FROM eligible_intel
+	ORDER BY scope_type, scope_id, ip_address, update_time DESC, ip_id DESC
+)
+SELECT stats.scope_type, stats.scope_id, stats.ip_address, stats.port,
+	endpoint.protocol, service.service, service.banner, service.title, service.http_body,
+	COALESCE(service.http_body_truncated, FALSE) AS http_body_truncated,
+	service.tls_subject, COALESCE(service.source, endpoint.source) AS source,
+	endpoint.scanner_name, stats.first_seen_at, stats.last_seen_at,
+	intel.asn, intel.isp, intel.as_org, intel.country_code, intel.country_name,
+	intel.region_name, intel.city_name, endpoint.id AS latest_endpoint_observation_id,
+	service.id AS latest_service_observation_id
+FROM endpoint_stats stats
+JOIN latest_endpoint endpoint USING (scope_type, scope_id, ip_address, port)
+LEFT JOIN latest_service service USING (scope_type, scope_id, ip_address, port)
+LEFT JOIN latest_intel intel USING (scope_type, scope_id, ip_address);

@@ -175,7 +175,8 @@ tag:生产环境
 
 冒号会根据字段转换为不同操作：
 
-- `service`、`banner`、`isp`、`org`、`city`、`scanner`：转换为包含匹配 `~`；
+- `service`、`banner`、`title`、`http_body`、`tls_subject`、`isp`、`org`、`city`、
+  `scanner`：转换为包含匹配 `~`；
 - 其他字段：转换为精确匹配 `=`；
 - `ip` 的值为 CIDR 时，按网段包含关系处理。
 
@@ -225,6 +226,9 @@ ip IN "2001:db8::/32"
 | `protocol` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 例如 `tcp` |
 | `service` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新服务识别结果 |
 | `banner` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新服务 Banner |
+| `title`、`http.title` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新 HTTP 页面标题 |
+| `http_body`、`http.body` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 截断后的最新 HTTP 正文，仅用于搜索 |
+| `tls_subject`、`tls.subject` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新 TLS 证书 Subject |
 | `source` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | observation 来源 |
 
 示例：
@@ -233,10 +237,13 @@ ip IN "2001:db8::/32"
 port >= 8000 AND port <= 8999
 protocol = tcp AND port IN (22, 80, 443)
 service = "https" AND banner ~ "nginx"
+title ~ "camera" AND http.body ~ "hikvision"
+tls.subject ~ "example.com"
 EXISTS(service) AND NOT EXISTS(banner)
 ```
 
-Banner 查询值最少需要两个字符；其他文本值长度必须在 1–128 个字符之间。
+Banner、标题、HTTP Body 和 TLS Subject 查询值最少需要两个字符；其他文本值长度必须在
+1–128 个字符之间。搜索结果列表不会返回完整 HTTP Body。
 
 ### 4.3 扫描器字段
 
@@ -334,7 +341,7 @@ port = 80 AND has_endpoint(port = 443 AND service = "https")
 `has_endpoint(...)` 内只允许使用端点字段：
 
 ```text
-port, protocol, service, banner, source
+port, protocol, service, banner, title, http_body, tls_subject, source
 ```
 
 资产字段应写在函数外部：
@@ -477,8 +484,8 @@ Content-Type: application/json
 `span` 是前端 JavaScript 字符串使用的 UTF-16 起止位置，可直接传给输入框的
 `setSelectionRange(start, end)`。
 
-分页参数错误返回 HTTP `400`；数据库或连接池异常返回 HTTP `500`，不会向客户端暴露
-内部 SQL 和数据库错误。
+分页参数错误返回 HTTP `400`；数据库或连接池异常返回 HTTP `500`。关闭 PostgreSQL
+回退且 Elasticsearch 不可用时返回 HTTP `503`。响应不会暴露内部 SQL、认证信息和底层错误。
 
 ## 9. 查询限制与安全
 
@@ -491,14 +498,14 @@ Content-Type: application/json
 | 条件数量 | 50 个 |
 | 单个 `IN` 列表 | 100 个值 |
 | 文本值长度 | 1–128 字符 |
-| Banner 值长度 | 2–128 字符 |
+| Banner/标题/HTTP Body/TLS Subject 值长度 | 2–128 字符 |
 | 每页结果 | 1–100 条 |
 | 最大 offset | 10000 |
 
-查询字符串不会作为 SQL 片段执行：
+查询字符串不会作为 SQL 或 Elasticsearch JSON 片段执行：
 
 - 字段和操作符必须来自服务端白名单；
-- 所有搜索值使用 PostgreSQL 绑定参数；
+- PostgreSQL 搜索值使用绑定参数，Elasticsearch 查询由受控 AST 生成；
 - `%`、`_` 在包含搜索中作为普通字符；
 - 用户权限过滤由服务端固定注入，搜索语法不能覆盖；
 - 当前不开放任意 `scan_observation.data` JSON 路径和正则搜索。

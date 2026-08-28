@@ -4,6 +4,7 @@ use std::str::FromStr;
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
 use crate::logs::write::error_logs;
+use crate::search_projection;
 use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, patch, post, web};
 use deadpool_postgres::{Pool, Transaction};
 use serde::{Deserialize, Serialize};
@@ -344,6 +345,10 @@ pub(crate) async fn update_tag(
         Err(error_value) => return database_error(&req, "UpdateTagQueryError", &error_value),
     };
     let updated = tag_from_row(&row);
+    if let Err(error_value) = search_projection::enqueue_tag_assignments(&transaction, tag_id).await
+    {
+        return database_error(&req, "UpdateTagSearchOutboxError", &error_value);
+    }
     if let Err(error_value) = audit_change(
         &transaction,
         &req,
@@ -390,6 +395,10 @@ pub(crate) async fn delete_tag(
         }
         Err(error_value) => return database_error(&req, "DeleteTagLookupError", &error_value),
     };
+    if let Err(error_value) = search_projection::enqueue_tag_assignments(&transaction, tag_id).await
+    {
+        return database_error(&req, "DeleteTagSearchOutboxError", &error_value);
+    }
     let removed_assignments = match transaction
         .execute("DELETE FROM asset_ip_tag WHERE tag_id = $1;", &[&tag_id])
         .await
@@ -528,6 +537,9 @@ pub(crate) async fn assign_tag(
     {
         return database_error(&req, "AssignTagQueryError", &error_value);
     }
+    if let Err(error_value) = search_projection::enqueue_ip(&transaction, &ip).await {
+        return database_error(&req, "AssignTagSearchOutboxError", &error_value);
+    }
     if let Err(error_value) = audit_change(
         &transaction,
         &req,
@@ -594,6 +606,9 @@ pub(crate) async fn remove_tag(
     if removed == 0 {
         return HttpResponse::NotFound()
             .json(json!({"success": false, "message": "IP 未绑定该标签"}));
+    }
+    if let Err(error_value) = search_projection::enqueue_ip(&transaction, &ip).await {
+        return database_error(&req, "RemoveTagSearchOutboxError", &error_value);
     }
     if let Err(error_value) = audit_change(
         &transaction,

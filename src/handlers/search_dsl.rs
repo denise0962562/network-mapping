@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
 use ipnet::IpNet;
+use serde_json::{Value, json};
 
 const MAX_QUERY_LENGTH: usize = 2_048;
 const MAX_DEPTH: usize = 12;
@@ -40,6 +41,9 @@ enum Field {
     Protocol,
     Service,
     Banner,
+    Title,
+    HttpBody,
+    TlsSubject,
     Source,
     Scanner,
     FirstSeen,
@@ -109,6 +113,345 @@ pub(crate) struct CompiledFilter {
     pub(crate) parameters: Vec<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ElasticsearchCompilation {
+    Supported(Value),
+    RequiresPostgres,
+}
+
+pub(crate) fn parse_and_compile_elasticsearch(
+    query: &str,
+) -> Result<ElasticsearchCompilation, SearchSyntaxError> {
+    let (expression, normalized_query) = parse_expression(query)?;
+    let mut compiler = ElasticsearchCompiler::default();
+    let Some(filter) = compiler.compile_expr(&expression)? else {
+        return Ok(ElasticsearchCompilation::RequiresPostgres);
+    };
+    if compiler.predicate_count > MAX_PREDICATES {
+        return Err(SearchSyntaxError::new(
+            format!("查询条件不能超过 {MAX_PREDICATES} 个"),
+            0,
+            normalized_query.len(),
+        ));
+    }
+    Ok(ElasticsearchCompilation::Supported(filter))
+}
+
+#[derive(Default)]
+struct ElasticsearchCompiler {
+    predicate_count: usize,
+}
+
+impl ElasticsearchCompiler {
+    fn compile_expr(&mut self, expression: &Expr) -> Result<Option<Value>, SearchSyntaxError> {
+        match expression {
+            Expr::Predicate(predicate) => {
+                self.predicate_count += 1;
+                self.compile_predicate(predicate).map(Some)
+            }
+            Expr::And(left, right) => {
+                let (Some(left), Some(right)) =
+                    (self.compile_expr(left)?, self.compile_expr(right)?)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(json!({"bool": {"filter": [left, right]}})))
+            }
+            Expr::Or(left, right) => {
+                let (Some(left), Some(right)) =
+                    (self.compile_expr(left)?, self.compile_expr(right)?)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(json!({
+                    "bool": {"should": [left, right], "minimum_should_match": 1}
+                })))
+            }
+            // SQL 的三值逻辑会让 NOT 对缺失字段的行为不同于 ES must_not。
+            // 复杂 NOT 和跨端点条件继续走 PostgreSQL，以保证结果语义完全一致。
+            Expr::Not(_) | Expr::HasEndpoint(_) => Ok(None),
+        }
+    }
+
+    fn compile_predicate(&self, predicate: &Predicate) -> Result<Value, SearchSyntaxError> {
+        let operator = if predicate.operator == Operator::Colon {
+            predicate.field.default_colon_operator()
+        } else {
+            predicate.operator
+        };
+        if operator == Operator::Exists {
+            return Ok(json!({"exists": {"field": es_field(predicate.field)}}));
+        }
+        if predicate.values.is_empty() {
+            return Err(SearchSyntaxError::new("搜索值不能为空", 0, 0));
+        }
+        match predicate.field {
+            Field::Ip => self.compile_ip(operator, &predicate.values),
+            Field::Port | Field::TagId => {
+                self.compile_integer(predicate.field, operator, &predicate.values)
+            }
+            Field::FirstSeen | Field::LastSeen => {
+                self.compile_time(predicate.field, operator, &predicate.values)
+            }
+            field => self.compile_text(field, operator, &predicate.values),
+        }
+    }
+
+    fn compile_ip(
+        &self,
+        operator: Operator,
+        values: &[String],
+    ) -> Result<Value, SearchSyntaxError> {
+        if !matches!(
+            operator,
+            Operator::Eq | Operator::NotEq | Operator::In | Operator::NotIn
+        ) {
+            return Err(unsupported_operator(Field::Ip));
+        }
+        let mut normalized = Vec::with_capacity(values.len());
+        for value in values {
+            if value.contains('/') {
+                normalized.push(normalize_network(value)?);
+            } else {
+                normalized.push(
+                    IpAddr::from_str(value)
+                        .map_err(|_| SearchSyntaxError::new("IP 地址格式无效", 0, 0))?
+                        .to_string(),
+                );
+            }
+        }
+        let positive = if normalized.len() == 1 {
+            json!({"term": {"ip": normalized.remove(0)}})
+        } else {
+            json!({"terms": {"ip": normalized}})
+        };
+        Ok(negative_filter(operator, "ip", positive, false))
+    }
+
+    fn compile_integer(
+        &self,
+        field: Field,
+        operator: Operator,
+        values: &[String],
+    ) -> Result<Value, SearchSyntaxError> {
+        if matches!(operator, Operator::Contains | Operator::NotContains) {
+            return Err(unsupported_operator(field));
+        }
+        let mut parsed_values = Vec::with_capacity(values.len());
+        for value in values {
+            let parsed = value.parse::<i64>().map_err(|_| {
+                SearchSyntaxError::new(format!("{} 必须是数字", field.display_name()), 0, 0)
+            })?;
+            if field == Field::Port && !(1..=65_535).contains(&parsed) {
+                return Err(SearchSyntaxError::new("端口必须在 1 到 65535 之间", 0, 0));
+            }
+            if field == Field::TagId && parsed <= 0 {
+                return Err(SearchSyntaxError::new("tag.id 必须是正整数", 0, 0));
+            }
+            parsed_values.push(parsed);
+        }
+        let name = es_field(field);
+        if matches!(
+            operator,
+            Operator::Greater | Operator::GreaterEq | Operator::Less | Operator::LessEq
+        ) {
+            if parsed_values.len() != 1 {
+                return Err(unsupported_operator(field));
+            }
+            let range_operator = match operator {
+                Operator::Greater => "gt",
+                Operator::GreaterEq => "gte",
+                Operator::Less => "lt",
+                Operator::LessEq => "lte",
+                _ => unreachable!(),
+            };
+            return Ok(json!({"range": {(name): {(range_operator): parsed_values[0]}}}));
+        }
+        let positive = if parsed_values.len() == 1 {
+            json!({"term": {(name): parsed_values[0]}})
+        } else {
+            json!({"terms": {(name): parsed_values}})
+        };
+        Ok(negative_filter(
+            operator,
+            name,
+            positive,
+            field == Field::TagId,
+        ))
+    }
+
+    fn compile_time(
+        &self,
+        field: Field,
+        operator: Operator,
+        values: &[String],
+    ) -> Result<Value, SearchSyntaxError> {
+        if values.len() != 1
+            || !matches!(
+                operator,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Greater
+                    | Operator::GreaterEq
+                    | Operator::Less
+                    | Operator::LessEq
+            )
+        {
+            return Err(unsupported_operator(field));
+        }
+        let value = normalize_time(&values[0])?;
+        let name = es_field(field);
+        if matches!(operator, Operator::Eq | Operator::NotEq) {
+            let positive = json!({"term": {(name): value}});
+            return Ok(negative_filter(operator, name, positive, false));
+        }
+        let range_operator = match operator {
+            Operator::Greater => "gt",
+            Operator::GreaterEq => "gte",
+            Operator::Less => "lt",
+            Operator::LessEq => "lte",
+            _ => unreachable!(),
+        };
+        Ok(json!({"range": {(name): {(range_operator): value}}}))
+    }
+
+    fn compile_text(
+        &self,
+        field: Field,
+        operator: Operator,
+        values: &[String],
+    ) -> Result<Value, SearchSyntaxError> {
+        if matches!(
+            operator,
+            Operator::Greater | Operator::GreaterEq | Operator::Less | Operator::LessEq
+        ) {
+            return Err(unsupported_operator(field));
+        }
+        for value in values {
+            validate_text_value(field, value)?;
+        }
+        let name = es_field(field);
+        let contains = matches!(operator, Operator::Contains | Operator::NotContains);
+        let exact_keyword = matches!(
+            field,
+            Field::Protocol
+                | Field::Service
+                | Field::Country
+                | Field::Source
+                | Field::Tag
+                | Field::TagKind
+        );
+        let normalized_values = values
+            .iter()
+            .map(|value| {
+                let value = if field == Field::Asn {
+                    value
+                        .strip_prefix("AS")
+                        .or_else(|| value.strip_prefix("as"))
+                        .unwrap_or(value)
+                } else {
+                    value
+                };
+                if exact_keyword && !contains {
+                    value.to_lowercase()
+                } else {
+                    value.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        let positive = if contains || !exact_keyword {
+            let wildcard_name = es_contains_field(field);
+            let clauses = normalized_values
+                .iter()
+                .map(|value| {
+                    let escaped = escape_es_wildcard(value);
+                    let pattern = if contains {
+                        format!("*{escaped}*")
+                    } else {
+                        escaped
+                    };
+                    json!({"wildcard": {(wildcard_name): {"value": pattern, "case_insensitive": true}}})
+                })
+                .collect::<Vec<_>>();
+            if clauses.len() == 1 {
+                clauses.into_iter().next().expect("one wildcard clause")
+            } else {
+                json!({"bool": {"should": clauses, "minimum_should_match": 1}})
+            }
+        } else if normalized_values.len() == 1 {
+            json!({"term": {(name): normalized_values[0]}})
+        } else {
+            json!({"terms": {(name): normalized_values}})
+        };
+        let missing_matches_negative = matches!(field, Field::Tag | Field::TagKind);
+        Ok(negative_filter(
+            operator,
+            name,
+            positive,
+            missing_matches_negative,
+        ))
+    }
+}
+
+fn negative_filter(
+    operator: Operator,
+    field: &str,
+    positive: Value,
+    missing_matches: bool,
+) -> Value {
+    if !matches!(
+        operator,
+        Operator::NotEq | Operator::NotContains | Operator::NotIn
+    ) {
+        return positive;
+    }
+    if missing_matches {
+        json!({"bool": {"must_not": [positive]}})
+    } else {
+        json!({"bool": {"filter": [{"exists": {"field": field}}], "must_not": [positive]}})
+    }
+}
+
+fn es_field(field: Field) -> &'static str {
+    match field {
+        Field::Ip => "ip",
+        Field::Asn => "asn",
+        Field::Isp => "isp",
+        Field::Org => "as_org",
+        Field::Country => "country_code",
+        Field::City => "city_name",
+        Field::Tag => "tag_names",
+        Field::TagId => "tag_ids",
+        Field::TagKind => "tag_kinds",
+        Field::Port => "port",
+        Field::Protocol => "protocol",
+        Field::Service => "service",
+        Field::Banner => "banner",
+        Field::Title => "title",
+        Field::HttpBody => "http_body",
+        Field::TlsSubject => "tls_subject",
+        Field::Source => "source",
+        Field::Scanner => "scanner_name",
+        Field::FirstSeen => "first_seen",
+        Field::LastSeen => "last_seen",
+    }
+}
+
+fn es_contains_field(field: Field) -> &'static str {
+    match field {
+        Field::Title => "title_contains",
+        Field::HttpBody => "http_body_contains",
+        _ => es_field(field),
+    }
+}
+
+fn escape_es_wildcard(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('*', "\\*")
+        .replace('?', "\\?")
+}
+
 impl Field {
     fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -125,6 +468,9 @@ impl Field {
             "protocol" => Some(Self::Protocol),
             "service" => Some(Self::Service),
             "banner" => Some(Self::Banner),
+            "title" | "http.title" => Some(Self::Title),
+            "http_body" | "http.body" => Some(Self::HttpBody),
+            "tls_subject" | "tls.subject" => Some(Self::TlsSubject),
             "source" => Some(Self::Source),
             "scanner" | "scanner_name" => Some(Self::Scanner),
             "first_seen" => Some(Self::FirstSeen),
@@ -148,6 +494,9 @@ impl Field {
             Self::Protocol => "protocol",
             Self::Service => "service",
             Self::Banner => "banner",
+            Self::Title => "title",
+            Self::HttpBody => "http_body",
+            Self::TlsSubject => "tls_subject",
             Self::Source => "source",
             Self::Scanner => "scanner",
             Self::FirstSeen => "first_seen",
@@ -158,15 +507,28 @@ impl Field {
     fn is_endpoint(self) -> bool {
         matches!(
             self,
-            Self::Port | Self::Protocol | Self::Service | Self::Banner | Self::Source
+            Self::Port
+                | Self::Protocol
+                | Self::Service
+                | Self::Banner
+                | Self::Title
+                | Self::HttpBody
+                | Self::TlsSubject
+                | Self::Source
         )
     }
 
     fn default_colon_operator(self) -> Operator {
         match self {
-            Self::Service | Self::Banner | Self::Isp | Self::Org | Self::City | Self::Scanner => {
-                Operator::Contains
-            }
+            Self::Service
+            | Self::Banner
+            | Self::Title
+            | Self::HttpBody
+            | Self::TlsSubject
+            | Self::Isp
+            | Self::Org
+            | Self::City
+            | Self::Scanner => Operator::Contains,
             Self::Ip
             | Self::Asn
             | Self::Country
@@ -183,6 +545,23 @@ impl Field {
 }
 
 pub(crate) fn parse_and_compile(query: &str) -> Result<CompiledFilter, SearchSyntaxError> {
+    let (expression, query) = parse_expression(query)?;
+    let mut compiler = Compiler::default();
+    let sql = compiler.compile_expr(&expression, "result", false)?;
+    if compiler.predicate_count > MAX_PREDICATES {
+        return Err(SearchSyntaxError::new(
+            format!("查询条件不能超过 {MAX_PREDICATES} 个"),
+            0,
+            query.len(),
+        ));
+    }
+    Ok(CompiledFilter {
+        sql,
+        parameters: compiler.parameters,
+    })
+}
+
+fn parse_expression(query: &str) -> Result<(Expr, &str), SearchSyntaxError> {
     let query = query.trim();
     if query.is_empty() {
         return Err(SearchSyntaxError::new("请输入搜索内容", 0, 0));
@@ -214,19 +593,7 @@ pub(crate) fn parse_and_compile(query: &str) -> Result<CompiledFilter, SearchSyn
         Parser::new(tokenize(query)?).parse()?
     };
 
-    let mut compiler = Compiler::default();
-    let sql = compiler.compile_expr(&expression, "result", false)?;
-    if compiler.predicate_count > MAX_PREDICATES {
-        return Err(SearchSyntaxError::new(
-            format!("查询条件不能超过 {MAX_PREDICATES} 个"),
-            0,
-            query.len(),
-        ));
-    }
-    Ok(CompiledFilter {
-        sql,
-        parameters: compiler.parameters,
-    })
+    Ok((expression, query))
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, SearchSyntaxError> {
@@ -709,6 +1076,9 @@ impl Compiler {
             | Field::Protocol
             | Field::Service
             | Field::Banner
+            | Field::Title
+            | Field::HttpBody
+            | Field::TlsSubject
             | Field::Source
             | Field::Scanner => {
                 self.compile_text(predicate.field, operator, &predicate.values, alias)
@@ -992,6 +1362,9 @@ fn text_column(field: Field, alias: &str) -> Option<String> {
         Field::Protocol => "protocol",
         Field::Service => "service",
         Field::Banner => "banner",
+        Field::Title => "title",
+        Field::HttpBody => "http_body",
+        Field::TlsSubject => "tls_subject",
         Field::Source => "source",
         Field::Scanner => "scanner_name",
         _ => return None,
@@ -1082,7 +1455,14 @@ fn normalize_time(value: &str) -> Result<String, SearchSyntaxError> {
 
 fn validate_text_value(field: Field, value: &str) -> Result<(), SearchSyntaxError> {
     let length = value.chars().count();
-    let minimum = if field == Field::Banner { 2 } else { 1 };
+    let minimum = if matches!(
+        field,
+        Field::Banner | Field::Title | Field::HttpBody | Field::TlsSubject
+    ) {
+        2
+    } else {
+        1
+    };
     if !(minimum..=128).contains(&length) {
         return Err(SearchSyntaxError::new(
             format!(
@@ -1123,7 +1503,7 @@ fn unsupported_operator(field: Field) -> SearchSyntaxError {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_and_compile;
+    use super::{ElasticsearchCompilation, parse_and_compile, parse_and_compile_elasticsearch};
 
     #[test]
     fn compiles_boolean_precedence_and_bound_values() {
@@ -1207,6 +1587,42 @@ mod tests {
             .expect("hostile-looking text remains a bound value");
         assert!(!compiled.sql.contains("OR TRUE"));
         assert_eq!(compiled.parameters, vec!["https' OR TRUE --"]);
+    }
+
+    #[test]
+    fn compiles_supported_queries_to_elasticsearch_filter_dsl() {
+        let ElasticsearchCompilation::Supported(filter) = parse_and_compile_elasticsearch(
+            "country = CN AND port = 443 AND banner ~ \"Hikvision\"",
+        )
+        .expect("Elasticsearch filter should compile") else {
+            panic!("query should be supported by Elasticsearch");
+        };
+        let serialized = filter.to_string();
+        assert!(serialized.contains("country_code"));
+        assert!(serialized.contains("banner"));
+        assert!(serialized.contains("*Hikvision*"));
+    }
+
+    #[test]
+    fn routes_cross_endpoint_and_complex_not_queries_to_postgres() {
+        assert!(matches!(
+            parse_and_compile_elasticsearch("has_endpoint(port = 443)").unwrap(),
+            ElasticsearchCompilation::RequiresPostgres
+        ));
+        assert!(matches!(
+            parse_and_compile_elasticsearch("NOT EXISTS(banner)").unwrap(),
+            ElasticsearchCompilation::RequiresPostgres
+        ));
+    }
+
+    #[test]
+    fn supports_http_and_tls_search_fields() {
+        let sql =
+            parse_and_compile("title ~ camera AND http.body ~ hikvision AND tls.subject ~ example")
+                .expect("new searchable fields should compile");
+        assert!(sql.sql.contains("result.title ILIKE"));
+        assert!(sql.sql.contains("result.http_body ILIKE"));
+        assert!(sql.sql.contains("result.tls_subject ILIKE"));
     }
 
     #[test]

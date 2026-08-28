@@ -8,7 +8,10 @@ use tokio_postgres::types::ToSql;
 use tracing::error;
 
 use crate::admin::UserBaseI;
-use crate::handlers::search_dsl::parse_and_compile;
+use crate::elasticsearch::ElasticsearchService;
+use crate::handlers::search_dsl::{
+    ElasticsearchCompilation, parse_and_compile, parse_and_compile_elasticsearch,
+};
 use crate::handlers::tags::{AssetTag, tags_from_json};
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -53,6 +56,8 @@ struct SearchItem {
     protocol: Option<String>,
     service: Option<String>,
     banner: Option<String>,
+    title: Option<String>,
+    tls_subject: Option<String>,
     scanner_name: Option<String>,
     scan_time: Option<i64>,
     asn: Option<String>,
@@ -110,9 +115,30 @@ fn bad_request(message: impl Into<String>) -> HttpResponse {
     HttpResponse::BadRequest().json(serde_json::json!({ "message": message.into() }))
 }
 
+#[get("/api/search/elasticsearch/status")]
+pub async fn elasticsearch_status(
+    pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
+    user: UserBaseI,
+) -> impl Responder {
+    if user.role != 1 {
+        return HttpResponse::Forbidden()
+            .json(serde_json::json!({"message": "仅管理员可以查看搜索索引状态"}));
+    }
+    match elasticsearch.status(pool.get_ref()).await {
+        Ok(status) => HttpResponse::Ok().json(status),
+        Err(error_value) => {
+            error!(event = "ElasticsearchStatusError", message = %error_value);
+            HttpResponse::InternalServerError()
+                .json(serde_json::json!({"message": "无法读取搜索索引状态"}))
+        }
+    }
+}
+
 #[post("/api/search/v2")]
 pub async fn search_v2(
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     payload: web::Json<AdvancedSearchRequest>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -141,59 +167,73 @@ pub async fn search_v2(
         }
     };
 
+    if let Ok(ElasticsearchCompilation::Supported(filter)) = parse_and_compile_elasticsearch(query)
+    {
+        if elasticsearch.can_read() {
+            match elasticsearch
+                .search(user.role, user.id, filter, limit, offset)
+                .await
+            {
+                Ok(page) => {
+                    let items = page
+                        .items
+                        .into_iter()
+                        .map(|item| SearchItem {
+                            ip_address: item.ip_address,
+                            port: Some(item.port),
+                            protocol: item.protocol,
+                            service: item.service,
+                            banner: item.banner,
+                            title: item.title,
+                            tls_subject: item.tls_subject,
+                            scanner_name: item.scanner_name,
+                            scan_time: Some(item.scan_time),
+                            asn: item.asn,
+                            isp: item.isp,
+                            as_org: item.as_org,
+                            country_code: item.country_code,
+                            country_name: item.country_name,
+                            region_name: item.region_name,
+                            city_name: item.city_name,
+                            tags: item.tags,
+                        })
+                        .collect();
+                    return HttpResponse::Ok().json(SearchResponse {
+                        query_type: "advanced",
+                        query: query.to_owned(),
+                        items,
+                        total: page.total,
+                        limit,
+                        offset,
+                    });
+                }
+                Err(err) if elasticsearch.fallback_to_postgres() => {
+                    error!(event = "ElasticsearchSearchFallback", message = %err, error = ?err);
+                }
+                Err(err) => {
+                    error!(event = "ElasticsearchSearchError", message = %err, error = ?err);
+                    return HttpResponse::ServiceUnavailable()
+                        .json(serde_json::json!({"message": "搜索索引暂时不可用"}));
+                }
+            }
+        } else if !elasticsearch.fallback_to_postgres() {
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"message": "搜索索引暂时不可用"}));
+        }
+    }
+
     let limit_parameter = compiled.parameters.len() + 3;
     let offset_parameter = compiled.parameters.len() + 4;
     let statement = format!(
-        "WITH eligible AS (\
-            SELECT observation.*, \
-                   COALESCE(scanner.name, execution.assigned_scanner_id, execution.requested_scanner_id) AS scanner_name \
-            FROM scan_observation observation \
-            JOIN scan_task_execution execution ON execution.id = observation.execution_id \
-            JOIN scan_task task ON task.id = execution.task_id \
-            LEFT JOIN scanner_info scanner \
-              ON scanner.scanner_id = COALESCE(execution.assigned_scanner_id, execution.requested_scanner_id) \
-            WHERE execution.execution_status = 'succeeded' \
-              AND ($1 = 1 OR task.user_id = $2)\
-         ), endpoint_stats AS (\
-            SELECT ip_address, port, MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at \
-            FROM eligible WHERE port > 0 GROUP BY ip_address, port\
-         ), latest_endpoint AS (\
-            SELECT ranked.* FROM (\
-                SELECT eligible.*, ROW_NUMBER() OVER (\
-                    PARTITION BY ip_address, port ORDER BY observed_at DESC, id DESC\
-                ) AS row_number \
-                FROM eligible WHERE port > 0\
-            ) ranked WHERE ranked.row_number = 1\
-         ), latest_service AS (\
-            SELECT ranked.* FROM (\
-                SELECT eligible.*, ROW_NUMBER() OVER (\
-                    PARTITION BY ip_address, port ORDER BY observed_at DESC, id DESC\
-                ) AS row_number \
-                FROM eligible WHERE port > 0 AND kind = 'service'\
-            ) ranked WHERE ranked.row_number = 1\
-         ), latest_intel AS (\
-            SELECT ranked.* FROM (\
-                SELECT intel.ip_address, intel.asn, intel.isp, intel.as_org, intel.country_code, \
-                       intel.country_name, intel.region_name, intel.city_name, ROW_NUMBER() OVER (\
-                           PARTITION BY intel.ip_address ORDER BY intel.update_time DESC, intel.ip_id DESC\
-                       ) AS row_number \
-                FROM ips intel \
-                JOIN scan_task_execution execution ON execution.id = intel.execution_id \
-                JOIN scan_task task ON task.id = execution.task_id \
-                WHERE execution.execution_status = 'succeeded' \
-                  AND ($1 = 1 OR task.user_id = $2)\
-            ) ranked WHERE ranked.row_number = 1\
-         ), search_rows AS (\
-            SELECT stats.ip_address, stats.port, endpoint.protocol, service.service, service.banner, \
-                   COALESCE(service.source, endpoint.source) AS source, endpoint.scanner_name, \
-                   stats.first_seen_at, stats.last_seen_at, intel.asn, intel.isp, intel.as_org, \
-                   intel.country_code, intel.country_name, intel.region_name, intel.city_name \
-            FROM endpoint_stats stats \
-            JOIN latest_endpoint endpoint \
-              ON endpoint.ip_address = stats.ip_address AND endpoint.port = stats.port \
-            LEFT JOIN latest_service service \
-              ON service.ip_address = stats.ip_address AND service.port = stats.port \
-            LEFT JOIN latest_intel intel ON intel.ip_address = stats.ip_address\
+        "WITH search_rows AS (\
+            SELECT current.ip_address, current.port, current.protocol, current.service, \
+                   current.banner, current.title, current.http_body, current.tls_subject, \
+                   current.source, current.scanner_name, current.first_seen_at, current.last_seen_at, \
+                   current.asn, current.isp, current.as_org, current.country_code, \
+                   current.country_name, current.region_name, current.city_name \
+            FROM asset_endpoint_current current \
+            WHERE (($1 = 1 AND current.scope_type = 'global' AND current.scope_id = 0) \
+                OR ($1 <> 1 AND current.scope_type = 'user' AND current.scope_id = $2))\
          ), filtered AS (\
             SELECT result.*, COUNT(*) OVER()::BIGINT AS total \
             FROM search_rows result WHERE {} \
@@ -201,7 +241,7 @@ pub async fn search_v2(
             LIMIT ${} OFFSET ${}\
          ) \
          SELECT host(filtered.ip_address) AS ip_address, filtered.port, filtered.protocol, \
-                filtered.service, filtered.banner, filtered.scanner_name, \
+                filtered.service, filtered.banner, filtered.title, filtered.tls_subject, filtered.scanner_name, \
                 FLOOR(EXTRACT(EPOCH FROM filtered.last_seen_at) * 1000)::BIGINT AS scan_time, \
                 filtered.asn, filtered.isp, filtered.as_org, filtered.country_code, \
                 filtered.country_name, filtered.region_name, filtered.city_name, filtered.total, \
@@ -256,6 +296,8 @@ pub async fn search_v2(
             protocol: row.get("protocol"),
             service: row.get("service"),
             banner: row.get("banner"),
+            title: row.get("title"),
+            tls_subject: row.get("tls_subject"),
             scanner_name: row.get("scanner_name"),
             scan_time: row.get("scan_time"),
             asn: row.get("asn"),
@@ -292,24 +334,19 @@ async fn search_assets(
     let client = pool.get().await?;
     let statement = format!(
         "SELECT latest.*, COUNT(*) OVER() AS total FROM (\
-         SELECT DISTINCT ON (s.ip_address, s.port) host(s.ip_address) AS ip_address, \
-         s.port, s.protocol, s.service, s.banner, \
-         COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, \
-         FLOOR(EXTRACT(EPOCH FROM s.observed_at) * 1000)::BIGINT AS scan_time, \
-         i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.region_name, i.city_name, \
+         SELECT host(s.ip_address) AS ip_address, s.port, s.protocol, s.service, s.banner, \
+         s.title, s.tls_subject, s.scanner_name, \
+         FLOOR(EXTRACT(EPOCH FROM s.last_seen_at) * 1000)::BIGINT AS scan_time, \
+         s.asn, s.isp, s.as_org, s.country_code, s.country_name, s.region_name, s.city_name, \
          COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
-         FROM scan_observation s \
-         JOIN scan_task_execution e ON e.id = s.execution_id \
-         JOIN scan_task t ON t.id = e.task_id \
-         LEFT JOIN scanner_info scanner ON scanner.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
-         LEFT JOIN ips i ON i.execution_id = s.execution_id AND i.ip_address = s.ip_address \
+         FROM asset_endpoint_current s \
          LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT(\
              'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
              ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
              FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
              WHERE assignment.ip_address = s.ip_address AND tag.is_active) tag_data ON true \
-         WHERE {where_clause} AND e.execution_status <> 'superseded' AND ($2 = 1 OR t.user_id = $3) \
-         ORDER BY s.ip_address, s.port, s.observed_at DESC, s.id DESC\
+         WHERE {where_clause} AND (($2 = 1 AND s.scope_type = 'global' AND s.scope_id = 0) \
+             OR ($2 <> 1 AND s.scope_type = 'user' AND s.scope_id = $3)) \
          ) latest ORDER BY latest.ip_address, latest.port LIMIT $4 OFFSET $5"
     );
     let rows = client
@@ -324,6 +361,8 @@ async fn search_assets(
             protocol: row.get("protocol"),
             service: row.get("service"),
             banner: row.get("banner"),
+            title: row.get("title"),
+            tls_subject: row.get("tls_subject"),
             scanner_name: row.get("scanner_name"),
             scan_time: row.get("scan_time"),
             asn: row.get("asn"),

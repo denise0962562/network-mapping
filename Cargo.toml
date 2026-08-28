@@ -30,6 +30,7 @@ futures-util = "0.3"
 futures = "0.3"
 ipnet = "2.12"
 regex = "1.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 openssl = "0.10"
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "pool"]}
 totp-rs = { version = "5.7", features = ["gen_secret", "otpauth"]}

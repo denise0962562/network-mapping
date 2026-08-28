@@ -1,9 +1,12 @@
+#![recursion_limit = "256"]
+
 pub mod admin;
 pub mod audit;
 pub mod backup;
 pub mod client_ip;
 pub mod config;
 pub mod db;
+pub mod elasticsearch;
 pub mod frontend;
 pub mod handlers;
 pub mod login;
@@ -23,6 +26,8 @@ pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
 pub mod scanner_latency;
+mod search_content;
+pub mod search_projection;
 
 #[cfg(test)]
 pub mod test; // 测试模块
@@ -1796,6 +1801,7 @@ pub async fn save_scanner_results(
             .entry(ip_addr)
             .or_insert_with(|| maxmind.lookup(ip_addr))
             .clone();
+        let search_content = search_content::extract_search_content(observation.data.as_ref());
         observation_rows.push(serde_json::json!({
             "observation_key": observation_key,
             "kind": observation.kind,
@@ -1804,6 +1810,11 @@ pub async fn save_scanner_results(
             "protocol": observation.protocol,
             "service": observation.service,
             "banner": observation.banner,
+            "title": search_content.title,
+            "http_body": search_content.http_body,
+            "http_body_truncated": search_content.http_body_truncated,
+            "tls_subject": search_content.tls_subject,
+            "search_content_extracted": true,
             "source": observation.source,
             "data": observation.data,
             "asn": intel.asn,
@@ -1824,14 +1835,18 @@ pub async fn save_scanner_results(
             "WITH input AS MATERIALIZED ( \
                 SELECT * FROM jsonb_to_recordset($4::jsonb) AS item( \
                     observation_key TEXT, kind TEXT, ip_address INET, port INT, \
-                    protocol TEXT, service TEXT, banner TEXT, source TEXT, data JSONB, \
+                    protocol TEXT, service TEXT, banner TEXT, title TEXT, http_body TEXT, \
+                    http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
+                    search_content_extracted BOOLEAN, \
                     asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
                     country_name TEXT, region_name TEXT, city_name TEXT) \
              ), inserted_observations AS ( \
                 INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
-                    ip_address, port, protocol, service, banner, source, data) \
+                    ip_address, port, protocol, service, banner, title, http_body, \
+                    http_body_truncated, tls_subject, search_content_extracted, source, data) \
                 SELECT $2, $3, observation_key, kind, ip_address, port, protocol, service, \
-                    banner, source, data FROM input \
+                    banner, title, http_body, http_body_truncated, tls_subject, \
+                    search_content_extracted, source, data FROM input \
                 ON CONFLICT (execution_id, observation_key) DO NOTHING \
                 RETURNING ip_address, port \
              ), inserted_endpoints AS MATERIALIZED ( \
@@ -1885,6 +1900,9 @@ pub async fn save_scanner_results(
                  lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false WHERE id = $2;",
                 &[&get_unix_epoch_ms(), &execution_db_id],
             )
+            .await
+            .map_err(scanner_result_database_error)?;
+        search_projection::refresh_for_execution(&transaction, execution_db_id)
             .await
             .map_err(scanner_result_database_error)?;
         refresh_task_aggregate(&transaction, task_db_id)

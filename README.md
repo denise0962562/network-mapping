@@ -91,7 +91,7 @@ cargo run -- --refresh-ip-intel
 
 ## 资产高级搜索
 
-搜索页支持 IP/CIDR、端口、协议、服务、Banner、ASN、地理信息、扫描器、观察时间和资产
+搜索页支持 IP/CIDR、端口、协议、服务、Banner、HTTP 标题/正文、TLS Subject、ASN、地理信息、扫描器、观察时间和资产
 标签的组合查询。可以使用 `AND`、`OR`、`NOT`、括号、比较运算、包含匹配、`IN`、
 `EXISTS`，并通过 `has_endpoint(...)` 表达同一个 IP 上存在多个不同端点。
 
@@ -105,6 +105,10 @@ AND tag = "生产环境"
 统一接口为 `POST /api/search/v2`；裸 IP、裸 CIDR、`port:443`、`service:https` 和
 `banner:nginx` 等旧输入仍然兼容。完整字段表、标签否定语义、逻辑优先级、跨端点查询、
 API 请求响应和限制参见[资产搜索语法与 API](docs/SEARCH_SYNTAX.md)。
+
+服务端可选接入 Elasticsearch 9.5.2 作为当前端点搜索读模型，并以 PostgreSQL 当前投影和
+事务 Outbox 保证权限、回填与故障回退。部署、配置、全量重建、状态检查和恢复流程参见
+[Elasticsearch 9.5.2 搜索接入](docs/ELASTICSEARCH.md)。
 
 ## 扫描器调度
 
