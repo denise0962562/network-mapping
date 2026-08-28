@@ -1,11 +1,10 @@
 use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::AuditContext;
-use crate::client_ip::normalize_ip;
+use crate::client_ip::{normalize_ip, request_ip};
 use crate::config::SecurityConfig;
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
-use crate::trusted_proxy::TrustedProxyState;
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
     TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
@@ -245,7 +244,6 @@ pub(crate) async fn scanner_public_ip_handler(
     query: web::Query<ScannerPublicIpQuery>,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    trusted_proxies: web::Data<TrustedProxyState>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
@@ -274,7 +272,7 @@ pub(crate) async fn scanner_public_ip_handler(
         };
     }
 
-    let Some(address) = trusted_proxies.client_ip(&req).await else {
+    let Some(address) = request_ip(&req) else {
         error!(
             event = "ScannerPublicIpUnavailable",
             scanner_id = %query.scannerid,
@@ -330,7 +328,6 @@ pub(crate) async fn scanner_heartbeat_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    trusted_proxies: web::Data<TrustedProxyState>,
     latency_history: web::Data<ScannerLatencyHistory>,
     heartbeat: web::Json<ScannerHeartbeat>,
 ) -> impl Responder {
@@ -356,10 +353,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         }
     };
 
-    let ip_address = trusted_proxies
-        .client_ip(&req)
-        .await
-        .map(|address| address.to_string());
+    let ip_address = request_ip(&req).map(|address| address.to_string());
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {

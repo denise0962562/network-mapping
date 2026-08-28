@@ -10,6 +10,7 @@ use network_mapping_server::admin::{
 };
 use network_mapping_server::audit::RequestId;
 use network_mapping_server::backup::BackupManager;
+use network_mapping_server::client_ip::request_ip;
 use network_mapping_server::config::{Clis, SelfChecking};
 use network_mapping_server::elasticsearch::{
     ElasticsearchService, run_worker as run_elasticsearch_worker,
@@ -19,8 +20,8 @@ use network_mapping_server::logs::write::error_chain_diagnostics;
 use network_mapping_server::logs::{self, LogRollingMode};
 use network_mapping_server::maxmind::MaxMindState;
 use network_mapping_server::middlewares::{
-    csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, ratelimit::RateLimitMiddleware,
-    smiddleware::AuthMiddleware,
+    client_ip::ClientIpMiddleware, csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM,
+    ratelimit::RateLimitMiddleware, smiddleware::AuthMiddleware,
 };
 use network_mapping_server::monitor::{self, HealthEvent};
 use network_mapping_server::open_source::OpenSourceCatalog;
@@ -370,10 +371,7 @@ async fn main() -> io::Result<()> {
                 req.extensions_mut()
                     .insert(request_log::RequestActor(actor.clone()));
                 let method = req.method().to_string();
-                let client_ip = req
-                    .connection_info()
-                    .realip_remote_addr()
-                    .and_then(request_log::parse_ip);
+                let client_ip = request_ip(req.request());
                 let user_agent = req
                     .headers()
                     .get(header::USER_AGENT)
@@ -491,6 +489,8 @@ async fn main() -> io::Result<()> {
                     Ok(response)
                 }
             })
+            // 最外层先按可信代理规则解析一次来源 IP，供请求日志、限流、认证与审计复用。
+            .wrap(ClientIpMiddleware::new(trusted_proxy_state.clone()))
             .configure(config::init_routes)
             .configure(frontend::configure)
             .configure(|cfg| frontend::configure_assets(cfg, &frontend_directory))

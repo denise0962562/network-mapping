@@ -1179,10 +1179,8 @@ pub async fn insert_system_status(
 
 ///通过该函数获取到访问者的ip，如果失败则会返回一个字符串
 pub fn get_conn_ip(req: &HttpRequest) -> String {
-    match req.connection_info().realip_remote_addr() {
-        Some(value) => crate::client_ip::parse_ip(value)
-            .map(|address| address.to_string())
-            .unwrap_or_else(|| value.to_owned()),
+    match crate::client_ip::request_ip(req) {
+        Some(value) => value.to_string(),
         None => {
             warn!(
                 event = "GetHTTPClientIPError",

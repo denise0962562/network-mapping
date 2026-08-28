@@ -18,6 +18,8 @@ pub mod hmiddleware;
 pub mod csrfmiddleware;
 // 该中间件用于限制公开入口请求频率
 pub mod ratelimit;
+// 该中间件用于按可信代理配置统一解析请求来源 IP
+pub mod client_ip;
 
 /// 认证中间件查询出的请求级 CSRF 预期值，由内层 CSRF 中间件直接校验，
 /// 避免为同一请求再次查询 Session。

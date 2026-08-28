@@ -57,11 +57,6 @@ pub fn classify_status(status: u16) -> (&'static str, Option<&'static str>) {
     }
 }
 
-/// 把 `realip_remote_addr` 返回的字符串解析成 `IpAddr`；无法解析时为 `None`（写 NULL）。
-pub fn parse_ip(value: &str) -> Option<IpAddr> {
-    crate::client_ip::parse_ip(value)
-}
-
 pub const CHANNEL_CAPACITY: usize = 8192;
 const BATCH_SIZE: usize = 500;
 const FLUSH_INTERVAL_MS: u64 = 500;
@@ -253,8 +248,7 @@ async fn purge_expired(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_status, parse_ip};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use super::classify_status;
 
     #[test]
     fn classifies_client_and_server_errors() {
@@ -270,26 +264,5 @@ mod tests {
         assert_eq!(classify_status(418), ("client_error", Some("client_error")));
         assert_eq!(classify_status(500), ("server_error", Some("server_error")));
         assert_eq!(classify_status(503), ("server_error", Some("server_error")));
-    }
-
-    #[test]
-    fn parses_ip_and_socket_address() {
-        assert_eq!(
-            parse_ip("192.0.2.1"),
-            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
-        );
-        assert_eq!(
-            parse_ip("192.0.2.1:443"),
-            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
-        );
-        assert_eq!(
-            parse_ip("[2001:db8::1]:443"),
-            Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
-        );
-        assert_eq!(
-            parse_ip("::ffff:64.81.116.137"),
-            Some(IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137)))
-        );
-        assert_eq!(parse_ip("unknown"), None);
     }
 }

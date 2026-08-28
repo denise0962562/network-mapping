@@ -216,9 +216,7 @@ fn rate_limit_key(req: &ServiceRequest, path: &str, client: &str) -> String {
 }
 
 fn client_identifier(req: &ServiceRequest) -> String {
-    req.connection_info()
-        .realip_remote_addr()
-        .and_then(crate::client_ip::parse_ip)
+    crate::client_ip::request_ip(req.request())
         .map(|address| address.to_string())
         .unwrap_or_else(|| "unknown".to_owned())
 }

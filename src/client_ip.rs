@@ -1,5 +1,14 @@
 use std::net::{IpAddr, SocketAddr};
 
+use actix_web::{HttpMessage, HttpRequest};
+
+/// The client address resolved once at the outer request boundary.
+///
+/// Keeping the attempted resolution (including `None`) in request extensions prevents
+/// downstream consumers from applying a different proxy-header policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedClientIp(pub Option<IpAddr>);
+
 /// Normalize IPv4-mapped IPv6 addresses so one IPv4 client has one canonical identity.
 pub fn normalize_ip(address: IpAddr) -> IpAddr {
     match address {
@@ -24,9 +33,25 @@ pub fn display_ip(address: Option<IpAddr>) -> Option<String> {
     address.map(normalize_ip).map(|address| address.to_string())
 }
 
+/// Return the centrally resolved client address. Requests created outside the application
+/// middleware (for example focused handler tests) safely fall back to the TCP peer and never
+/// trust forwarding headers on their own.
+pub fn request_ip(request: &HttpRequest) -> Option<IpAddr> {
+    request
+        .extensions()
+        .get::<ResolvedClientIp>()
+        .and_then(|resolved| resolved.0)
+        .or_else(|| {
+            request
+                .peer_addr()
+                .map(|address| normalize_ip(address.ip()))
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{display_ip, normalize_ip, parse_ip};
+    use super::{ResolvedClientIp, display_ip, normalize_ip, parse_ip, request_ip};
+    use actix_web::{HttpMessage, test as actix_test};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -50,5 +75,28 @@ mod tests {
             Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
         );
         assert_eq!(parse_ip("unknown"), None);
+    }
+
+    #[test]
+    fn request_ip_prefers_the_centrally_resolved_address() {
+        let request = actix_test::TestRequest::default()
+            .peer_addr("127.0.0.1:443".parse().unwrap())
+            .insert_header(("x-forwarded-for", "203.0.113.9"))
+            .to_http_request();
+        request
+            .extensions_mut()
+            .insert(ResolvedClientIp(Some("203.0.113.9".parse().unwrap())));
+
+        assert_eq!(request_ip(&request), Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn request_ip_falls_back_to_peer_without_trusting_headers() {
+        let request = actix_test::TestRequest::default()
+            .peer_addr("127.0.0.1:443".parse().unwrap())
+            .insert_header(("x-forwarded-for", "203.0.113.9"))
+            .to_http_request();
+
+        assert_eq!(request_ip(&request), Some("127.0.0.1".parse().unwrap()));
     }
 }
