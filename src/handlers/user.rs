@@ -21,6 +21,7 @@ use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
 use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
+use crate::scanner_maintenance::{ScannerMaintenanceState, maintenance_response};
 use crate::{generate_hash_password, get_conn_ip, log_out, verify_password};
 use uuid::Uuid;
 
@@ -816,13 +817,18 @@ async fn web_add_scanner_h(
 async fn get_scanners_h(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    maintenance: web::Data<ScannerMaintenanceState>,
     _user_base_i: UserBaseI,
 ) -> impl Responder {
     match get_scanners(pool.get_ref()).await {
-        Ok(scanners) => HttpResponse::Ok().json(json!({
-            "success": true,
-            "data": scanners,
-        })),
+        Ok(scanners) => {
+            let maintenance = maintenance.snapshot().await;
+            HttpResponse::Ok().json(json!({
+                "success": true,
+                "data": scanners,
+                "maintenance": maintenance.enabled.then_some(maintenance),
+            }))
+        }
         Err(error) => {
             error_logs(&req, "GetScannersError", &error.to_string());
             HttpResponse::InternalServerError().finish()
@@ -860,6 +866,7 @@ async fn scanner_register_h(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    maintenance: web::Data<ScannerMaintenanceState>,
     register_data: web::Json<ScannerRegisterData>,
 ) -> impl Responder {
     let registration_token = req
@@ -871,6 +878,32 @@ async fn scanner_register_h(
     let Some(registration_token) = registration_token else {
         return HttpResponse::Unauthorized().body("missing scanner registration token");
     };
+
+    let maintenance_snapshot = maintenance.snapshot().await;
+    if maintenance_snapshot.blocks_new_work() {
+        let token_hash =
+            match crate::hash_scanner_token(registration_token, &security.scanner_token_pepper) {
+                Ok(value) => value,
+                Err(_) => return HttpResponse::InternalServerError().finish(),
+            };
+        let client = match pool.get().await {
+            Ok(client) => client,
+            Err(_) => return HttpResponse::InternalServerError().finish(),
+        };
+        let authorized = client
+            .query_opt(
+                "SELECT id FROM scanner_info WHERE scanner_id = $1 \
+                 AND registration_token_hash = $2 AND registration_consumed_at IS NULL \
+                 AND registration_token_expires_at > NOW() AND deleted_at IS NULL LIMIT 1;",
+                &[&register_data.scanner_id, &token_hash],
+            )
+            .await;
+        match authorized {
+            Ok(Some(_)) => return maintenance_response(&maintenance_snapshot),
+            Ok(None) => return HttpResponse::Unauthorized().finish(),
+            Err(_) => return HttpResponse::InternalServerError().finish(),
+        }
+    }
 
     match scanner_register(
         &pool,

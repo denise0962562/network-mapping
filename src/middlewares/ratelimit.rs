@@ -154,6 +154,11 @@ fn policy_for_path(path: &str) -> Option<RateLimitPolicy> {
             window: Duration::from_secs(60),
             message: "扫描器网络探测过于频繁，请稍后再试",
         }),
+        "/api/scanner/maintenance" => Some(RateLimitPolicy {
+            max_requests: 12,
+            window: Duration::from_secs(60),
+            message: "扫描器维护状态查询过于频繁，请稍后再试",
+        }),
         "/api/scanner/task/fail" | "/api/scanner/task/cancelled" => Some(RateLimitPolicy {
             max_requests: 30,
             window: Duration::from_secs(60),
@@ -205,6 +210,7 @@ fn rate_limit_key(req: &ServiceRequest, path: &str, client: &str) -> String {
         "/api/scanner/result"
             | "/api/scanner/heartbeat"
             | "/api/scanner/network/public-ip"
+            | "/api/scanner/maintenance"
             | "/api/scanner/task/fail"
             | "/api/scanner/task/cancelled"
     ) && let Some(token_fingerprint) = bearer_fingerprint(req)

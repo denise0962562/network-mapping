@@ -39,7 +39,9 @@ impl ExpectedCsrfToken {
 
 pub(crate) fn is_scanner_api_request(method: &Method, path: &str) -> bool {
     match path {
-        "/api/task/apply" | "/api/scanner/network/public-ip" => method == Method::GET,
+        "/api/task/apply" | "/api/scanner/network/public-ip" | "/api/scanner/maintenance" => {
+            method == Method::GET
+        }
         "/api/scanner/register"
         | "/api/scanner/heartbeat"
         | "/api/scanner/result"
@@ -224,6 +226,10 @@ mod tests {
             &Method::GET,
             "/api/scanner/network/public-ip"
         ));
+        assert!(is_scanner_api_request(
+            &Method::GET,
+            "/api/scanner/maintenance"
+        ));
 
         assert!(!is_scanner_api_request(&Method::GET, "/api/scanner/result"));
         assert!(!is_scanner_api_request(&Method::PUT, "/api/scanner/result"));
@@ -231,6 +237,10 @@ mod tests {
         assert!(!is_scanner_api_request(
             &Method::POST,
             "/api/scanner/network/public-ip"
+        ));
+        assert!(!is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/maintenance"
         ));
         assert!(!is_scanner_api_request(
             &Method::GET,

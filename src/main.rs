@@ -27,6 +27,9 @@ use network_mapping_server::monitor::{self, HealthEvent};
 use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
 use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
+use network_mapping_server::scanner_maintenance::{
+    ScannerMaintenanceState, run_reconciler as run_scanner_maintenance_reconciler,
+};
 use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
 use network_mapping_server::tls::build_acceptor;
 use network_mapping_server::trusted_proxy::TrustedProxyState;
@@ -173,6 +176,15 @@ async fn main() -> io::Result<()> {
             .await
             .map_err(|error| io::Error::other(format!("加载可信代理配置失败：{error}")))?,
     );
+    let scanner_maintenance_state = web::Data::new(
+        ScannerMaintenanceState::from_database(&db_pool)
+            .await
+            .map_err(|error| io::Error::other(format!("加载扫描服务维护状态失败：{error}")))?,
+    );
+    tokio::spawn(run_scanner_maintenance_reconciler(
+        scanner_maintenance_state.clone(),
+        db_pool.clone(),
+    ));
     if let Ok(client) = db_pool.get().await
         && let Err(error_value) = client
             .execute(
@@ -356,6 +368,7 @@ async fn main() -> io::Result<()> {
             .app_data(backup_manager.clone())
             .app_data(elasticsearch_data.clone())
             .app_data(trusted_proxy_state.clone())
+            .app_data(scanner_maintenance_state.clone())
             .app_data(security.clone())
             .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())
@@ -465,7 +478,11 @@ async fn main() -> io::Result<()> {
                             let slow_duration = duration_ms
                                 .map(i64::from)
                                 .filter(|value| monitor.is_slow_request(*value));
-                            let is_server_error = monitor.server_error_enabled() && status >= 500;
+                            let is_expected_maintenance =
+                                response.headers().contains_key("nm-maintenance-version");
+                            let is_server_error = monitor.server_error_enabled()
+                                && status >= 500
+                                && !is_expected_maintenance;
                             if slow_duration.is_some() || is_server_error {
                                 let client_ip_str = client_ip.map(|ip| ip.to_string());
                                 let actor_name_str = actor_name.clone();

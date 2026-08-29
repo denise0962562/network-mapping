@@ -6,6 +6,9 @@ use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
+use crate::scanner_maintenance::{
+    MaintenanceSnapshot, ScannerMaintenanceState, maintenance_response,
+};
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
     TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
@@ -228,6 +231,28 @@ fn bearer_token(req: &HttpRequest) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+async fn maintenance_gate_for_runtime_scanner(
+    pool: &Pool,
+    security: &SecurityConfig,
+    scanner_id: Uuid,
+    token: &str,
+    snapshot: MaintenanceSnapshot,
+    should_block: bool,
+) -> Option<HttpResponse> {
+    if !should_block {
+        return None;
+    }
+    match validate_scanner_credentials(pool, scanner_id, token, &security.scanner_token_pepper)
+        .await
+    {
+        Ok(()) => Some(maintenance_response(&snapshot)),
+        Err(ApplyTaskError::ScannerUnauthorized) => {
+            Some(HttpResponse::Unauthorized().body("unauthorized"))
+        }
+        Err(_) => Some(HttpResponse::InternalServerError().finish()),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ScannerPublicIpQuery {
     scannerid: Uuid,
@@ -245,6 +270,7 @@ pub(crate) async fn scanner_public_ip_handler(
     query: web::Query<ScannerPublicIpQuery>,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    maintenance: web::Data<ScannerMaintenanceState>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
@@ -271,6 +297,11 @@ pub(crate) async fn scanner_public_ip_handler(
                 HttpResponse::InternalServerError().finish()
             }
         };
+    }
+
+    let snapshot = maintenance.snapshot().await;
+    if snapshot.blocks_all_scanner_requests() {
+        return maintenance_response(&snapshot);
     }
 
     let Some(address) = request_ip(&req) else {
@@ -440,11 +471,27 @@ pub(crate) async fn scanner_heartbeat_handler(
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
     latency_history: web::Data<ScannerLatencyHistory>,
+    maintenance: web::Data<ScannerMaintenanceState>,
     heartbeat: web::Json<ScannerHeartbeat>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
+    let maintenance_snapshot = maintenance.snapshot().await;
+    let should_block = maintenance_snapshot.blocks_all_scanner_requests()
+        || (maintenance_snapshot.blocks_new_work() && heartbeat.active_task_id.is_none());
+    if let Some(response) = maintenance_gate_for_runtime_scanner(
+        pool.get_ref(),
+        security.get_ref(),
+        heartbeat.scanner_id,
+        token,
+        maintenance_snapshot,
+        should_block,
+    )
+    .await
+    {
+        return response;
+    }
     if !matches!(heartbeat.state.as_str(), "idle" | "scanning" | "stopping") {
         return HttpResponse::BadRequest().body("invalid scanner state");
     }
@@ -695,11 +742,25 @@ pub(crate) async fn scanner_task_failure_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    maintenance: web::Data<ScannerMaintenanceState>,
     failure: web::Json<ScannerTaskFailure>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
+    let maintenance_snapshot = maintenance.snapshot().await;
+    if let Some(response) = maintenance_gate_for_runtime_scanner(
+        pool.get_ref(),
+        security.get_ref(),
+        failure.scanner_id,
+        token,
+        maintenance_snapshot.clone(),
+        maintenance_snapshot.blocks_all_scanner_requests(),
+    )
+    .await
+    {
+        return response;
+    }
     let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
         Ok(value) => value,
         Err(error) => {
@@ -837,11 +898,25 @@ pub(crate) async fn scanner_task_cancelled_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    maintenance: web::Data<ScannerMaintenanceState>,
     cancelled: web::Json<ScannerTaskCancelled>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
+    let maintenance_snapshot = maintenance.snapshot().await;
+    if let Some(response) = maintenance_gate_for_runtime_scanner(
+        pool.get_ref(),
+        security.get_ref(),
+        cancelled.scanner_id,
+        token,
+        maintenance_snapshot.clone(),
+        maintenance_snapshot.blocks_all_scanner_requests(),
+    )
+    .await
+    {
+        return response;
+    }
     let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
         Ok(value) => value,
         Err(error) => {
@@ -1336,6 +1411,7 @@ async fn apply_task_handler(
     scanner_id: web::Query<ApplyTaskQuery>,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
+    maintenance: web::Data<ScannerMaintenanceState>,
 ) -> impl Responder {
     let database_conn = pool.get_ref();
     let token = req
@@ -1347,6 +1423,20 @@ async fn apply_task_handler(
     let Some(token) = token else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
+
+    let maintenance_snapshot = maintenance.snapshot().await;
+    if let Some(response) = maintenance_gate_for_runtime_scanner(
+        database_conn,
+        security.get_ref(),
+        scanner_id.scannerid,
+        token,
+        maintenance_snapshot.clone(),
+        maintenance_snapshot.blocks_new_work(),
+    )
+    .await
+    {
+        return response;
+    }
 
     if scanner_id.dryrun.unwrap_or(false) {
         return match validate_scanner_credentials(
@@ -1407,6 +1497,7 @@ async fn upload_scanner_result_handler(
     maxmind: web::Data<MaxMindState>,
     elasticsearch: web::Data<crate::elasticsearch::ElasticsearchService>,
     security: web::Data<SecurityConfig>,
+    maintenance: web::Data<ScannerMaintenanceState>,
     upload_data: web::Json<ScannerResultUpload>,
 ) -> impl Responder {
     let token = req
@@ -1418,6 +1509,20 @@ async fn upload_scanner_result_handler(
     let Some(token) = token else {
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
+
+    let maintenance_snapshot = maintenance.snapshot().await;
+    if let Some(response) = maintenance_gate_for_runtime_scanner(
+        pool.get_ref(),
+        security.get_ref(),
+        upload_data.scanner_id,
+        token,
+        maintenance_snapshot.clone(),
+        maintenance_snapshot.blocks_all_scanner_requests(),
+    )
+    .await
+    {
+        return response;
+    }
 
     match save_scanner_results(
         pool.get_ref(),

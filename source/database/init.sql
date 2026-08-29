@@ -572,6 +572,28 @@ CREATE INDEX IF NOT EXISTS idx_scanner_latency_scanner_time
 CREATE INDEX IF NOT EXISTS idx_scanner_latency_time
 	ON scanner_latency_sample(measured_at);
 
+-- 扫描服务维护状态。单行表用于跨进程重启恢复；预计结束时间仅用于提示，
+-- enabled 只能由管理员通过 Web 控制接口显式关闭。
+CREATE TABLE IF NOT EXISTS scanner_maintenance_state (
+	singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+	enabled BOOLEAN NOT NULL DEFAULT FALSE,
+	phase TEXT NOT NULL DEFAULT 'off' CHECK (phase IN ('off', 'draining', 'active')),
+	maintenance_id UUID,
+	message TEXT NOT NULL DEFAULT '',
+	expected_end_at TIMESTAMPTZ,
+	retry_after_seconds INT NOT NULL DEFAULT 600 CHECK (retry_after_seconds BETWEEN 60 AND 86400),
+	started_at TIMESTAMPTZ,
+	started_by INT REFERENCES users(id),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	exited_at TIMESTAMPTZ,
+	exited_by INT REFERENCES users(id),
+	revision BIGINT NOT NULL DEFAULT 0
+);
+
+INSERT INTO scanner_maintenance_state (singleton)
+VALUES (TRUE)
+ON CONFLICT (singleton) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,
 	actor_user_id INT,
