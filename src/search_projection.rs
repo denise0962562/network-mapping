@@ -1,6 +1,7 @@
 use deadpool_postgres::{GenericClient, Pool};
 use serde_json::json;
 
+use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
 use crate::search_content::extract_search_content;
 
 const PROJECTION_COLUMNS: &str = r#"
@@ -117,7 +118,7 @@ where
 pub async fn ensure_initialized(
     pool: &Pool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    backfill_search_content(pool).await?;
+    backfill_search_content(pool, &NoopProgressReporter).await?;
     let mut connection = pool.get().await?;
     let transaction = connection.transaction().await?;
     transaction
@@ -144,7 +145,17 @@ pub async fn ensure_initialized(
 }
 
 pub async fn rebuild(pool: &Pool) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    backfill_search_content(pool).await?;
+    rebuild_with_progress(pool, &NoopProgressReporter).await
+}
+
+pub async fn rebuild_with_progress(
+    pool: &Pool,
+    reporter: &dyn ProgressReporter,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    backfill_search_content(pool, reporter).await?;
+    reporter.report(ProgressUpdate::phase(
+        "正在执行 PostgreSQL 当前端点投影重建",
+    ));
     let mut connection = pool.get().await?;
     let transaction = connection.transaction().await?;
     transaction
@@ -160,8 +171,32 @@ pub async fn rebuild(pool: &Pool) -> Result<u64, Box<dyn std::error::Error + Sen
 
 async fn backfill_search_content(
     pool: &Pool,
+    reporter: &dyn ProgressReporter,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let mut total = 0_u64;
+    let expected_total = if reporter.is_enabled() {
+        reporter.report(ProgressUpdate::phase("正在统计待提取搜索内容的观察记录"));
+        let total: i64 = pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT COUNT(*)::BIGINT AS total FROM scan_observation \
+                 WHERE NOT search_content_extracted;",
+                &[],
+            )
+            .await?
+            .get("total");
+        Some(u64::try_from(total)?)
+    } else {
+        None
+    };
+    let mut completed = 0_u64;
+    reporter.report(ProgressUpdate::count(
+        "回填搜索内容",
+        0,
+        expected_total,
+        "条",
+        "",
+    ));
     loop {
         let mut connection = pool.get().await?;
         let transaction = connection.transaction().await?;
@@ -196,10 +231,17 @@ async fn backfill_search_content(
                 )
                 .await?;
         }
-        total = total.saturating_add(rows.len() as u64);
+        completed = completed.saturating_add(rows.len() as u64);
         transaction.commit().await?;
+        reporter.report(ProgressUpdate::count(
+            "回填搜索内容",
+            completed,
+            expected_total,
+            "条",
+            "",
+        ));
     }
-    Ok(total)
+    Ok(completed)
 }
 
 async fn rebuild_in_transaction<C>(client: &C) -> Result<u64, tokio_postgres::Error>

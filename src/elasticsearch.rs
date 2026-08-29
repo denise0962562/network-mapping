@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio::time::interval;
 use tracing::{error, info, warn};
 
+use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
 use crate::config::{ElasticsearchConfig, ScanStorageMode};
 use crate::handlers::tags::{AssetTag, tags_from_json};
 
@@ -1389,14 +1390,49 @@ impl ElasticsearchService {
     }
 
     pub async fn full_sync(&self, pool: &Pool) -> Result<u64, String> {
+        self.full_sync_with_progress(pool, &NoopProgressReporter)
+            .await
+    }
+
+    pub async fn full_sync_with_progress(
+        &self,
+        pool: &Pool,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<u64, String> {
         if !self.enabled() {
             return Err("Elasticsearch 未启用".to_owned());
         }
+        reporter.report(ProgressUpdate::phase("正在检查 Elasticsearch 并初始化索引"));
         self.initialize(pool).await?;
+        reporter.report(ProgressUpdate::phase("正在重置 Elasticsearch 搜索索引"));
         clear_full_sync_marker(pool).await?;
         self.reset_index().await?;
+        let expected_total = if reporter.is_enabled() {
+            reporter.report(ProgressUpdate::phase("正在统计待同步搜索文档"));
+            let total: i64 = pool
+                .get()
+                .await
+                .map_err(|error| error.to_string())?
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT AS total FROM asset_endpoint_current;",
+                    &[],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .get("total");
+            Some(u64::try_from(total).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
         let mut cursor = 0_i64;
         let mut indexed = 0_u64;
+        reporter.report(ProgressUpdate::count(
+            "同步 Elasticsearch 搜索文档",
+            0,
+            expected_total,
+            "条",
+            "",
+        ));
         loop {
             let documents = load_documents(
                 pool,
@@ -1414,9 +1450,25 @@ impl ElasticsearchService {
                 .last()
                 .map(|document| document.projection_version)
                 .unwrap_or(cursor);
-            indexed = indexed.saturating_add(documents.len() as u64);
+            reporter.report(ProgressUpdate::count(
+                "同步 Elasticsearch 搜索文档",
+                indexed,
+                expected_total,
+                "条",
+                format!("正在写入下一批，末尾 projection_version={cursor}"),
+            ));
+            let document_count = documents.len() as u64;
             self.bulk_index(&documents).await?;
+            indexed = indexed.saturating_add(document_count);
+            reporter.report(ProgressUpdate::count(
+                "同步 Elasticsearch 搜索文档",
+                indexed,
+                expected_total,
+                "条",
+                format!("最后成功 projection_version={cursor}"),
+            ));
         }
+        reporter.report(ProgressUpdate::phase("正在写入 Elasticsearch 同步完成标记"));
         let connection = pool.get().await.map_err(|error| error.to_string())?;
         connection
             .execute(
@@ -1440,15 +1492,57 @@ impl ElasticsearchService {
     }
 
     pub async fn migrate_scan_data(&self, pool: &Pool) -> Result<ScanMigrationReport, String> {
+        self.migrate_scan_data_with_progress(pool, &NoopProgressReporter)
+            .await
+    }
+
+    pub async fn migrate_scan_data_with_progress(
+        &self,
+        pool: &Pool,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<ScanMigrationReport, String> {
         if !self.inner.config.scan_storage.writes_elasticsearch() {
             return Err(
                 "扫描数据迁移要求 elasticsearch.scan_storage=dual 或 elasticsearch".to_owned(),
             );
         }
+        reporter.report(ProgressUpdate::phase(
+            "正在检查 Elasticsearch 并初始化扫描索引",
+        ));
         self.initialize(pool).await?;
         let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let (expected_batches, expected_observations) = if reporter.is_enabled() {
+            reporter.report(ProgressUpdate::phase("正在统计待迁移扫描数据"));
+            let totals = connection
+                .query_one(
+                    "SELECT (SELECT COUNT(*) FROM scan_result_batch)::BIGINT AS batches, \
+                            (SELECT COUNT(*) FROM scan_observation)::BIGINT AS observations;",
+                    &[],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            (
+                Some(
+                    u64::try_from(totals.get::<_, i64>("batches"))
+                        .map_err(|error| error.to_string())?,
+                ),
+                Some(
+                    u64::try_from(totals.get::<_, i64>("observations"))
+                        .map_err(|error| error.to_string())?,
+                ),
+            )
+        } else {
+            (None, None)
+        };
         let mut cursor = 0_i64;
         let mut report = ScanMigrationReport::default();
+        reporter.report(ProgressUpdate::count(
+            "迁移扫描批次",
+            0,
+            expected_batches,
+            "批次",
+            observation_progress(0, expected_observations),
+        ));
         loop {
             let batches = connection
                 .query(
@@ -1532,6 +1626,16 @@ impl ElasticsearchService {
                     batch_index: batch.get("batch_index"),
                     is_final: batch.get("is_final"),
                 };
+                reporter.report(ProgressUpdate::count(
+                    "迁移扫描批次",
+                    report.batches,
+                    expected_batches,
+                    "批次",
+                    format!(
+                        "正在写入 batch_id={batch_id}，{}",
+                        observation_progress(report.observations, expected_observations)
+                    ),
+                ));
                 let result = self.persist_scan_batch(&context, &observations).await?;
                 let storage_references = json!(result.indices);
                 connection.execute(
@@ -1552,8 +1656,19 @@ impl ElasticsearchService {
                 }
                 report.batches += 1;
                 report.observations += observations.len() as u64;
+                reporter.report(ProgressUpdate::count(
+                    "迁移扫描批次",
+                    report.batches,
+                    expected_batches,
+                    "批次",
+                    format!(
+                        "最后成功 batch_id={batch_id}，{}",
+                        observation_progress(report.observations, expected_observations)
+                    ),
+                ));
             }
         }
+        reporter.report(ProgressUpdate::phase("正在写入扫描数据迁移完成标记"));
         connection.execute(
             "INSERT INTO scan_storage_state (state_key, state_value, updated_at) \
              VALUES ('elasticsearch_scan_migration', $1, NOW()) \
@@ -2191,6 +2306,13 @@ fn scan_observation_index(prefix: &str, observed_at_ms: i64) -> Result<String, S
     let observed_at = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
         .ok_or_else(|| format!("无效 observed_at：{observed_at_ms}"))?;
     Ok(format!("{}-{}", prefix, observed_at.format("%Y.%m")))
+}
+
+fn observation_progress(completed: u64, total: Option<u64>) -> String {
+    match total {
+        Some(total) => format!("观察 {completed}/{total} 条"),
+        None => format!("观察 {completed} 条"),
+    }
 }
 
 fn scan_observation_template(prefix: &str, replicas: u32) -> Value {

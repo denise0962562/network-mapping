@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod audit;
 pub mod backup;
+pub mod cli_progress;
 pub mod client_ip;
 pub mod config;
 pub mod db;
