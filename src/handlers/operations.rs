@@ -621,7 +621,8 @@ async fn release_scanner_tasks(
 ) -> Result<u64, tokio_postgres::Error> {
     let rows = transaction.query(
         "UPDATE scan_task_execution SET execution_status = 'pending', assigned_scanner_id = NULL, lease_expires_at = NULL, \
-         task_start_time = NULL, cancel_requested = false, failure_reason = $1 \
+         maintenance_hold = FALSE, maintenance_hold_until = NULL, task_start_time = NULL, \
+         cancel_requested = false, failure_reason = $1 \
          WHERE assigned_scanner_id = $2 AND execution_status = 'running' RETURNING task_id;", &[&reason, &scanner_id]).await?;
     let task_ids: std::collections::HashSet<i32> =
         rows.iter().map(|row| row.get("task_id")).collect();

@@ -106,6 +106,8 @@ CREATE TABLE IF NOT EXISTS scan_task_execution (
 	task_start_time BIGINT,
 	task_end_time BIGINT,
 	lease_expires_at BIGINT,
+	maintenance_hold BOOLEAN NOT NULL DEFAULT false,
+	maintenance_hold_until TIMESTAMPTZ,
 	failure_reason TEXT,
 	cancel_requested BOOLEAN NOT NULL DEFAULT false,
 	result_ip_count BIGINT,
@@ -117,6 +119,8 @@ CREATE TABLE IF NOT EXISTS scan_task_execution (
 ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_ip_count BIGINT;
 ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_port_count BIGINT;
 ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_observation_count BIGINT;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS maintenance_hold BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS maintenance_hold_until TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS automatic_target_state (
 	strategy TEXT PRIMARY KEY,
@@ -683,6 +687,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_event_request
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_execution_address ON ips (execution_id, ip_address);
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
 	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
+
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_maintenance_hold
+	ON scan_task_execution (maintenance_hold_until)
+	WHERE execution_status = 'running' AND maintenance_hold = TRUE;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	ON scan_task_execution (task_id, assigned_scanner_id)
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;

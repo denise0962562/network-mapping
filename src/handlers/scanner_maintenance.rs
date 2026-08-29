@@ -10,7 +10,8 @@ use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::SecurityConfig;
 use crate::scanner_maintenance::{
-    DEFAULT_RETRY_AFTER_SECONDS, MaintenanceSnapshot, ScannerMaintenanceState, active_task_count,
+    DEFAULT_RETRY_AFTER_SECONDS, MaintenanceSnapshot, RESULT_UPLOAD_GRACE_HOURS,
+    ScannerMaintenanceState, active_task_count, held_task_count,
 };
 use crate::{ApplyTaskError, validate_scanner_credentials};
 
@@ -68,13 +69,14 @@ fn validate_message(message: &str) -> Result<String, HttpResponse> {
 }
 
 async fn status_response(pool: &Pool, snapshot: MaintenanceSnapshot) -> HttpResponse {
-    match active_task_count(pool).await {
-        Ok(running_tasks) => HttpResponse::Ok().json(json!({
+    match (active_task_count(pool).await, held_task_count(pool).await) {
+        (Ok(running_tasks), Ok(held_tasks)) => HttpResponse::Ok().json(json!({
             "success": true,
             "data": snapshot,
             "running_tasks": running_tasks,
+            "held_tasks": held_tasks,
         })),
-        Err(error_value) => {
+        (Err(error_value), _) | (_, Err(error_value)) => {
             error!(event = "ScannerMaintenanceCountError", message = %error_value);
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
@@ -166,6 +168,18 @@ pub async fn enter_maintenance(
             "message": "扫描服务已经处于维护模式"
         }));
     };
+    if let Err(error_value) = transaction
+        .execute(
+            "UPDATE scan_task_execution SET maintenance_hold = TRUE, \
+             maintenance_hold_until = NULL, lease_expires_at = NULL \
+             WHERE execution_status = 'running';",
+            &[],
+        )
+        .await
+    {
+        error!(event = "ScannerMaintenanceHoldTasksError", message = %error_value);
+        return HttpResponse::InternalServerError().finish();
+    }
     let snapshot = MaintenanceSnapshot::from_row(&row);
     let mut audit = AuditEvent::user(
         "configuration",
@@ -180,6 +194,7 @@ pub async fn enter_maintenance(
         "message": message,
         "expected_end_at": body.expected_end_at,
         "retry_after_seconds": DEFAULT_RETRY_AFTER_SECONDS,
+        "task_action": "finish_and_cache",
     }));
     if let Err(error_value) =
         write_audit(&transaction, &AuditContext::from_request(&req), &audit).await
@@ -318,6 +333,18 @@ pub async fn exit_maintenance(
             "message": "维护状态已变化，请刷新后重试"
         }));
     };
+    if let Err(error_value) = transaction
+        .execute(
+            "UPDATE scan_task_execution SET maintenance_hold_until = \
+             NOW() + make_interval(hours => $1::int) WHERE execution_status = 'running' \
+             AND maintenance_hold = TRUE;",
+            &[&RESULT_UPLOAD_GRACE_HOURS],
+        )
+        .await
+    {
+        error!(event = "ScannerMaintenanceReleaseTasksError", message = %error_value);
+        return HttpResponse::InternalServerError().finish();
+    }
     let snapshot = MaintenanceSnapshot::from_row(&row);
     let mut audit = AuditEvent::user(
         "configuration",
@@ -328,7 +355,10 @@ pub async fn exit_maintenance(
     audit.resource_type = Some("scanner_maintenance".to_owned());
     audit.resource_id = previous.maintenance_id.map(|value| value.to_string());
     audit.response_status = Some(200);
-    audit.changes = Some(json!({"phase": "off"}));
+    audit.changes = Some(json!({
+        "phase": "off",
+        "result_upload_grace_hours": RESULT_UPLOAD_GRACE_HOURS,
+    }));
     if write_audit(&transaction, &AuditContext::from_request(&req), &audit)
         .await
         .is_err()

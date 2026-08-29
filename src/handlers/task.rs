@@ -32,6 +32,7 @@ struct ScannerHeartbeatLease {
     status: &'static str,
     expires_at_ms: Option<i64>,
     ttl_ms: i64,
+    maintenance_hold: bool,
 }
 
 #[derive(Serialize)]
@@ -46,6 +47,7 @@ struct ScannerHeartbeatResponse {
     success: bool,
     lease: Option<ScannerHeartbeatLease>,
     command: Option<ScannerHeartbeatCommand>,
+    maintenance: Option<MaintenanceSnapshot>,
 }
 
 #[derive(Deserialize)]
@@ -478,14 +480,13 @@ pub(crate) async fn scanner_heartbeat_handler(
         return HttpResponse::Unauthorized().body("missing scanner token");
     };
     let maintenance_snapshot = maintenance.snapshot().await;
-    let should_block = maintenance_snapshot.blocks_all_scanner_requests()
-        || (maintenance_snapshot.blocks_new_work() && heartbeat.active_task_id.is_none());
+    let should_block = maintenance_snapshot.blocks_new_work() && heartbeat.active_task_id.is_none();
     if let Some(response) = maintenance_gate_for_runtime_scanner(
         pool.get_ref(),
         security.get_ref(),
         heartbeat.scanner_id,
         token,
-        maintenance_snapshot,
+        maintenance_snapshot.clone(),
         should_block,
     )
     .await
@@ -658,9 +659,10 @@ pub(crate) async fn scanner_heartbeat_handler(
         let lease_expires_at = crate::get_unix_epoch_ms() + crate::TASK_LEASE_MS;
         let renewed = match transaction
             .query_opt(
-                "UPDATE scan_task_execution e SET lease_expires_at = $1 FROM scan_task t \
+                "UPDATE scan_task_execution e SET lease_expires_at = CASE \
+                 WHEN e.maintenance_hold THEN NULL ELSE $1 END FROM scan_task t \
                  WHERE e.task_id = t.id AND t.task_id = $2 AND e.assigned_scanner_id = $3 \
-                 AND e.execution_status = 'running' RETURNING e.lease_expires_at;",
+                 AND e.execution_status = 'running' RETURNING e.maintenance_hold, e.lease_expires_at;",
                 &[&lease_expires_at, &task_id.to_string(), &scanner_id],
             )
             .await
@@ -671,12 +673,18 @@ pub(crate) async fn scanner_heartbeat_handler(
             }
             Ok(row) => row,
         };
-        if renewed.is_some() {
+        if let Some(renewed) = renewed {
+            let maintenance_hold: bool = renewed.get("maintenance_hold");
             lease = Some(ScannerHeartbeatLease {
                 task_id,
                 status: "renewed",
-                expires_at_ms: Some(lease_expires_at),
-                ttl_ms: crate::TASK_LEASE_MS,
+                expires_at_ms: renewed.get("lease_expires_at"),
+                ttl_ms: if maintenance_hold {
+                    crate::scanner_maintenance::RESULT_UPLOAD_GRACE_TTL_MS
+                } else {
+                    crate::TASK_LEASE_MS
+                },
+                maintenance_hold,
             });
             match transaction
                 .query_opt(
@@ -705,6 +713,7 @@ pub(crate) async fn scanner_heartbeat_handler(
                 status: "lost",
                 expires_at_ms: None,
                 ttl_ms: crate::TASK_LEASE_MS,
+                maintenance_hold: false,
             });
         }
     }
@@ -734,6 +743,7 @@ pub(crate) async fn scanner_heartbeat_handler(
             command_type: "cancel_task",
             task_id,
         }),
+        maintenance: maintenance_snapshot.enabled.then_some(maintenance_snapshot),
     })
 }
 
@@ -827,7 +837,8 @@ pub(crate) async fn scanner_task_failure_handler(
             "UPDATE scan_task_execution SET execution_status = CASE WHEN $1::boolean OR attempt_count >= 3 THEN 'failed' ELSE 'pending' END, \
              task_end_time = CASE WHEN $1::boolean OR attempt_count >= 3 THEN $2::bigint ELSE NULL::bigint END, task_start_time = NULL, \
              assigned_scanner_id = CASE WHEN $1::boolean OR attempt_count >= 3 THEN assigned_scanner_id ELSE NULL END, \
-             lease_expires_at = NULL, failure_reason = $3, cancel_requested = false \
+             lease_expires_at = NULL, maintenance_hold = FALSE, maintenance_hold_until = NULL, \
+             failure_reason = $3, cancel_requested = false \
              WHERE task_id = (SELECT id FROM scan_task WHERE task_id = $4) AND assigned_scanner_id = $5 \
              AND execution_status = 'running' RETURNING execution_status, task_id;",
             &[
@@ -977,10 +988,15 @@ pub(crate) async fn scanner_task_cancelled_handler(
     let changed = transaction
         .query(
             "UPDATE scan_task_execution e SET execution_status = 'cancelled', task_end_time = $1, \
-             lease_expires_at = NULL, cancel_requested = false, failure_reason = NULL FROM scan_task t \
+             lease_expires_at = NULL, maintenance_hold = FALSE, maintenance_hold_until = NULL, \
+             cancel_requested = false, failure_reason = NULL FROM scan_task t \
              WHERE e.task_id = t.id AND t.task_id = $2 AND e.assigned_scanner_id = $3 \
              AND e.execution_status = 'running' AND e.cancel_requested = true RETURNING e.task_id;",
-            &[&crate::get_unix_epoch_ms(), &cancelled.task_id.to_string(), &cancelled.scanner_id.to_string()],
+            &[
+                &crate::get_unix_epoch_ms(),
+                &cancelled.task_id.to_string(),
+                &cancelled.scanner_id.to_string(),
+            ],
         )
         .await;
     match changed {
@@ -1803,8 +1819,10 @@ mod tests {
                 status: "lost",
                 expires_at_ms: None,
                 ttl_ms: crate::TASK_LEASE_MS,
+                maintenance_hold: false,
             }),
             command: None,
+            maintenance: None,
         })
         .unwrap();
 
@@ -1812,5 +1830,6 @@ mod tests {
         assert_eq!(body["lease"]["status"], "lost");
         assert!(body["lease"]["expires_at_ms"].is_null());
         assert_eq!(body["lease"]["ttl_ms"], crate::TASK_LEASE_MS);
+        assert_eq!(body["lease"]["maintenance_hold"], false);
     }
 }

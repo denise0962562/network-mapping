@@ -2230,6 +2230,7 @@ pub async fn save_scanner_results(
             .execute(
                 "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
                  lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false, \
+                 maintenance_hold = FALSE, maintenance_hold_until = NULL, \
                  result_ip_count = $3, result_port_count = $4, result_observation_count = $5 WHERE id = $2;",
                 &[
                     &get_unix_epoch_ms(),
@@ -2343,7 +2344,7 @@ pub async fn apply_task(
             "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port, t.address_family, t.scan_plan \
          FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
          JOIN scanner_info s ON s.scanner_id = $2 \
-         WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.cancel_requested = false \
+         WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.maintenance_hold = FALSE AND e.cancel_requested = false \
               AND (e.lease_expires_at IS NULL OR e.lease_expires_at < $1))) \
            AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
@@ -2373,6 +2374,7 @@ pub async fn apply_task(
         .execute(
             "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1), task_end_time = NULL, \
              execution_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3, \
+             maintenance_hold = FALSE, maintenance_hold_until = NULL, \
              attempt_count = attempt_count + 1, failure_reason = NULL WHERE id = $4;",
             &[
                 &get_unix_epoch_ms(),

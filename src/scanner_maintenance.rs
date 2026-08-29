@@ -12,6 +12,9 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 pub const DEFAULT_RETRY_AFTER_SECONDS: i32 = 600;
+pub const NOTIFICATION_GRACE_SECONDS: i64 = 60;
+pub const RESULT_UPLOAD_GRACE_HOURS: i64 = 24;
+pub const RESULT_UPLOAD_GRACE_TTL_MS: i64 = RESULT_UPLOAD_GRACE_HOURS * 60 * 60 * 1000;
 const DRAIN_EMPTY_CHECKS_REQUIRED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -43,6 +46,9 @@ pub struct MaintenanceSnapshot {
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     pub revision: i64,
+    pub task_action: &'static str,
+    pub notification_grace_seconds: i64,
+    pub result_upload_grace_hours: i64,
 }
 
 impl MaintenanceSnapshot {
@@ -57,6 +63,9 @@ impl MaintenanceSnapshot {
             started_at: row.get("started_at"),
             updated_at: row.get("updated_at"),
             revision: row.get("revision"),
+            task_action: "finish_and_cache",
+            notification_grace_seconds: NOTIFICATION_GRACE_SECONDS,
+            result_upload_grace_hours: RESULT_UPLOAD_GRACE_HOURS,
         }
     }
 
@@ -106,21 +115,32 @@ impl ScannerMaintenanceState {
     }
 
     async fn reconcile(&self, pool: &Pool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let released = release_expired_maintenance_holds(pool).await?;
+        if released > 0 {
+            info!(
+                released,
+                "expired maintenance-held tasks returned to the queue"
+            );
+        }
         let snapshot = self.snapshot().await;
         if !snapshot.enabled || snapshot.phase != MaintenancePhase::Draining {
             self.consecutive_empty_checks.store(0, Ordering::Relaxed);
             return Ok(());
         }
 
-        let reclaimed = reclaim_expired_tasks(pool).await?;
-        if reclaimed > 0 {
+        let newly_held = freeze_running_tasks(pool).await?;
+        if newly_held > 0 {
             info!(
-                reclaimed,
-                "expired scanner task leases reclaimed while draining"
+                newly_held,
+                "running scanner tasks frozen during maintenance notification window"
             );
         }
         let running_tasks = active_task_count(pool).await?;
-        if running_tasks > 0 {
+        let held_tasks = held_task_count(pool).await?;
+        let notification_window_elapsed = snapshot.started_at.is_some_and(|started_at| {
+            Utc::now().signed_duration_since(started_at).num_seconds() >= NOTIFICATION_GRACE_SECONDS
+        });
+        if running_tasks > held_tasks || (held_tasks > 0 && !notification_window_elapsed) {
             self.consecutive_empty_checks.store(0, Ordering::Relaxed);
             return Ok(());
         }
@@ -155,7 +175,21 @@ impl ScannerMaintenanceState {
     }
 }
 
-async fn reclaim_expired_tasks(
+async fn freeze_running_tasks(
+    pool: &Pool,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let client = pool.get().await?;
+    Ok(client
+        .execute(
+            "UPDATE scan_task_execution SET maintenance_hold = TRUE, \
+             maintenance_hold_until = NULL, lease_expires_at = NULL \
+             WHERE execution_status = 'running' AND maintenance_hold = FALSE;",
+            &[],
+        )
+        .await?)
+}
+
+async fn release_expired_maintenance_holds(
     pool: &Pool,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut client = pool.get().await?;
@@ -164,13 +198,14 @@ async fn reclaim_expired_tasks(
         .query(
             "UPDATE scan_task_execution SET execution_status = CASE WHEN cancel_requested \
              THEN 'cancelled' ELSE 'pending' END, assigned_scanner_id = CASE WHEN cancel_requested \
-             THEN assigned_scanner_id ELSE NULL END, lease_expires_at = NULL, task_start_time = \
+             THEN assigned_scanner_id ELSE NULL END, lease_expires_at = NULL, maintenance_hold = FALSE, \
+             maintenance_hold_until = NULL, task_start_time = \
              CASE WHEN cancel_requested THEN task_start_time ELSE NULL END, task_end_time = CASE \
              WHEN cancel_requested THEN (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
              ELSE NULL END, cancel_requested = false, failure_reason = CASE WHEN cancel_requested \
-             THEN NULL ELSE 'task lease expired during maintenance drain' END WHERE \
-             execution_status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < \
-             (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT RETURNING task_id;",
+             THEN NULL ELSE 'maintenance result upload grace period expired' END WHERE \
+             execution_status = 'running' AND maintenance_hold = TRUE \
+             AND maintenance_hold_until IS NOT NULL AND maintenance_hold_until < NOW() RETURNING task_id;",
             &[],
         )
         .await?;
@@ -191,6 +226,18 @@ pub async fn active_task_count(
         .query_one(
             "SELECT COUNT(*)::BIGINT AS count FROM scan_task_execution \
              WHERE execution_status = 'running';",
+            &[],
+        )
+        .await?;
+    Ok(row.get("count"))
+}
+
+pub async fn held_task_count(pool: &Pool) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let client = pool.get().await?;
+    let row = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT AS count FROM scan_task_execution \
+             WHERE execution_status = 'running' AND maintenance_hold = TRUE;",
             &[],
         )
         .await?;
@@ -229,6 +276,8 @@ pub fn maintenance_response(snapshot: &MaintenanceSnapshot) -> HttpResponse {
                 "expected_end_at": snapshot.expected_end_at,
                 "server_time": Utc::now(),
                 "retry_after_seconds": snapshot.retry_after_seconds,
+                "task_action": snapshot.task_action,
+                "result_upload_grace_hours": snapshot.result_upload_grace_hours,
                 "manual_exit_required": true,
                 "revision": snapshot.revision,
             }
@@ -237,7 +286,10 @@ pub fn maintenance_response(snapshot: &MaintenanceSnapshot) -> HttpResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{MaintenancePhase, MaintenanceSnapshot, maintenance_response};
+    use super::{
+        MaintenancePhase, MaintenanceSnapshot, NOTIFICATION_GRACE_SECONDS,
+        RESULT_UPLOAD_GRACE_HOURS, maintenance_response,
+    };
     use actix_web::body::to_bytes;
     use chrono::Utc;
 
@@ -253,6 +305,9 @@ mod tests {
             started_at: Some(Utc::now()),
             updated_at: Utc::now(),
             revision: 1,
+            task_action: "finish_and_cache",
+            notification_grace_seconds: NOTIFICATION_GRACE_SECONDS,
+            result_upload_grace_hours: RESULT_UPLOAD_GRACE_HOURS,
         };
         let response = maintenance_response(&snapshot);
         assert_eq!(
@@ -268,5 +323,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["code"], "scanner_maintenance");
         assert_eq!(value["maintenance"]["phase"], "active");
+        assert_eq!(value["maintenance"]["task_action"], "finish_and_cache");
+        assert_eq!(value["maintenance"]["result_upload_grace_hours"], 24);
     }
 }
