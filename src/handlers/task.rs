@@ -660,7 +660,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         let renewed = match transaction
             .query_opt(
                 "UPDATE scan_task_execution e SET lease_expires_at = CASE \
-                 WHEN e.maintenance_hold THEN NULL ELSE $1 END FROM scan_task t \
+                 WHEN e.maintenance_hold THEN NULL ELSE $1::bigint END FROM scan_task t \
                  WHERE e.task_id = t.id AND t.task_id = $2 AND e.assigned_scanner_id = $3 \
                  AND e.execution_status = 'running' RETURNING e.maintenance_hold, e.lease_expires_at;",
                 &[&lease_expires_at, &task_id.to_string(), &scanner_id],
