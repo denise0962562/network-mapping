@@ -144,7 +144,7 @@ jobs:
           cp -a README.md LICENSE network-mapping-server.service "$server_root/"
           cp -a templates deploy docs "$server_root/"
           mkdir -p "$server_root/source"
-          cp -a source/database "$server_root/source/"
+          cp -a source/database source/open_source_projects.json "$server_root/source/"
           cp -a _frontend/dist "$frontend_root/"
 
           cat > "$package_root/BUILD-INFO" <<EOF
