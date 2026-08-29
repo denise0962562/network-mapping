@@ -23,6 +23,7 @@ const SPA_ROUTES: &[&str] = &[
     "/open-source",
     "/testpage",
     "/setting",
+    "/setting/maintenance",
     "/setting/scan",
     "/setting/mail-templates",
     "/user/info",
@@ -323,6 +324,7 @@ mod tests {
         assert!(is_spa_path("/admin/backups"));
         assert!(is_spa_path("/analysis/scan"));
         assert!(is_spa_path("/analysis/performance"));
+        assert!(is_spa_path("/setting/maintenance"));
         assert!(!is_spa_path("/asset"));
         assert!(is_spa_path("/task/019c0000-0000-7000-8000-000000000001"));
         assert!(is_spa_path("/scanner/019c0000-0000-4000-8000-000000000001"));

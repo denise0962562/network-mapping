@@ -10,19 +10,26 @@ use network_mapping_server::admin::{
 };
 use network_mapping_server::audit::RequestId;
 use network_mapping_server::backup::BackupManager;
+use network_mapping_server::client_ip::request_ip;
 use network_mapping_server::config::{Clis, SelfChecking};
+use network_mapping_server::elasticsearch::{
+    ElasticsearchService, run_worker as run_elasticsearch_worker,
+};
 use network_mapping_server::frontend::{self, FrontendAssets};
 use network_mapping_server::logs::write::error_chain_diagnostics;
 use network_mapping_server::logs::{self, LogRollingMode};
 use network_mapping_server::maxmind::MaxMindState;
 use network_mapping_server::middlewares::{
-    csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM, ratelimit::RateLimitMiddleware,
-    smiddleware::AuthMiddleware,
+    client_ip::ClientIpMiddleware, csrfmiddleware::CsrfMiddleware, hmiddleware::SHeaderM,
+    ratelimit::RateLimitMiddleware, smiddleware::AuthMiddleware,
 };
 use network_mapping_server::monitor::{self, HealthEvent};
 use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
 use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
+use network_mapping_server::scanner_maintenance::{
+    ScannerMaintenanceState, run_reconciler as run_scanner_maintenance_reconciler,
+};
 use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
 use network_mapping_server::tls::build_acceptor;
 use network_mapping_server::trusted_proxy::TrustedProxyState;
@@ -57,6 +64,7 @@ async fn main() -> io::Result<()> {
     config.check();
     let request_log_config = config.requests.clone();
     let monitor_config = config.monitor.clone();
+    let elasticsearch_config = config.elasticsearch.clone();
     let frontend_directory = config.frontend.directory.clone();
     let maxmind_directory = config.maxmind.directory.clone();
     let automatic_target_service = AutomaticTargetService::new(config.automatic_target.clone())
@@ -115,11 +123,68 @@ async fn main() -> io::Result<()> {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(e) => panic!("初始化数据库错误{}", e),
     };
+    if !args.rebuild_elasticsearch
+        && !args.refresh_ip_intel
+        && !args.migrate_scan_data_to_elasticsearch
+        && !elasticsearch_config.scan_storage.reads_elasticsearch()
+    {
+        match network_mapping_server::search_projection::ensure_initialized(&db_pool).await {
+            Ok(true) => info!(target: "server::startup", "历史数据已生成 PostgreSQL 当前端点投影"),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(io::Error::other(format!("初始化当前端点投影失败：{error}")));
+            }
+        }
+    }
+    let elasticsearch_service = ElasticsearchService::new(elasticsearch_config)
+        .map_err(|error| io::Error::other(format!("创建 Elasticsearch 客户端失败：{error}")))?;
+    if args.migrate_scan_data_to_elasticsearch {
+        let report = elasticsearch_service
+            .migrate_scan_data(&db_pool)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("迁移扫描数据到 Elasticsearch 失败：{error}"))
+            })?;
+        println!(
+            "扫描数据迁移完成：批次 {} 个，观察 {} 条",
+            report.batches, report.observations
+        );
+        return Ok(());
+    }
+    if args.rebuild_elasticsearch {
+        if !elasticsearch_service.enabled() {
+            return Err(io::Error::other(
+                "--rebuild-elasticsearch 要求 elasticsearch.enabled=true",
+            ));
+        }
+        let projected = network_mapping_server::search_projection::rebuild(&db_pool)
+            .await
+            .map_err(|error| io::Error::other(format!("重建当前端点投影失败：{error}")))?;
+        let indexed = elasticsearch_service
+            .full_sync(&db_pool)
+            .await
+            .map_err(|error| io::Error::other(format!("重建 Elasticsearch 索引失败：{error}")))?;
+        println!("Elasticsearch 重建完成：PostgreSQL 投影 {projected} 条，索引 {indexed} 条");
+        return Ok(());
+    }
+    elasticsearch_service
+        .validate_scan_cutover(&db_pool)
+        .await
+        .map_err(|error| io::Error::other(format!("扫描存储切换检查失败：{error}")))?;
     let trusted_proxy_state = web::Data::new(
         TrustedProxyState::from_database(&db_pool)
             .await
             .map_err(|error| io::Error::other(format!("加载可信代理配置失败：{error}")))?,
     );
+    let scanner_maintenance_state = web::Data::new(
+        ScannerMaintenanceState::from_database(&db_pool)
+            .await
+            .map_err(|error| io::Error::other(format!("加载扫描服务维护状态失败：{error}")))?,
+    );
+    tokio::spawn(run_scanner_maintenance_reconciler(
+        scanner_maintenance_state.clone(),
+        db_pool.clone(),
+    ));
     if let Ok(client) = db_pool.get().await
         && let Err(error_value) = client
             .execute(
@@ -137,9 +202,14 @@ async fn main() -> io::Result<()> {
     if args.refresh_ip_intel {
         match maxmind_state.refresh_ip_intel(&db_pool).await {
             Ok(report) => {
+                let projected = network_mapping_server::search_projection::rebuild(&db_pool)
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("刷新 IP 情报后的搜索投影重建失败：{error}"))
+                    })?;
                 println!(
-                    "IP 情报刷新完成：扫描 {} 条，更新 {} 条，无匹配 {} 条",
-                    report.scanned, report.updated, report.unmatched
+                    "IP 情报刷新完成：扫描 {} 条，更新 {} 条，无匹配 {} 条，搜索投影 {} 条",
+                    report.scanned, report.updated, report.unmatched, projected
                 );
                 return Ok(());
             }
@@ -148,6 +218,13 @@ async fn main() -> io::Result<()> {
                 return Err(io::Error::other("刷新历史 IP 情报失败"));
             }
         }
+    }
+    let elasticsearch_data = web::Data::new(elasticsearch_service.clone());
+    if elasticsearch_service.enabled() {
+        tokio::spawn(run_elasticsearch_worker(
+            elasticsearch_service.clone(),
+            db_pool.clone(),
+        ));
     }
 
     info!(target: "server::startup", "正在检查系统账户");
@@ -228,7 +305,14 @@ async fn main() -> io::Result<()> {
 
         loop {
             ticker.tick().await;
-            match insert_system_status(&db_pool, database_c.db_name.clone(), sys.clone()).await {
+            match insert_system_status(
+                &db_pool,
+                database_c.db_name.clone(),
+                sys.clone(),
+                &elasticsearch_service,
+            )
+            .await
+            {
                 Ok(_) => (),
                 Err(e) => {
                     error!(
@@ -282,7 +366,9 @@ async fn main() -> io::Result<()> {
             .app_data(automatic_target_service.clone())
             .app_data(open_source_catalog.clone())
             .app_data(backup_manager.clone())
+            .app_data(elasticsearch_data.clone())
             .app_data(trusted_proxy_state.clone())
+            .app_data(scanner_maintenance_state.clone())
             .app_data(security.clone())
             .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())
@@ -326,10 +412,7 @@ async fn main() -> io::Result<()> {
                 req.extensions_mut()
                     .insert(request_log::RequestActor(actor.clone()));
                 let method = req.method().to_string();
-                let client_ip = req
-                    .connection_info()
-                    .realip_remote_addr()
-                    .and_then(request_log::parse_ip);
+                let client_ip = request_ip(req.request());
                 let user_agent = req
                     .headers()
                     .get(header::USER_AGENT)
@@ -395,7 +478,11 @@ async fn main() -> io::Result<()> {
                             let slow_duration = duration_ms
                                 .map(i64::from)
                                 .filter(|value| monitor.is_slow_request(*value));
-                            let is_server_error = monitor.server_error_enabled() && status >= 500;
+                            let is_expected_maintenance =
+                                response.headers().contains_key("nm-maintenance-version");
+                            let is_server_error = monitor.server_error_enabled()
+                                && status >= 500
+                                && !is_expected_maintenance;
                             if slow_duration.is_some() || is_server_error {
                                 let client_ip_str = client_ip.map(|ip| ip.to_string());
                                 let actor_name_str = actor_name.clone();
@@ -447,6 +534,8 @@ async fn main() -> io::Result<()> {
                     Ok(response)
                 }
             })
+            // 最外层先按可信代理规则解析一次来源 IP，供请求日志、限流、认证与审计复用。
+            .wrap(ClientIpMiddleware::new(trusted_proxy_state.clone()))
             .configure(config::init_routes)
             .configure(frontend::configure)
             .configure(|cfg| frontend::configure_assets(cfg, &frontend_directory))

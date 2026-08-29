@@ -2,12 +2,14 @@ use actix_web::{HttpRequest, HttpResponse, Responder, get, web};
 use chrono::{DateTime, Duration, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
 use tracing::error;
 use uuid::Uuid;
 
 use crate::ReceiveSystemStatusInfo;
 use crate::admin::UserBaseI;
+use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::error_logs;
 use crate::{SystemDetails, SystemStatusJson, Systems, get_system_status_info};
 
@@ -198,6 +200,7 @@ pub(crate) async fn get_analysis_distribution(
     req: HttpRequest,
     query: web::Query<DistributionQuery>,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
@@ -211,6 +214,17 @@ pub(crate) async fn get_analysis_distribution(
     let limit = query.limit.unwrap_or(5);
     if !matches!(limit, 5 | 7 | 10) {
         return bad_request("limit must be 5, 7 or 10");
+    }
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return analysis_distribution_from_elasticsearch(
+            &req,
+            elasticsearch.get_ref(),
+            &filters,
+            dimension,
+            limit,
+            &user,
+        )
+        .await;
     }
 
     let client = match pool.get().await {
@@ -309,12 +323,17 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     req: HttpRequest,
     query: web::Query<HeatmapQuery>,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return analysis_heatmap_from_elasticsearch(&req, elasticsearch.get_ref(), &filters, &user)
+            .await;
+    }
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error_value) => {
@@ -366,6 +385,193 @@ pub(crate) async fn get_analysis_discovery_heatmap(
         success: true,
         data: HeatmapData { items },
         meta: analysis_meta(&filters),
+    })
+}
+
+fn analysis_es_filters(filters: &AnalysisFilters, user: &UserBaseI) -> Vec<Value> {
+    let mut result = vec![json!({"range": {"observed_at": {
+        "gte": filters.start_ms, "lt": filters.end_ms, "format": "epoch_millis"
+    }}})];
+    if user.role != 1 {
+        result.push(json!({"term": {"user_id": user.id}}));
+    }
+    if let Some(scanner_id) = filters.scanner_id.as_deref() {
+        result.push(json!({"term": {"scanner_id": scanner_id}}));
+    }
+    if let Some(task_source) = filters.task_source.as_deref() {
+        result.push(json!({"term": {"task_source": task_source}}));
+    }
+    result
+}
+
+async fn analysis_distribution_from_elasticsearch(
+    req: &HttpRequest,
+    elasticsearch: &ElasticsearchService,
+    filters: &AnalysisFilters,
+    dimension: DistributionDimension,
+    limit: i64,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let mut query_filters = analysis_es_filters(filters, user);
+    let field = match dimension {
+        DistributionDimension::Service => {
+            query_filters.push(json!({"term": {"kind": "service"}}));
+            query_filters.push(json!({"exists": {"field": "service"}}));
+            "service"
+        }
+        DistributionDimension::Port => "port",
+    };
+    let mut after = None;
+    let mut counts = HashMap::<String, i64>::new();
+    loop {
+        let mut composite = json!({
+            "size": 1000,
+            "sources": [
+                {"label": {"terms": {"field": field}}},
+                {"endpoint": {"terms": {"field": "endpoint_id"}}}
+            ]
+        });
+        if let Some(value) = after.take() {
+            composite
+                .as_object_mut()
+                .expect("composite aggregation is an object")
+                .insert("after".to_owned(), value);
+        }
+        let result = match elasticsearch
+            .scan_query(
+                ScanQueryIndex::Observations,
+                &json!({
+                    "size": 0,
+                    "query": {"bool": {"filter": query_filters}},
+                    "aggs": {"groups": {"composite": composite}}
+                }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                error_logs(req, "AnalysisDistributionElasticsearchError", &error);
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"message": "扫描结果索引暂时不可用"}));
+            }
+        };
+        let buckets = result
+            .pointer("/aggregations/groups/buckets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for bucket in &buckets {
+            let label = bucket
+                .pointer("/key/label")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_default();
+            *counts.entry(label).or_default() += 1;
+        }
+        after = result.pointer("/aggregations/groups/after_key").cloned();
+        if buckets.len() < 1000 || after.is_none() {
+            break;
+        }
+    }
+    let mut all_items = counts.into_iter().collect::<Vec<_>>();
+    all_items.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let total = all_items.iter().map(|item| item.1).sum::<i64>();
+    let items = all_items
+        .into_iter()
+        .take(limit as usize)
+        .map(|(name, count)| DistributionItem {
+            name,
+            count,
+            percentage: percentage(count, total),
+        })
+        .collect::<Vec<_>>();
+    let visible_count = items.iter().map(|item| item.count).sum::<i64>();
+    HttpResponse::Ok().json(AnalysisResponse {
+        success: true,
+        data: DistributionData {
+            dimension: dimension.as_str(),
+            items,
+            other_count: total.saturating_sub(visible_count),
+            total,
+        },
+        meta: analysis_meta(filters),
+    })
+}
+
+async fn analysis_heatmap_from_elasticsearch(
+    req: &HttpRequest,
+    elasticsearch: &ElasticsearchService,
+    filters: &AnalysisFilters,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let mut after = None;
+    let mut counts = BTreeMap::<i64, i64>::new();
+    loop {
+        let mut composite = json!({
+            "size": 1000,
+            "sources": [
+                {"day": {"date_histogram": {"field": "observed_at",
+                    "calendar_interval": "1d", "time_zone": "+08:00"}}},
+                {"address": {"terms": {"field": "ip_address"}}}
+            ]
+        });
+        if let Some(value) = after.take() {
+            composite
+                .as_object_mut()
+                .expect("composite aggregation is an object")
+                .insert("after".to_owned(), value);
+        }
+        let result = match elasticsearch
+            .scan_query(
+                ScanQueryIndex::Observations,
+                &json!({
+                    "size": 0,
+                    "query": {"bool": {"filter": analysis_es_filters(filters, user)}},
+                    "aggs": {"groups": {"composite": composite}}
+                }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                error_logs(req, "AnalysisHeatmapElasticsearchError", &error);
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"message": "扫描结果索引暂时不可用"}));
+            }
+        };
+        let buckets = result
+            .pointer("/aggregations/groups/buckets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for bucket in &buckets {
+            if let Some(day) = bucket.pointer("/key/day").and_then(Value::as_i64) {
+                *counts.entry(day).or_default() += 1;
+            }
+        }
+        after = result.pointer("/aggregations/groups/after_key").cloned();
+        if buckets.len() < 1000 || after.is_none() {
+            break;
+        }
+    }
+    let timezone = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset");
+    let items = counts
+        .into_iter()
+        .filter_map(|(day, count)| {
+            DateTime::<Utc>::from_timestamp_millis(day).map(|time| HeatmapItem {
+                date: time.with_timezone(&timezone).format("%Y-%m-%d").to_string(),
+                count,
+            })
+        })
+        .collect::<Vec<_>>();
+    HttpResponse::Ok().json(AnalysisResponse {
+        success: true,
+        data: HeatmapData { items },
+        meta: analysis_meta(filters),
     })
 }
 

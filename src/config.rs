@@ -41,6 +41,8 @@ pub struct Config {
     pub monitor: MonitorConfig,
     #[serde(default)]
     pub backup: BackupConfig,
+    #[serde(default)]
+    pub elasticsearch: ElasticsearchConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -74,6 +76,7 @@ impl SelfChecking for Config {
         let _ = &self.requests.check();
         let _ = &self.monitor.check();
         let _ = &self.backup.check();
+        let _ = &self.elasticsearch.check();
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -94,6 +97,7 @@ impl SelfChecking for Config {
         self.requests.try_check()?;
         self.monitor.try_check()?;
         self.backup.try_check()?;
+        self.elasticsearch.try_check()?;
         self.automatic_target.validate()?;
         Ok(true)
     }
@@ -199,6 +203,224 @@ impl BackupConfig {
             let base_directory = config_path.parent().unwrap_or_else(|| Path::new(""));
             *config_file = base_directory.join(&*config_file);
         }
+    }
+}
+
+/// Elasticsearch 搜索读模型配置。默认关闭，升级现有部署时不会产生外部依赖。
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct ElasticsearchConfig {
+    pub enabled: bool,
+    pub read_enabled: bool,
+    /// 扫描事实的权威存储。`dual` 用于迁移核对，`elasticsearch` 停止写入
+    /// PostgreSQL 扫描事实表，仅保留任务状态和上传回执。
+    pub scan_storage: ScanStorageMode,
+    pub url: String,
+    pub index: String,
+    pub observation_index_prefix: String,
+    pub execution_endpoint_index: String,
+    pub current_endpoint_index: String,
+    pub scan_number_of_replicas: u32,
+    pub expected_version: String,
+    pub api_key: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub ca_certificate_file: Option<PathBuf>,
+    pub request_timeout_seconds: u64,
+    pub poll_interval_ms: u64,
+    pub bulk_batch_size: usize,
+    pub fallback_to_postgres: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanStorageMode {
+    #[default]
+    Postgres,
+    Dual,
+    Elasticsearch,
+}
+
+impl ScanStorageMode {
+    pub fn writes_elasticsearch(self) -> bool {
+        matches!(self, Self::Dual | Self::Elasticsearch)
+    }
+
+    pub fn writes_postgres(self) -> bool {
+        matches!(self, Self::Postgres | Self::Dual)
+    }
+
+    pub fn reads_elasticsearch(self) -> bool {
+        self == Self::Elasticsearch
+    }
+}
+
+impl fmt::Debug for ElasticsearchConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ElasticsearchConfig")
+            .field("enabled", &self.enabled)
+            .field("read_enabled", &self.read_enabled)
+            .field("scan_storage", &self.scan_storage)
+            .field("url", &self.url)
+            .field("index", &self.index)
+            .field("observation_index_prefix", &self.observation_index_prefix)
+            .field("execution_endpoint_index", &self.execution_endpoint_index)
+            .field("current_endpoint_index", &self.current_endpoint_index)
+            .field("scan_number_of_replicas", &self.scan_number_of_replicas)
+            .field("expected_version", &self.expected_version)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("ca_certificate_file", &self.ca_certificate_file)
+            .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("bulk_batch_size", &self.bulk_batch_size)
+            .field("fallback_to_postgres", &self.fallback_to_postgres)
+            .finish()
+    }
+}
+
+impl Default for ElasticsearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            read_enabled: false,
+            scan_storage: ScanStorageMode::Postgres,
+            url: "https://127.0.0.1:9200".to_owned(),
+            index: "network-mapping-assets-v1".to_owned(),
+            observation_index_prefix: "network-mapping-scan-observations-v1".to_owned(),
+            execution_endpoint_index: "network-mapping-execution-endpoints-v1".to_owned(),
+            current_endpoint_index: "network-mapping-endpoints-current-v2".to_owned(),
+            scan_number_of_replicas: 1,
+            expected_version: "9.5.2".to_owned(),
+            api_key: None,
+            username: None,
+            password: None,
+            ca_certificate_file: None,
+            request_timeout_seconds: 30,
+            poll_interval_ms: 500,
+            bulk_batch_size: 500,
+            fallback_to_postgres: true,
+        }
+    }
+}
+
+impl ElasticsearchConfig {
+    fn resolve_relative_to(&mut self, config_path: &Path) {
+        let Some(certificate) = &mut self.ca_certificate_file else {
+            return;
+        };
+        if certificate.is_relative() {
+            let base_directory = config_path.parent().unwrap_or_else(|| Path::new(""));
+            *certificate = base_directory.join(&*certificate);
+        }
+    }
+}
+
+impl SelfChecking for ElasticsearchConfig {
+    fn check(&self) {
+        if let Err(error) = self.try_check() {
+            panic!("{error}");
+        }
+        info!(
+            target: "server::startup",
+            component = "elasticsearch",
+            enabled = self.enabled,
+            read_enabled = self.read_enabled,
+            index = %self.index,
+            expected_version = %self.expected_version,
+            "配置检查通过"
+        );
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if self.read_enabled && !self.enabled {
+            return Err("elasticsearch.read_enabled 要求 enabled=true".into());
+        }
+        if self.scan_storage.writes_elasticsearch() && !self.enabled {
+            return Err(
+                "elasticsearch.scan_storage 使用 dual/elasticsearch 时要求 enabled=true".into(),
+            );
+        }
+        if self.scan_storage.reads_elasticsearch() && !self.read_enabled {
+            return Err("elasticsearch.scan_storage=elasticsearch 时要求 read_enabled=true".into());
+        }
+        if !self.enabled {
+            return Ok(true);
+        }
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|_| "elasticsearch.url 必须是有效的 HTTP(S) URL")?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err("elasticsearch.url 必须是有效的 HTTP(S) URL".into());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("elasticsearch.url 不得包含用户名或密码，请使用独立认证字段".into());
+        }
+        if self.expected_version != "9.5.2" {
+            return Err("当前接入固定要求 elasticsearch.expected_version = 9.5.2".into());
+        }
+        if self.index.is_empty()
+            || self.index.len() > 255
+            || self
+                .index
+                .chars()
+                .next()
+                .is_some_and(|value| matches!(value, '_' | '-' | '+'))
+            || self.index.chars().any(|value| {
+                value.is_ascii_uppercase()
+                    || value.is_whitespace()
+                    || matches!(
+                        value,
+                        '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|' | ',' | '#'
+                    )
+            })
+        {
+            return Err("elasticsearch.index 不是有效的 Elasticsearch 索引名".into());
+        }
+        for (name, value) in [
+            ("observation_index_prefix", &self.observation_index_prefix),
+            ("execution_endpoint_index", &self.execution_endpoint_index),
+            ("current_endpoint_index", &self.current_endpoint_index),
+        ] {
+            if value.is_empty()
+                || value.len() > 240
+                || value.chars().any(|character| {
+                    character.is_ascii_uppercase()
+                        || character.is_whitespace()
+                        || matches!(
+                            character,
+                            '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|' | ',' | '#'
+                        )
+                })
+            {
+                return Err(format!("elasticsearch.{name} 不是有效的索引名前缀").into());
+            }
+        }
+        if self.api_key.is_some() && (self.username.is_some() || self.password.is_some()) {
+            return Err("elasticsearch.api_key 与 username/password 不能同时配置".into());
+        }
+        if self.username.is_some() != self.password.is_some() {
+            return Err("elasticsearch.username 和 password 必须同时配置".into());
+        }
+        if self.request_timeout_seconds == 0 {
+            return Err("elasticsearch.request_timeout_seconds 必须大于 0".into());
+        }
+        if !(100..=60_000).contains(&self.poll_interval_ms) {
+            return Err("elasticsearch.poll_interval_ms 必须在 100 到 60000 之间".into());
+        }
+        if !(1..=2_000).contains(&self.bulk_batch_size) {
+            return Err("elasticsearch.bulk_batch_size 必须在 1 到 2000 之间".into());
+        }
+        if self.scan_number_of_replicas > 5 {
+            return Err("elasticsearch.scan_number_of_replicas 必须在 0 到 5 之间".into());
+        }
+        if self.scan_storage.reads_elasticsearch() && self.scan_number_of_replicas == 0 {
+            return Err(
+                "elasticsearch 承担权威扫描存储时 scan_number_of_replicas 必须至少为 1".into(),
+            );
+        }
+        Ok(true)
     }
 }
 
@@ -841,6 +1063,7 @@ impl Config {
         config.frontend.resolve_relative_to(path);
         config.maxmind.resolve_relative_to(path);
         config.backup.resolve_relative_to(path);
+        config.elasticsearch.resolve_relative_to(path);
         config
     }
 }
@@ -848,8 +1071,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomaticTargetConfig, BackupConfig, Clis, FrontendConfig, MaxMindConfig,
-        NotificationPreferences, SecurityConfig, SelfChecking, TlsConfig,
+        AutomaticTargetConfig, BackupConfig, Clis, ElasticsearchConfig, FrontendConfig,
+        MaxMindConfig, NotificationPreferences, SecurityConfig, SelfChecking, TlsConfig,
         session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
@@ -1000,6 +1223,8 @@ mod tests {
 
         assert!(!cli.terminal_verbose);
         assert!(!cli.refresh_ip_intel);
+        assert!(!cli.rebuild_elasticsearch);
+        assert!(!cli.migrate_scan_data_to_elasticsearch);
     }
 
     #[test]
@@ -1016,6 +1241,37 @@ mod tests {
             .expect("refresh CLI flag should parse");
 
         assert!(cli.refresh_ip_intel);
+    }
+
+    #[test]
+    fn elasticsearch_config_is_safe_by_default_and_requires_9_5_2() {
+        let mut config = ElasticsearchConfig::default();
+        assert!(!config.enabled);
+        assert!(!config.read_enabled);
+        assert!(config.try_check().unwrap());
+
+        config.enabled = true;
+        config.expected_version = "9.5.1".to_owned();
+        assert!(config.try_check().is_err());
+        config.expected_version = "9.5.2".to_owned();
+        assert!(config.try_check().unwrap());
+        config.read_enabled = true;
+        config.enabled = false;
+        assert!(config.try_check().is_err());
+    }
+
+    #[test]
+    fn rebuild_elasticsearch_flag_enables_one_off_rebuild() {
+        let cli = Clis::try_parse_from(["networkm", "--rebuild-elasticsearch"])
+            .expect("rebuild Elasticsearch CLI flag should parse");
+        assert!(cli.rebuild_elasticsearch);
+    }
+
+    #[test]
+    fn migrate_scan_data_flag_enables_one_off_migration() {
+        let cli = Clis::try_parse_from(["networkm", "--migrate-scan-data-to-elasticsearch"])
+            .expect("scan migration CLI flag should parse");
+        assert!(cli.migrate_scan_data_to_elasticsearch);
     }
 
     #[test]
@@ -1100,6 +1356,11 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::system_resources::get_system_resource_history)
         .service(handlers::system_resources::get_database_size_history)
         .service(handlers::scanner_latency::get_scanner_latency_history)
+        .service(handlers::scanner_maintenance::get_maintenance_status)
+        .service(handlers::scanner_maintenance::enter_maintenance)
+        .service(handlers::scanner_maintenance::update_maintenance)
+        .service(handlers::scanner_maintenance::exit_maintenance)
+        .service(handlers::scanner_maintenance::scanner_maintenance_probe)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
         .service(handlers::search::search_ip)
@@ -1107,6 +1368,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::search::search_port)
         .service(handlers::search::search_service)
         .service(handlers::search::search_banner)
+        .service(handlers::search::elasticsearch_status)
         .service(handlers::search::search_v2)
         .service(handlers::assets::get_asset_summary)
         .service(handlers::assets::get_asset_ports)
@@ -1176,6 +1438,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::operations::delete_scanner)
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
+        .service(utils::get_server_config_h)
         .service(utils::get_mail_settings_h)
         .service(utils::save_mail_settings_h)
         .service(utils::get_session_settings_h)
@@ -1301,4 +1564,12 @@ pub struct Clis {
     /// 使用当前 MaxMind 数据库刷新历史 IP 情报后退出
     #[arg(long)]
     pub refresh_ip_intel: bool,
+
+    /// 重建 PostgreSQL 当前端点投影和 Elasticsearch 索引后退出
+    #[arg(long)]
+    pub rebuild_elasticsearch: bool,
+
+    /// 将 PostgreSQL 中现有扫描事实幂等迁移到新的 Elasticsearch 扫描索引后退出
+    #[arg(long)]
+    pub migrate_scan_data_to_elasticsearch: bool,
 }

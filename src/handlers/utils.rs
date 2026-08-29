@@ -74,6 +74,28 @@ async fn get_server_version() -> impl Responder {
     }))
 }
 
+/// 获取当前 Web 监听配置（只读）
+#[get("/api/config/server")]
+pub async fn get_server_config_h(
+    server_config: web::Data<ServerConfig>,
+    user_base_i: UserBaseI,
+) -> impl Responder {
+    if user_base_i.role != 1 {
+        return HttpResponse::Forbidden().json(json!({
+            "success": false,
+            "message": "仅管理员可以读取 Web 监听配置"
+        }));
+    }
+
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": {
+            "host": server_config.host.as_str(),
+            "port": server_config.port
+        }
+    }))
+}
+
 /// 用于启动加载 RIR 数据
 #[cfg(feature = "rir")]
 #[get("/api/updaterir")]
@@ -151,7 +173,73 @@ fn validate_mail_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_mail_settings;
+    use actix_web::{App, HttpMessage, http::StatusCode, test as actix_test, web};
+    use serde_json::{Value, json};
+
+    use super::{get_server_config_h, validate_mail_settings};
+    use crate::{admin::UserBaseI, config::ServerConfig};
+
+    fn test_server_config() -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 9443,
+            encrypt_key: "test".to_owned(),
+            max_body_size: 1024,
+        }
+    }
+
+    fn test_user(role: i32) -> UserBaseI {
+        UserBaseI {
+            id: 1,
+            username: "tester".to_owned(),
+            role,
+            email: None,
+            limit_login: false,
+            enable_2fa: false,
+        }
+    }
+
+    #[actix_web::test]
+    async fn server_config_returns_only_read_only_listen_fields_for_admin() {
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_server_config()))
+                .service(get_server_config_h),
+        )
+        .await;
+        let request = actix_test::TestRequest::get()
+            .uri("/api/config/server")
+            .to_request();
+        request.extensions_mut().insert(test_user(1));
+
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(
+            body,
+            json!({
+                "success": true,
+                "data": { "host": "127.0.0.1", "port": 9443 }
+            })
+        );
+    }
+
+    #[actix_web::test]
+    async fn server_config_rejects_non_admin_users() {
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_server_config()))
+                .service(get_server_config_h),
+        )
+        .await;
+        let request = actix_test::TestRequest::get()
+            .uri("/api/config/server")
+            .to_request();
+        request.extensions_mut().insert(test_user(0));
+
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
     #[test]
     fn valid_mail_settings_are_accepted() {

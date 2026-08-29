@@ -1,6 +1,7 @@
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::SecurityConfig;
+use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::error_logs;
 use crate::{generate_scanner_token, hash_scanner_token};
 use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, post, put, web};
@@ -259,10 +260,22 @@ fn csv_cell(value: &str) -> String {
 pub(crate) async fn export_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
     task_id: web::Path<Uuid>,
     query: web::Query<ExportQuery>,
     user: UserBaseI,
 ) -> impl Responder {
+    let id = task_id.into_inner().to_string();
+    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+        return export_task_from_elasticsearch(
+            &req,
+            elasticsearch.get_ref(),
+            &id,
+            query.format.as_deref(),
+            &user,
+        )
+        .await;
+    }
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
@@ -270,7 +283,6 @@ pub(crate) async fn export_task(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let id = task_id.into_inner().to_string();
     let rows = match connection
         .query(
             "SELECT e.execution_id, e.assigned_scanner_id, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name, \
@@ -354,6 +366,118 @@ pub(crate) async fn export_task(
         .insert_header((
             "Content-Disposition",
             format!("attachment; filename=task-{id}.csv"),
+        ))
+        .content_type("text/csv; charset=utf-8")
+        .body(csv)
+}
+
+async fn export_task_from_elasticsearch(
+    req: &HttpRequest,
+    elasticsearch: &ElasticsearchService,
+    task_id: &str,
+    format: Option<&str>,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let mut filters = vec![json!({"term": {"task_id": task_id}})];
+    if user.role != 1 {
+        filters.push(json!({"term": {"user_id": user.id}}));
+    }
+    let mut search_after = None;
+    let mut rows = Vec::new();
+    loop {
+        let mut body = json!({
+            "size": 1000,
+            "query": {"bool": {"filter": filters}},
+            "sort": [{"execution_id": "asc"}, {"ip": "asc"}, {"port": "asc"}]
+        });
+        if let Some(value) = search_after.take() {
+            body.as_object_mut()
+                .expect("query body is object")
+                .insert("search_after".to_owned(), value);
+        }
+        let result = match elasticsearch
+            .scan_query(ScanQueryIndex::ExecutionEndpoints, &body)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                error_logs(req, "ExportTaskElasticsearchError", &error);
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"message": "扫描结果索引暂时不可用"}));
+            }
+        };
+        let hits = result
+            .pointer("/hits/hits")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for hit in &hits {
+            if let Some(source) = hit.get("_source") {
+                rows.push(json!({
+                    "execution_id": source.get("execution_id"),
+                    "scanner_id": source.get("scanner_id"),
+                    "scanner_name": source.get("scanner_name"),
+                    "ip": source.get("ip"), "asn": source.get("asn"),
+                    "isp": source.get("isp"), "port": source.get("port"),
+                    "as_org": source.get("as_org"), "country_code": source.get("country_code"),
+                    "country_name": source.get("country_name"), "city_name": source.get("city_name"),
+                    "protocol": source.get("protocol"), "service": source.get("service"),
+                    "banner": source.get("banner"), "scan_time": source.get("observed_at_ms")
+                }));
+            }
+        }
+        search_after = hits.last().and_then(|hit| hit.get("sort")).cloned();
+        if hits.len() < 1000 || search_after.is_none() {
+            break;
+        }
+    }
+    if format == Some("json") {
+        return HttpResponse::Ok().json(json!({"task_id": task_id, "results": rows}));
+    }
+    let mut csv = String::from(
+        "execution_id,scanner_id,scanner_name,ip,asn,as_org,isp,country_code,country_name,city_name,port,protocol,service,banner,scan_time\n",
+    );
+    let fields = [
+        "execution_id",
+        "scanner_id",
+        "scanner_name",
+        "ip",
+        "asn",
+        "as_org",
+        "isp",
+        "country_code",
+        "country_name",
+        "city_name",
+        "port",
+        "protocol",
+        "service",
+        "banner",
+        "scan_time",
+    ];
+    for row in rows {
+        let values = fields.map(|field| {
+            row.get(field)
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| value.as_i64().map(|number| number.to_string()))
+                })
+                .unwrap_or_default()
+        });
+        csv.push_str(
+            &values
+                .iter()
+                .map(|value| csv_cell(value))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        csv.push('\n');
+    }
+    HttpResponse::Ok()
+        .insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=task-{task_id}.csv"),
         ))
         .content_type("text/csv; charset=utf-8")
         .body(csv)
@@ -497,7 +621,8 @@ async fn release_scanner_tasks(
 ) -> Result<u64, tokio_postgres::Error> {
     let rows = transaction.query(
         "UPDATE scan_task_execution SET execution_status = 'pending', assigned_scanner_id = NULL, lease_expires_at = NULL, \
-         task_start_time = NULL, cancel_requested = false, failure_reason = $1 \
+         maintenance_hold = FALSE, maintenance_hold_until = NULL, task_start_time = NULL, \
+         cancel_requested = false, failure_reason = $1 \
          WHERE assigned_scanner_id = $2 AND execution_status = 'running' RETURNING task_id;", &[&reason, &scanner_id]).await?;
     let task_ids: std::collections::HashSet<i32> =
         rows.iter().map(|row| row.get("task_id")).collect();

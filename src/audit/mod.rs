@@ -10,7 +10,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::admin::UserBaseI;
-use crate::client_ip::{normalize_ip, parse_ip};
+use crate::client_ip::request_ip;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RequestId(pub Uuid);
@@ -38,10 +38,7 @@ impl AuditContext {
             })
             .unwrap_or_else(Uuid::new_v4);
 
-        let source_ip = req
-            .peer_addr()
-            .map(|address| normalize_ip(address.ip()))
-            .or_else(|| parse_ip(req.connection_info().realip_remote_addr()?));
+        let source_ip = request_ip(req);
         let user_agent = req
             .headers()
             .get("User-Agent")
@@ -176,7 +173,26 @@ pub async fn write_standalone(pool: &Pool, context: &AuditContext, event: &Audit
         }
     };
     if let Err(error_value) = write(&client, context, event).await {
-        error!(event = "AuditWriteError", request_id = %context.request_id, message = %error_value);
+        if let Some(database_error) = error_value.as_db_error() {
+            error!(
+                event = "AuditWriteError",
+                request_id = %context.request_id,
+                category = %event.category,
+                action = %event.action,
+                sqlstate = database_error.code().code(),
+                constraint = database_error.constraint().unwrap_or(""),
+                detail = database_error.detail().unwrap_or(""),
+                message = database_error.message(),
+            );
+        } else {
+            error!(
+                event = "AuditWriteError",
+                request_id = %context.request_id,
+                category = %event.category,
+                action = %event.action,
+                message = %error_value,
+            );
+        }
         return false;
     }
     true
@@ -184,7 +200,9 @@ pub async fn write_standalone(pool: &Pool, context: &AuditContext, event: &Audit
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ip;
+    use super::AuditContext;
+    use crate::client_ip::{ResolvedClientIp, parse_ip};
+    use actix_web::{HttpMessage, test as actix_test};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -206,5 +224,32 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(64, 81, 116, 137)))
         );
         assert_eq!(parse_ip("unknown"), None);
+    }
+
+    #[test]
+    fn audit_context_uses_centrally_resolved_client_ip() {
+        let request = actix_test::TestRequest::default()
+            .peer_addr("[::1]:443".parse().unwrap())
+            .insert_header(("x-forwarded-for", "203.0.113.29"))
+            .to_http_request();
+        request
+            .extensions_mut()
+            .insert(ResolvedClientIp(Some("203.0.113.29".parse().unwrap())));
+
+        assert_eq!(
+            AuditContext::from_request(&request).source_ip,
+            Some("203.0.113.29".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn database_schema_allows_backup_audit_events_and_migrates_existing_constraints() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+
+        assert!(initialization_sql.contains("'data_access', 'audit', 'backup'\n\t))"));
+        assert!(initialization_sql.contains("'data_access', 'audit', 'backup'\n        ))"));
+        assert!(
+            initialization_sql.contains("OR POSITION('backup' IN pg_get_constraintdef(oid)) = 0")
+        );
     }
 }

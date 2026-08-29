@@ -106,10 +106,21 @@ CREATE TABLE IF NOT EXISTS scan_task_execution (
 	task_start_time BIGINT,
 	task_end_time BIGINT,
 	lease_expires_at BIGINT,
+	maintenance_hold BOOLEAN NOT NULL DEFAULT false,
+	maintenance_hold_until TIMESTAMPTZ,
 	failure_reason TEXT,
 	cancel_requested BOOLEAN NOT NULL DEFAULT false,
+	result_ip_count BIGINT,
+	result_port_count BIGINT,
+	result_observation_count BIGINT,
 	CONSTRAINT uk_task_execution_scanner UNIQUE(task_id, requested_scanner_id)
 );
+
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_ip_count BIGINT;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_port_count BIGINT;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS result_observation_count BIGINT;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS maintenance_hold BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS maintenance_hold_until TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS automatic_target_state (
 	strategy TEXT PRIMARY KEY,
@@ -211,11 +222,35 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	is_final BOOLEAN NOT NULL,
 	observation_count INT NOT NULL CHECK (observation_count >= 0),
 	protocol_version SMALLINT NOT NULL DEFAULT 2 CHECK (protocol_version IN (1, 2)),
+	payload_checksum VARCHAR(64),
+	storage_backend TEXT NOT NULL DEFAULT 'postgres',
+	storage_references JSONB NOT NULL DEFAULT '[]'::JSONB,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	UNIQUE(execution_id, upload_id, batch_index)
 );
 
+CREATE TABLE IF NOT EXISTS scan_storage_state (
+	state_key TEXT PRIMARY KEY,
+	state_value JSONB NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scan_projection_outbox (
+	execution_id INT PRIMARY KEY REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	last_error TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_projection_outbox_pending
+	ON scan_projection_outbox(available_at, execution_id) WHERE processed_at IS NULL;
+
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT NOT NULL DEFAULT 2;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS payload_checksum VARCHAR(64);
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_references JSONB NOT NULL DEFAULT '[]'::JSONB;
 DO $$
 BEGIN
 	IF NOT EXISTS (
@@ -240,6 +275,11 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 	protocol TEXT NOT NULL,
 	service TEXT,
 	banner TEXT,
+	title TEXT,
+	http_body TEXT,
+	http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+	tls_subject TEXT,
+	search_content_extracted BOOLEAN NOT NULL DEFAULT FALSE,
 	source TEXT NOT NULL,
 	data JSONB,
 	observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -248,6 +288,11 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 
 -- 旧版结果允许协议为空；v2 上传仍由应用层要求协议非空。
 ALTER TABLE scan_observation ALTER COLUMN protocol DROP NOT NULL;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS http_body TEXT;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS tls_subject TEXT;
+ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS search_content_extracted BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
 	ON scan_observation(execution_id, kind);
@@ -258,6 +303,16 @@ CREATE INDEX IF NOT EXISTS idx_scan_observation_observed_at
 CREATE INDEX IF NOT EXISTS idx_scan_observation_service
 	ON scan_observation(service)
 	WHERE kind = 'service' AND service IS NOT NULL;
+
+-- One-time compatibility backfill. These are execution-level control-plane counters;
+-- scan facts remain in scan_observation for PostgreSQL/dual mode or Elasticsearch after cutover.
+UPDATE scan_task_execution execution SET
+	result_ip_count = (SELECT COUNT(*) FROM ips WHERE execution_id = execution.id),
+	result_port_count = (SELECT COUNT(*) FROM ports p JOIN ips i ON i.ip_id = p.ip_id WHERE i.execution_id = execution.id),
+	result_observation_count = (SELECT COUNT(*) FROM scan_observation WHERE execution_id = execution.id)
+WHERE execution.result_ip_count IS NULL
+	OR execution.result_port_count IS NULL
+	OR execution.result_observation_count IS NULL;
 CREATE INDEX IF NOT EXISTS idx_scan_observation_asset_endpoint_latest
 	ON scan_observation(ip_address, port, observed_at DESC, id DESC)
 	WHERE port > 0;
@@ -435,8 +490,11 @@ CREATE TABLE IF NOT EXISTS system_status (
 	ram JSONB DEFAULT NULL,
 	disk JSONB DEFAULT NULL,
 	db_postgresql JSONB DEFAULT NULL,
+	db_elasticsearch JSONB DEFAULT NULL,
 	network JSONB DEFAULT NULL
 );
+
+ALTER TABLE system_status ADD COLUMN IF NOT EXISTS db_elasticsearch JSONB DEFAULT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_system_status_create_time
 	ON system_status(create_time);
@@ -518,6 +576,28 @@ CREATE INDEX IF NOT EXISTS idx_scanner_latency_scanner_time
 CREATE INDEX IF NOT EXISTS idx_scanner_latency_time
 	ON scanner_latency_sample(measured_at);
 
+-- 扫描服务维护状态。单行表用于跨进程重启恢复；预计结束时间仅用于提示，
+-- enabled 只能由管理员通过 Web 控制接口显式关闭。
+CREATE TABLE IF NOT EXISTS scanner_maintenance_state (
+	singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+	enabled BOOLEAN NOT NULL DEFAULT FALSE,
+	phase TEXT NOT NULL DEFAULT 'off' CHECK (phase IN ('off', 'draining', 'active')),
+	maintenance_id UUID,
+	message TEXT NOT NULL DEFAULT '',
+	expected_end_at TIMESTAMPTZ,
+	retry_after_seconds INT NOT NULL DEFAULT 600 CHECK (retry_after_seconds BETWEEN 60 AND 86400),
+	started_at TIMESTAMPTZ,
+	started_by INT REFERENCES users(id),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	exited_at TIMESTAMPTZ,
+	exited_by INT REFERENCES users(id),
+	revision BIGINT NOT NULL DEFAULT 0
+);
+
+INSERT INTO scanner_maintenance_state (singleton)
+VALUES (TRUE)
+ON CONFLICT (singleton) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,
 	actor_user_id INT,
@@ -536,7 +616,7 @@ CREATE TABLE IF NOT EXISTS audit_event (
 	occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	category TEXT NOT NULL CONSTRAINT audit_event_category_check CHECK (category IN (
 		'authentication', 'authorization', 'user_security', 'task', 'scanner',
-		'automatic_target', 'configuration', 'data_access', 'audit'
+		'automatic_target', 'configuration', 'data_access', 'audit', 'backup'
 	)),
 	action TEXT NOT NULL,
 	outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied')),
@@ -557,7 +637,7 @@ CREATE TABLE IF NOT EXISTS audit_event (
 	metadata JSONB NOT NULL DEFAULT '{}'::JSONB
 );
 
--- 兼容尚未包含系统生成目标分类的已有审计表。
+-- 兼容尚未包含新审计分类的已有审计表。
 DO $$
 BEGIN
     IF EXISTS (
@@ -565,7 +645,10 @@ BEGIN
         FROM pg_constraint
         WHERE conrelid = 'audit_event'::regclass
           AND conname = 'audit_event_category_check'
-          AND POSITION('automatic_target' IN pg_get_constraintdef(oid)) = 0
+          AND (
+              POSITION('automatic_target' IN pg_get_constraintdef(oid)) = 0
+              OR POSITION('backup' IN pg_get_constraintdef(oid)) = 0
+          )
     ) THEN
         ALTER TABLE audit_event DROP CONSTRAINT audit_event_category_check;
     END IF;
@@ -578,7 +661,7 @@ BEGIN
     ) THEN
         ALTER TABLE audit_event ADD CONSTRAINT audit_event_category_check CHECK (category IN (
             'authentication', 'authorization', 'user_security', 'task', 'scanner',
-            'automatic_target', 'configuration', 'data_access', 'audit'
+            'automatic_target', 'configuration', 'data_access', 'audit', 'backup'
         ));
     END IF;
 END $$;
@@ -604,6 +687,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_event_request
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_execution_address ON ips (execution_id, ip_address);
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
 	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
+
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_maintenance_hold
+	ON scan_task_execution (maintenance_hold_until)
+	WHERE execution_status = 'running' AND maintenance_hold = TRUE;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	ON scan_task_execution (task_id, assigned_scanner_id)
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
@@ -878,3 +965,130 @@ CREATE INDEX IF NOT EXISTS idx_backup_job_created_at
 	ON backup_job (created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_job_single_active
 	ON backup_job ((1)) WHERE status IN ('queued', 'running');
+
+-- 搜索读模型：按用户权限范围和管理员全局范围预先维护每个 IP:port 的当前状态。
+-- 历史 observation 仍是权威事实；此表和 Elasticsearch 索引均可重建。
+CREATE SEQUENCE IF NOT EXISTS asset_endpoint_projection_version_seq;
+
+CREATE TABLE IF NOT EXISTS asset_endpoint_current (
+	scope_type TEXT NOT NULL CHECK (scope_type IN ('global', 'user')),
+	scope_id INT NOT NULL CHECK (
+		(scope_type = 'global' AND scope_id = 0)
+		OR (scope_type = 'user' AND scope_id > 0)
+	),
+	ip_address INET NOT NULL,
+	port INT NOT NULL CHECK (port > 0 AND port <= 65535),
+	protocol TEXT,
+	service TEXT,
+	banner TEXT,
+	title TEXT,
+	http_body TEXT,
+	http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+	tls_subject TEXT,
+	source TEXT NOT NULL,
+	scanner_name TEXT,
+	first_seen_at TIMESTAMPTZ NOT NULL,
+	last_seen_at TIMESTAMPTZ NOT NULL,
+	asn TEXT,
+	isp TEXT,
+	as_org TEXT,
+	country_code VARCHAR(2),
+	country_name TEXT,
+	region_name TEXT,
+	city_name TEXT,
+	latest_endpoint_observation_id BIGINT NOT NULL,
+	latest_service_observation_id BIGINT,
+	projection_version BIGINT NOT NULL DEFAULT nextval('asset_endpoint_projection_version_seq'),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	PRIMARY KEY (scope_type, scope_id, ip_address, port)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_endpoint_current_scope_latest
+	ON asset_endpoint_current(scope_type, scope_id, last_seen_at DESC, ip_address, port);
+CREATE INDEX IF NOT EXISTS idx_asset_endpoint_current_ip
+	ON asset_endpoint_current(ip_address, scope_type, scope_id);
+
+-- Outbox 与扫描结果或标签变更位于同一 PostgreSQL 事务，ES 故障不会阻塞扫描写入。
+CREATE TABLE IF NOT EXISTS search_index_outbox (
+	id BIGSERIAL PRIMARY KEY,
+	event_kind TEXT NOT NULL CHECK (event_kind IN ('execution', 'ip', 'full')),
+	aggregate_key TEXT NOT NULL,
+	payload JSONB NOT NULL DEFAULT '{}',
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	locked_at TIMESTAMPTZ,
+	processed_at TIMESTAMPTZ,
+	last_error TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_index_outbox_pending
+	ON search_index_outbox(available_at, id)
+	WHERE processed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS search_projection_state (
+	state_key TEXT PRIMARY KEY,
+	state_value TEXT NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 该视图只在投影刷新/全量重建时读取。普通搜索直接读取 asset_endpoint_current，
+-- 避免每个请求都在完整历史上执行窗口函数和聚合。
+CREATE OR REPLACE VIEW asset_endpoint_search_source AS
+WITH eligible AS MATERIALIZED (
+	SELECT scope.scope_type, scope.scope_id, observation.*,
+		COALESCE(scanner.name, execution.assigned_scanner_id, execution.requested_scanner_id) AS scanner_name
+	FROM scan_observation observation
+	JOIN scan_task_execution execution ON execution.id = observation.execution_id
+	JOIN scan_task task ON task.id = execution.task_id
+	LEFT JOIN scanner_info scanner
+		ON scanner.scanner_id = COALESCE(execution.assigned_scanner_id, execution.requested_scanner_id)
+	CROSS JOIN LATERAL (
+		VALUES ('global'::TEXT, 0), ('user'::TEXT, task.user_id)
+	) AS scope(scope_type, scope_id)
+	WHERE execution.execution_status = 'succeeded' AND observation.port > 0
+), endpoint_stats AS (
+	SELECT scope_type, scope_id, ip_address, port,
+		MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at
+	FROM eligible
+	GROUP BY scope_type, scope_id, ip_address, port
+), latest_endpoint AS (
+	SELECT DISTINCT ON (scope_type, scope_id, ip_address, port)
+		scope_type, scope_id, ip_address, port, protocol, source, scanner_name, id
+	FROM eligible
+	ORDER BY scope_type, scope_id, ip_address, port, observed_at DESC, id DESC
+), latest_service AS (
+	SELECT DISTINCT ON (scope_type, scope_id, ip_address, port)
+		scope_type, scope_id, ip_address, port, service, banner, title, http_body,
+		http_body_truncated, tls_subject, source, id
+	FROM eligible
+	WHERE kind = 'service'
+	ORDER BY scope_type, scope_id, ip_address, port, observed_at DESC, id DESC
+), eligible_intel AS MATERIALIZED (
+	SELECT scope.scope_type, scope.scope_id, intel.*
+	FROM ips intel
+	JOIN scan_task_execution execution ON execution.id = intel.execution_id
+	JOIN scan_task task ON task.id = execution.task_id
+	CROSS JOIN LATERAL (
+		VALUES ('global'::TEXT, 0), ('user'::TEXT, task.user_id)
+	) AS scope(scope_type, scope_id)
+	WHERE execution.execution_status = 'succeeded'
+), latest_intel AS (
+	SELECT DISTINCT ON (scope_type, scope_id, ip_address)
+		scope_type, scope_id, ip_address, asn, isp, as_org, country_code,
+		country_name, region_name, city_name
+	FROM eligible_intel
+	ORDER BY scope_type, scope_id, ip_address, update_time DESC, ip_id DESC
+)
+SELECT stats.scope_type, stats.scope_id, stats.ip_address, stats.port,
+	endpoint.protocol, service.service, service.banner, service.title, service.http_body,
+	COALESCE(service.http_body_truncated, FALSE) AS http_body_truncated,
+	service.tls_subject, COALESCE(service.source, endpoint.source) AS source,
+	endpoint.scanner_name, stats.first_seen_at, stats.last_seen_at,
+	intel.asn, intel.isp, intel.as_org, intel.country_code, intel.country_name,
+	intel.region_name, intel.city_name, endpoint.id AS latest_endpoint_observation_id,
+	service.id AS latest_service_observation_id
+FROM endpoint_stats stats
+JOIN latest_endpoint endpoint USING (scope_type, scope_id, ip_address, port)
+LEFT JOIN latest_service service USING (scope_type, scope_id, ip_address, port)
+LEFT JOIN latest_intel intel USING (scope_type, scope_id, ip_address);
