@@ -2122,7 +2122,7 @@ pub async fn save_scanner_results(
                     observation_key TEXT, kind TEXT, ip_address INET, port INT, \
                     protocol TEXT, service TEXT, banner TEXT, title TEXT, http_body TEXT, \
                     http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
-                    search_content_extracted BOOLEAN, observed_at_ms BIGINT, \
+                    search_content_extracted BOOLEAN, observed_at BIGINT, \
                     asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
                     country_name TEXT, region_name TEXT, city_name TEXT) \
              ), inserted_observations AS ( \
@@ -2131,7 +2131,7 @@ pub async fn save_scanner_results(
                     http_body_truncated, tls_subject, search_content_extracted, source, data, observed_at) \
                 SELECT $2, $3, observation_key, kind, ip_address, port, protocol, service, \
                     banner, title, http_body, http_body_truncated, tls_subject, \
-                    search_content_extracted, source, data, to_timestamp(observed_at_ms / 1000.0) FROM input \
+                    search_content_extracted, source, data, to_timestamp(observed_at / 1000.0) FROM input \
                 ON CONFLICT (execution_id, observation_key) DO NOTHING \
                 RETURNING ip_address, port \
              ), inserted_endpoints AS MATERIALIZED ( \

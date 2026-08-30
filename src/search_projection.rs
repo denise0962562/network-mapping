@@ -1,5 +1,5 @@
 use deadpool_postgres::{GenericClient, Pool};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
 use crate::search_content::extract_search_content;
@@ -51,6 +51,13 @@ fn projection_upsert_sql(filter: &str) -> String {
     )
 }
 
+fn execution_outbox_values(execution_id: i32) -> (String, Value) {
+    (
+        execution_id.to_string(),
+        json!({"execution_id": execution_id}),
+    )
+}
+
 pub(crate) async fn refresh_for_execution<C>(
     client: &C,
     execution_id: i32,
@@ -73,11 +80,12 @@ where
            AND affected.port = source.port)",
     );
     let updated = client.execute(&sql, &[&execution_id]).await?;
+    let (aggregate_key, payload) = execution_outbox_values(execution_id);
     client
         .execute(
             "INSERT INTO search_index_outbox (event_kind, aggregate_key, payload) \
-             VALUES ('execution', $1::TEXT, JSONB_BUILD_OBJECT('execution_id', $1));",
-            &[&execution_id],
+             VALUES ('execution', $1::TEXT, $2::JSONB);",
+            &[&aggregate_key, &payload],
         )
         .await?;
     Ok(updated)
@@ -280,4 +288,17 @@ where
         )
         .await?;
     Ok(inserted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execution_outbox_values;
+
+    #[test]
+    fn execution_outbox_uses_text_key_and_numeric_payload() {
+        let (aggregate_key, payload) = execution_outbox_values(42);
+
+        assert_eq!(aggregate_key, "42");
+        assert_eq!(payload["execution_id"], 42);
+    }
 }
