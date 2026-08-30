@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 pub const DEFAULT_RETRY_AFTER_SECONDS: i32 = 600;
 pub const NOTIFICATION_GRACE_SECONDS: i64 = 60;
-pub const RESULT_UPLOAD_GRACE_HOURS: i64 = 24;
-pub const RESULT_UPLOAD_GRACE_TTL_MS: i64 = RESULT_UPLOAD_GRACE_HOURS * 60 * 60 * 1000;
+pub const RESULT_UPLOAD_GRACE_HOURS: i32 = 24;
+pub const RESULT_UPLOAD_GRACE_TTL_MS: i64 = RESULT_UPLOAD_GRACE_HOURS as i64 * 60 * 60 * 1000;
 const DRAIN_EMPTY_CHECKS_REQUIRED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -48,7 +48,7 @@ pub struct MaintenanceSnapshot {
     pub revision: i64,
     pub task_action: &'static str,
     pub notification_grace_seconds: i64,
-    pub result_upload_grace_hours: i64,
+    pub result_upload_grace_hours: i32,
 }
 
 impl MaintenanceSnapshot {
