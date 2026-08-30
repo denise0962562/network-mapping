@@ -122,6 +122,14 @@ expected_version = "9.5.2"
 request_timeout_seconds = 30
 poll_interval_ms = 500
 bulk_batch_size = 500
+# 历史扫描数据按执行实例并行迁移；单个执行实例内部仍保持批次顺序。
+scan_migration_concurrency = 4
+scan_migration_page_size = 100
+# Bulk 遇到 429/502/503/504 或网络错误时进行指数退避重试。
+bulk_max_retries = 4
+bulk_retry_initial_ms = 200
+# 至少完成这些批次后持久化一次断点状态。
+scan_migration_checkpoint_batches = 100
 # 只影响 postgres/dual 的旧搜索副本；elasticsearch 权威模式始终失败关闭，不回退陈旧事实。
 fallback_to_postgres = true
 
