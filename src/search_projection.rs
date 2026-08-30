@@ -293,6 +293,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::execution_outbox_values;
+    use tokio_postgres::types::{ToSql, Type};
 
     #[test]
     fn execution_outbox_uses_text_key_and_numeric_payload() {
@@ -300,5 +301,7 @@ mod tests {
 
         assert_eq!(aggregate_key, "42");
         assert_eq!(payload["execution_id"], 42);
+        assert!(<String as ToSql>::accepts(&Type::TEXT));
+        assert!(<serde_json::Value as ToSql>::accepts(&Type::JSONB));
     }
 }

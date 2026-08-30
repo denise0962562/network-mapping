@@ -598,19 +598,19 @@ pub(crate) async fn scanner_heartbeat_handler(
              scan_capabilities = $16, scan_capabilities_updated_at = NOW(), \
              latency_rtt_us = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
                  AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
-                 THEN $17 ELSE latency_rtt_us END, \
+                 THEN $17::BIGINT ELSE latency_rtt_us END, \
              latency_network_rtt_us = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
                  AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
-                 THEN $18 ELSE latency_network_rtt_us END, \
+                 THEN $18::BIGINT ELSE latency_network_rtt_us END, \
              latency_server_processing_us = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
                  AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
-                 THEN $19 ELSE latency_server_processing_us END, \
+                 THEN $19::BIGINT ELSE latency_server_processing_us END, \
              latency_probe_id = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
                  AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
-                 THEN $21 ELSE latency_probe_id END, \
+                 THEN $21::UUID ELSE latency_probe_id END, \
              latency_measured_at = CASE WHEN $20::TIMESTAMPTZ IS NOT NULL \
                  AND (latency_measured_at IS NULL OR $20 >= latency_measured_at) \
-                 THEN $20 ELSE latency_measured_at END \
+                 THEN $20::TIMESTAMPTZ ELSE latency_measured_at END \
              WHERE scanner_id = $22 AND runtime_token_hash = $23 AND is_enable = TRUE \
              RETURNING id;",
             &[

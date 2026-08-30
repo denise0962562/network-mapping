@@ -2373,8 +2373,8 @@ pub async fn apply_task(
     let lease_expires_at = get_unix_epoch_ms() + 90_000;
     transaction
         .execute(
-            "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1), task_end_time = NULL, \
-             execution_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3, \
+            "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1::BIGINT), task_end_time = NULL, \
+             execution_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3::BIGINT, \
              maintenance_hold = FALSE, maintenance_hold_until = NULL, \
              attempt_count = attempt_count + 1, failure_reason = NULL WHERE id = $4;",
             &[
@@ -2805,9 +2805,9 @@ pub async fn get_system_status_info(
                 "SELECT *
                         FROM system_status
                         WHERE create_time BETWEEN
-                            COALESCE($1, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                            COALESCE($1::BIGINT, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
                             AND
-                            COALESCE($2, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                            COALESCE($2::BIGINT, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
                         ORDER BY id DESC
                         LIMIT $3;",
                 &[&start_at, &end_at, &count],
