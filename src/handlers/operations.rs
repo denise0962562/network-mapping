@@ -87,7 +87,7 @@ pub(crate) async fn cancel_task(
     };
     if let Err(error) = transaction.execute(
         "UPDATE scan_task_execution SET execution_status = CASE WHEN execution_status = 'pending' THEN 'cancelled' ELSE execution_status END, \
-         cancel_requested = (execution_status = 'running'), task_end_time = CASE WHEN execution_status = 'pending' THEN $1 ELSE task_end_time END, \
+         cancel_requested = (execution_status = 'running'), task_end_time = CASE WHEN execution_status = 'pending' THEN $1::BIGINT ELSE task_end_time END, \
          lease_expires_at = CASE WHEN execution_status = 'pending' THEN NULL ELSE lease_expires_at END \
          WHERE task_id = $2 AND execution_status IN ('pending', 'running');", &[&now, &task_pk]).await {
         error_logs(&req, "CancelTaskDatabaseError", &error.to_string());

@@ -4,18 +4,23 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{GenericClient, Pool};
+use futures_util::{StreamExt, stream};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::interval;
+use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 
+use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
 use crate::config::{ElasticsearchConfig, ScanStorageMode};
 use crate::handlers::tags::{AssetTag, tags_from_json};
 
 const INDEX_SCHEMA_VERSION: &str = "1";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
 const SCAN_INDEX_SCHEMA_VERSION: &str = "1";
+const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
+const ENSURE_SCAN_MIGRATION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_scan_observation_batch_id_id \
+     ON scan_observation(batch_id, id);";
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScanBatchContext {
@@ -441,6 +446,71 @@ impl ElasticsearchService {
         }
     }
 
+    async fn send_bulk_with_retry(
+        &self,
+        path: &str,
+        body: &str,
+        create_conflict_is_success: bool,
+    ) -> Result<Value, String> {
+        let max_retries = self.inner.config.bulk_max_retries;
+        for attempt in 0..=max_retries {
+            let response = self
+                .request(Method::POST, path)
+                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                .body(body.to_owned())
+                .send()
+                .await;
+            match response {
+                Ok(response) if is_retryable_bulk_status(response.status()) => {
+                    let status = response.status();
+                    if attempt == max_retries {
+                        return Err(response_error(response).await);
+                    }
+                    warn!(
+                        event = "ElasticsearchBulkRetry",
+                        attempt = attempt + 1,
+                        max_retries,
+                        %status,
+                        "Bulk 请求收到临时 HTTP 状态，准备重试"
+                    );
+                }
+                Ok(response) => {
+                    let result = response_json(response).await?;
+                    if !bulk_response_is_retryable(&result, create_conflict_is_success) {
+                        return Ok(result);
+                    }
+                    if attempt == max_retries {
+                        return Ok(result);
+                    }
+                    warn!(
+                        event = "ElasticsearchBulkRetry",
+                        attempt = attempt + 1,
+                        max_retries,
+                        "Bulk 响应包含可重试条目，准备重试整个幂等请求"
+                    );
+                }
+                Err(error) => {
+                    if attempt == max_retries {
+                        return Err(error.to_string());
+                    }
+                    warn!(
+                        event = "ElasticsearchBulkRetry",
+                        attempt = attempt + 1,
+                        max_retries,
+                        message = %error,
+                        "Bulk 请求发生网络错误，准备重试"
+                    );
+                }
+            }
+            sleep(bulk_retry_delay(
+                self.inner.config.bulk_retry_initial_ms,
+                attempt,
+            ))
+            .await;
+        }
+        unreachable!("bulk retry loop always returns")
+    }
+
     async fn initialize(&self, pool: &Pool) -> Result<IndexState, String> {
         if !self.enabled() {
             return Ok(IndexState::Existing);
@@ -598,6 +668,15 @@ impl ElasticsearchService {
         }
         self.ensure_scan_indices().await?;
 
+        self.persist_scan_batch_prepared(context, observations)
+            .await
+    }
+
+    async fn persist_scan_batch_prepared(
+        &self,
+        context: &ScanBatchContext,
+        observations: &[Value],
+    ) -> Result<ScanBatchWriteResult, String> {
         let payload_checksum = scan_batch_payload_checksum(context, observations)?;
         let mut body = String::new();
         let mut expected = Vec::with_capacity(observations.len());
@@ -662,17 +741,13 @@ impl ElasticsearchService {
             } else {
                 ""
             };
-            let response = self
-                .request(
-                    Method::POST,
+            let result = self
+                .send_bulk_with_retry(
                     &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+                    &body,
+                    true,
                 )
-                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-                .body(body)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let result = response_json(response).await?;
+                .await?;
             self.validate_scan_bulk_result(&result, &expected).await?;
         }
 
@@ -865,17 +940,13 @@ impl ElasticsearchService {
         } else {
             ""
         };
-        let response = self
-            .request(
-                Method::POST,
+        let result = self
+            .send_bulk_with_retry(
                 &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+                &body,
+                false,
             )
-            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let result = response_json(response).await?;
+            .await?;
         let failures = result
             .get("items")
             .and_then(Value::as_array)
@@ -992,16 +1063,12 @@ impl ElasticsearchService {
                 }
             }
             let bulk = self
-                .request(
-                    Method::POST,
+                .send_bulk_with_retry(
                     "/_bulk?wait_for_active_shards=all&refresh=wait_for",
+                    &body,
+                    false,
                 )
-                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-                .body(body)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let bulk = response_json(bulk).await?;
+                .await?;
             if bulk.get("errors").and_then(Value::as_bool) == Some(true) {
                 let failure = bulk
                     .get("items")
@@ -1124,14 +1191,7 @@ impl ElasticsearchService {
             body.push_str(&serde_json::to_string(document).map_err(|error| error.to_string())?);
             body.push('\n');
         }
-        let response = self
-            .request(Method::POST, "/_bulk")
-            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let result = response_json(response).await?;
+        let result = self.send_bulk_with_retry("/_bulk", &body, false).await?;
         if result.get("errors").and_then(Value::as_bool) != Some(true) {
             self.mark_success();
             return Ok(());
@@ -1389,14 +1449,49 @@ impl ElasticsearchService {
     }
 
     pub async fn full_sync(&self, pool: &Pool) -> Result<u64, String> {
+        self.full_sync_with_progress(pool, &NoopProgressReporter)
+            .await
+    }
+
+    pub async fn full_sync_with_progress(
+        &self,
+        pool: &Pool,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<u64, String> {
         if !self.enabled() {
             return Err("Elasticsearch 未启用".to_owned());
         }
+        reporter.report(ProgressUpdate::phase("正在检查 Elasticsearch 并初始化索引"));
         self.initialize(pool).await?;
+        reporter.report(ProgressUpdate::phase("正在重置 Elasticsearch 搜索索引"));
         clear_full_sync_marker(pool).await?;
         self.reset_index().await?;
+        let expected_total = if reporter.is_enabled() {
+            reporter.report(ProgressUpdate::phase("正在统计待同步搜索文档"));
+            let total: i64 = pool
+                .get()
+                .await
+                .map_err(|error| error.to_string())?
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT AS total FROM asset_endpoint_current;",
+                    &[],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .get("total");
+            Some(u64::try_from(total).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
         let mut cursor = 0_i64;
         let mut indexed = 0_u64;
+        reporter.report(ProgressUpdate::count(
+            "同步 Elasticsearch 搜索文档",
+            0,
+            expected_total,
+            "条",
+            "",
+        ));
         loop {
             let documents = load_documents(
                 pool,
@@ -1414,9 +1509,25 @@ impl ElasticsearchService {
                 .last()
                 .map(|document| document.projection_version)
                 .unwrap_or(cursor);
-            indexed = indexed.saturating_add(documents.len() as u64);
+            reporter.report(ProgressUpdate::count(
+                "同步 Elasticsearch 搜索文档",
+                indexed,
+                expected_total,
+                "条",
+                format!("正在写入下一批，末尾 projection_version={cursor}"),
+            ));
+            let document_count = documents.len() as u64;
             self.bulk_index(&documents).await?;
+            indexed = indexed.saturating_add(document_count);
+            reporter.report(ProgressUpdate::count(
+                "同步 Elasticsearch 搜索文档",
+                indexed,
+                expected_total,
+                "条",
+                format!("最后成功 projection_version={cursor}"),
+            ));
         }
+        reporter.report(ProgressUpdate::phase("正在写入 Elasticsearch 同步完成标记"));
         let connection = pool.get().await.map_err(|error| error.to_string())?;
         connection
             .execute(
@@ -1440,64 +1551,343 @@ impl ElasticsearchService {
     }
 
     pub async fn migrate_scan_data(&self, pool: &Pool) -> Result<ScanMigrationReport, String> {
+        self.migrate_scan_data_with_progress(pool, &NoopProgressReporter)
+            .await
+    }
+
+    pub async fn migrate_scan_data_with_progress(
+        &self,
+        pool: &Pool,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<ScanMigrationReport, String> {
         if !self.inner.config.scan_storage.writes_elasticsearch() {
             return Err(
                 "扫描数据迁移要求 elasticsearch.scan_storage=dual 或 elasticsearch".to_owned(),
             );
         }
+        reporter.report(ProgressUpdate::phase(
+            "正在检查 Elasticsearch 并初始化扫描索引",
+        ));
         self.initialize(pool).await?;
+        reporter.report(ProgressUpdate::phase("正在在线创建扫描迁移读取索引"));
         let connection = pool.get().await.map_err(|error| error.to_string())?;
-        let mut cursor = 0_i64;
-        let mut report = ScanMigrationReport::default();
+        connection
+            .batch_execute(ENSURE_SCAN_MIGRATION_INDEX_SQL)
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(connection);
+
+        reporter.report(ProgressUpdate::phase("正在确定迁移高水位和恢复断点"));
+        let (high_watermark, resume_execution_cursor, expected, mut report) =
+            self.prepare_scan_migration(pool).await?;
+        let expected_batches = reporter.is_enabled().then_some(expected.batches);
+        let expected_observations = reporter.is_enabled().then_some(expected.observations);
+        let mut execution_cursor = resume_execution_cursor;
+        let mut confirmed_execution_cursor = resume_execution_cursor;
+        let mut last_checkpoint_batches = report.batches;
+        reporter.report(ProgressUpdate::count(
+            "迁移扫描批次",
+            report.batches,
+            expected_batches,
+            "批次",
+            observation_progress(report.observations, expected_observations),
+        ));
         loop {
-            let batches = connection
+            let connection = pool.get().await.map_err(|error| error.to_string())?;
+            let rows = connection
                 .query(
-                    "SELECT b.id, b.upload_id, b.batch_index, b.is_final, t.task_id, t.user_id, \
-                        t.task_source, e.id AS execution_pk, e.execution_id, \
-                        COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
-                        COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name \
-                     FROM scan_result_batch b JOIN scan_task_execution e ON e.id = b.execution_id \
-                     JOIN scan_task t ON t.id = e.task_id \
-                     LEFT JOIN scanner_info scanner ON scanner.scanner_id = \
-                        COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
-                     WHERE b.id > $1 ORDER BY b.id LIMIT 100;",
-                    &[&cursor],
+                    "SELECT e.id FROM scan_task_execution e \
+                     WHERE e.id > $1 AND EXISTS (SELECT 1 FROM scan_result_batch b \
+                        WHERE b.execution_id = e.id AND b.id <= $2 \
+                          AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres')) \
+                     ORDER BY e.id LIMIT $3;",
+                    &[
+                        &execution_cursor,
+                        &high_watermark,
+                        &i64::try_from(self.inner.config.scan_migration_page_size)
+                            .map_err(|error| error.to_string())?,
+                    ],
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            if batches.is_empty() {
+            drop(connection);
+            if rows.is_empty() {
                 break;
             }
-            for batch in batches {
-                let batch_id: i64 = batch.get("id");
-                cursor = batch_id;
-                let execution_id: String = batch.get("execution_id");
-                let rows = connection
-                    .query(
-                        "SELECT o.observation_key, o.kind, host(o.ip_address) AS ip_address, o.port, \
-                            o.protocol, o.service, o.banner, o.title, o.http_body, o.http_body_truncated, \
-                            o.tls_subject, o.search_content_extracted, o.source, o.data, \
-                            FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS observed_at, \
-                            i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.region_name, i.city_name, \
-                            COALESCE(tags.tags, '[]'::JSONB) AS tags \
-                         FROM scan_observation o \
-                         LEFT JOIN ips i ON i.execution_id = o.execution_id AND i.ip_address = o.ip_address \
-                         LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT( \
-                            'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description) \
-                            ORDER BY tag.id) AS tags FROM asset_ip_tag assignment \
-                            JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                            WHERE assignment.ip_address = o.ip_address AND tag.is_active) tags ON true \
-                         WHERE o.batch_id = $1 ORDER BY o.id;",
-                        &[&batch_id],
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let observations = rows.into_iter().map(|row| {
+            let execution_ids = rows
+                .into_iter()
+                .map(|row| row.get::<_, i32>("id"))
+                .collect::<Vec<_>>();
+            execution_cursor = *execution_ids
+                .last()
+                .expect("non-empty execution page has a last id");
+            let mut migrations = stream::iter(execution_ids.into_iter().map(|execution_db_id| {
+                let service = self.clone();
+                let pool = pool.clone();
+                async move {
+                    service
+                        .migrate_scan_execution(&pool, execution_db_id, high_watermark)
+                        .await
+                }
+            }))
+            .buffer_unordered(self.inner.config.scan_migration_concurrency);
+            while let Some(result) = migrations.next().await {
+                let migrated = match result {
+                    Ok(migrated) => migrated,
+                    Err(error) => {
+                        if let Err(checkpoint_error) = self
+                            .write_scan_migration_state(
+                                pool,
+                                "in_progress",
+                                high_watermark,
+                                confirmed_execution_cursor,
+                                report,
+                            )
+                            .await
+                        {
+                            warn!(
+                                event = "ScanMigrationCheckpointError",
+                                message = %checkpoint_error
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+                report.batches = report.batches.saturating_add(migrated.batches);
+                report.observations = report.observations.saturating_add(migrated.observations);
+                reporter.report(ProgressUpdate::count(
+                    "迁移扫描批次",
+                    report.batches,
+                    expected_batches,
+                    "批次",
+                    format!(
+                        "并发执行实例迁移中，最后调度 execution_db_id={execution_cursor}，{}",
+                        observation_progress(report.observations, expected_observations)
+                    ),
+                ));
+            }
+            confirmed_execution_cursor = execution_cursor;
+            if report.batches.saturating_sub(last_checkpoint_batches)
+                < self.inner.config.scan_migration_checkpoint_batches
+            {
+                continue;
+            }
+            self.write_scan_migration_state(
+                pool,
+                "in_progress",
+                high_watermark,
+                confirmed_execution_cursor,
+                report,
+            )
+            .await?;
+            last_checkpoint_batches = report.batches;
+        }
+        reporter.report(ProgressUpdate::phase("正在写入扫描数据迁移完成标记"));
+        let remaining: i64 = pool
+            .get()
+            .await
+            .map_err(|error| error.to_string())?
+            .query_one(
+                "SELECT COUNT(*)::BIGINT AS remaining FROM scan_result_batch \
+                 WHERE id <= $1 AND (payload_checksum IS NULL OR storage_backend = 'postgres');",
+                &[&high_watermark],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get("remaining");
+        if remaining > 0 {
+            self.write_scan_migration_state(pool, "in_progress", high_watermark, 0, report)
+                .await?;
+            return Err(format!(
+                "迁移高水位 {high_watermark} 以下仍有 {remaining} 个未完成批次，已重置执行游标以便重试"
+            ));
+        }
+        report = expected;
+        self.write_scan_migration_state(
+            pool,
+            "complete",
+            high_watermark,
+            confirmed_execution_cursor,
+            report,
+        )
+        .await?;
+        Ok(report)
+    }
+
+    async fn prepare_scan_migration(
+        &self,
+        pool: &Pool,
+    ) -> Result<(i64, i32, ScanMigrationReport, ScanMigrationReport), String> {
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let previous = connection
+            .query_opt(
+                "SELECT state_value FROM scan_storage_state WHERE state_key = $1;",
+                &[&SCAN_MIGRATION_STATE_KEY],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, Value>("state_value"));
+        let resumable_high_watermark = previous
+            .as_ref()
+            .filter(|state| self.scan_migration_state_is_resumable(state))
+            .and_then(|state| state.get("high_watermark").and_then(Value::as_i64));
+        let high_watermark = match resumable_high_watermark {
+            Some(high_watermark) => high_watermark,
+            None => connection
+                .query_one(
+                    "SELECT COALESCE(MAX(id), 0)::BIGINT AS high_watermark FROM scan_result_batch;",
+                    &[],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .get("high_watermark"),
+        };
+        let resume_execution_cursor = previous
+            .as_ref()
+            .filter(|state| self.scan_migration_state_is_resumable(state))
+            .and_then(|state| state.get("execution_cursor").and_then(Value::as_i64))
+            .and_then(|cursor| i32::try_from(cursor).ok())
+            .unwrap_or(0);
+        let totals = connection
+            .query_one(
+                "SELECT batch_counts.batches, batch_counts.completed_batches, \
+                        observation_counts.observations, observation_counts.completed_observations \
+                 FROM (SELECT COUNT(*)::BIGINT AS batches, \
+                              COUNT(*) FILTER (WHERE payload_checksum IS NOT NULL AND storage_backend <> 'postgres')::BIGINT AS completed_batches \
+                       FROM scan_result_batch WHERE id <= $1) batch_counts \
+                 CROSS JOIN (SELECT COUNT(*)::BIGINT AS observations, \
+                                    COUNT(*) FILTER (WHERE b.payload_checksum IS NOT NULL AND b.storage_backend <> 'postgres')::BIGINT AS completed_observations \
+                             FROM scan_observation o JOIN scan_result_batch b ON b.id = o.batch_id \
+                             WHERE b.id <= $1) observation_counts;",
+                &[&high_watermark],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let expected = ScanMigrationReport {
+            batches: u64::try_from(totals.get::<_, i64>("batches"))
+                .map_err(|error| error.to_string())?,
+            observations: u64::try_from(totals.get::<_, i64>("observations"))
+                .map_err(|error| error.to_string())?,
+        };
+        let completed = ScanMigrationReport {
+            batches: u64::try_from(totals.get::<_, i64>("completed_batches"))
+                .map_err(|error| error.to_string())?,
+            observations: u64::try_from(totals.get::<_, i64>("completed_observations"))
+                .map_err(|error| error.to_string())?,
+        };
+        drop(connection);
+        self.write_scan_migration_state(
+            pool,
+            "in_progress",
+            high_watermark,
+            resume_execution_cursor,
+            completed,
+        )
+        .await?;
+        Ok((high_watermark, resume_execution_cursor, expected, completed))
+    }
+
+    fn scan_migration_state_is_resumable(&self, state: &Value) -> bool {
+        state.get("status").and_then(Value::as_str) == Some("in_progress")
+            && state
+                .get("observation_index_prefix")
+                .and_then(Value::as_str)
+                == Some(self.inner.config.observation_index_prefix.as_str())
+            && state
+                .get("execution_endpoint_index")
+                .and_then(Value::as_str)
+                == Some(self.inner.config.execution_endpoint_index.as_str())
+            && state.get("current_endpoint_index").and_then(Value::as_str)
+                == Some(self.inner.config.current_endpoint_index.as_str())
+    }
+
+    async fn write_scan_migration_state(
+        &self,
+        pool: &Pool,
+        status: &str,
+        high_watermark: i64,
+        execution_cursor: i32,
+        report: ScanMigrationReport,
+    ) -> Result<(), String> {
+        let value = json!({
+            "status": status,
+            "observation_index_prefix": self.inner.config.observation_index_prefix,
+            "execution_endpoint_index": self.inner.config.execution_endpoint_index,
+            "current_endpoint_index": self.inner.config.current_endpoint_index,
+            "high_watermark": high_watermark,
+            "execution_cursor": execution_cursor,
+            "batches": report.batches,
+            "observations": report.observations
+        });
+        pool.get()
+            .await
+            .map_err(|error| error.to_string())?
+            .execute(
+                "INSERT INTO scan_storage_state (state_key, state_value, updated_at) \
+                 VALUES ($1, $2, NOW()) ON CONFLICT (state_key) DO UPDATE \
+                 SET state_value = EXCLUDED.state_value, updated_at = NOW();",
+                &[&SCAN_MIGRATION_STATE_KEY, &value],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn migrate_scan_execution(
+        &self,
+        pool: &Pool,
+        execution_db_id: i32,
+        high_watermark: i64,
+    ) -> Result<ScanMigrationReport, String> {
+        let mut connection = pool.get().await.map_err(|error| error.to_string())?;
+        let batches = connection
+            .query(
+                "SELECT b.id, b.upload_id, b.batch_index, b.is_final, t.task_id, t.user_id, \
+                    t.task_source, e.execution_id, \
+                    COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
+                    COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name \
+                 FROM scan_result_batch b JOIN scan_task_execution e ON e.id = b.execution_id \
+                 JOIN scan_task t ON t.id = e.task_id \
+                 LEFT JOIN scanner_info scanner ON scanner.scanner_id = \
+                    COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
+                 WHERE b.execution_id = $1 AND b.id <= $2 \
+                   AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres') \
+                 ORDER BY b.batch_index, b.id;",
+                &[&execution_db_id, &high_watermark],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut report = ScanMigrationReport::default();
+        for batch in batches {
+            let batch_id: i64 = batch.get("id");
+            let execution_id: String = batch.get("execution_id");
+            let rows = connection
+                .query(
+                    "SELECT o.observation_key, o.kind, host(o.ip_address) AS ip_address, o.port, \
+                        o.protocol, o.service, o.banner, o.title, o.http_body, o.http_body_truncated, \
+                        o.tls_subject, o.search_content_extracted, o.source, o.data, \
+                        FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS observed_at, \
+                        i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.region_name, i.city_name, \
+                        COALESCE(tags.tags, '[]'::JSONB) AS tags \
+                     FROM scan_observation o \
+                     LEFT JOIN ips i ON i.execution_id = o.execution_id AND i.ip_address = o.ip_address \
+                     LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT( \
+                        'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description) \
+                        ORDER BY tag.id) AS tags FROM asset_ip_tag assignment \
+                        JOIN asset_tag tag ON tag.id = assignment.tag_id \
+                        WHERE assignment.ip_address = o.ip_address AND tag.is_active) tags ON true \
+                     WHERE o.batch_id = $1 ORDER BY o.id;",
+                    &[&batch_id],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let observations = rows
+                .into_iter()
+                .map(|row| {
                     let ip: String = row.get("ip_address");
                     let port: i32 = row.get("port");
-                    let endpoint_id = sha256_hex(
-                        format!("{execution_id}\0{ip}\0{port}").as_bytes(),
-                    );
+                    let endpoint_id =
+                        sha256_hex(format!("{execution_id}\0{ip}\0{port}").as_bytes());
                     json!({
                         "observation_key": row.get::<_, String>("observation_key"),
                         "endpoint_id": endpoint_id,
@@ -1520,53 +1910,81 @@ impl ElasticsearchService {
                         "city_name": row.get::<_, Option<String>>("city_name"),
                         "tags": row.get::<_, Value>("tags")
                     })
-                }).collect::<Vec<_>>();
-                let context = ScanBatchContext {
-                    task_id: batch.get("task_id"),
-                    execution_id: execution_id.clone(),
-                    user_id: batch.get("user_id"),
-                    task_source: batch.get("task_source"),
-                    scanner_id: batch.get("scanner_id"),
-                    scanner_name: batch.get("scanner_name"),
-                    upload_id: batch.get("upload_id"),
-                    batch_index: batch.get("batch_index"),
-                    is_final: batch.get("is_final"),
-                };
-                let result = self.persist_scan_batch(&context, &observations).await?;
-                let storage_references = json!(result.indices);
-                connection.execute(
-                    "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'dual', \
-                        storage_references = $3 WHERE id = $1;",
-                    &[&batch_id, &result.payload_checksum, &storage_references],
-                ).await.map_err(|error| error.to_string())?;
-                if let Some(summary) = result.execution_summary {
-                    let execution_pk: i32 = batch.get("execution_pk");
-                    connection.execute(
+                })
+                .collect::<Vec<_>>();
+            let context = ScanBatchContext {
+                task_id: batch.get("task_id"),
+                execution_id,
+                user_id: batch.get("user_id"),
+                task_source: batch.get("task_source"),
+                scanner_id: batch.get("scanner_id"),
+                scanner_name: batch.get("scanner_name"),
+                upload_id: batch.get("upload_id"),
+                batch_index: batch.get("batch_index"),
+                is_final: batch.get("is_final"),
+            };
+            let result = self
+                .persist_scan_batch_prepared(&context, &observations)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "迁移 execution_db_id={execution_db_id} batch_id={batch_id} 失败：{error}"
+                    )
+                })?;
+            let storage_references = json!(result.indices);
+            if context.is_final {
+                self.promote_execution(&context).await.map_err(|error| {
+                    format!(
+                        "发布 execution_db_id={execution_db_id} batch_id={batch_id} 失败：{error}"
+                    )
+                })?;
+                let transaction = connection
+                    .transaction()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .execute(
+                        "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'dual', \
+                         storage_references = $3 WHERE id = $1;",
+                        &[&batch_id, &result.payload_checksum, &storage_references],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let summary = result
+                    .execution_summary
+                    .ok_or_else(|| "最终扫描批次缺少执行汇总".to_owned())?;
+                transaction
+                    .execute(
                         "UPDATE scan_task_execution SET result_ip_count = $2, result_port_count = $3, \
-                            result_observation_count = $4 WHERE id = $1;",
-                        &[&execution_pk, &summary.ip_count, &summary.port_count, &summary.observation_count],
-                    ).await.map_err(|error| error.to_string())?;
-                }
-                if context.is_final {
-                    self.promote_execution(&context).await?;
-                }
-                report.batches += 1;
-                report.observations += observations.len() as u64;
+                         result_observation_count = $4 WHERE id = $1;",
+                        &[
+                            &execution_db_id,
+                            &summary.ip_count,
+                            &summary.port_count,
+                            &summary.observation_count,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                connection
+                    .execute(
+                    "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'dual', \
+                     storage_references = $3 WHERE id = $1;",
+                    &[&batch_id, &result.payload_checksum, &storage_references],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
             }
+            report.batches = report.batches.saturating_add(1);
+            report.observations = report
+                .observations
+                .saturating_add(observations.len() as u64);
         }
-        connection.execute(
-            "INSERT INTO scan_storage_state (state_key, state_value, updated_at) \
-             VALUES ('elasticsearch_scan_migration', $1, NOW()) \
-             ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = NOW();",
-            &[&json!({
-                "observation_index_prefix": self.inner.config.observation_index_prefix,
-                "execution_endpoint_index": self.inner.config.execution_endpoint_index,
-                "current_endpoint_index": self.inner.config.current_endpoint_index,
-                "last_batch_id": cursor,
-                "batches": report.batches,
-                "observations": report.observations
-            })],
-        ).await.map_err(|error| error.to_string())?;
         Ok(report)
     }
 
@@ -1579,6 +1997,7 @@ impl ElasticsearchService {
         let row = connection.query_one(
             "SELECT EXISTS (SELECT 1 FROM scan_storage_state \
                 WHERE state_key = 'elasticsearch_scan_migration' \
+                  AND COALESCE(state_value->>'status', 'complete') = 'complete' \
                   AND state_value->>'observation_index_prefix' = $1 \
                   AND state_value->>'execution_endpoint_index' = $2 \
                   AND state_value->>'current_endpoint_index' = $3) AS migration_ready, \
@@ -2105,6 +2524,54 @@ async fn response_json(response: reqwest::Response) -> Result<Value, String> {
     response.json().await.map_err(|error| error.to_string())
 }
 
+fn is_retryable_bulk_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn bulk_response_is_retryable(result: &Value, create_conflict_is_success: bool) -> bool {
+    if result.get("errors").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let mut saw_retryable = false;
+    for action in result
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .flat_map(|item| item.values())
+    {
+        let Some(status) = action.get("status").and_then(Value::as_u64) else {
+            return false;
+        };
+        if status < 300 || (create_conflict_is_success && status == 409) {
+            continue;
+        }
+        let Ok(status) = u16::try_from(status) else {
+            return false;
+        };
+        let Ok(status) = StatusCode::from_u16(status) else {
+            return false;
+        };
+        if !is_retryable_bulk_status(status) {
+            return false;
+        }
+        saw_retryable = true;
+    }
+    saw_retryable
+}
+
+fn bulk_retry_delay(initial_ms: u64, attempt: u32) -> Duration {
+    let multiplier = 1_u64.checked_shl(attempt.min(16)).unwrap_or(u64::MAX);
+    Duration::from_millis(initial_ms.saturating_mul(multiplier).min(30_000))
+}
+
 async fn response_error(response: reqwest::Response) -> String {
     let status = response.status();
     let body = response
@@ -2191,6 +2658,13 @@ fn scan_observation_index(prefix: &str, observed_at_ms: i64) -> Result<String, S
     let observed_at = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
         .ok_or_else(|| format!("无效 observed_at：{observed_at_ms}"))?;
     Ok(format!("{}-{}", prefix, observed_at.format("%Y.%m")))
+}
+
+fn observation_progress(completed: u64, total: Option<u64>) -> String {
+    match total {
+        Some(total) => format!("观察 {completed}/{total} 条"),
+        None => format!("观察 {completed} 条"),
+    }
 }
 
 fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
@@ -2536,9 +3010,12 @@ fn index_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScanBatchContext, index_definition, parse_asn, parse_storage_metrics,
-        scan_batch_payload_checksum, scan_endpoint_index_definition,
+        ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchService, ScanBatchContext,
+        bulk_response_is_retryable, bulk_retry_delay, index_definition, parse_asn,
+        parse_storage_metrics, scan_batch_payload_checksum, scan_endpoint_index_definition,
     };
+    use crate::config::ElasticsearchConfig;
+    use std::time::Duration;
 
     #[test]
     fn index_mapping_targets_elasticsearch_9_5_2_and_expected_field_types() {
@@ -2566,6 +3043,68 @@ mod tests {
         assert_eq!(parse_asn("AS4134"), Some(4134));
         assert_eq!(parse_asn("4134"), Some(4134));
         assert_eq!(parse_asn("unknown"), None);
+    }
+
+    #[test]
+    fn scan_migration_index_supports_ordered_batch_reads_online() {
+        assert!(ENSURE_SCAN_MIGRATION_INDEX_SQL.contains("CREATE INDEX CONCURRENTLY"));
+        assert!(ENSURE_SCAN_MIGRATION_INDEX_SQL.contains("scan_observation(batch_id, id)"));
+    }
+
+    #[test]
+    fn scan_migration_only_resumes_matching_in_progress_window() {
+        let service = ElasticsearchService::new(ElasticsearchConfig::default()).unwrap();
+        let matching = serde_json::json!({
+            "status": "in_progress",
+            "observation_index_prefix": "network-mapping-scan-observations-v1",
+            "execution_endpoint_index": "network-mapping-execution-endpoints-v1",
+            "current_endpoint_index": "network-mapping-endpoints-current-v2",
+            "high_watermark": 42
+        });
+        assert!(service.scan_migration_state_is_resumable(&matching));
+
+        let mut complete = matching.clone();
+        complete["status"] = serde_json::json!("complete");
+        assert!(!service.scan_migration_state_is_resumable(&complete));
+
+        let mut different_index = matching;
+        different_index["current_endpoint_index"] = serde_json::json!("other-index");
+        assert!(!service.scan_migration_state_is_resumable(&different_index));
+    }
+
+    #[test]
+    fn bulk_retry_only_accepts_transient_item_failures() {
+        let throttled = serde_json::json!({
+            "errors": true,
+            "items": [
+                {"create": {"status": 201}},
+                {"create": {"status": 429}}
+            ]
+        });
+        assert!(bulk_response_is_retryable(&throttled, true));
+
+        let permanent = serde_json::json!({
+            "errors": true,
+            "items": [
+                {"create": {"status": 429}},
+                {"create": {"status": 400}}
+            ]
+        });
+        assert!(!bulk_response_is_retryable(&permanent, true));
+
+        let existing = serde_json::json!({
+            "errors": true,
+            "items": [{"create": {"status": 409}}]
+        });
+        assert!(!bulk_response_is_retryable(&existing, true));
+        assert!(!bulk_response_is_retryable(&existing, false));
+    }
+
+    #[test]
+    fn bulk_retry_delay_is_exponential_and_capped() {
+        assert_eq!(bulk_retry_delay(200, 0), Duration::from_millis(200));
+        assert_eq!(bulk_retry_delay(200, 3), Duration::from_millis(1_600));
+        assert_eq!(bulk_retry_delay(60_000, 10), Duration::from_secs(30));
     }
 
     #[test]

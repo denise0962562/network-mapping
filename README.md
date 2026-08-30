@@ -89,6 +89,9 @@ directory = "source/maxmind"
 cargo run -- --refresh-ip-intel
 ```
 
+刷新期间会立即显示当前阶段，并每 5 秒输出已扫描、已更新、无匹配数量和耗时；随后重建
+搜索投影时也会持续输出心跳，便于在 SSH 或日志重定向环境确认任务仍在运行。
+
 ## 资产高级搜索
 
 搜索页支持 IP/CIDR、端口、协议、服务、Banner、HTTP 标题/正文、TLS Subject、ASN、地理信息、扫描器、观察时间和资产

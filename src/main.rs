@@ -10,6 +10,7 @@ use network_mapping_server::admin::{
 };
 use network_mapping_server::audit::RequestId;
 use network_mapping_server::backup::BackupManager;
+use network_mapping_server::cli_progress::CliProgressReporter;
 use network_mapping_server::client_ip::request_ip;
 use network_mapping_server::config::{Clis, SelfChecking};
 use network_mapping_server::elasticsearch::{
@@ -139,12 +140,23 @@ async fn main() -> io::Result<()> {
     let elasticsearch_service = ElasticsearchService::new(elasticsearch_config)
         .map_err(|error| io::Error::other(format!("创建 Elasticsearch 客户端失败：{error}")))?;
     if args.migrate_scan_data_to_elasticsearch {
-        let report = elasticsearch_service
-            .migrate_scan_data(&db_pool)
+        let progress = CliProgressReporter::new("扫描数据迁移");
+        let report = match elasticsearch_service
+            .migrate_scan_data_with_progress(&db_pool, &progress)
             .await
-            .map_err(|error| {
-                io::Error::other(format!("迁移扫描数据到 Elasticsearch 失败：{error}"))
-            })?;
+        {
+            Ok(report) => report,
+            Err(error) => {
+                progress.fail(&error);
+                return Err(io::Error::other(format!(
+                    "迁移扫描数据到 Elasticsearch 失败：{error}"
+                )));
+            }
+        };
+        progress.finish(format!(
+            "{} 个批次，{} 条观察",
+            report.batches, report.observations
+        ));
         println!(
             "扫描数据迁移完成：批次 {} 个，观察 {} 条",
             report.batches, report.observations
@@ -157,13 +169,31 @@ async fn main() -> io::Result<()> {
                 "--rebuild-elasticsearch 要求 elasticsearch.enabled=true",
             ));
         }
-        let projected = network_mapping_server::search_projection::rebuild(&db_pool)
+        let progress = CliProgressReporter::new("Elasticsearch 重建");
+        let projected = match network_mapping_server::search_projection::rebuild_with_progress(
+            &db_pool, &progress,
+        )
+        .await
+        {
+            Ok(projected) => projected,
+            Err(error) => {
+                progress.fail(format!("重建当前端点投影失败：{error}"));
+                return Err(io::Error::other(format!("重建当前端点投影失败：{error}")));
+            }
+        };
+        let indexed = match elasticsearch_service
+            .full_sync_with_progress(&db_pool, &progress)
             .await
-            .map_err(|error| io::Error::other(format!("重建当前端点投影失败：{error}")))?;
-        let indexed = elasticsearch_service
-            .full_sync(&db_pool)
-            .await
-            .map_err(|error| io::Error::other(format!("重建 Elasticsearch 索引失败：{error}")))?;
+        {
+            Ok(indexed) => indexed,
+            Err(error) => {
+                progress.fail(format!("重建 Elasticsearch 索引失败：{error}"));
+                return Err(io::Error::other(format!(
+                    "重建 Elasticsearch 索引失败：{error}"
+                )));
+            }
+        };
+        progress.finish(format!("PostgreSQL 投影 {projected} 条，索引 {indexed} 条"));
         println!("Elasticsearch 重建完成：PostgreSQL 投影 {projected} 条，索引 {indexed} 条");
         return Ok(());
     }
@@ -200,13 +230,30 @@ async fn main() -> io::Result<()> {
 
     let maxmind_state = MaxMindState::from_directory(&maxmind_directory);
     if args.refresh_ip_intel {
-        match maxmind_state.refresh_ip_intel(&db_pool).await {
+        let progress = CliProgressReporter::new("IP 情报刷新");
+        match maxmind_state
+            .refresh_ip_intel_with_progress(&db_pool, &progress)
+            .await
+        {
             Ok(report) => {
-                let projected = network_mapping_server::search_projection::rebuild(&db_pool)
+                let projected =
+                    match network_mapping_server::search_projection::rebuild_with_progress(
+                        &db_pool, &progress,
+                    )
                     .await
-                    .map_err(|error| {
-                        io::Error::other(format!("刷新 IP 情报后的搜索投影重建失败：{error}"))
-                    })?;
+                    {
+                        Ok(projected) => projected,
+                        Err(error) => {
+                            progress.fail(format!("搜索投影重建失败：{error}"));
+                            return Err(io::Error::other(format!(
+                                "刷新 IP 情报后的搜索投影重建失败：{error}"
+                            )));
+                        }
+                    };
+                progress.finish(format!(
+                    "扫描 {} 条，更新 {} 条，无匹配 {} 条，搜索投影 {} 条",
+                    report.scanned, report.updated, report.unmatched, projected
+                ));
                 println!(
                     "IP 情报刷新完成：扫描 {} 条，更新 {} 条，无匹配 {} 条，搜索投影 {} 条",
                     report.scanned, report.updated, report.unmatched, projected
@@ -214,6 +261,7 @@ async fn main() -> io::Result<()> {
                 return Ok(());
             }
             Err(error) => {
+                progress.fail(error.to_string());
                 error!(event = "RefreshIpIntelError", message = %error);
                 return Err(io::Error::other("刷新历史 IP 情报失败"));
             }

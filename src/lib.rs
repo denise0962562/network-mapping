@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod audit;
 pub mod backup;
+pub mod cli_progress;
 pub mod client_ip;
 pub mod config;
 pub mod db;
@@ -2121,7 +2122,7 @@ pub async fn save_scanner_results(
                     observation_key TEXT, kind TEXT, ip_address INET, port INT, \
                     protocol TEXT, service TEXT, banner TEXT, title TEXT, http_body TEXT, \
                     http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
-                    search_content_extracted BOOLEAN, observed_at_ms BIGINT, \
+                    search_content_extracted BOOLEAN, observed_at BIGINT, \
                     asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
                     country_name TEXT, region_name TEXT, city_name TEXT) \
              ), inserted_observations AS ( \
@@ -2130,7 +2131,7 @@ pub async fn save_scanner_results(
                     http_body_truncated, tls_subject, search_content_extracted, source, data, observed_at) \
                 SELECT $2, $3, observation_key, kind, ip_address, port, protocol, service, \
                     banner, title, http_body, http_body_truncated, tls_subject, \
-                    search_content_extracted, source, data, to_timestamp(observed_at_ms / 1000.0) FROM input \
+                    search_content_extracted, source, data, to_timestamp(observed_at / 1000.0) FROM input \
                 ON CONFLICT (execution_id, observation_key) DO NOTHING \
                 RETURNING ip_address, port \
              ), inserted_endpoints AS MATERIALIZED ( \
@@ -2372,8 +2373,8 @@ pub async fn apply_task(
     let lease_expires_at = get_unix_epoch_ms() + 90_000;
     transaction
         .execute(
-            "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1), task_end_time = NULL, \
-             execution_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3, \
+            "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1::BIGINT), task_end_time = NULL, \
+             execution_status = 'running', assigned_scanner_id = $2, lease_expires_at = $3::BIGINT, \
              maintenance_hold = FALSE, maintenance_hold_until = NULL, \
              attempt_count = attempt_count + 1, failure_reason = NULL WHERE id = $4;",
             &[
@@ -2804,9 +2805,9 @@ pub async fn get_system_status_info(
                 "SELECT *
                         FROM system_status
                         WHERE create_time BETWEEN
-                            COALESCE($1, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                            COALESCE($1::BIGINT, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
                             AND
-                            COALESCE($2, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+                            COALESCE($2::BIGINT, (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
                         ORDER BY id DESC
                         LIMIT $3;",
                 &[&start_at, &end_at, &count],

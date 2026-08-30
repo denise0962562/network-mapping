@@ -5,6 +5,8 @@ use maxminddb::{Reader, geoip2};
 use serde::Serialize;
 use tracing::{error, warn};
 
+use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
+
 const CITY_DB: &str = "GeoLite2-City.mmdb";
 const COUNTRY_DB: &str = "GeoLite2-Country.mmdb";
 const ASN_DB: &str = "GeoLite2-ASN.mmdb";
@@ -99,6 +101,15 @@ impl MaxMindState {
         &self,
         pool: &deadpool_postgres::Pool,
     ) -> Result<RefreshIpIntelReport, Box<dyn std::error::Error + Send + Sync>> {
+        self.refresh_ip_intel_with_progress(pool, &NoopProgressReporter)
+            .await
+    }
+
+    pub async fn refresh_ip_intel_with_progress(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        reporter: &dyn ProgressReporter,
+    ) -> Result<RefreshIpIntelReport, Box<dyn std::error::Error + Send + Sync>> {
         if self.city.is_none() && self.country.is_none() && self.asn.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -108,8 +119,25 @@ impl MaxMindState {
         }
 
         let mut client = pool.get().await?;
+        let expected_total = if reporter.is_enabled() {
+            reporter.report(ProgressUpdate::phase("正在统计历史 IP 记录"));
+            let total: i64 = client
+                .query_one("SELECT COUNT(*)::BIGINT AS total FROM ips;", &[])
+                .await?
+                .get("total");
+            Some(u64::try_from(total)?)
+        } else {
+            None
+        };
         let mut report = RefreshIpIntelReport::default();
         let mut last_ip_id = 0_i32;
+        reporter.report(ProgressUpdate::count(
+            "刷新 IP 情报",
+            0,
+            expected_total,
+            "条",
+            "更新 0 条，无匹配 0 条",
+        ));
 
         loop {
             let rows = client
@@ -162,6 +190,13 @@ impl MaxMindState {
                 report.updated += 1;
             }
             transaction.commit().await?;
+            reporter.report(ProgressUpdate::count(
+                "刷新 IP 情报",
+                report.scanned as u64,
+                expected_total,
+                "条",
+                format!("更新 {} 条，无匹配 {} 条", report.updated, report.unmatched),
+            ));
         }
 
         Ok(report)

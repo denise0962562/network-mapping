@@ -229,6 +229,17 @@ pub struct ElasticsearchConfig {
     pub request_timeout_seconds: u64,
     pub poll_interval_ms: u64,
     pub bulk_batch_size: usize,
+    /// Number of scan executions migrated concurrently. Batches belonging to the same
+    /// execution remain ordered so that a final batch cannot publish a partial projection.
+    pub scan_migration_concurrency: usize,
+    /// Number of execution identifiers fetched from PostgreSQL for each scheduling page.
+    pub scan_migration_page_size: usize,
+    /// Maximum retries for transient Elasticsearch bulk failures.
+    pub bulk_max_retries: u32,
+    /// Initial exponential backoff delay for Elasticsearch bulk retries.
+    pub bulk_retry_initial_ms: u64,
+    /// Persist migration progress after at least this many newly migrated batches.
+    pub scan_migration_checkpoint_batches: u64,
     pub fallback_to_postgres: bool,
 }
 
@@ -276,6 +287,17 @@ impl fmt::Debug for ElasticsearchConfig {
             .field("request_timeout_seconds", &self.request_timeout_seconds)
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("bulk_batch_size", &self.bulk_batch_size)
+            .field(
+                "scan_migration_concurrency",
+                &self.scan_migration_concurrency,
+            )
+            .field("scan_migration_page_size", &self.scan_migration_page_size)
+            .field("bulk_max_retries", &self.bulk_max_retries)
+            .field("bulk_retry_initial_ms", &self.bulk_retry_initial_ms)
+            .field(
+                "scan_migration_checkpoint_batches",
+                &self.scan_migration_checkpoint_batches,
+            )
             .field("fallback_to_postgres", &self.fallback_to_postgres)
             .finish()
     }
@@ -301,6 +323,11 @@ impl Default for ElasticsearchConfig {
             request_timeout_seconds: 30,
             poll_interval_ms: 500,
             bulk_batch_size: 500,
+            scan_migration_concurrency: 4,
+            scan_migration_page_size: 100,
+            bulk_max_retries: 4,
+            bulk_retry_initial_ms: 200,
+            scan_migration_checkpoint_batches: 100,
             fallback_to_postgres: true,
         }
     }
@@ -411,6 +438,26 @@ impl SelfChecking for ElasticsearchConfig {
         }
         if !(1..=2_000).contains(&self.bulk_batch_size) {
             return Err("elasticsearch.bulk_batch_size 必须在 1 到 2000 之间".into());
+        }
+        if !(1..=32).contains(&self.scan_migration_concurrency) {
+            return Err("elasticsearch.scan_migration_concurrency 必须在 1 到 32 之间".into());
+        }
+        if !(1..=10_000).contains(&self.scan_migration_page_size) {
+            return Err("elasticsearch.scan_migration_page_size 必须在 1 到 10000 之间".into());
+        }
+        if self.scan_migration_page_size < self.scan_migration_concurrency {
+            return Err(
+                "elasticsearch.scan_migration_page_size 不能小于 scan_migration_concurrency".into(),
+            );
+        }
+        if self.bulk_max_retries > 10 {
+            return Err("elasticsearch.bulk_max_retries 必须在 0 到 10 之间".into());
+        }
+        if !(10..=60_000).contains(&self.bulk_retry_initial_ms) {
+            return Err("elasticsearch.bulk_retry_initial_ms 必须在 10 到 60000 之间".into());
+        }
+        if self.scan_migration_checkpoint_batches == 0 {
+            return Err("elasticsearch.scan_migration_checkpoint_batches 必须大于 0".into());
         }
         if self.scan_number_of_replicas > 5 {
             return Err("elasticsearch.scan_number_of_replicas 必须在 0 到 5 之间".into());
@@ -1248,6 +1295,9 @@ mod tests {
         let mut config = ElasticsearchConfig::default();
         assert!(!config.enabled);
         assert!(!config.read_enabled);
+        assert_eq!(config.scan_migration_concurrency, 4);
+        assert!(config.scan_migration_page_size >= config.scan_migration_concurrency);
+        assert_eq!(config.bulk_max_retries, 4);
         assert!(config.try_check().unwrap());
 
         config.enabled = true;
@@ -1257,6 +1307,28 @@ mod tests {
         assert!(config.try_check().unwrap());
         config.read_enabled = true;
         config.enabled = false;
+        assert!(config.try_check().is_err());
+    }
+
+    #[test]
+    fn elasticsearch_config_rejects_unsafe_scan_migration_limits() {
+        let mut config = ElasticsearchConfig {
+            enabled: true,
+            scan_migration_concurrency: 0,
+            ..ElasticsearchConfig::default()
+        };
+        assert!(config.try_check().is_err());
+
+        config.scan_migration_concurrency = 8;
+        config.scan_migration_page_size = 4;
+        assert!(config.try_check().is_err());
+
+        config.scan_migration_page_size = 100;
+        config.bulk_max_retries = 11;
+        assert!(config.try_check().is_err());
+
+        config.bulk_max_retries = 4;
+        config.bulk_retry_initial_ms = 0;
         assert!(config.try_check().is_err());
     }
 
