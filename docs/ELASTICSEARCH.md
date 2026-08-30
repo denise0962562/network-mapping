@@ -98,6 +98,13 @@ fallback_to_postgres = false
 表。回滚时先停止写入，切回 `dual/postgres` 并补齐切换后产生的 ES-only 数据，不能直接
 假设 PostgreSQL 已包含它们。
 
+`dual` 只表示扫描事实双写，读取仍来自 PostgreSQL，或在 `read_enabled=true` 时来自旧的
+`index` 兼容搜索副本；它不会读取迁移生成的 `current_endpoint_index`。首次启用旧搜索副本
+会从 `asset_endpoint_current` 单独执行一次全量同步。同步完成前若同时设置
+`fallback_to_postgres=false`，搜索会失败关闭并返回 503“搜索索引暂时不可用”。不要把扫描
+事实迁移完成误认为旧搜索副本也已完成同步；计划切换到 ES 权威读取时，应完成前置校验后
+使用 `scan_storage="elasticsearch"`，并满足至少一份活动副本的生产要求。
+
 ## 查询覆盖与权限
 
 ES 权威模式覆盖简单搜索、高级布尔搜索、`NOT`、`has_endpoint(...)`、资产概览/端口/历史、

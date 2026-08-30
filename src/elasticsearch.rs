@@ -19,6 +19,8 @@ const INDEX_SCHEMA_VERSION: &str = "1";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
 const SCAN_INDEX_SCHEMA_VERSION: &str = "1";
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
+const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
+     ON asset_endpoint_current(projection_version);";
 const ENSURE_SCAN_MIGRATION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_scan_observation_batch_id_id \
      ON scan_observation(batch_id, id);";
 
@@ -531,6 +533,9 @@ impl ElasticsearchService {
                 self.inner.config.expected_version
             ));
         }
+        if !self.inner.config.scan_storage.reads_elasticsearch() {
+            self.ensure_legacy_search_projection_index(pool).await?;
+        }
         self.ensure_scan_indices().await?;
         let state = if self.inner.config.scan_storage.reads_elasticsearch() {
             IndexState::Existing
@@ -592,6 +597,14 @@ impl ElasticsearchService {
             runtime.last_error = None;
         });
         Ok(state)
+    }
+
+    async fn ensure_legacy_search_projection_index(&self, pool: &Pool) -> Result<(), String> {
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        connection
+            .batch_execute(ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn ensure_index(&self) -> Result<IndexState, String> {
@@ -3010,9 +3023,10 @@ fn index_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchService, ScanBatchContext,
-        bulk_response_is_retryable, bulk_retry_delay, index_definition, parse_asn,
-        parse_storage_metrics, scan_batch_payload_checksum, scan_endpoint_index_definition,
+        ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
+        ElasticsearchService, ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay,
+        index_definition, parse_asn, parse_storage_metrics, scan_batch_payload_checksum,
+        scan_endpoint_index_definition,
     };
     use crate::config::ElasticsearchConfig;
     use std::time::Duration;
@@ -3049,6 +3063,15 @@ mod tests {
     fn scan_migration_index_supports_ordered_batch_reads_online() {
         assert!(ENSURE_SCAN_MIGRATION_INDEX_SQL.contains("CREATE INDEX CONCURRENTLY"));
         assert!(ENSURE_SCAN_MIGRATION_INDEX_SQL.contains("scan_observation(batch_id, id)"));
+    }
+
+    #[test]
+    fn legacy_search_full_sync_indexes_projection_cursor_online() {
+        assert!(ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL.contains("CREATE INDEX CONCURRENTLY"));
+        assert!(
+            ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL
+                .contains("asset_endpoint_current(projection_version)")
+        );
     }
 
     #[test]
