@@ -57,7 +57,7 @@ pub(crate) async fn cancel_task(
     let id = task_id.into_inner().to_string();
     let row = match transaction
         .query_opt(
-            "SELECT task_status FROM scan_task WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) FOR UPDATE;",
+            "SELECT id, task_status FROM scan_task WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) FOR UPDATE;",
             &[&id, &user.role, &user.id],
         )
         .await
@@ -69,6 +69,7 @@ pub(crate) async fn cancel_task(
             return HttpResponse::InternalServerError().finish();
         }
     };
+    let task_pk: i32 = row.get("id");
     let status: String = row.get("task_status");
     match status.as_str() {
         "pending" | "running" => {}
@@ -78,13 +79,6 @@ pub(crate) async fn cancel_task(
         }
     }
     let now = crate::get_unix_epoch_ms();
-    let task_pk: i32 = match transaction
-        .query_one("SELECT id FROM scan_task WHERE task_id = $1", &[&id])
-        .await
-    {
-        Ok(row) => row.get("id"),
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
     if let Err(error) = transaction.execute(
         "UPDATE scan_task_execution SET execution_status = CASE WHEN execution_status = 'pending' THEN 'cancelled' ELSE execution_status END, \
          cancel_requested = (execution_status = 'running'), task_end_time = CASE WHEN execution_status = 'pending' THEN $1::BIGINT ELSE task_end_time END, \

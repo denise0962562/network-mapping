@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio_postgres::types::ToSql;
 use tracing::error;
 use uuid::Uuid;
 
@@ -56,6 +57,23 @@ fn normalize_query(query: &LoginRecordQuery) -> Result<(u32, u32, Option<String>
         return Err("登录结果筛选条件不正确");
     }
     Ok((page, page_size, outcome.map(str::to_owned)))
+}
+
+fn login_record_filter<'a>(
+    actor_id: &'a String,
+    target_username: &'a String,
+    outcome: &'a Option<String>,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut sql = "category = 'authentication' AND action = 'auth.login' \
+        AND (actor_id = $1 OR (actor_id IS NULL AND \
+             COALESCE(actor_name, metadata->>'attempted_username') = $2))"
+        .to_owned();
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![actor_id, target_username];
+    if let Some(value) = outcome.as_ref() {
+        params.push(value);
+        sql.push_str(&format!(" AND outcome = ${}", params.len()));
+    }
+    (sql, params)
 }
 
 pub(crate) async fn record_completed_login(
@@ -137,14 +155,12 @@ async fn list_login_records(
         }
     };
     let actor_id = target_id.to_string();
-    const FILTER: &str = "category = 'authentication' AND action = 'auth.login' \
-        AND (actor_id = $1 OR (actor_id IS NULL AND \
-             COALESCE(actor_name, metadata->>'attempted_username') = $2)) \
-        AND ($3::TEXT IS NULL OR outcome = $3)";
+    let target_username = target_username.to_owned();
+    let (filter_sql, filter_params) = login_record_filter(&actor_id, &target_username, &outcome);
     let total = match client
         .query_one(
-            &format!("SELECT COUNT(*) AS total FROM audit_event WHERE {FILTER};"),
-            &[&actor_id, &target_username, &outcome],
+            &format!("SELECT COUNT(*) AS total FROM audit_event WHERE {filter_sql};"),
+            &filter_params,
         )
         .await
     {
@@ -157,18 +173,18 @@ async fn list_login_records(
     };
     let limit = i64::from(page_size);
     let offset = i64::from((page - 1) * page_size);
-    let rows = match client
-        .query(
-            &format!(
-                "SELECT event_id, occurred_at, outcome, source_ip, user_agent, \
-                 reason_code, COALESCE(metadata->>'auth_method', 'password') AS auth_method \
-                 FROM audit_event WHERE {FILTER} ORDER BY occurred_at DESC, id DESC \
-                 LIMIT $4 OFFSET $5;"
-            ),
-            &[&actor_id, &target_username, &outcome, &limit, &offset],
-        )
-        .await
-    {
+    let list_sql = format!(
+        "SELECT event_id, occurred_at, outcome, source_ip, user_agent, \
+         reason_code, COALESCE(metadata->>'auth_method', 'password') AS auth_method \
+         FROM audit_event WHERE {filter_sql} ORDER BY occurred_at DESC, id DESC \
+         LIMIT ${} OFFSET ${};",
+        filter_params.len() + 1,
+        filter_params.len() + 2,
+    );
+    let mut list_params = filter_params;
+    list_params.push(&limit);
+    list_params.push(&offset);
+    let rows = match client.query(&list_sql, &list_params).await {
         Ok(value) => value,
         Err(error_value) => {
             error!(event = "LoginRecordQueryError", message = %error_value);
@@ -270,7 +286,7 @@ pub async fn admin_login_records(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginRecordQuery, normalize_query};
+    use super::{LoginRecordQuery, login_record_filter, normalize_query};
 
     #[test]
     fn login_record_query_is_bounded_and_validated() {
@@ -290,5 +306,19 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn login_record_filter_only_adds_outcome_when_present() {
+        let actor_id = "42".to_owned();
+        let username = "alice".to_owned();
+        let (sql, params) = login_record_filter(&actor_id, &username, &None);
+        assert!(!sql.contains("outcome"));
+        assert_eq!(params.len(), 2);
+
+        let outcome = Some("success".to_owned());
+        let (sql, params) = login_record_filter(&actor_id, &username, &outcome);
+        assert!(sql.contains("outcome = $3"));
+        assert_eq!(params.len(), 3);
     }
 }
