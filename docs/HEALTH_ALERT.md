@@ -1,12 +1,14 @@
 # 健康监控与告警
 
-系统在后台持续检测三类健康信号，命中阈值后通过邮件通知管理员：
+系统在后台持续检测五类健康信号，命中阈值后通过邮件通知管理员：
 
 1. **慢请求**：响应耗时超过阈值。
 2. **5xx 错误**：服务端处理异常（500–599）。
 3. **慢 SQL**：平均执行耗时超过阈值的近期慢查询。
+4. **慢 Elasticsearch 查询/写入**：应用观察到的 ES 端到端耗时超过分级阈值。
+5. **Elasticsearch 异常**：网络、HTTP、超时或分片失败。
 
-三者共享同一套通知链路：去重冷却 → 渲染 `health_alert` 邮件模板 → 发送给启用中的管理员。
+这些信号共享同一套通知链路：去重冷却 → 渲染 `health_alert` 邮件模板 → 发送给启用中的管理员。
 
 ## 目标
 
@@ -21,11 +23,13 @@
 | 慢请求 | `main.rs` 请求中间件 `wrap_fn` 的 `duration_ms` | `duration_ms ≥ slow_request_threshold_ms` | `slow_request:{method}:{path}` |
 | 5xx 错误 | 同一中间件的 `status_code`（复用 `classify_status`，5xx 归为 `server_error`） | `500 ≤ status ≤ 599` 且 `server_error_enabled` | `server_error:{path}:{status}` |
 | 慢 SQL | 后台任务轮询 `pg_stat_statements` | `mean_exec_time ≥ slow_sql_threshold_ms` 且 `calls` 较上次轮询有增量（近期仍在执行） | `slow_sql:{queryid}` |
+| 慢 ES 查询/写入 | `ElasticsearchService` 统一请求入口 | 按 query/write 阈值判定，同时检查 `timed_out`、HTTP 状态和失败分片 | `{alert_type}:{operation}` |
 
 说明：
 
 - 慢请求与 5xx 复用 `request_log` 采集点已经算好的 `status` / `duration_ms`，只在命中阈值时才克隆字符串，正常请求零额外分配。
 - 慢 SQL 用 `calls` 增量过滤掉「历史上慢、但已不再执行」的查询，避免首轮或重启后误报一批陈旧慢查询；首轮轮询只建立基线，不告警。
+- ES 请求使用有限集合的 `X-Opaque-Id` 标识操作类型，使用唯一 W3C `traceparent` 关联应用告警、Query Logging、Slow Log 和任务 API。告警只记录操作名、耗时、ES `took`、状态、分片和 trace ID，不记录查询或 Bulk 正文。
 
 ## 通知机制
 
@@ -85,6 +89,10 @@ slow_request_threshold_ms = 3000    # 慢请求阈值（毫秒）
 server_error_enabled = true         # 是否对 5xx 告警
 slow_sql_threshold_ms = 3000        # 慢 SQL 阈值（毫秒，基于 mean_exec_time）
 slow_sql_check_interval_seconds = 60# 慢 SQL 轮询间隔（秒）
+elasticsearch_query_warning_threshold_ms = 1000
+elasticsearch_query_critical_threshold_ms = 3000
+elasticsearch_write_warning_threshold_ms = 5000
+elasticsearch_write_critical_threshold_ms = 15000
 alert_cooldown_seconds = 300        # 同一告警 key 的冷却时间（秒）
 ```
 
@@ -96,7 +104,7 @@ alert_cooldown_seconds = 300        # 同一告警 key 的冷却时间（秒）
 - **慢 SQL 告警是「近期仍在执行」**：`calls` 增量判定意味着某条慢查询只在它继续被调用时才会反复触发（受冷却窗口约束）；停止执行后不再告警。
 - **冷却状态在内存中**：重启后去重窗口清零，重启后短时间内可能重复收到一批告警。告警事件已持久化到 `health_alert` 历史表，但冷却去重仍基于内存，尚未用历史表做跨重启去重（见「待定 / 后续」）。
 - **每次告警给每位管理员各发一封**：管理员较多时一封事件对应多封邮件。
-- **告警邮件不记录请求体 / 查询参数 / 敏感信息**：慢请求与 5xx 只携带 method、path（不含 query）、状态码、耗时、请求 ID、来源 IP、操作者；慢 SQL 携带查询文本（截断到 2000 字符），若文本不可见则回退为 `queryid`。
+- **告警邮件不记录 HTTP 请求体或 ES DSL/Bulk 正文**：慢请求与 5xx 只携带 method、path（不含 query）、状态码、耗时、请求 ID、来源 IP、操作者；ES 告警只携带脱敏的固定元数据。PostgreSQL 慢 SQL 仍携带查询文本（截断到 2000 字符），若文本不可见则回退为 `queryid`。
 
 ## 涉及文件
 

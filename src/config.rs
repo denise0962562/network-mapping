@@ -554,6 +554,14 @@ pub struct MonitorConfig {
     pub slow_sql_threshold_ms: i64,
     /// 慢 SQL 轮询间隔（秒）。
     pub slow_sql_check_interval_seconds: u64,
+    /// Elasticsearch 查询告警阈值（毫秒）。
+    pub elasticsearch_query_warning_threshold_ms: i64,
+    /// Elasticsearch 查询严重告警阈值（毫秒）。
+    pub elasticsearch_query_critical_threshold_ms: i64,
+    /// Elasticsearch 写入告警阈值（毫秒）。
+    pub elasticsearch_write_warning_threshold_ms: i64,
+    /// Elasticsearch 写入严重告警阈值（毫秒）。
+    pub elasticsearch_write_critical_threshold_ms: i64,
     /// 同一告警 key 的冷却时间（秒），冷却窗口内的重复事件被合并丢弃。
     pub alert_cooldown_seconds: u64,
 }
@@ -566,6 +574,10 @@ impl Default for MonitorConfig {
             server_error_enabled: true,
             slow_sql_threshold_ms: 3000,
             slow_sql_check_interval_seconds: 60,
+            elasticsearch_query_warning_threshold_ms: 1000,
+            elasticsearch_query_critical_threshold_ms: 3000,
+            elasticsearch_write_warning_threshold_ms: 5000,
+            elasticsearch_write_critical_threshold_ms: 15000,
             alert_cooldown_seconds: 300,
         }
     }
@@ -588,6 +600,38 @@ impl SelfChecking for MonitorConfig {
         }
         if self.slow_sql_check_interval_seconds == 0 {
             return Err("monitor.slow_sql_check_interval_seconds 必须大于 0".into());
+        }
+        for (name, value) in [
+            (
+                "monitor.elasticsearch_query_warning_threshold_ms",
+                self.elasticsearch_query_warning_threshold_ms,
+            ),
+            (
+                "monitor.elasticsearch_query_critical_threshold_ms",
+                self.elasticsearch_query_critical_threshold_ms,
+            ),
+            (
+                "monitor.elasticsearch_write_warning_threshold_ms",
+                self.elasticsearch_write_warning_threshold_ms,
+            ),
+            (
+                "monitor.elasticsearch_write_critical_threshold_ms",
+                self.elasticsearch_write_critical_threshold_ms,
+            ),
+        ] {
+            if value <= 0 {
+                return Err(format!("{name} 必须大于 0").into());
+            }
+        }
+        if self.elasticsearch_query_critical_threshold_ms
+            < self.elasticsearch_query_warning_threshold_ms
+        {
+            return Err("Elasticsearch 查询严重阈值不能小于告警阈值".into());
+        }
+        if self.elasticsearch_write_critical_threshold_ms
+            < self.elasticsearch_write_warning_threshold_ms
+        {
+            return Err("Elasticsearch 写入严重阈值不能小于告警阈值".into());
         }
         if self.alert_cooldown_seconds == 0 {
             return Err("monitor.alert_cooldown_seconds 必须大于 0".into());
@@ -1119,8 +1163,8 @@ impl Config {
 mod tests {
     use super::{
         AutomaticTargetConfig, BackupConfig, Clis, ElasticsearchConfig, FrontendConfig,
-        MaxMindConfig, NotificationPreferences, SecurityConfig, SelfChecking, TlsConfig,
-        session_ttl_seconds_from_minutes,
+        MaxMindConfig, MonitorConfig, NotificationPreferences, SecurityConfig, SelfChecking,
+        TlsConfig, session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -1329,6 +1373,20 @@ mod tests {
 
         config.bulk_max_retries = 4;
         config.bulk_retry_initial_ms = 0;
+        assert!(config.try_check().is_err());
+    }
+
+    #[test]
+    fn monitor_config_orders_elasticsearch_warning_and_critical_thresholds() {
+        let mut config = MonitorConfig::default();
+        assert!(config.try_check().is_ok());
+
+        config.elasticsearch_query_critical_threshold_ms =
+            config.elasticsearch_query_warning_threshold_ms - 1;
+        assert!(config.try_check().is_err());
+
+        config = MonitorConfig::default();
+        config.elasticsearch_write_warning_threshold_ms = 0;
         assert!(config.try_check().is_err());
     }
 

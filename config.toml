@@ -80,6 +80,12 @@ server_error_enabled = true
 slow_sql_threshold_ms = 3000
 # 慢 SQL 轮询间隔（秒）。
 slow_sql_check_interval_seconds = 60
+# Elasticsearch Query DSL 请求的 warning / critical 阈值（毫秒）。
+elasticsearch_query_warning_threshold_ms = 1000
+elasticsearch_query_critical_threshold_ms = 3000
+# Elasticsearch Bulk、update_by_query 等写入请求的 warning / critical 阈值（毫秒）。
+elasticsearch_write_warning_threshold_ms = 5000
+elasticsearch_write_critical_threshold_ms = 15000
 # 同一告警 key 的冷却时间（秒），冷却窗口内的重复告警被合并丢弃。
 alert_cooldown_seconds = 300
 

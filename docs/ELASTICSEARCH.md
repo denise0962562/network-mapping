@@ -128,3 +128,34 @@ scope，管理员查询 `global` scope。权威模式绝不回退到停止更新
 验收至少包括：历史迁移可重复、批次/观察数一致；重复批次幂等而不同内容被拒绝；缺批或
 多个 final 不能成功；扫描器重启保持上传身份和观察时间；用户权限不串数据；标签操作刷新
 ES；ES 中断时任务不成功且恢复后能续传；快照已校验并完成独立恢复。
+
+## 慢查询诊断
+
+服务端会为 ES 请求记录端到端耗时，并注入有限集合的 `X-Opaque-Id` 和唯一 W3C
+`traceparent`。达到 `[monitor]` 阈值、超时、HTTP 失败或分片失败时，事件进入现有
+`health_alert` 与邮件链路。应用不会记录 DSL、Bulk 正文或认证信息。
+
+Elasticsearch 9.4+ 推荐同时开启统一 Query Logging。该设置应由运维账号执行，不要给业务
+API Key 增加集群设置权限：
+
+```json
+PUT /_cluster/settings
+{
+  "persistent": {
+    "elasticsearch.querylog.enabled": true,
+    "elasticsearch.querylog.threshold": "1s",
+    "elasticsearch.querylog.include.user": true,
+    "elasticsearch.querylog.include.system_indices": false
+  }
+}
+```
+
+自托管集群还需启用 Filebeat Elasticsearch module 的 `querylog` fileset，或 Elastic Agent
+Elasticsearch integration，将各协调节点的 `*_querylog.json` 收集到内置
+`logs-elasticsearch.querylog-default` data stream。Query Logging 可能保存完整查询正文，必须
+限制该数据流的读取权限并设置短保留期；高流量时提高 threshold，避免异步日志队列丢弃。
+
+Query Logging 记录协调节点端到端查询。需要定位具体慢分片时，再对业务索引临时设置 Search
+Slow Log 的 query/fetch 阈值。写入不受 Query Logging 覆盖，Bulk/索引问题使用 Indexing Slow
+Log，并将 `index.indexing.slowlog.source` 设为 `0`，避免扫描证据进入日志。`profile: true`
+只用于脱敏查询的受控复现，不得在生产请求中默认开启。

@@ -296,6 +296,7 @@ async fn main() -> io::Result<()> {
         db_pool.clone(),
         ser_con.encrypt_key.clone(),
     );
+    elasticsearch_service.set_monitor(monitor_handle.clone());
 
     let tls = build_acceptor(&config.tls)?;
     let frontend_assets = FrontendAssets::new(frontend_directory);
