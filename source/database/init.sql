@@ -624,9 +624,17 @@ CREATE INDEX IF NOT EXISTS idx_scanner_latency_scanner_time
 CREATE INDEX IF NOT EXISTS idx_scanner_latency_time
 	ON scanner_latency_sample(measured_at);
 
--- 扫描服务维护状态。单行表用于跨进程重启恢复；预计结束时间仅用于提示，
+-- 系统维护状态。单行表用于跨进程重启恢复；预计结束时间仅用于提示，
 -- enabled 只能由管理员通过 Web 控制接口显式关闭。
-CREATE TABLE IF NOT EXISTS scanner_maintenance_state (
+DO $$
+BEGIN
+	IF to_regclass('public.scanner_maintenance_state') IS NOT NULL
+		AND to_regclass('public.system_maintenance_state') IS NULL THEN
+		ALTER TABLE scanner_maintenance_state RENAME TO system_maintenance_state;
+	END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS system_maintenance_state (
 	singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
 	enabled BOOLEAN NOT NULL DEFAULT FALSE,
 	phase TEXT NOT NULL DEFAULT 'off' CHECK (phase IN ('off', 'draining', 'active')),
@@ -642,9 +650,41 @@ CREATE TABLE IF NOT EXISTS scanner_maintenance_state (
 	revision BIGINT NOT NULL DEFAULT 0
 );
 
-INSERT INTO scanner_maintenance_state (singleton)
+INSERT INTO system_maintenance_state (singleton)
 VALUES (TRUE)
 ON CONFLICT (singleton) DO NOTHING;
+
+-- 系统维护历史。每次进入维护即创建记录；退出维护时补齐结束信息，
+-- 以便服务重启或操作者变更后仍可完整追溯维护窗口。
+CREATE TABLE IF NOT EXISTS system_maintenance_history (
+	id BIGSERIAL PRIMARY KEY,
+	maintenance_id UUID NOT NULL UNIQUE,
+	message TEXT NOT NULL DEFAULT '',
+	expected_end_at TIMESTAMPTZ,
+	started_at TIMESTAMPTZ NOT NULL,
+	ended_at TIMESTAMPTZ,
+	started_by_user_id INT REFERENCES users(id) ON DELETE SET NULL,
+	started_by_username VARCHAR(200) NOT NULL,
+	ended_by_user_id INT REFERENCES users(id) ON DELETE SET NULL,
+	ended_by_username VARCHAR(200),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	CHECK (ended_at IS NULL OR ended_at >= started_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_maintenance_history_started_at
+	ON system_maintenance_history (started_at DESC, id DESC);
+
+-- 升级期间若系统已处于维护模式，补建未完成的历史记录。
+INSERT INTO system_maintenance_history (
+	maintenance_id, message, expected_end_at, started_at, started_by_user_id,
+	started_by_username, updated_at
+)
+SELECT s.maintenance_id, s.message, s.expected_end_at, s.started_at, s.started_by,
+	COALESCE(u.username, '未知操作者'), s.updated_at
+FROM system_maintenance_state s
+LEFT JOIN users u ON u.id = s.started_by
+WHERE s.enabled = TRUE AND s.maintenance_id IS NOT NULL AND s.started_at IS NOT NULL
+ON CONFLICT (maintenance_id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,

@@ -1,7 +1,7 @@
 use actix_web::{HttpRequest, HttpResponse, Responder, get, patch, post, web};
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::error;
 use uuid::Uuid;
@@ -9,11 +9,14 @@ use uuid::Uuid;
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::SecurityConfig;
-use crate::scanner_maintenance::{
+use crate::system_maintenance::{
     DEFAULT_RETRY_AFTER_SECONDS, MaintenanceSnapshot, RESULT_UPLOAD_GRACE_HOURS,
-    ScannerMaintenanceState, active_task_count, held_task_count,
+    SystemMaintenanceState, active_task_count, held_task_count,
 };
 use crate::{ApplyTaskError, validate_scanner_credentials};
+
+const DEFAULT_HISTORY_LIMIT: i64 = 20;
+const MAX_HISTORY_LIMIT: i64 = 100;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,8 +39,25 @@ pub struct ExitMaintenanceRequest {
 }
 
 #[derive(Deserialize)]
-pub struct ScannerMaintenanceQuery {
+pub struct SystemMaintenanceHistoryQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct ScannerSystemMaintenanceQuery {
     scannerid: Uuid,
+}
+
+#[derive(Serialize)]
+struct SystemMaintenanceHistoryItem {
+    maintenance_id: Uuid,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    expected_end_at: Option<DateTime<Utc>>,
+    actual_duration_seconds: i64,
+    operator_username: String,
+    in_progress: bool,
 }
 
 fn require_admin(user: &UserBaseI) -> Result<(), HttpResponse> {
@@ -46,7 +66,7 @@ fn require_admin(user: &UserBaseI) -> Result<(), HttpResponse> {
     } else {
         Err(HttpResponse::Forbidden().json(json!({
             "success": false,
-            "message": "仅管理员可以管理扫描服务维护模式"
+            "message": "仅管理员可以管理系统维护模式"
         })))
     }
 }
@@ -77,7 +97,7 @@ async fn status_response(pool: &Pool, snapshot: MaintenanceSnapshot) -> HttpResp
             "held_tasks": held_tasks,
         })),
         (Err(error_value), _) | (_, Err(error_value)) => {
-            error!(event = "ScannerMaintenanceCountError", message = %error_value);
+            error!(event = "SystemMaintenanceCountError", message = %error_value);
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
                 "message": "读取运行任务数量失败"
@@ -86,10 +106,10 @@ async fn status_response(pool: &Pool, snapshot: MaintenanceSnapshot) -> HttpResp
     }
 }
 
-#[get("/api/admin/scanner-maintenance")]
+#[get("/api/admin/system-maintenance")]
 pub async fn get_maintenance_status(
     pool: web::Data<Pool>,
-    state: web::Data<ScannerMaintenanceState>,
+    state: web::Data<SystemMaintenanceState>,
     user: UserBaseI,
 ) -> impl Responder {
     if let Err(response) = require_admin(&user) {
@@ -98,11 +118,79 @@ pub async fn get_maintenance_status(
     status_response(pool.get_ref(), state.snapshot().await).await
 }
 
-#[post("/api/admin/scanner-maintenance/enter")]
+#[get("/api/admin/system-maintenance/history")]
+pub async fn get_maintenance_history(
+    pool: web::Data<Pool>,
+    user: UserBaseI,
+    query: web::Query<SystemMaintenanceHistoryQuery>,
+) -> impl Responder {
+    if let Err(response) = require_admin(&user) {
+        return response;
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(error_value) => {
+            error!(event = "SystemMaintenanceHistoryPoolError", message = %error_value);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let rows = match client
+        .query(
+            "SELECT maintenance_id, started_at, ended_at, expected_end_at, \
+             EXTRACT(EPOCH FROM (COALESCE(ended_at, NOW()) - started_at))::BIGINT \
+             AS actual_duration_seconds, started_by_username, ended_at IS NULL AS in_progress \
+             FROM system_maintenance_history ORDER BY started_at DESC, id DESC LIMIT $1 OFFSET $2;",
+            &[&limit, &offset],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error_value) => {
+            error!(event = "SystemMaintenanceHistoryQueryError", message = %error_value);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let total = match client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT AS count FROM system_maintenance_history;",
+            &[],
+        )
+        .await
+    {
+        Ok(row) => row.get::<_, i64>("count"),
+        Err(error_value) => {
+            error!(event = "SystemMaintenanceHistoryCountError", message = %error_value);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let items: Vec<SystemMaintenanceHistoryItem> = rows
+        .iter()
+        .map(|row| SystemMaintenanceHistoryItem {
+            maintenance_id: row.get("maintenance_id"),
+            started_at: row.get("started_at"),
+            ended_at: row.get("ended_at"),
+            expected_end_at: row.get("expected_end_at"),
+            actual_duration_seconds: row.get("actual_duration_seconds"),
+            operator_username: row.get("started_by_username"),
+            in_progress: row.get("in_progress"),
+        })
+        .collect();
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "data": { "items": items, "total": total }
+    }))
+}
+
+#[post("/api/admin/system-maintenance/enter")]
 pub async fn enter_maintenance(
     req: HttpRequest,
     pool: web::Data<Pool>,
-    state: web::Data<ScannerMaintenanceState>,
+    state: web::Data<SystemMaintenanceState>,
     user: UserBaseI,
     body: web::Json<EnterMaintenanceRequest>,
 ) -> impl Responder {
@@ -127,20 +215,20 @@ pub async fn enter_maintenance(
     let mut client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error!(event = "ScannerMaintenancePoolError", message = %error_value);
+            error!(event = "SystemMaintenancePoolError", message = %error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
     let transaction = match client.transaction().await {
         Ok(transaction) => transaction,
         Err(error_value) => {
-            error!(event = "ScannerMaintenanceTransactionError", message = %error_value);
+            error!(event = "SystemMaintenanceTransactionError", message = %error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
     let row = match transaction
         .query_opt(
-            "UPDATE scanner_maintenance_state SET enabled = TRUE, phase = 'draining', \
+            "UPDATE system_maintenance_state SET enabled = TRUE, phase = 'draining', \
              maintenance_id = $1, message = $2, expected_end_at = $3, retry_after_seconds = $4, \
              started_at = NOW(), started_by = $5, updated_at = NOW(), exited_at = NULL, \
              exited_by = NULL, revision = revision + 1 WHERE singleton = TRUE AND enabled = FALSE \
@@ -158,16 +246,42 @@ pub async fn enter_maintenance(
     {
         Ok(row) => row,
         Err(error_value) => {
-            error!(event = "ScannerMaintenanceEnterError", message = %error_value);
+            error!(event = "SystemMaintenanceEnterError", message = %error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
     let Some(row) = row else {
         return HttpResponse::Conflict().json(json!({
             "success": false,
-            "message": "扫描服务已经处于维护模式"
+            "message": "系统已经处于维护模式"
         }));
     };
+    match transaction
+        .execute(
+            "INSERT INTO system_maintenance_history (maintenance_id, message, expected_end_at, \
+             started_at, started_by_user_id, started_by_username, updated_at) \
+             SELECT $1, $2, $3, started_at, $4, $5, updated_at \
+             FROM system_maintenance_state WHERE singleton = TRUE AND maintenance_id = $1;",
+            &[
+                &maintenance_id,
+                &message,
+                &body.expected_end_at,
+                &user.id,
+                &user.username,
+            ],
+        )
+        .await
+    {
+        Ok(1) => {}
+        Ok(_) => {
+            error!(event = "SystemMaintenanceHistoryInsertMissing", maintenance_id = %maintenance_id);
+            return HttpResponse::InternalServerError().finish();
+        }
+        Err(error_value) => {
+            error!(event = "SystemMaintenanceHistoryInsertError", message = %error_value);
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
     if let Err(error_value) = transaction
         .execute(
             "UPDATE scan_task_execution SET maintenance_hold = TRUE, \
@@ -177,17 +291,17 @@ pub async fn enter_maintenance(
         )
         .await
     {
-        error!(event = "ScannerMaintenanceHoldTasksError", message = %error_value);
+        error!(event = "SystemMaintenanceHoldTasksError", message = %error_value);
         return HttpResponse::InternalServerError().finish();
     }
     let snapshot = MaintenanceSnapshot::from_row(&row);
     let mut audit = AuditEvent::user(
         "configuration",
-        "scanner.maintenance.enter",
+        "system.maintenance.enter",
         "success",
         &user,
     )
-    .resource("scanner_maintenance", maintenance_id.to_string());
+    .resource("system_maintenance", maintenance_id.to_string());
     audit.response_status = Some(200);
     audit.changes = Some(json!({
         "phase": "draining",
@@ -199,22 +313,22 @@ pub async fn enter_maintenance(
     if let Err(error_value) =
         write_audit(&transaction, &AuditContext::from_request(&req), &audit).await
     {
-        error!(event = "ScannerMaintenanceAuditError", message = %error_value);
+        error!(event = "SystemMaintenanceAuditError", message = %error_value);
         return HttpResponse::InternalServerError().finish();
     }
     if let Err(error_value) = transaction.commit().await {
-        error!(event = "ScannerMaintenanceCommitError", message = %error_value);
+        error!(event = "SystemMaintenanceCommitError", message = %error_value);
         return HttpResponse::InternalServerError().finish();
     }
     state.replace(snapshot.clone()).await;
     status_response(pool.get_ref(), snapshot).await
 }
 
-#[patch("/api/admin/scanner-maintenance")]
+#[patch("/api/admin/system-maintenance")]
 pub async fn update_maintenance(
     req: HttpRequest,
     pool: web::Data<Pool>,
-    state: web::Data<ScannerMaintenanceState>,
+    state: web::Data<SystemMaintenanceState>,
     user: UserBaseI,
     body: web::Json<UpdateMaintenanceRequest>,
 ) -> impl Responder {
@@ -244,7 +358,7 @@ pub async fn update_maintenance(
     };
     let row = match transaction
         .query_opt(
-            "UPDATE scanner_maintenance_state SET message = $1, expected_end_at = $2, \
+            "UPDATE system_maintenance_state SET message = $1, expected_end_at = $2, \
              updated_at = NOW(), revision = revision + 1 WHERE singleton = TRUE \
              AND enabled = TRUE AND revision = $3 RETURNING enabled, phase, maintenance_id, \
              message, expected_end_at, retry_after_seconds, started_at, updated_at, revision;",
@@ -254,7 +368,7 @@ pub async fn update_maintenance(
     {
         Ok(row) => row,
         Err(error_value) => {
-            error!(event = "ScannerMaintenanceUpdateError", message = %error_value);
+            error!(event = "SystemMaintenanceUpdateError", message = %error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -265,14 +379,39 @@ pub async fn update_maintenance(
         }));
     };
     let snapshot = MaintenanceSnapshot::from_row(&row);
+    let Some(maintenance_id) = snapshot.maintenance_id else {
+        error!(
+            event = "SystemMaintenanceMissingId",
+            "enabled system maintenance has no id"
+        );
+        return HttpResponse::InternalServerError().finish();
+    };
+    match transaction
+        .execute(
+            "UPDATE system_maintenance_history SET message = $1, expected_end_at = $2, \
+             updated_at = NOW() WHERE maintenance_id = $3 AND ended_at IS NULL;",
+            &[&message, &body.expected_end_at, &maintenance_id],
+        )
+        .await
+    {
+        Ok(1) => {}
+        Ok(_) => {
+            error!(event = "SystemMaintenanceHistoryMissing", maintenance_id = %maintenance_id);
+            return HttpResponse::InternalServerError().finish();
+        }
+        Err(error_value) => {
+            error!(event = "SystemMaintenanceHistoryUpdateError", message = %error_value);
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
     let mut audit = AuditEvent::user(
         "configuration",
-        "scanner.maintenance.update",
+        "system.maintenance.update",
         "success",
         &user,
     );
-    audit.resource_type = Some("scanner_maintenance".to_owned());
-    audit.resource_id = snapshot.maintenance_id.map(|value| value.to_string());
+    audit.resource_type = Some("system_maintenance".to_owned());
+    audit.resource_id = Some(maintenance_id.to_string());
     audit.response_status = Some(200);
     audit.changes = Some(json!({
         "message": message,
@@ -289,18 +428,17 @@ pub async fn update_maintenance(
     status_response(pool.get_ref(), snapshot).await
 }
 
-#[post("/api/admin/scanner-maintenance/exit")]
+#[post("/api/admin/system-maintenance/exit")]
 pub async fn exit_maintenance(
     req: HttpRequest,
     pool: web::Data<Pool>,
-    state: web::Data<ScannerMaintenanceState>,
+    state: web::Data<SystemMaintenanceState>,
     user: UserBaseI,
     body: web::Json<ExitMaintenanceRequest>,
 ) -> impl Responder {
     if let Err(response) = require_admin(&user) {
         return response;
     }
-    let previous = state.snapshot().await;
     let mut client = match pool.get().await {
         Ok(client) => client,
         Err(_) => return HttpResponse::InternalServerError().finish(),
@@ -311,19 +449,22 @@ pub async fn exit_maintenance(
     };
     let row = match transaction
         .query_opt(
-            "UPDATE scanner_maintenance_state SET enabled = FALSE, phase = 'off', \
+            "UPDATE system_maintenance_state AS state SET enabled = FALSE, phase = 'off', \
              maintenance_id = NULL, message = '', expected_end_at = NULL, started_at = NULL, \
              updated_at = NOW(), exited_at = NOW(), exited_by = $1, revision = revision + 1 \
-             WHERE singleton = TRUE AND enabled = TRUE AND revision = $2 \
-             RETURNING enabled, phase, maintenance_id, message, expected_end_at, \
-             retry_after_seconds, started_at, updated_at, revision;",
+             FROM (SELECT maintenance_id AS previous_maintenance_id \
+                   FROM system_maintenance_state WHERE singleton = TRUE) AS previous \
+             WHERE state.singleton = TRUE AND state.enabled = TRUE AND state.revision = $2 \
+             RETURNING state.enabled, state.phase, state.maintenance_id, state.message, \
+             state.expected_end_at, state.retry_after_seconds, state.started_at, state.updated_at, \
+             state.revision, previous.previous_maintenance_id;",
             &[&user.id, &body.revision],
         )
         .await
     {
         Ok(row) => row,
         Err(error_value) => {
-            error!(event = "ScannerMaintenanceExitError", message = %error_value);
+            error!(event = "SystemMaintenanceExitError", message = %error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -333,6 +474,33 @@ pub async fn exit_maintenance(
             "message": "维护状态已变化，请刷新后重试"
         }));
     };
+    let previous_maintenance_id: Option<Uuid> = row.get("previous_maintenance_id");
+    let Some(previous_maintenance_id) = previous_maintenance_id else {
+        error!(
+            event = "SystemMaintenanceMissingId",
+            "exiting system maintenance has no id"
+        );
+        return HttpResponse::InternalServerError().finish();
+    };
+    match transaction
+        .execute(
+            "UPDATE system_maintenance_history SET ended_at = NOW(), ended_by_user_id = $1, \
+             ended_by_username = $2, updated_at = NOW() \
+             WHERE maintenance_id = $3 AND ended_at IS NULL;",
+            &[&user.id, &user.username, &previous_maintenance_id],
+        )
+        .await
+    {
+        Ok(1) => {}
+        Ok(_) => {
+            error!(event = "SystemMaintenanceHistoryMissing", maintenance_id = %previous_maintenance_id);
+            return HttpResponse::InternalServerError().finish();
+        }
+        Err(error_value) => {
+            error!(event = "SystemMaintenanceHistoryExitError", message = %error_value);
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
     if let Err(error_value) = transaction
         .execute(
             "UPDATE scan_task_execution SET maintenance_hold_until = \
@@ -342,18 +510,13 @@ pub async fn exit_maintenance(
         )
         .await
     {
-        error!(event = "ScannerMaintenanceReleaseTasksError", message = %error_value);
+        error!(event = "SystemMaintenanceReleaseTasksError", message = %error_value);
         return HttpResponse::InternalServerError().finish();
     }
     let snapshot = MaintenanceSnapshot::from_row(&row);
-    let mut audit = AuditEvent::user(
-        "configuration",
-        "scanner.maintenance.exit",
-        "success",
-        &user,
-    );
-    audit.resource_type = Some("scanner_maintenance".to_owned());
-    audit.resource_id = previous.maintenance_id.map(|value| value.to_string());
+    let mut audit = AuditEvent::user("configuration", "system.maintenance.exit", "success", &user);
+    audit.resource_type = Some("system_maintenance".to_owned());
+    audit.resource_id = Some(previous_maintenance_id.to_string());
     audit.response_status = Some(200);
     audit.changes = Some(json!({
         "phase": "off",
@@ -371,12 +534,12 @@ pub async fn exit_maintenance(
 }
 
 #[get("/api/scanner/maintenance")]
-pub async fn scanner_maintenance_probe(
+pub async fn scanner_system_maintenance_probe(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    state: web::Data<ScannerMaintenanceState>,
-    query: web::Query<ScannerMaintenanceQuery>,
+    state: web::Data<SystemMaintenanceState>,
+    query: web::Query<ScannerSystemMaintenanceQuery>,
 ) -> impl Responder {
     let token = req
         .headers()
@@ -403,7 +566,7 @@ pub async fn scanner_maintenance_probe(
             HttpResponse::Unauthorized().body("unauthorized")
         }
         Err(error_value) => {
-            error!(event = "ScannerMaintenanceProbeError", message = %error_value);
+            error!(event = "SystemMaintenanceProbeError", message = %error_value);
             HttpResponse::InternalServerError().finish()
         }
     }

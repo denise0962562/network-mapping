@@ -6,8 +6,8 @@ use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
-use crate::scanner_maintenance::{
-    MaintenanceSnapshot, ScannerMaintenanceState, maintenance_response,
+use crate::system_maintenance::{
+    MaintenanceSnapshot, SystemMaintenanceState, maintenance_response,
 };
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
@@ -272,7 +272,7 @@ pub(crate) async fn scanner_public_ip_handler(
     query: web::Query<ScannerPublicIpQuery>,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
@@ -473,7 +473,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
     latency_history: web::Data<ScannerLatencyHistory>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
     heartbeat: web::Json<ScannerHeartbeat>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
@@ -680,7 +680,7 @@ pub(crate) async fn scanner_heartbeat_handler(
                 status: "renewed",
                 expires_at_ms: renewed.get("lease_expires_at"),
                 ttl_ms: if maintenance_hold {
-                    crate::scanner_maintenance::RESULT_UPLOAD_GRACE_TTL_MS
+                    crate::system_maintenance::RESULT_UPLOAD_GRACE_TTL_MS
                 } else {
                     crate::TASK_LEASE_MS
                 },
@@ -752,7 +752,7 @@ pub(crate) async fn scanner_task_failure_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
     failure: web::Json<ScannerTaskFailure>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
@@ -909,7 +909,7 @@ pub(crate) async fn scanner_task_cancelled_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
     cancelled: web::Json<ScannerTaskCancelled>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
@@ -1427,7 +1427,7 @@ async fn apply_task_handler(
     scanner_id: web::Query<ApplyTaskQuery>,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
 ) -> impl Responder {
     let database_conn = pool.get_ref();
     let token = req
@@ -1513,7 +1513,7 @@ async fn upload_scanner_result_handler(
     maxmind: web::Data<MaxMindState>,
     elasticsearch: web::Data<crate::elasticsearch::ElasticsearchService>,
     security: web::Data<SecurityConfig>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
     upload_data: web::Json<ScannerResultUpload>,
 ) -> impl Responder {
     let token = req

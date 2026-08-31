@@ -78,12 +78,12 @@ impl MaintenanceSnapshot {
     }
 }
 
-pub struct ScannerMaintenanceState {
+pub struct SystemMaintenanceState {
     snapshot: RwLock<MaintenanceSnapshot>,
     consecutive_empty_checks: AtomicU8,
 }
 
-impl ScannerMaintenanceState {
+impl SystemMaintenanceState {
     pub async fn from_database(
         pool: &Pool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -92,7 +92,7 @@ impl ScannerMaintenanceState {
             .query_one(
                 "SELECT enabled, phase, maintenance_id, message, expected_end_at, \
                  retry_after_seconds, started_at, updated_at, revision \
-                 FROM scanner_maintenance_state WHERE singleton = TRUE;",
+                 FROM system_maintenance_state WHERE singleton = TRUE;",
                 &[],
             )
             .await?;
@@ -155,7 +155,7 @@ impl ScannerMaintenanceState {
         let client = pool.get().await?;
         let row = client
             .query_opt(
-                "UPDATE scanner_maintenance_state SET phase = 'active', updated_at = NOW(), \
+                "UPDATE system_maintenance_state SET phase = 'active', updated_at = NOW(), \
                  revision = revision + 1 WHERE singleton = TRUE AND enabled = TRUE \
                  AND phase = 'draining' RETURNING enabled, phase, maintenance_id, message, \
                  expected_end_at, retry_after_seconds, started_at, updated_at, revision;",
@@ -167,7 +167,7 @@ impl ScannerMaintenanceState {
             info!(
                 maintenance_id = ?next.maintenance_id,
                 revision = next.revision,
-                "scanner maintenance drain completed"
+                "system maintenance drain completed"
             );
             self.replace(next).await;
         }
@@ -244,13 +244,13 @@ pub async fn held_task_count(pool: &Pool) -> Result<i64, Box<dyn std::error::Err
     Ok(row.get("count"))
 }
 
-pub async fn run_reconciler(state: web::Data<ScannerMaintenanceState>, pool: Pool) {
+pub async fn run_reconciler(state: web::Data<SystemMaintenanceState>, pool: Pool) {
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     loop {
         ticker.tick().await;
         if let Err(error_value) = state.reconcile(&pool).await {
             error!(
-                event = "ScannerMaintenanceReconcileError",
+                event = "SystemMaintenanceReconcileError",
                 message = %error_value,
             );
         }
@@ -267,7 +267,7 @@ pub fn maintenance_response(snapshot: &MaintenanceSnapshot) -> HttpResponse {
         .insert_header(("NM-Maintenance-Version", "1"))
         .json(json!({
             "success": false,
-            "code": "scanner_maintenance",
+            "code": "system_maintenance",
             "maintenance": {
                 "id": snapshot.maintenance_id,
                 "phase": snapshot.phase,
@@ -321,7 +321,7 @@ mod tests {
         );
         let body = to_bytes(response.into_body()).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["code"], "scanner_maintenance");
+        assert_eq!(value["code"], "system_maintenance");
         assert_eq!(value["maintenance"]["phase"], "active");
         assert_eq!(value["maintenance"]["task_action"], "finish_and_cache");
         assert_eq!(value["maintenance"]["result_upload_grace_hours"], 24);

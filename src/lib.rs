@@ -27,9 +27,9 @@ pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
 pub mod scanner_latency;
-pub mod scanner_maintenance;
 mod search_content;
 pub mod search_projection;
+pub mod system_maintenance;
 
 #[cfg(test)]
 pub mod test; // 测试模块
