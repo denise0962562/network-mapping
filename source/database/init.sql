@@ -164,22 +164,70 @@ ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_name TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS region_name TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS city_name TEXT DEFAULT NULL;
 
--- 资产标签独立于扫描执行保存。同一个 IP 的标签会应用到所有任务与历史结果。
-CREATE TABLE IF NOT EXISTS asset_tag (
+-- 标签分类用于在 Web 端组织标签；风险语义仍由 asset_tag.kind 控制。
+CREATE TABLE IF NOT EXISTS asset_tag_category (
 	id BIGSERIAL PRIMARY KEY,
 	name VARCHAR(32) NOT NULL,
-	kind TEXT NOT NULL CHECK (kind IN ('info', 'malicious', 'benign')),
 	description VARCHAR(256),
+	sort_order INT NOT NULL DEFAULT 0,
 	is_active BOOLEAN NOT NULL DEFAULT TRUE,
 	created_by INT REFERENCES users(id) ON DELETE SET NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_tag_category_active_name
+	ON asset_tag_category (LOWER(name)) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_asset_tag_category_active_sort
+	ON asset_tag_category (is_active, sort_order, id);
+
+INSERT INTO asset_tag_category (name, description, sort_order)
+SELECT '未分类', '系统升级时用于接收已有标签的默认分类', 0
+WHERE NOT EXISTS (
+	SELECT 1 FROM asset_tag_category WHERE is_active AND LOWER(name) = LOWER('未分类')
+);
+
+-- 资产标签独立于扫描执行保存。同一个 IP 的标签会应用到所有任务与历史结果。
+CREATE TABLE IF NOT EXISTS asset_tag (
+	id BIGSERIAL PRIMARY KEY,
+	name VARCHAR(32) NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('info', 'malicious', 'benign')),
+	description VARCHAR(256),
+	category_id BIGINT CONSTRAINT fk_asset_tag_category REFERENCES asset_tag_category(id),
+	is_active BOOLEAN NOT NULL DEFAULT TRUE,
+	created_by INT REFERENCES users(id) ON DELETE SET NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 兼容已有标签表：补列、回填默认分类，再收紧约束。
+ALTER TABLE asset_tag ADD COLUMN IF NOT EXISTS category_id BIGINT;
+UPDATE asset_tag
+SET category_id = (
+	SELECT id FROM asset_tag_category
+	WHERE is_active AND LOWER(name) = LOWER('未分类')
+	ORDER BY id LIMIT 1
+)
+WHERE category_id IS NULL;
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = 'fk_asset_tag_category' AND conrelid = 'asset_tag'::REGCLASS
+	) THEN
+		ALTER TABLE asset_tag
+			ADD CONSTRAINT fk_asset_tag_category
+			FOREIGN KEY (category_id) REFERENCES asset_tag_category(id);
+	END IF;
+END $$;
+ALTER TABLE asset_tag ALTER COLUMN category_id SET NOT NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_tag_active_name
 	ON asset_tag (LOWER(name)) WHERE is_active;
 CREATE INDEX IF NOT EXISTS idx_asset_tag_kind_active
 	ON asset_tag (kind, is_active);
+CREATE INDEX IF NOT EXISTS idx_asset_tag_category_active
+	ON asset_tag (category_id, is_active);
 
 CREATE TABLE IF NOT EXISTS asset_ip_tag (
 	ip_address INET NOT NULL,

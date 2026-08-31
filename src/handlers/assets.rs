@@ -193,10 +193,12 @@ pub(crate) async fn get_asset_summary(
                 ORDER BY i.update_time DESC, i.ip_id DESC LIMIT 1\
              ), asset_tags AS (\
                 SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(\
-                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
-                    ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id), '[]'::JSONB) AS tags \
+                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+                    'category_id', category.id, 'category_name', category.name\
+                    ) ORDER BY category.sort_order, LOWER(category.name), CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id), '[]'::JSONB) AS tags \
                 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active\
+                JOIN asset_tag_category category ON category.id = tag.category_id \
+                WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active AND category.is_active\
              ) \
              SELECT stats.*, \
                     (SELECT COUNT(DISTINCT service)::BIGINT FROM eligible \
@@ -566,10 +568,12 @@ async fn get_asset_summary_from_elasticsearch(
         Ok(connection) => connection
             .query_one(
                 "SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT('id', tag.id, 'name', tag.name, \
-                    'kind', tag.kind, 'description', tag.description) ORDER BY tag.id) \
+                    'kind', tag.kind, 'description', tag.description, 'category_id', category.id, \
+                    'category_name', category.name) ORDER BY category.sort_order, LOWER(category.name), tag.id) \
                     FILTER (WHERE tag.id IS NOT NULL), '[]'::JSONB) AS tags \
                  FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                 WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active;",
+                 JOIN asset_tag_category category ON category.id = tag.category_id \
+                 WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active AND category.is_active;",
                 &[&ip],
             )
             .await

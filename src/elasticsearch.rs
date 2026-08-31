@@ -15,9 +15,9 @@ use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate
 use crate::config::{ElasticsearchConfig, ScanStorageMode};
 use crate::handlers::tags::{AssetTag, tags_from_json};
 
-const INDEX_SCHEMA_VERSION: &str = "1";
+const INDEX_SCHEMA_VERSION: &str = "2";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
-const SCAN_INDEX_SCHEMA_VERSION: &str = "1";
+const SCAN_INDEX_SCHEMA_VERSION: &str = "2";
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
 const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
      ON asset_endpoint_current(projection_version);";
@@ -1885,10 +1885,12 @@ impl ElasticsearchService {
                      FROM scan_observation o \
                      LEFT JOIN ips i ON i.execution_id = o.execution_id AND i.ip_address = o.ip_address \
                      LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT( \
-                        'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description) \
-                        ORDER BY tag.id) AS tags FROM asset_ip_tag assignment \
+                        'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+                        'category_id', category.id, 'category_name', category.name) \
+                        ORDER BY category.sort_order, LOWER(category.name), tag.id) AS tags FROM asset_ip_tag assignment \
                         JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                        WHERE assignment.ip_address = o.ip_address AND tag.is_active) tags ON true \
+                        JOIN asset_tag_category category ON category.id = tag.category_id \
+                        WHERE assignment.ip_address = o.ip_address AND tag.is_active AND category.is_active) tags ON true \
                      WHERE o.batch_id = $1 ORDER BY o.id;",
                     &[&batch_id],
                 )
@@ -2182,9 +2184,12 @@ async fn process_scan_tag_event(
     let connection = pool.get().await.map_err(|error| error.to_string())?;
     let rows = connection
         .query(
-            "SELECT tag.id, tag.name, tag.kind, tag.description \
+            "SELECT tag.id, tag.name, tag.kind, tag.description, category.id AS category_id, \
+                    category.name AS category_name \
              FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-             WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active ORDER BY tag.id;",
+             JOIN asset_tag_category category ON category.id = tag.category_id \
+             WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active AND category.is_active \
+             ORDER BY category.sort_order, LOWER(category.name), tag.id;",
             &[&event.aggregate_key],
         )
         .await
@@ -2196,6 +2201,8 @@ async fn process_scan_tag_event(
             name: row.get("name"),
             kind: row.get("kind"),
             description: row.get("description"),
+            category_id: row.try_get("category_id").ok(),
+            category_name: row.try_get("category_name").ok(),
         })
         .collect::<Vec<_>>();
     service
@@ -2314,10 +2321,12 @@ async fn load_documents(
                 COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
          FROM asset_endpoint_current current \
          LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT(\
-             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
-             ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
+             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+             'category_id', category.id, 'category_name', category.name\
+             ) ORDER BY category.sort_order, LOWER(category.name), CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
              FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-             WHERE assignment.ip_address = current.ip_address AND tag.is_active) tag_data ON true \
+             JOIN asset_tag_category category ON category.id = tag.category_id \
+             WHERE assignment.ip_address = current.ip_address AND tag.is_active AND category.is_active) tag_data ON true \
          WHERE current.projection_version > $1 AND {filter} \
          ORDER BY current.projection_version LIMIT $2"
     );
@@ -2729,7 +2738,8 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "city_name": {"type": "keyword"},
                     "tags": {"type": "object", "properties": {
                         "id": {"type": "long"}, "name": {"type": "keyword"},
-                        "kind": {"type": "keyword"}, "description": {"type": "text", "index": false}
+                        "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
+                        "category_id": {"type": "long"}, "category_name": {"type": "keyword"}
                     }}
                 }
             }
@@ -2797,7 +2807,8 @@ fn scan_endpoint_index_definition(replicas: u32) -> Value {
                 "city_name": {"type": "wildcard"},
                 "tags": {"type": "object", "properties": {
                     "id": {"type": "long"}, "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "kind": {"type": "keyword"}, "description": {"type": "text", "index": false}
+                    "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
+                    "category_id": {"type": "long"}, "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
                 }},
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tag_ids": {"type": "long"},
@@ -3006,7 +3017,9 @@ fn index_definition() -> Value {
                         "id": {"type": "long"},
                         "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                         "kind": {"type": "keyword"},
-                        "description": {"type": "text", "index": false}
+                        "description": {"type": "text", "index": false},
+                        "category_id": {"type": "long"},
+                        "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
                     }
                 },
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},

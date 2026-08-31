@@ -37,6 +37,7 @@ enum Field {
     Tag,
     TagId,
     TagKind,
+    TagCategory,
     Port,
     Protocol,
     Service,
@@ -393,6 +394,7 @@ impl ElasticsearchCompiler {
                 | Field::Source
                 | Field::Tag
                 | Field::TagKind
+                | Field::TagCategory
         );
         let normalized_values = values
             .iter()
@@ -436,7 +438,8 @@ impl ElasticsearchCompiler {
         } else {
             json!({"terms": {(name): normalized_values}})
         };
-        let missing_matches_negative = matches!(field, Field::Tag | Field::TagKind);
+        let missing_matches_negative =
+            matches!(field, Field::Tag | Field::TagKind | Field::TagCategory);
         Ok(negative_filter(
             operator,
             name,
@@ -476,6 +479,7 @@ fn es_field(field: Field) -> &'static str {
         Field::Tag => "tag_names",
         Field::TagId => "tag_ids",
         Field::TagKind => "tag_kinds",
+        Field::TagCategory => "tags.category_name",
         Field::Port => "port",
         Field::Protocol => "protocol",
         Field::Service => "service",
@@ -517,6 +521,7 @@ impl Field {
             "tag" => Some(Self::Tag),
             "tag.id" => Some(Self::TagId),
             "tag.kind" => Some(Self::TagKind),
+            "tag.category" => Some(Self::TagCategory),
             "port" => Some(Self::Port),
             "protocol" => Some(Self::Protocol),
             "service" => Some(Self::Service),
@@ -543,6 +548,7 @@ impl Field {
             Self::Tag => "tag",
             Self::TagId => "tag.id",
             Self::TagKind => "tag.kind",
+            Self::TagCategory => "tag.category",
             Self::Port => "port",
             Self::Protocol => "protocol",
             Self::Service => "service",
@@ -588,6 +594,7 @@ impl Field {
             | Self::Tag
             | Self::TagId
             | Self::TagKind
+            | Self::TagCategory
             | Self::Port
             | Self::Protocol
             | Self::Source
@@ -1118,7 +1125,7 @@ impl Compiler {
             Field::FirstSeen | Field::LastSeen => {
                 self.compile_time(predicate.field, operator, &predicate.values, alias)
             }
-            Field::Tag | Field::TagKind => {
+            Field::Tag | Field::TagKind | Field::TagCategory => {
                 self.compile_tag(predicate.field, operator, &predicate.values, alias)
             }
             Field::Asn
@@ -1143,8 +1150,8 @@ impl Compiler {
         let sql = match field {
             Field::Ip => "TRUE".to_owned(),
             Field::Port => format!("{alias}.port > 0"),
-            Field::Tag | Field::TagId | Field::TagKind => format!(
-                "EXISTS (SELECT 1 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id WHERE assignment.ip_address = {alias}.ip_address AND tag.is_active)"
+            Field::Tag | Field::TagId | Field::TagKind | Field::TagCategory => format!(
+                "EXISTS (SELECT 1 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id JOIN asset_tag_category category ON category.id = tag.category_id WHERE assignment.ip_address = {alias}.ip_address AND tag.is_active AND category.is_active)"
             ),
             Field::FirstSeen => format!("{alias}.first_seen_at IS NOT NULL"),
             Field::LastSeen => format!("{alias}.last_seen_at IS NOT NULL"),
@@ -1297,10 +1304,11 @@ impl Compiler {
         ) {
             return Err(unsupported_operator(field));
         }
-        let column = if field == Field::Tag {
-            "tag.name"
-        } else {
-            "tag.kind"
+        let column = match field {
+            Field::Tag => "tag.name",
+            Field::TagKind => "tag.kind",
+            Field::TagCategory => "category.name",
+            _ => unreachable!("compile_tag only accepts tag text fields"),
         };
         let mut clauses = Vec::new();
         for value in values {
@@ -1345,7 +1353,7 @@ impl Compiler {
         }
         let condition = clauses.join(" OR ");
         Ok(format!(
-            "{}EXISTS (SELECT 1 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id WHERE assignment.ip_address = {alias}.ip_address AND tag.is_active AND ({condition}))",
+            "{}EXISTS (SELECT 1 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id JOIN asset_tag_category category ON category.id = tag.category_id WHERE assignment.ip_address = {alias}.ip_address AND tag.is_active AND category.is_active AND ({condition}))",
             if negative { "NOT " } else { "" }
         ))
     }
@@ -1693,6 +1701,22 @@ mod tests {
     }
 
     #[test]
+    fn compiles_tag_category_for_postgres_and_elasticsearch() {
+        let sql = parse_and_compile("tag.category = \"运行环境\"")
+            .expect("tag category should compile for PostgreSQL");
+        assert!(sql.sql.contains("asset_tag_category category"));
+        assert!(sql.sql.contains("LOWER(category.name)"));
+
+        let ElasticsearchCompilation::Supported(filter) =
+            parse_and_compile_elasticsearch("tag.category = \"运行环境\"")
+                .expect("tag category should compile for Elasticsearch")
+        else {
+            panic!("tag category should be supported by Elasticsearch");
+        };
+        assert!(filter.to_string().contains("tags.category_name"));
+    }
+
+    #[test]
     fn documented_queries_compile() {
         let queries = [
             "ip IN 192.0.2.0/24 AND port IN (80, 443) AND service ~ \"http\" AND tag = \"生产环境\"",
@@ -1702,6 +1726,7 @@ mod tests {
             "ip = 2001:db8::10",
             "EXISTS(service) AND NOT EXISTS(banner)",
             "tag = \"公网\" AND tag = \"核心资产\"",
+            "tag.category = \"运行环境\" AND tag = \"生产环境\"",
             "tag.kind IN (malicious, info)",
             "port = 80 AND has_endpoint(port = 443 AND service = \"https\")",
             "scanner ~ \"上海\" AND port = 443",

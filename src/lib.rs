@@ -1981,10 +1981,12 @@ pub async fn save_scanner_results(
         let tag_rows = transaction
             .query(
                 "SELECT host(assignment.ip_address) AS ip, JSONB_AGG(JSONB_BUILD_OBJECT( \
-                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description) \
-                    ORDER BY tag.id) AS tags \
+                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+                    'category_id', category.id, 'category_name', category.name) \
+                    ORDER BY category.sort_order, LOWER(category.name), tag.id) AS tags \
                  FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                 WHERE tag.is_active AND assignment.ip_address IN \
+                 JOIN asset_tag_category category ON category.id = tag.category_id \
+                 WHERE tag.is_active AND category.is_active AND assignment.ip_address IN \
                     (SELECT address::INET FROM UNNEST($1::TEXT[]) address) \
                  GROUP BY assignment.ip_address;",
                 &[&addresses],
