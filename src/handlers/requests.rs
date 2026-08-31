@@ -142,6 +142,40 @@ fn filter_params<'a>(
     ]
 }
 
+fn request_list_filter<'a>(
+    query: &'a dyn RequestFilter,
+    start: &'a Option<DateTime<Utc>>,
+    end: &'a Option<DateTime<Utc>>,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut conditions = Vec::new();
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    macro_rules! push_filter {
+        ($value:expr, $predicate:expr) => {
+            if let Some(value) = $value.as_ref() {
+                params.push(value);
+                conditions.push(format!($predicate, params.len()));
+            }
+        };
+    }
+    push_filter!(query.method(), "http_method = ${}");
+    push_filter!(query.path(), "request_path ILIKE '%' || ${} || '%'");
+    push_filter!(query.status(), "status_code = ${}");
+    push_filter!(query.error_level(), "error_level = ${}");
+    push_filter!(query.error_type(), "error_type = ${}");
+    push_filter!(query.request_id(), "request_id = ${}");
+    push_filter!(start, "occurred_at >= ${}");
+    push_filter!(end, "occurred_at <= ${}");
+    if query.only_errors().is_some() {
+        conditions.push("error_level <> 'ok'".to_owned());
+    }
+    let sql = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    (sql, params)
+}
+
 /// 两个查询结构体共享过滤字段的读取接口，避免手写两遍参数列表。
 trait RequestFilter {
     fn method(&self) -> &Option<String>;
@@ -445,8 +479,8 @@ pub(crate) async fn list_requests(
         }
     };
 
-    let params = filter_params(&*query, &query.start, &query.end);
-    let count_sql = format!("SELECT COUNT(*) FROM request_log {FILTER_SQL}");
+    let (filter_sql, params) = request_list_filter(&*query, &query.start, &query.end);
+    let count_sql = format!("SELECT COUNT(*) FROM request_log{filter_sql}");
     let total: i64 = match client.query_one(&count_sql, &params).await {
         Ok(row) => row.get(0),
         Err(error_value) => {
@@ -458,7 +492,10 @@ pub(crate) async fn list_requests(
     let list_sql = format!(
         "SELECT id, request_id, occurred_at, http_method, request_path, status_code, duration_ms, \
          client_ip, user_agent, actor_id, actor_name, error_level, error_type \
-         FROM request_log {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $10 OFFSET $11"
+         FROM request_log{filter_sql} ORDER BY occurred_at DESC, id DESC \
+         LIMIT ${} OFFSET ${}",
+        params.len() + 1,
+        params.len() + 2,
     );
     let mut list_params = params;
     list_params.push(&page_size);
@@ -827,8 +864,49 @@ pub(crate) async fn request_performance(
 
 #[cfg(test)]
 mod tests {
-    use super::{metric_delta, performance_window, resolve_granularity, window_range};
+    use super::{
+        RequestQuery, metric_delta, performance_window, request_list_filter, resolve_granularity,
+        window_range,
+    };
     use chrono::{Duration, Utc};
+
+    fn request_query() -> RequestQuery {
+        RequestQuery {
+            method: None,
+            path: None,
+            status: None,
+            error_level: None,
+            error_type: None,
+            request_id: None,
+            start: None,
+            end: None,
+            only_errors: None,
+            page: None,
+            page_size: None,
+        }
+    }
+
+    #[test]
+    fn request_list_filter_omits_absent_predicates() {
+        let value = request_query();
+        let (sql, params) = request_list_filter(&value, &value.start, &value.end);
+        assert!(sql.is_empty());
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn request_list_filter_numbers_present_parameters() {
+        let mut value = request_query();
+        value.method = Some("GET".to_owned());
+        value.status = Some(500);
+        value.only_errors = Some(true);
+        let (sql, params) = request_list_filter(&value, &value.start, &value.end);
+        assert_eq!(
+            sql,
+            " WHERE http_method = $1 AND status_code = $2 AND error_level <> 'ok'"
+        );
+        assert_eq!(params.len(), 2);
+    }
 
     #[test]
     fn window_range_only_accepts_presets() {

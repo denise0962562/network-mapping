@@ -55,6 +55,20 @@ pub struct HealthEvent {
     pub details: Vec<(String, String)>,
 }
 
+struct SlowSqlObservation<'a> {
+    queryid: i64,
+    query: &'a str,
+    mean_exec_time_ms: f64,
+    max_exec_time_ms: f64,
+    calls_delta: i64,
+    total_exec_time_ms: f64,
+    rows_delta: i64,
+    shared_blks_hit_delta: i64,
+    shared_blks_read_delta: i64,
+    temp_blks_read_delta: i64,
+    temp_blks_written_delta: i64,
+}
+
 impl HealthEvent {
     pub fn slow_request(
         method: &str,
@@ -108,13 +122,20 @@ impl HealthEvent {
         }
     }
 
-    pub fn slow_sql(
-        queryid: i64,
-        query: &str,
-        mean_exec_time_ms: f64,
-        max_exec_time_ms: f64,
-        calls_delta: i64,
-    ) -> Self {
+    fn slow_sql(observation: &SlowSqlObservation<'_>) -> Self {
+        let SlowSqlObservation {
+            queryid,
+            query,
+            mean_exec_time_ms,
+            max_exec_time_ms,
+            calls_delta,
+            total_exec_time_ms,
+            rows_delta,
+            shared_blks_hit_delta,
+            shared_blks_read_delta,
+            temp_blks_read_delta,
+            temp_blks_written_delta,
+        } = observation;
         let query_text = if query.is_empty() {
             format!("queryid={queryid}")
         } else {
@@ -125,13 +146,40 @@ impl HealthEvent {
             severity: "warning",
             key: format!("slow_sql:{queryid}"),
             summary: format!(
-                "检测到慢 SQL（平均 {mean_exec_time_ms:.1}ms，峰值 {max_exec_time_ms:.1}ms）"
+                "检测到慢 SQL（本周期平均 {mean_exec_time_ms:.1}ms，历史峰值 {max_exec_time_ms:.1}ms）"
             ),
             details: vec![
                 ("查询".to_owned(), query_text),
-                ("平均耗时".to_owned(), format!("{mean_exec_time_ms:.1} ms")),
-                ("峰值耗时".to_owned(), format!("{max_exec_time_ms:.1} ms")),
+                (
+                    "本周期平均耗时".to_owned(),
+                    format!("{mean_exec_time_ms:.1} ms"),
+                ),
+                (
+                    "本周期总耗时".to_owned(),
+                    format!("{total_exec_time_ms:.1} ms"),
+                ),
+                (
+                    "历史峰值耗时".to_owned(),
+                    format!("{max_exec_time_ms:.1} ms"),
+                ),
                 ("本周期调用次数".to_owned(), calls_delta.to_string()),
+                ("本周期返回行数".to_owned(), rows_delta.to_string()),
+                (
+                    "本周期共享块命中".to_owned(),
+                    shared_blks_hit_delta.to_string(),
+                ),
+                (
+                    "本周期共享块读取".to_owned(),
+                    shared_blks_read_delta.to_string(),
+                ),
+                (
+                    "本周期临时块读取".to_owned(),
+                    temp_blks_read_delta.to_string(),
+                ),
+                (
+                    "本周期临时块写入".to_owned(),
+                    temp_blks_written_delta.to_string(),
+                ),
             ],
         }
     }

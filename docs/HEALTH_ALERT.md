@@ -4,7 +4,7 @@
 
 1. **慢请求**：响应耗时超过阈值。
 2. **5xx 错误**：服务端处理异常（500–599）。
-3. **慢 SQL**：平均执行耗时超过阈值的近期慢查询。
+3. **慢 SQL**：当前轮询窗口平均执行耗时超过阈值的近期慢查询。
 4. **慢 Elasticsearch 查询/写入**：应用观察到的 ES 端到端耗时超过分级阈值。
 5. **Elasticsearch 异常**：网络、HTTP、超时或分片失败。
 
@@ -22,13 +22,13 @@
 | --- | --- | --- | --- |
 | 慢请求 | `main.rs` 请求中间件 `wrap_fn` 的 `duration_ms` | `duration_ms ≥ slow_request_threshold_ms` | `slow_request:{method}:{path}` |
 | 5xx 错误 | 同一中间件的 `status_code`（复用 `classify_status`，5xx 归为 `server_error`） | `500 ≤ status ≤ 599` 且 `server_error_enabled` | `server_error:{path}:{status}` |
-| 慢 SQL | 后台任务轮询 `pg_stat_statements` | `mean_exec_time ≥ slow_sql_threshold_ms` 且 `calls` 较上次轮询有增量（近期仍在执行） | `slow_sql:{queryid}` |
+| 慢 SQL | 后台任务轮询 `pg_stat_statements` | 相邻轮询间的 `Δtotal_exec_time / Δcalls ≥ slow_sql_threshold_ms` | `slow_sql:{queryid}` |
 | 慢 ES 查询/写入 | `ElasticsearchService` 统一请求入口 | 按 query/write 阈值判定，同时检查 `timed_out`、HTTP 状态和失败分片 | `{alert_type}:{operation}` |
 
 说明：
 
 - 慢请求与 5xx 复用 `request_log` 采集点已经算好的 `status` / `duration_ms`，只在命中阈值时才克隆字符串，正常请求零额外分配。
-- 慢 SQL 用 `calls` 增量过滤掉「历史上慢、但已不再执行」的查询，避免首轮或重启后误报一批陈旧慢查询；首轮轮询只建立基线，不告警。
+- 慢 SQL 使用相邻轮询间的累计计数差计算窗口平均值，过滤掉「历史上慢、但当前已恢复或不再执行」的查询；告警同时记录本周期总耗时、返回行数、共享块命中/读取和临时块读写。首轮轮询只建立基线，不告警。
 - ES 请求使用有限集合的 `X-Opaque-Id` 标识操作类型，使用唯一 W3C `traceparent` 关联应用告警、Query Logging、Slow Log 和任务 API。告警只记录操作名、耗时、ES `took`、状态、分片和 trace ID，不记录查询或 Bulk 正文。
 
 ## 通知机制
@@ -74,7 +74,7 @@
   ```
 
   - 未启用该扩展时，慢 SQL 检测**不影响**慢请求 / 5xx 告警，只会在首轮记录一次 `warn` 后跳过，后续失败记 `error`。
-  - 时间单位为**毫秒**（`pg_stat_statements` 的 `mean_exec_time` / `max_exec_time` 本身即毫秒）。
+  - 时间单位为**毫秒**（`pg_stat_statements.total_exec_time` / `max_exec_time` 本身即毫秒）。
   - PostgreSQL 15+ 中 `query` 文本可能对无权限用户返回 NULL，此时告警以 `queryid` 作为标识，不影响告警产生。
   - `queryid` 本身也可能为 NULL（如关闭 `compute_query_id` 时未被计数的 utility 语句）；这类语句无法用 `queryid` 去重，慢 SQL 检测会跳过、不产生告警。
 
@@ -87,7 +87,7 @@
 enabled = true                      # 是否启用健康监控与告警（默认 true）
 slow_request_threshold_ms = 3000    # 慢请求阈值（毫秒）
 server_error_enabled = true         # 是否对 5xx 告警
-slow_sql_threshold_ms = 3000        # 慢 SQL 阈值（毫秒，基于 mean_exec_time）
+slow_sql_threshold_ms = 3000        # 慢 SQL 阈值（毫秒，基于当前轮询窗口平均耗时）
 slow_sql_check_interval_seconds = 60# 慢 SQL 轮询间隔（秒）
 elasticsearch_query_warning_threshold_ms = 1000
 elasticsearch_query_critical_threshold_ms = 3000
@@ -101,7 +101,7 @@ alert_cooldown_seconds = 300        # 同一告警 key 的冷却时间（秒）
 ## 注意事项
 
 - **升级后监控默认开启**：由于 `enabled` 默认 `true`，老配置升级后健康监控自动生效；若 SMTP 未配或没有管理员邮箱，告警会被静默跳过（不会报错刷日志）。
-- **慢 SQL 告警是「近期仍在执行」**：`calls` 增量判定意味着某条慢查询只在它继续被调用时才会反复触发（受冷却窗口约束）；停止执行后不再告警。
+- **慢 SQL 告警是「当前窗口确实慢」**：使用 `total_exec_time` 和 `calls` 的增量计算当前窗口平均值；停止执行、当前窗口恢复正常或统计计数重置后不会告警。
 - **冷却状态在内存中**：重启后去重窗口清零，重启后短时间内可能重复收到一批告警。告警事件已持久化到 `health_alert` 历史表，但冷却去重仍基于内存，尚未用历史表做跨重启去重（见「待定 / 后续」）。
 - **每次告警给每位管理员各发一封**：管理员较多时一封事件对应多封邮件。
 - **告警邮件不记录 HTTP 请求体或 ES DSL/Bulk 正文**：慢请求与 5xx 只携带 method、path（不含 query）、状态码、耗时、请求 ID、来源 IP、操作者；ES 告警只携带脱敏的固定元数据。PostgreSQL 慢 SQL 仍携带查询文本（截断到 2000 字符），若文本不可见则回退为 `queryid`。

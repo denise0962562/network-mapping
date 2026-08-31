@@ -991,6 +991,8 @@ CREATE TABLE IF NOT EXISTS health_alert (
 
 CREATE INDEX IF NOT EXISTS idx_health_alert_key_time
 	ON health_alert (alert_type, alert_key, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_health_alert_time
+	ON health_alert (occurred_at DESC, id DESC);
 
 -- pgBackRest Web 管理任务。仓库中的 backup.info 仍是备份集的权威数据源；
 -- 本表只保存手动操作的执行状态、日志和审计关联。

@@ -77,7 +77,7 @@ server_error_enabled = true
 # 注意：慢 SQL 检测依赖 pg_stat_statements 扩展，需在 postgresql.conf 配置
 # shared_preload_libraries = 'pg_stat_statements' 并重启后执行
 # CREATE EXTENSION pg_stat_statements; 未启用时该检测会跳过并记录警告日志。
-slow_sql_threshold_ms = 3000
+slow_sql_threshold_ms = 3000                 # 当前轮询窗口内的平均执行耗时阈值
 # 慢 SQL 轮询间隔（秒）。
 slow_sql_check_interval_seconds = 60
 # Elasticsearch Query DSL 请求的 warning / critical 阈值（毫秒）。

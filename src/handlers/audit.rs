@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::admin::UserBaseI;
@@ -75,22 +76,45 @@ fn event_from_row(row: tokio_postgres::Row) -> AuditEventResponse {
     }
 }
 
-const FILTER_SQL: &str = "
-    WHERE ($1::TEXT IS NULL OR category = $1)
-      AND ($2::TEXT IS NULL OR action = $2)
-      AND ($3::TEXT IS NULL OR outcome = $3)
-      AND ($4::TEXT IS NULL OR actor_id = $4)
-      AND ($5::TEXT IS NULL OR resource_type = $5)
-      AND ($6::TEXT IS NULL OR resource_id = $6)
-      AND ($7::TIMESTAMPTZ IS NULL OR occurred_at >= $7)
-      AND ($8::TIMESTAMPTZ IS NULL OR occurred_at <= $8)
-      AND ($9::TEXT IS NULL OR action ILIKE '%' || $9 || '%'
-           OR COALESCE(actor_name, '') ILIKE '%' || $9 || '%'
-           OR COALESCE(resource_id, '') ILIKE '%' || $9 || '%')
-      AND ($10::UUID IS NULL OR request_id = $10)";
-
 fn is_admin(user: &UserBaseI) -> bool {
     user.role == 1
+}
+
+fn audit_filter(query: &AuditQuery) -> (String, Vec<&(dyn ToSql + Sync)>) {
+    let mut conditions = Vec::new();
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    macro_rules! push_filter {
+        ($value:expr, $predicate:expr) => {
+            if let Some(value) = $value.as_ref() {
+                params.push(value);
+                conditions.push(format!($predicate, params.len()));
+            }
+        };
+    }
+    push_filter!(query.category, "category = ${}");
+    push_filter!(query.action, "action = ${}");
+    push_filter!(query.outcome, "outcome = ${}");
+    push_filter!(query.actor_id, "actor_id = ${}");
+    push_filter!(query.resource_type, "resource_type = ${}");
+    push_filter!(query.resource_id, "resource_id = ${}");
+    push_filter!(query.start, "occurred_at >= ${}");
+    push_filter!(query.end, "occurred_at <= ${}");
+    if let Some(value) = query.keyword.as_ref() {
+        params.push(value);
+        let index = params.len();
+        conditions.push(format!(
+            "(action ILIKE '%' || ${index} || '%' \
+             OR COALESCE(actor_name, '') ILIKE '%' || ${index} || '%' \
+             OR COALESCE(resource_id, '') ILIKE '%' || ${index} || '%')"
+        ));
+    }
+    push_filter!(query.request_id, "request_id = ${}");
+    let sql = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    (sql, params)
 }
 
 fn pagination(page: Option<i64>, page_size: Option<i64>) -> (i64, i64) {
@@ -124,20 +148,9 @@ pub(crate) async fn list_audit_events(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let filter_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-        &query.category,
-        &query.action,
-        &query.outcome,
-        &query.actor_id,
-        &query.resource_type,
-        &query.resource_id,
-        &query.start,
-        &query.end,
-        &query.keyword,
-        &query.request_id,
-    ];
-    let count_sql = format!("SELECT COUNT(*) FROM audit_event {FILTER_SQL}");
-    let total: i64 = match client.query_one(&count_sql, filter_params).await {
+    let (filter_sql, filter_params) = audit_filter(&query);
+    let count_sql = format!("SELECT COUNT(*) FROM audit_event{filter_sql}");
+    let total: i64 = match client.query_one(&count_sql, &filter_params).await {
         Ok(row) => row.get(0),
         Err(error_value) => {
             error_logs(&req, "AuditQueryError", &error_value.to_string());
@@ -148,9 +161,12 @@ pub(crate) async fn list_audit_events(
         "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
          actor_name, resource_type, resource_id, request_id, source_ip, user_agent, \
          http_method, request_path, response_status, reason_code, changes, metadata \
-         FROM audit_event {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $11 OFFSET $12"
+         FROM audit_event{filter_sql} ORDER BY occurred_at DESC, id DESC \
+         LIMIT ${} OFFSET ${}",
+        filter_params.len() + 1,
+        filter_params.len() + 2,
     );
-    let mut params = filter_params.to_vec();
+    let mut params = filter_params;
     params.push(&page_size);
     params.push(&offset);
     let rows = match client.query(&list_sql, &params).await {
@@ -238,25 +254,14 @@ pub(crate) async fn export_audit_events(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-        &query.category,
-        &query.action,
-        &query.outcome,
-        &query.actor_id,
-        &query.resource_type,
-        &query.resource_id,
-        &query.start,
-        &query.end,
-        &query.keyword,
-        &query.request_id,
-    ];
+    let (filter_sql, params) = audit_filter(&query);
     let sql = format!(
         "SELECT event_id, occurred_at, category, action, outcome, severity, actor_type, actor_id, \
          actor_name, resource_type, resource_id, request_id, source_ip, \
          user_agent, http_method, request_path, response_status, reason_code, changes, metadata \
-         FROM audit_event {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT 10000"
+         FROM audit_event{filter_sql} ORDER BY occurred_at DESC, id DESC LIMIT 10000"
     );
-    let rows = match client.query(&sql, params).await {
+    let rows = match client.query(&sql, &params).await {
         Ok(rows) => rows,
         Err(error_value) => {
             error_logs(&req, "AuditExportError", &error_value.to_string());
@@ -328,7 +333,46 @@ pub(crate) async fn export_audit_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{AUDIT_EXPORT_HEADER, csv_cell, pagination};
+    use super::{AUDIT_EXPORT_HEADER, AuditQuery, audit_filter, csv_cell, pagination};
+    use uuid::Uuid;
+
+    fn query() -> AuditQuery {
+        AuditQuery {
+            category: None,
+            action: None,
+            outcome: None,
+            actor_id: None,
+            resource_type: None,
+            resource_id: None,
+            keyword: None,
+            request_id: None,
+            start: None,
+            end: None,
+            page: None,
+            page_size: None,
+        }
+    }
+
+    #[test]
+    fn audit_filter_omits_absent_predicates() {
+        let value = query();
+        let (sql, params) = audit_filter(&value);
+        assert!(sql.is_empty());
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn audit_filter_reuses_keyword_parameter_and_numbers_following_filter() {
+        let mut value = query();
+        value.category = Some("task".to_owned());
+        value.keyword = Some("scanner".to_owned());
+        value.request_id = Some(Uuid::nil());
+        let (sql, params) = audit_filter(&value);
+        assert!(sql.contains("category = $1"));
+        assert_eq!(sql.matches("$2").count(), 3);
+        assert!(sql.contains("request_id = $3"));
+        assert_eq!(params.len(), 3);
+    }
 
     #[test]
     fn pagination_bounds_are_stable() {
