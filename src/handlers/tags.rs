@@ -10,6 +10,7 @@ use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, patch, post, 
 use deadpool_postgres::{Pool, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio_postgres::types::ToSql;
 
 const MAX_TAGS_PER_IP: i64 = 20;
 
@@ -91,6 +92,33 @@ pub(crate) struct AssignTagRequest {
 #[derive(Deserialize)]
 pub(crate) struct RemoveTagQuery {
     ip: String,
+}
+
+fn tag_list_filter<'a>(
+    category_id: &'a Option<i64>,
+    kind: &'a Option<String>,
+    search: &'a Option<String>,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut conditions = vec!["tag.is_active".to_owned(), "category.is_active".to_owned()];
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+
+    if let Some(category_id) = category_id.as_ref() {
+        params.push(category_id);
+        conditions.push(format!("category.id = ${}", params.len()));
+    }
+    if let Some(kind) = kind.as_ref() {
+        params.push(kind);
+        conditions.push(format!("tag.kind = ${}", params.len()));
+    }
+    if let Some(search) = search.as_ref() {
+        params.push(search);
+        let index = params.len();
+        conditions.push(format!(
+            "(tag.name ILIKE ${index} OR COALESCE(tag.description, '') ILIKE ${index})"
+        ));
+    }
+
+    (conditions.join(" AND "), params)
 }
 
 struct ValidatedTag {
@@ -679,8 +707,12 @@ pub(crate) async fn list_tags(
         .kind
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if kind.is_some_and(|value| !matches!(value, "info" | "malicious" | "benign")) {
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if kind
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "info" | "malicious" | "benign"))
+    {
         return HttpResponse::BadRequest()
             .json(json!({"success": false, "message": "标签类型无效"}));
     }
@@ -694,23 +726,18 @@ pub(crate) async fn list_tags(
         Ok(value) => value,
         Err(error_value) => return database_error(&req, "ListTagsPoolError", &error_value),
     };
-    let rows = match connection
-        .query(
-            "SELECT tag.id, tag.name, tag.kind, tag.description, category.id AS category_id, \
-                    category.name AS category_name, COUNT(assignment.tag_id)::BIGINT AS assignment_count \
-             FROM asset_tag tag JOIN asset_tag_category category ON category.id = tag.category_id \
-             LEFT JOIN asset_ip_tag assignment ON assignment.tag_id = tag.id \
-             WHERE tag.is_active AND category.is_active \
-               AND ($1::BIGINT IS NULL OR category.id = $1) \
-               AND ($2::TEXT IS NULL OR tag.kind = $2) \
-               AND ($3::TEXT IS NULL OR tag.name ILIKE $3 OR COALESCE(tag.description, '') ILIKE $3) \
-             GROUP BY tag.id, tag.name, tag.kind, tag.description, category.id, category.name, category.sort_order \
-             ORDER BY category.sort_order, LOWER(category.name), \
-                      CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id;",
-            &[&query.category_id, &kind, &search],
-        )
-        .await
-    {
+    let (filter_sql, params) = tag_list_filter(&query.category_id, &kind, &search);
+    let sql = format!(
+        "SELECT tag.id, tag.name, tag.kind, tag.description, category.id AS category_id, \
+                category.name AS category_name, COUNT(assignment.tag_id)::BIGINT AS assignment_count \
+         FROM asset_tag tag JOIN asset_tag_category category ON category.id = tag.category_id \
+         LEFT JOIN asset_ip_tag assignment ON assignment.tag_id = tag.id \
+         WHERE {filter_sql} \
+         GROUP BY tag.id, tag.name, tag.kind, tag.description, category.id, category.name, category.sort_order \
+         ORDER BY category.sort_order, LOWER(category.name), \
+                  CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id;"
+    );
+    let rows = match connection.query(&sql, &params).await {
         Ok(value) => value,
         Err(error_value) => return database_error(&req, "ListTagsQueryError", &error_value),
     };
@@ -1392,7 +1419,9 @@ async fn refresh_elasticsearch_tag_ips(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_ip, tags_from_json, validate_tag, validate_tag_category};
+    use super::{
+        normalize_ip, tag_list_filter, tags_from_json, validate_tag, validate_tag_category,
+    };
     use serde_json::json;
 
     #[test]
@@ -1432,5 +1461,27 @@ mod tests {
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].kind, "benign");
         assert_eq!(tags[0].category_name.as_deref(), Some("处置状态"));
+    }
+
+    #[test]
+    fn tag_list_filter_omits_absent_options() {
+        let (sql, params) = tag_list_filter(&None, &None, &None);
+        assert_eq!(sql, "tag.is_active AND category.is_active");
+        assert!(params.is_empty());
+        assert!(!sql.contains("IS NULL OR"));
+    }
+
+    #[test]
+    fn tag_list_filter_numbers_present_options_only() {
+        let category_id = Some(3);
+        let kind = Some("malicious".to_owned());
+        let search = Some("%edge%".to_owned());
+        let (sql, params) = tag_list_filter(&category_id, &kind, &search);
+
+        assert_eq!(params.len(), 3);
+        assert!(sql.contains("category.id = $1"));
+        assert!(sql.contains("tag.kind = $2"));
+        assert!(sql.contains("tag.name ILIKE $3"));
+        assert!(sql.contains("tag.description, '') ILIKE $3"));
     }
 }

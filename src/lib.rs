@@ -2545,6 +2545,121 @@ pub struct TaskListPage {
     pub has_more: bool,
 }
 
+fn task_list_filter<'a>(
+    filters: &'a TaskListFilters,
+    owner_id: &'a Option<i32>,
+    include_cursor: bool,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut conditions = Vec::new();
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+
+    if let Some(owner_id) = owner_id {
+        params.push(owner_id);
+        conditions.push(format!("t.user_id = ${}", params.len()));
+    }
+    if !filters.include_system {
+        conditions.push("t.task_source <> 'automatic'".to_owned());
+    }
+    if let Some(task_id) = filters.task_id.as_ref() {
+        params.push(task_id);
+        conditions.push(format!("t.task_id ILIKE '%' || ${} || '%'", params.len()));
+    }
+    if let Some(target) = filters.target.as_ref() {
+        params.push(target);
+        conditions.push(format!(
+            "EXISTS (SELECT 1 FROM unnest(t.task_target) AS targets(target) \
+             WHERE targets.target::TEXT ILIKE '%' || ${} || '%')",
+            params.len()
+        ));
+    }
+    if let Some(status) = filters.status.as_ref() {
+        params.push(status);
+        conditions.push(format!("t.task_status = ${}", params.len()));
+    }
+    if let Some(operator) = filters.operator.as_ref() {
+        params.push(operator);
+        conditions.push(format!(
+            "t.task_initiator ILIKE '%' || ${} || '%'",
+            params.len()
+        ));
+    }
+    if let Some(start_time) = filters.start_time.as_ref() {
+        params.push(start_time);
+        conditions.push(format!("t.task_create_time >= ${}", params.len()));
+    }
+    if let Some(end_time) = filters.end_time.as_ref() {
+        params.push(end_time);
+        conditions.push(format!("t.task_create_time <= ${}", params.len()));
+    }
+    if let Some(scanner_id) = filters.scanner_id.as_ref() {
+        params.push(scanner_id);
+        conditions.push(format!(
+            "COALESCE(t.assigned_scanner_id, '') ILIKE '%' || ${} || '%'",
+            params.len()
+        ));
+    }
+    if include_cursor && let Some(cursor) = filters.cursor.as_ref() {
+        params.push(cursor);
+        conditions.push(format!("t.id < ${}", params.len()));
+    }
+
+    let clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    (clause, params)
+}
+
+#[cfg(test)]
+mod task_list_filter_tests {
+    use super::{TaskListFilters, task_list_filter};
+
+    fn filters() -> TaskListFilters {
+        TaskListFilters {
+            cursor: None,
+            limit: 20,
+            include_system: true,
+            task_id: None,
+            target: None,
+            status: None,
+            operator: None,
+            start_time: None,
+            end_time: None,
+            scanner_id: None,
+        }
+    }
+
+    #[test]
+    fn administrator_without_filters_has_no_where_clause() {
+        let filters = filters();
+        let owner_id = None;
+        let (sql, params) = task_list_filter(&filters, &owner_id, false);
+        assert!(sql.is_empty());
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn user_filters_use_contiguous_parameters() {
+        let mut filters = filters();
+        filters.include_system = false;
+        filters.status = Some("running".to_owned());
+        filters.scanner_id = Some("scanner-a".to_owned());
+        filters.cursor = Some(100);
+        let owner_id = Some(7);
+
+        let (sql, params) = task_list_filter(&filters, &owner_id, true);
+
+        assert_eq!(params.len(), 4);
+        assert!(sql.contains("t.user_id = $1"));
+        assert!(sql.contains("t.task_source <> 'automatic'"));
+        assert!(sql.contains("t.task_status = $2"));
+        assert!(sql.contains("assigned_scanner_id, '') ILIKE '%' || $3 || '%'"));
+        assert!(sql.contains("t.id < $4"));
+        assert!(!sql.contains("OR"));
+    }
+}
+
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
 ///
 /// 接收多个参数，分别为
@@ -2676,66 +2791,27 @@ pub async fn get_filtered_task_page(
     }
     transaction.commit().await?;
 
-    let (role, user_id) = match permissions {
-        Permission::Administrator(id) => (1_i32, id),
-        Permission::Users(id) => (2_i32, id),
+    let owner_id = match permissions {
+        Permission::Administrator(_) => None,
+        Permission::Users(id) => Some(id),
     };
-    const FILTER_SQL: &str = "($1 = 1 OR t.user_id = $2) \
-        AND ($3::BOOLEAN OR t.task_source <> 'automatic') \
-        AND ($4::TEXT IS NULL OR t.task_id ILIKE '%' || $4 || '%') \
-        AND ($5::TEXT IS NULL OR EXISTS (\
-            SELECT 1 FROM unnest(t.task_target) AS targets(target) \
-            WHERE targets.target::TEXT ILIKE '%' || $5 || '%'\
-        )) \
-        AND ($6::TEXT IS NULL OR t.task_status = $6) \
-        AND ($7::TEXT IS NULL OR t.task_initiator ILIKE '%' || $7 || '%') \
-        AND ($8::BIGINT IS NULL OR t.task_create_time >= $8) \
-        AND ($9::BIGINT IS NULL OR t.task_create_time <= $9) \
-        AND ($10::TEXT IS NULL OR COALESCE(t.assigned_scanner_id, '') ILIKE '%' || $10 || '%')";
-    let count_sql = format!("SELECT COUNT(*)::BIGINT AS total FROM scan_task t WHERE {FILTER_SQL}");
-    let count_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-        &role,
-        &user_id,
-        &filters.include_system,
-        &filters.task_id,
-        &filters.target,
-        &filters.status,
-        &filters.operator,
-        &filters.start_time,
-        &filters.end_time,
-        &filters.scanner_id,
-    ];
+    let (count_filter, count_params) = task_list_filter(filters, &owner_id, false);
+    let count_sql = format!("SELECT COUNT(*)::BIGINT AS total FROM scan_task t{count_filter}");
     let total = connection
-        .query_one(&count_sql, count_params)
+        .query_one(&count_sql, &count_params)
         .await?
         .get("total");
 
     let page_size = filters.limit.clamp(1, 100);
     let fetch_limit = page_size + 1;
+    let (page_filter, mut page_params) = task_list_filter(filters, &owner_id, true);
+    page_params.push(&fetch_limit);
     let page_sql = format!(
-        "SELECT t.* FROM scan_task t WHERE {FILTER_SQL} \
-         AND ($11::INTEGER IS NULL OR t.id < $11) \
-         ORDER BY t.id DESC LIMIT $12"
+        "SELECT t.* FROM scan_task t{page_filter} \
+         ORDER BY t.id DESC LIMIT ${}",
+        page_params.len()
     );
-    let mut rows = connection
-        .query(
-            &page_sql,
-            &[
-                &role,
-                &user_id,
-                &filters.include_system,
-                &filters.task_id,
-                &filters.target,
-                &filters.status,
-                &filters.operator,
-                &filters.start_time,
-                &filters.end_time,
-                &filters.scanner_id,
-                &filters.cursor,
-                &fetch_limit,
-            ],
-        )
-        .await?;
+    let mut rows = connection.query(&page_sql, &page_params).await?;
     let has_more = rows.len() > page_size as usize;
     if has_more {
         rows.truncate(page_size as usize);

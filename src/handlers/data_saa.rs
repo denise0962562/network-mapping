@@ -4,6 +4,7 @@ use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use tokio_postgres::types::ToSql;
 use tracing::error;
 use uuid::Uuid;
 
@@ -46,6 +47,27 @@ struct AnalysisFilters {
     end_ms: i64,
     scanner_id: Option<String>,
     task_source: Option<String>,
+}
+
+fn push_analysis_scope<'a>(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<&'a (dyn ToSql + Sync)>,
+    owner_id: Option<&'a i32>,
+    scanner_id: &'a Option<String>,
+    task_source: &'a Option<String>,
+) {
+    if let Some(owner_id) = owner_id {
+        params.push(owner_id);
+        conditions.push(format!("t.user_id = ${}", params.len()));
+    }
+    if let Some(scanner_id) = scanner_id.as_ref() {
+        params.push(scanner_id);
+        conditions.push(format!("e.assigned_scanner_id = ${}", params.len()));
+    }
+    if let Some(task_source) = task_source.as_ref() {
+        params.push(task_source);
+        conditions.push(format!("t.task_source = ${}", params.len()));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +268,19 @@ pub(crate) async fn get_analysis_distribution(
         ),
         DistributionDimension::Port => ("s.port::TEXT", ""),
     };
+    let mut conditions = vec![
+        "s.observed_at >= $1".to_owned(),
+        "s.observed_at < $2".to_owned(),
+    ];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&filters.start_at, &filters.end_at];
+    push_analysis_scope(
+        &mut conditions,
+        &mut params,
+        (user.role != 1).then_some(&user.id),
+        &filters.scanner_id,
+        &filters.task_source,
+    );
+    params.push(&limit);
     let sql = format!(
         "WITH grouped AS (\
             SELECT {label_expression} AS label, \
@@ -253,31 +288,16 @@ pub(crate) async fn get_analysis_distribution(
             FROM scan_observation s \
             JOIN scan_task_execution e ON e.id = s.execution_id \
             JOIN scan_task t ON t.id = e.task_id \
-            WHERE s.observed_at >= $1 AND s.observed_at < $2 \
-              AND ($3 = 1 OR t.user_id = $4) \
-              AND ($5::TEXT IS NULL OR e.assigned_scanner_id = $5) \
-              AND ($6::TEXT IS NULL OR t.task_source = $6) \
+            WHERE {} \
               {additional_filter} \
             GROUP BY label\
         ) \
         SELECT label, endpoint_count, (SUM(endpoint_count) OVER ())::BIGINT AS total \
-        FROM grouped ORDER BY endpoint_count DESC, label LIMIT $7;"
+        FROM grouped ORDER BY endpoint_count DESC, label LIMIT ${};",
+        conditions.join(" AND "),
+        params.len()
     );
-    let rows = match client
-        .query(
-            &sql,
-            &[
-                &filters.start_at,
-                &filters.end_at,
-                &user.role,
-                &user.id,
-                &filters.scanner_id,
-                &filters.task_source,
-                &limit,
-            ],
-        )
-        .await
-    {
+    let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error_value) => {
             error_logs(
@@ -342,31 +362,31 @@ pub(crate) async fn get_analysis_discovery_heatmap(
         }
     };
 
-    let rows = match client
-        .query(
-            "SELECT to_char(\
+    let mut conditions = vec![
+        "i.create_time >= $1".to_owned(),
+        "i.create_time < $2".to_owned(),
+    ];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&filters.start_ms, &filters.end_ms];
+    push_analysis_scope(
+        &mut conditions,
+        &mut params,
+        (user.role != 1).then_some(&user.id),
+        &filters.scanner_id,
+        &filters.task_source,
+    );
+    let sql = format!(
+        "SELECT to_char(\
                  (to_timestamp(i.create_time / 1000.0) AT TIME ZONE 'Asia/Shanghai')::DATE,\
                  'YYYY-MM-DD'\
              ) AS day, COUNT(DISTINCT i.ip_address)::BIGINT AS discovered_count \
              FROM ips i \
              JOIN scan_task t ON t.id = i.task_id \
              JOIN scan_task_execution e ON e.id = i.execution_id \
-             WHERE i.create_time >= $1 AND i.create_time < $2 \
-               AND ($3 = 1 OR t.user_id = $4) \
-               AND ($5::TEXT IS NULL OR e.assigned_scanner_id = $5) \
-               AND ($6::TEXT IS NULL OR t.task_source = $6) \
+             WHERE {} \
              GROUP BY day ORDER BY day;",
-            &[
-                &filters.start_ms,
-                &filters.end_ms,
-                &user.role,
-                &user.id,
-                &filters.scanner_id,
-                &filters.task_source,
-            ],
-        )
-        .await
-    {
+        conditions.join(" AND ")
+    );
+    let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error_value) => {
             error_logs(&req, "AnalysisHeatmapQueryError", &error_value.to_string());
@@ -578,10 +598,12 @@ async fn analysis_heatmap_from_elasticsearch(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
+    use tokio_postgres::types::ToSql;
     use uuid::Uuid;
 
     use super::{
         AnalysisFilterQuery, DistributionDimension, MAX_RANGE_DAYS, normalize_filters, percentage,
+        push_analysis_scope,
     };
 
     fn query(start_offset_days: i64, task_source: Option<&str>) -> AnalysisFilterQuery {
@@ -629,5 +651,41 @@ mod tests {
     fn calculates_percentages_to_one_decimal_place() {
         assert_eq!(percentage(1, 3), 33.3);
         assert_eq!(percentage(0, 0), 0.0);
+    }
+
+    #[test]
+    fn postgres_scope_omits_absent_optional_conditions() {
+        let start = 1_i64;
+        let mut conditions = vec!["observed_at >= $1".to_owned()];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&start];
+
+        push_analysis_scope(&mut conditions, &mut params, None, &None, &None);
+
+        assert_eq!(conditions, ["observed_at >= $1"]);
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn postgres_scope_numbers_present_conditions_only() {
+        let start = 1_i64;
+        let owner_id = 7;
+        let scanner_id = Some("scanner-a".to_owned());
+        let task_source = Some("manual".to_owned());
+        let mut conditions = vec!["observed_at >= $1".to_owned()];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&start];
+
+        push_analysis_scope(
+            &mut conditions,
+            &mut params,
+            Some(&owner_id),
+            &scanner_id,
+            &task_source,
+        );
+
+        assert_eq!(params.len(), 4);
+        assert_eq!(conditions[1], "t.user_id = $2");
+        assert_eq!(conditions[2], "e.assigned_scanner_id = $3");
+        assert_eq!(conditions[3], "t.task_source = $4");
+        assert!(conditions.iter().all(|condition| !condition.contains("OR")));
     }
 }
