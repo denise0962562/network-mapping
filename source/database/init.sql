@@ -1027,6 +1027,29 @@ CREATE TABLE IF NOT EXISTS setting (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_item_type_key ON setting (item_type, key);
 
+-- 可在线发布的服务运行策略。setting 保留给旧的简单键值配置；这里以完整 JSON
+-- 文档、revision 与不可变历史确保校验、审计和并发更新可以原子完成。
+CREATE TABLE IF NOT EXISTS runtime_configuration (
+	namespace TEXT PRIMARY KEY,
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+	schema_version INT NOT NULL DEFAULT 1 CHECK (schema_version > 0),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_by_user_id INT REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS runtime_configuration_revision (
+	id BIGSERIAL PRIMARY KEY,
+	namespace TEXT NOT NULL,
+	revision BIGINT NOT NULL CHECK (revision > 0),
+	schema_version INT NOT NULL CHECK (schema_version > 0),
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	changed_by_user_id INT REFERENCES users(id),
+	change_reason TEXT NOT NULL DEFAULT '',
+	UNIQUE(namespace, revision)
+);
+
 INSERT INTO setting (item_type, key, value)
 VALUES ('security', 'session_ttl_seconds', '2700')
 ON CONFLICT (item_type, key) DO NOTHING;

@@ -16,6 +16,13 @@ use crate::config::{
     DatabaseConfig, EmailConfig, GetConfig, MailSettingsRequest, MailTestRequest,
     ScanSettingsRequest, ServerConfig, SessionSettingsRequest, session_ttl_seconds_from_minutes,
 };
+use crate::monitor::MonitorHandle;
+use crate::runtime_config::{
+    ANALYTICS_SNAPSHOT_NAMESPACE, AUTOMATIC_TARGET_NAMESPACE, DNS_FOLLOW_UP_NAMESPACE,
+    MONITOR_NAMESPACE, PersistError, REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings,
+    UpdateRuntimeConfigRequest, parse_analytics_snapshot, parse_automatic_target,
+    parse_dns_follow_up, parse_monitor, parse_requests, persist,
+};
 use crate::trusted_proxy::{
     MAX_CLIENT_IP_HEADER_LENGTH, MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState,
     validate_settings, write_settings_to_database,
@@ -94,6 +101,122 @@ pub async fn get_server_config_h(
             "port": server_config.port
         }
     }))
+}
+
+#[get("/api/config/runtime/{namespace}")]
+async fn get_runtime_config_h(
+    namespace: web::Path<String>,
+    settings: web::Data<RuntimeSettings>,
+    user: UserBaseI,
+) -> impl Responder {
+    if user.role != 1 {
+        return HttpResponse::Forbidden()
+            .json(json!({"success": false, "message": "仅管理员可以读取运行时配置"}));
+    }
+    match namespace.as_str() {
+        REQUESTS_NAMESPACE => {
+            let value = settings.requests.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: REQUESTS_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        MONITOR_NAMESPACE => {
+            let value = settings.monitor.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: MONITOR_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        AUTOMATIC_TARGET_NAMESPACE => {
+            let value = settings.automatic_target.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: AUTOMATIC_TARGET_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        DNS_FOLLOW_UP_NAMESPACE => {
+            let value = settings.dns_follow_up.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: DNS_FOLLOW_UP_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        ANALYTICS_SNAPSHOT_NAMESPACE => {
+            let value = settings.analytics_snapshot.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: ANALYTICS_SNAPSHOT_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        _ => {
+            HttpResponse::NotFound().json(json!({"success": false, "message": "未知运行时配置域"}))
+        }
+    }
+}
+
+#[post("/api/config/runtime/{namespace}")]
+async fn save_runtime_config_h(
+    req: HttpRequest,
+    namespace: web::Path<String>,
+    body: web::Json<UpdateRuntimeConfigRequest>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    settings: web::Data<RuntimeSettings>,
+    monitor: web::Data<MonitorHandle>,
+    user: UserBaseI,
+) -> impl Responder {
+    if user.role != 1 {
+        return HttpResponse::Forbidden()
+            .json(json!({"success": false, "message": "仅管理员可以修改运行时配置"}));
+    }
+    if body.expected_revision < 1
+        || body.change_reason.len() > 500
+        || body.change_reason.chars().any(char::is_control)
+    {
+        return HttpResponse::BadRequest()
+            .json(json!({"success": false, "message": "配置版本或变更原因无效"}));
+    }
+
+    macro_rules! publish {
+        ($namespace:expr, $parse:ident, $target:ident, $after:expr) => {{
+            let value = match $parse(body.document.clone()) {
+                Ok(value) => value,
+                Err(message) => return HttpResponse::BadRequest().json(json!({"success": false, "message": message})),
+            };
+            let revision = match persist(pool.get_ref(), $namespace, body.expected_revision, &value, &body.change_reason, user.id).await {
+                Ok(revision) => revision,
+                Err(PersistError::Conflict) => return HttpResponse::Conflict().json(json!({"success": false, "message": "配置已被其他管理员更新，请重新加载后再保存"})),
+                Err(error) => {
+                    error!(event = "SaveRuntimeConfigError", namespace = $namespace, message = %error);
+                    return HttpResponse::InternalServerError().json(json!({"success": false, "message": "保存运行时配置失败"}));
+                }
+            };
+            settings.$target.replace(value.clone(), revision).await;
+            $after(&value);
+            let mut event = AuditEvent::user("configuration", "runtime_config_update", "success", &user)
+                .resource("setting", $namespace);
+            event.response_status = Some(200);
+            event.metadata = json!({"namespace": $namespace, "revision": revision, "change_reason": body.change_reason});
+            write_standalone(pool.get_ref(), &AuditContext::from_request(&req), &event).await;
+            return HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: $namespace, revision, document: value }}));
+        }};
+    }
+
+    match namespace.as_str() {
+        REQUESTS_NAMESPACE => publish!(REQUESTS_NAMESPACE, parse_requests, requests, |_| {}),
+        MONITOR_NAMESPACE => publish!(
+            MONITOR_NAMESPACE,
+            parse_monitor,
+            monitor,
+            |value: &crate::config::MonitorConfig| monitor.replace_config(value.clone())
+        ),
+        AUTOMATIC_TARGET_NAMESPACE => publish!(
+            AUTOMATIC_TARGET_NAMESPACE,
+            parse_automatic_target,
+            automatic_target,
+            |_| {}
+        ),
+        DNS_FOLLOW_UP_NAMESPACE => publish!(
+            DNS_FOLLOW_UP_NAMESPACE,
+            parse_dns_follow_up,
+            dns_follow_up,
+            |_| {}
+        ),
+        ANALYTICS_SNAPSHOT_NAMESPACE => publish!(
+            ANALYTICS_SNAPSHOT_NAMESPACE,
+            parse_analytics_snapshot,
+            analytics_snapshot,
+            |_| {}
+        ),
+        _ => {
+            HttpResponse::NotFound().json(json!({"success": false, "message": "未知运行时配置域"}))
+        }
+    }
 }
 
 /// 用于启动加载 RIR 数据

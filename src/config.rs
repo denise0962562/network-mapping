@@ -133,7 +133,7 @@ impl AnalyticsSnapshotMode {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AnalyticsSnapshotConfig {
     pub mode: AnalyticsSnapshotMode,
@@ -589,7 +589,7 @@ impl SelfChecking for SecurityConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
 pub struct RequestsConfig {
     /// 是否采集请求日志（`request_log`）。
@@ -627,7 +627,7 @@ impl SelfChecking for RequestsConfig {
 ///
 /// 慢请求与 5xx 错误由请求中间件实时判定，慢 SQL 由后台任务轮询
 /// `pg_stat_statements` 视图判定，三者统一走邮件通知并共享同一冷却去重窗口。
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
 pub struct MonitorConfig {
     /// 是否启用健康监控与告警。
@@ -858,7 +858,7 @@ impl MaxMindConfig {
 
 pub const DEFAULT_COMMON_SCAN_PORTS: &str = "21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5432,5900,6379,8080,8443,9200,11211,27017";
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
 pub struct AutomaticTargetConfig {
     pub enabled: bool,
@@ -1663,6 +1663,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
         .service(utils::get_server_config_h)
+        .service(utils::get_runtime_config_h)
+        .service(utils::save_runtime_config_h)
         .service(utils::get_mail_settings_h)
         .service(utils::save_mail_settings_h)
         .service(utils::get_session_settings_h)

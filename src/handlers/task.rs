@@ -6,6 +6,7 @@ use crate::dns_follow_up::DnsFollowUpConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
+use crate::runtime_config::RuntimeConfig;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
 use crate::system_maintenance::{
     MaintenanceSnapshot, SystemMaintenanceState, maintenance_response,
@@ -1683,7 +1684,7 @@ async fn create_task(
 async fn create_dns_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
-    dns_follow_up: web::Data<DnsFollowUpConfig>,
+    dns_follow_up: web::Data<RuntimeConfig<DnsFollowUpConfig>>,
     input: web::Json<CreateDnsTask>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -1728,7 +1729,7 @@ async fn create_dns_task(
             .json(json!({"success": false, "message": "invalid DNS scan profile"}));
     }
     if input.follow_up_port_scan {
-        if !dns_follow_up.enabled {
+        if !dns_follow_up.get().await.value.enabled {
             return HttpResponse::Conflict().json(json!({
                 "success": false,
                 "message": "DNS 解析后自动创建端口任务未启用"
@@ -1971,7 +1972,7 @@ async fn upload_scanner_result_handler(
     pool: web::Data<Pool>,
     maxmind: web::Data<MaxMindState>,
     elasticsearch: web::Data<crate::elasticsearch::ElasticsearchService>,
-    dns_follow_up: web::Data<DnsFollowUpConfig>,
+    dns_follow_up: web::Data<RuntimeConfig<DnsFollowUpConfig>>,
     security: web::Data<SecurityConfig>,
     maintenance: web::Data<SystemMaintenanceState>,
     upload_data: web::Json<ScannerResultUpload>,
@@ -2000,11 +2001,12 @@ async fn upload_scanner_result_handler(
         return response;
     }
 
+    let dns_follow_up = dns_follow_up.get().await.value;
     match save_scanner_results(
         pool.get_ref(),
         maxmind.get_ref(),
         elasticsearch.get_ref(),
-        dns_follow_up.get_ref(),
+        &dns_follow_up,
         &upload_data,
         token,
         &security.scanner_token_pepper,

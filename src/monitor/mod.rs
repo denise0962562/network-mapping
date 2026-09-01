@@ -11,7 +11,7 @@ mod slow_sql;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use deadpool_postgres::Pool;
@@ -297,22 +297,15 @@ fn request_details(
 #[derive(Clone)]
 pub struct MonitorHandle {
     tx: mpsc::Sender<HealthEvent>,
-    slow_request_threshold_ms: i64,
-    server_error_enabled: bool,
-    elasticsearch_query_warning_threshold_ms: i64,
-    elasticsearch_query_critical_threshold_ms: i64,
-    elasticsearch_write_warning_threshold_ms: i64,
-    elasticsearch_write_critical_threshold_ms: i64,
+    config: Arc<RwLock<MonitorConfig>>,
     dropped_events: Arc<AtomicU64>,
 }
 
 impl MonitorHandle {
-    /// 启动后台通知与慢 SQL 轮询任务；`enabled = false` 时返回 `None` 且不启动任何任务。
-    pub fn new(config: &MonitorConfig, pool: Pool, encryption_key: String) -> Option<Self> {
-        if !config.enabled {
-            return None;
-        }
+    /// 启动后台通知与慢 SQL 轮询任务。开关由运行时快照控制，关闭时 worker 保持空闲。
+    pub fn new(config: MonitorConfig, pool: Pool, encryption_key: String) -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let config = Arc::new(RwLock::new(config));
         tokio::spawn(run_notifier(
             rx,
             pool.clone(),
@@ -321,30 +314,43 @@ impl MonitorHandle {
         ));
         tokio::spawn(slow_sql::run_monitor(pool, tx.clone(), config.clone()));
         info!(target: "server::startup", component = "monitor", "健康监控任务已启动");
-        Some(Self {
+        Self {
             tx,
-            slow_request_threshold_ms: config.slow_request_threshold_ms,
-            server_error_enabled: config.server_error_enabled,
-            elasticsearch_query_warning_threshold_ms: config
-                .elasticsearch_query_warning_threshold_ms,
-            elasticsearch_query_critical_threshold_ms: config
-                .elasticsearch_query_critical_threshold_ms,
-            elasticsearch_write_warning_threshold_ms: config
-                .elasticsearch_write_warning_threshold_ms,
-            elasticsearch_write_critical_threshold_ms: config
-                .elasticsearch_write_critical_threshold_ms,
+            config,
             dropped_events: Arc::new(AtomicU64::new(0)),
-        })
+        }
+    }
+
+    pub fn replace_config(&self, config: MonitorConfig) {
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .enabled
     }
 
     /// 该耗时是否达到慢请求阈值。
     pub fn is_slow_request(&self, duration_ms: i64) -> bool {
-        duration_ms >= self.slow_request_threshold_ms
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        config.enabled && duration_ms >= config.slow_request_threshold_ms
     }
 
     /// 是否启用 5xx 服务端错误告警。
     pub fn server_error_enabled(&self) -> bool {
-        self.server_error_enabled
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        config.enabled && config.server_error_enabled
     }
 
     /// 非阻塞投递一条告警事件；channel 满时直接丢弃，绝不阻塞请求路径。
@@ -365,14 +371,21 @@ impl MonitorHandle {
         if observation.kind == ElasticsearchOperationKind::Maintenance {
             return;
         }
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !config.enabled {
+            return;
+        }
         let (warning_threshold, critical_threshold) = match observation.kind {
             ElasticsearchOperationKind::Query => (
-                self.elasticsearch_query_warning_threshold_ms,
-                self.elasticsearch_query_critical_threshold_ms,
+                config.elasticsearch_query_warning_threshold_ms,
+                config.elasticsearch_query_critical_threshold_ms,
             ),
             ElasticsearchOperationKind::Write => (
-                self.elasticsearch_write_warning_threshold_ms,
-                self.elasticsearch_write_critical_threshold_ms,
+                config.elasticsearch_write_warning_threshold_ms,
+                config.elasticsearch_write_critical_threshold_ms,
             ),
             ElasticsearchOperationKind::Maintenance => return,
         };
@@ -437,12 +450,19 @@ async fn run_notifier(
     mut rx: mpsc::Receiver<HealthEvent>,
     pool: Pool,
     encryption_key: String,
-    config: MonitorConfig,
+    config: Arc<RwLock<MonitorConfig>>,
 ) {
-    let cooldown = Duration::from_secs(config.alert_cooldown_seconds);
     let last_alert = Mutex::new(HashMap::<String, Instant>::new());
 
     while let Some(event) = rx.recv().await {
+        let settings = config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if !settings.enabled {
+            continue;
+        }
+        let cooldown = Duration::from_secs(settings.alert_cooldown_seconds);
         {
             let mut last = last_alert
                 .lock()
@@ -487,6 +507,7 @@ async fn run_notifier(
 #[cfg(test)]
 mod tests {
     use super::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
+    use crate::config::MonitorConfig;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -498,12 +519,7 @@ mod tests {
         (
             MonitorHandle {
                 tx,
-                slow_request_threshold_ms: 3_000,
-                server_error_enabled: true,
-                elasticsearch_query_warning_threshold_ms: 1_000,
-                elasticsearch_query_critical_threshold_ms: 3_000,
-                elasticsearch_write_warning_threshold_ms: 5_000,
-                elasticsearch_write_critical_threshold_ms: 15_000,
+                config: Arc::new(std::sync::RwLock::new(MonitorConfig::default())),
                 dropped_events: Arc::new(AtomicU64::new(0)),
             },
             rx,

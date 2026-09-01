@@ -14,7 +14,9 @@ use tokio_postgres::types::ToSql;
 use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::config::RequestsConfig;
 use crate::logs::write::error_chain_diagnostics;
+use crate::runtime_config::RuntimeConfig;
 
 /// 操作者槽位：由最外层 `wrap_fn` 预置，内层 `AuthMiddleware` 鉴权成功后写入，
 /// 最外层响应后再读取，用于把 `actor_id` / `actor_name` 写进请求日志。
@@ -190,11 +192,33 @@ async fn insert_batch(
 }
 
 /// 分批删除超过 `retention_days` 的请求日志，避免长事务锁表。
-pub async fn run_retention(pool: Pool, retention_days: i32) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+pub async fn run_retention(pool: Pool, config: RuntimeConfig<RequestsConfig>) {
+    // 小间隔检查配置，实际清理仍最多每天执行一次。这样保存保留期后无需重启。
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_run = None;
+    let mut applied_revision = 0;
+    let mut changes = config.subscribe();
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            changed = changes.changed() => if changed.is_err() { return; }
+        }
+        let settings = config.get().await;
+        if settings.revision != applied_revision {
+            applied_revision = settings.revision;
+            last_run = None;
+        }
+        let settings = settings.value;
+        if !settings.enabled
+            || last_run.is_some_and(|at: std::time::Instant| {
+                at.elapsed() < Duration::from_secs(24 * 60 * 60)
+            })
+        {
+            continue;
+        }
+        last_run = Some(std::time::Instant::now());
+        let retention_days = settings.retention_days;
         match purge_expired(&pool, retention_days).await {
             Ok(purged) => {
                 if purged > 0 {

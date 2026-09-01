@@ -12,6 +12,7 @@ use crate::admin::get_default_scan_profile_from_database;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::build_scan_plan;
 use crate::config::AutomaticTargetConfig;
+use crate::runtime_config::RuntimeConfig;
 
 const STRATEGY: &str = "sequential_subnet";
 const SYSTEM_REQUEST_PATH: &str = "system://automatic-target-generator";
@@ -96,8 +97,14 @@ pub struct AutomaticTargetStatus {
 }
 
 impl AutomaticTargetService {
-    pub fn new(policy: AutomaticTargetConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        policy.validate()?;
+    pub fn new(
+        policy: AutomaticTargetConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        policy
+            .validate()
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                error.to_string().into()
+            })?;
         let ipv4_pools = policy
             .authorized_cidrs
             .iter()
@@ -426,16 +433,31 @@ impl AutomaticTargetService {
     }
 }
 
-pub async fn run_generator(service: AutomaticTargetService, pool: Pool) {
-    if !service.enabled() {
-        info!(target: "server::startup", "自动目标生成未启用");
-        return;
-    }
-    let mut ticker =
-        tokio::time::interval(std::time::Duration::from_secs(service.interval_seconds()));
+pub async fn run_generator(config: RuntimeConfig<AutomaticTargetConfig>, pool: Pool) {
     let mut previous_scanner_available = None;
+    let mut changes = config.subscribe();
     loop {
-        ticker.tick().await;
+        let settings = config.get().await.value;
+        let service = match AutomaticTargetService::new(settings) {
+            Ok(service) => service,
+            Err(error) => {
+                let error = error.to_string();
+                error!(target: "server::automatic_target", event = "AutomaticTargetConfigurationError", message = %error);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    changed = changes.changed() => if changed.is_err() { return; }
+                }
+                continue;
+            }
+        };
+        if !service.enabled() {
+            previous_scanner_available = None;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                changed = changes.changed() => if changed.is_err() { return; }
+            }
+            continue;
+        }
         match service.refill(&pool).await {
             Ok(report) => {
                 if previous_scanner_available == Some(false) && report.scanner_available {
@@ -466,9 +488,14 @@ pub async fn run_generator(service: AutomaticTargetService, pool: Pool) {
                 }
             }
             Err(error_value) => {
-                service.record_error(&pool, &error_value.to_string()).await;
+                let error_value = error_value.to_string();
+                service.record_error(&pool, &error_value).await;
                 error!(target: "server::automatic_target", event = "AutomaticTargetRefillError", message = %error_value);
             }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(service.interval_seconds())) => {}
+            changed = changes.changed() => if changed.is_err() { return; }
         }
     }
 }
@@ -476,12 +503,19 @@ pub async fn run_generator(service: AutomaticTargetService, pool: Pool) {
 #[get("/api/automatic-target/status")]
 pub async fn automatic_target_status(
     pool: web::Data<Pool>,
-    service: web::Data<AutomaticTargetService>,
+    config: web::Data<RuntimeConfig<AutomaticTargetConfig>>,
     user: crate::admin::UserBaseI,
 ) -> impl Responder {
     if user.role != 1 {
         return HttpResponse::Forbidden().finish();
     }
+    let service = match AutomaticTargetService::new(config.get().await.value) {
+        Ok(service) => service,
+        Err(error_value) => {
+            error!(event = "AutomaticTargetStatusConfigurationError", message = %error_value);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
     match service.status(pool.get_ref()).await {
         Ok(status) => HttpResponse::Ok().json(json!({"success": true, "data": status})),
         Err(error_value) => {

@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
 use deadpool_postgres::Pool;
 use serde_json::{Value, json};
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use tracing::{info, warn};
 
 use crate::config::AnalyticsSnapshotConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
+use crate::runtime_config::RuntimeConfig;
 
 const WORKER_LOCK_KEY: i64 = 0x4e4d_4153_4e50_0001;
 const MAX_EXECUTIONS_PER_TICK: usize = 100;
@@ -37,17 +38,20 @@ struct ExecutionFacts {
 /// Starts the worker only in `shadow` or `snapshot` mode. Realtime is deliberately the default
 /// for an upgraded installation, preventing a switch to empty statistics before backfill.
 pub async fn run_worker(
-    config: AnalyticsSnapshotConfig,
+    config: RuntimeConfig<AnalyticsSnapshotConfig>,
     pool: Pool,
     elasticsearch: ElasticsearchService,
 ) {
-    if !config.mode.runs_worker() {
-        return;
-    }
-
-    let mut ticker = interval(Duration::from_secs(config.interval_minutes * 60));
+    let mut changes = config.subscribe();
     loop {
-        ticker.tick().await;
+        let settings = config.get().await.value;
+        if !settings.mode.runs_worker() {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                changed = changes.changed() => if changed.is_err() { return; }
+            }
+            continue;
+        }
         for _ in 0..MAX_EXECUTIONS_PER_TICK {
             match process_one(&pool, &elasticsearch).await {
                 Ok(true) => {}
@@ -58,6 +62,10 @@ pub async fn run_worker(
                     // independent work so one legacy/corrupt execution cannot block upgrades.
                 }
             }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(settings.interval_minutes * 60)) => {}
+            changed = changes.changed() => if changed.is_err() { return; }
         }
     }
 }

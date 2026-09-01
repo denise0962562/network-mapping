@@ -13,6 +13,7 @@ use crate::admin::UserBaseI;
 use crate::config::AnalyticsSnapshotConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::error_logs;
+use crate::runtime_config::RuntimeConfig;
 use crate::{SystemDetails, SystemStatusJson, Systems, get_system_status_info};
 
 const ANALYSIS_TIMEZONE: &str = "Asia/Shanghai";
@@ -227,7 +228,7 @@ pub(crate) async fn get_analysis_distribution(
     query: web::Query<DistributionQuery>,
     pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
-    analytics_snapshot: web::Data<AnalyticsSnapshotConfig>,
+    analytics_snapshot: web::Data<RuntimeConfig<AnalyticsSnapshotConfig>>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
@@ -242,7 +243,7 @@ pub(crate) async fn get_analysis_distribution(
     if !matches!(limit, 5 | 7 | 10) {
         return bad_request("limit must be 5, 7 or 10");
     }
-    if analytics_snapshot.mode.reads_snapshot() {
+    if analytics_snapshot.get().await.value.mode.reads_snapshot() {
         return analysis_distribution_from_snapshot(
             &req,
             pool.get_ref(),
@@ -360,14 +361,14 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     query: web::Query<HeatmapQuery>,
     pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
-    analytics_snapshot: web::Data<AnalyticsSnapshotConfig>,
+    analytics_snapshot: web::Data<RuntimeConfig<AnalyticsSnapshotConfig>>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    if analytics_snapshot.mode.reads_snapshot() {
+    if analytics_snapshot.get().await.value.mode.reads_snapshot() {
         return analysis_heatmap_from_snapshot(&req, pool.get_ref(), &filters, &user).await;
     }
     if elasticsearch.scan_storage_mode().reads_elasticsearch() {

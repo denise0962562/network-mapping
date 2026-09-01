@@ -1,10 +1,10 @@
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// Policy controlling server-side port scan tasks derived from DNS A/AAAA answers.
 /// A disabled policy is the safe default for existing installations.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DnsFollowUpConfig {
     pub enabled: bool,
