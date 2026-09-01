@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::ReceiveSystemStatusInfo;
 use crate::admin::UserBaseI;
+use crate::config::AnalyticsSnapshotConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::error_logs;
 use crate::{SystemDetails, SystemStatusJson, Systems, get_system_status_info};
@@ -98,6 +99,8 @@ struct AnalysisMeta {
     start_at: DateTime<Utc>,
     end_at: DateTime<Utc>,
     timezone: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_as_of: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -166,6 +169,7 @@ fn analysis_meta(filters: &AnalysisFilters) -> AnalysisMeta {
         start_at: filters.start_at,
         end_at: filters.end_at,
         timezone: ANALYSIS_TIMEZONE,
+        data_as_of: None,
     }
 }
 
@@ -223,6 +227,7 @@ pub(crate) async fn get_analysis_distribution(
     query: web::Query<DistributionQuery>,
     pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
+    analytics_snapshot: web::Data<AnalyticsSnapshotConfig>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
@@ -236,6 +241,17 @@ pub(crate) async fn get_analysis_distribution(
     let limit = query.limit.unwrap_or(5);
     if !matches!(limit, 5 | 7 | 10) {
         return bad_request("limit must be 5, 7 or 10");
+    }
+    if analytics_snapshot.mode.reads_snapshot() {
+        return analysis_distribution_from_snapshot(
+            &req,
+            pool.get_ref(),
+            &filters,
+            dimension,
+            limit,
+            &user,
+        )
+        .await;
     }
     if elasticsearch.scan_storage_mode().reads_elasticsearch() {
         return analysis_distribution_from_elasticsearch(
@@ -344,12 +360,16 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     query: web::Query<HeatmapQuery>,
     pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
+    analytics_snapshot: web::Data<AnalyticsSnapshotConfig>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    if analytics_snapshot.mode.reads_snapshot() {
+        return analysis_heatmap_from_snapshot(&req, pool.get_ref(), &filters, &user).await;
+    }
     if elasticsearch.scan_storage_mode().reads_elasticsearch() {
         return analysis_heatmap_from_elasticsearch(&req, elasticsearch.get_ref(), &filters, &user)
             .await;
@@ -405,6 +425,182 @@ pub(crate) async fn get_analysis_discovery_heatmap(
         success: true,
         data: HeatmapData { items },
         meta: analysis_meta(&filters),
+    })
+}
+
+async fn snapshot_data_as_of(
+    client: &deadpool_postgres::Client,
+) -> Result<Option<DateTime<Utc>>, tokio_postgres::Error> {
+    let row = client
+        .query_opt(
+            "SELECT data_as_of FROM analytics_watermark WHERE watermark_key = 'scan_analysis';",
+            &[],
+        )
+        .await?;
+    Ok(row.map(|row| row.get("data_as_of")))
+}
+
+async fn analysis_distribution_from_snapshot(
+    req: &HttpRequest,
+    pool: &Pool,
+    filters: &AnalysisFilters,
+    dimension: DistributionDimension,
+    limit: i64,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let client = match pool.get().await {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(req, "AnalysisSnapshotPoolError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let data_as_of = match snapshot_data_as_of(&client).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+        }
+        Err(error) => {
+            error_logs(req, "AnalysisSnapshotWatermarkError", &error.to_string());
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+        }
+    };
+    let mut conditions = vec![
+        "bucket_start >= $1".to_owned(),
+        "bucket_start < $2".to_owned(),
+        "dimension = $3".to_owned(),
+    ];
+    let dimension_name = dimension.as_str();
+    let mut params: Vec<&(dyn ToSql + Sync)> =
+        vec![&filters.start_at, &filters.end_at, &dimension_name];
+    if user.role != 1 {
+        params.push(&user.id);
+        conditions.push(format!("owner_id = ${}", params.len()));
+    }
+    if let Some(scanner_id) = filters.scanner_id.as_ref() {
+        params.push(scanner_id);
+        conditions.push(format!("scanner_id = ${}", params.len()));
+    }
+    if let Some(task_source) = filters.task_source.as_ref() {
+        params.push(task_source);
+        conditions.push(format!("task_source = ${}", params.len()));
+    }
+    params.push(&limit);
+    let sql = format!(
+        "WITH grouped AS ( \
+             SELECT label, SUM(endpoint_count)::BIGINT AS endpoint_count \
+             FROM analytics_distribution_30m WHERE {} GROUP BY label \
+         ) SELECT label, endpoint_count, (SUM(endpoint_count) OVER ())::BIGINT AS total \
+           FROM grouped ORDER BY endpoint_count DESC, label LIMIT ${};",
+        conditions.join(" AND "),
+        params.len()
+    );
+    let rows = match client.query(&sql, &params).await {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(req, "AnalysisSnapshotDistributionError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let total = rows
+        .first()
+        .map(|row| row.get::<_, i64>("total"))
+        .unwrap_or(0);
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let count = row.get("endpoint_count");
+            DistributionItem {
+                name: row.get("label"),
+                count,
+                percentage: percentage(count, total),
+            }
+        })
+        .collect::<Vec<_>>();
+    let visible_count = items.iter().map(|item| item.count).sum::<i64>();
+    let mut meta = analysis_meta(filters);
+    meta.data_as_of = Some(data_as_of);
+    HttpResponse::Ok().json(AnalysisResponse {
+        success: true,
+        data: DistributionData {
+            dimension: dimension.as_str(),
+            items,
+            other_count: total.saturating_sub(visible_count),
+            total,
+        },
+        meta,
+    })
+}
+
+async fn analysis_heatmap_from_snapshot(
+    req: &HttpRequest,
+    pool: &Pool,
+    filters: &AnalysisFilters,
+    user: &UserBaseI,
+) -> HttpResponse {
+    let client = match pool.get().await {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(req, "AnalysisSnapshotPoolError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let data_as_of = match snapshot_data_as_of(&client).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+        }
+        Err(error) => {
+            error_logs(req, "AnalysisSnapshotWatermarkError", &error.to_string());
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+        }
+    };
+    let mut conditions = vec![
+        "day_start >= (($1 AT TIME ZONE 'Asia/Shanghai')::DATE)".to_owned(),
+        "day_start < (($2 AT TIME ZONE 'Asia/Shanghai')::DATE)".to_owned(),
+    ];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&filters.start_at, &filters.end_at];
+    if user.role != 1 {
+        params.push(&user.id);
+        conditions.push(format!("owner_id = ${}", params.len()));
+    }
+    if let Some(scanner_id) = filters.scanner_id.as_ref() {
+        params.push(scanner_id);
+        conditions.push(format!("scanner_id = ${}", params.len()));
+    }
+    if let Some(task_source) = filters.task_source.as_ref() {
+        params.push(task_source);
+        conditions.push(format!("task_source = ${}", params.len()));
+    }
+    let sql = format!(
+        "SELECT to_char(day_start, 'YYYY-MM-DD') AS day, COUNT(DISTINCT ip_address)::BIGINT AS discovered_count \
+         FROM analytics_discovery_fact WHERE {} GROUP BY day_start ORDER BY day_start;",
+        conditions.join(" AND ")
+    );
+    let rows = match client.query(&sql, &params).await {
+        Ok(value) => value,
+        Err(error) => {
+            error_logs(req, "AnalysisSnapshotHeatmapError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let items = rows
+        .into_iter()
+        .map(|row| HeatmapItem {
+            date: row.get("day"),
+            count: row.get("discovered_count"),
+        })
+        .collect();
+    let mut meta = analysis_meta(filters);
+    meta.data_as_of = Some(data_as_of);
+    HttpResponse::Ok().json(AnalysisResponse {
+        success: true,
+        data: HeatmapData { items },
+        meta,
     })
 }
 

@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod admin;
+pub mod analytics_snapshot;
 pub mod audit;
 pub mod backup;
 pub mod cli_progress;
@@ -2564,6 +2565,18 @@ pub async fn save_scanner_results(
                     &execution_summary.port_count,
                     &execution_summary.observation_count,
                 ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        // New servers enqueue analytics in the same transaction as successful completion.
+        // The analytics worker still reconciles older completed executions during upgrades.
+        transaction
+            .execute(
+                "INSERT INTO analytics_outbox (execution_id, status, available_at, locked_at, completed_at, last_error) \
+                 VALUES ($1, 'pending', NOW(), NULL, NULL, NULL) \
+                 ON CONFLICT (execution_id) DO UPDATE SET status = 'pending', available_at = NOW(), \
+                    locked_at = NULL, completed_at = NULL, last_error = NULL, updated_at = NOW();",
+                &[&execution_db_id],
             )
             .await
             .map_err(scanner_result_database_error)?;

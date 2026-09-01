@@ -378,6 +378,58 @@ CREATE INDEX IF NOT EXISTS idx_scan_observation_service_lower
 	ON scan_observation(LOWER(service))
 	WHERE kind = 'service' AND service IS NOT NULL;
 
+-- Analysis snapshots are deliberately independent from scan facts. Existing installations can
+-- upgrade safely: the worker reconciles already succeeded executions into this outbox.
+CREATE TABLE IF NOT EXISTS analytics_outbox (
+	execution_id INT PRIMARY KEY REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed')),
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	locked_at TIMESTAMPTZ,
+	completed_at TIMESTAMPTZ,
+	last_error TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_pending
+	ON analytics_outbox(available_at, execution_id) WHERE status <> 'completed';
+
+-- One compact, additive row per execution/window/dimension/label. It avoids repeatedly
+-- aggregating the raw observation history on interactive requests.
+CREATE TABLE IF NOT EXISTS analytics_distribution_30m (
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	bucket_start TIMESTAMPTZ NOT NULL,
+	owner_id INT NOT NULL,
+	scanner_id TEXT NOT NULL,
+	task_source TEXT NOT NULL,
+	dimension TEXT NOT NULL CHECK (dimension IN ('service', 'port')),
+	label TEXT NOT NULL,
+	endpoint_count BIGINT NOT NULL CHECK (endpoint_count >= 0),
+	PRIMARY KEY (execution_id, bucket_start, dimension, label)
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_distribution_query
+	ON analytics_distribution_30m(bucket_start, owner_id, scanner_id, task_source, dimension);
+
+-- IP facts are already deduplicated per execution/day. Queries only need to deduplicate this
+-- much smaller set, never the full observation corpus.
+CREATE TABLE IF NOT EXISTS analytics_discovery_fact (
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	day_start DATE NOT NULL,
+	owner_id INT NOT NULL,
+	scanner_id TEXT NOT NULL,
+	task_source TEXT NOT NULL,
+	ip_address INET NOT NULL,
+	PRIMARY KEY (execution_id, day_start, ip_address)
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_discovery_query
+	ON analytics_discovery_fact(day_start, owner_id, scanner_id, task_source);
+
+CREATE TABLE IF NOT EXISTS analytics_watermark (
+	watermark_key TEXT PRIMARY KEY,
+	data_as_of TIMESTAMPTZ NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- 将尚未进入 typed observation 模型的 v1 scaninfo 历史记录回填到合成批次。
 -- 使用动态 SQL，确保 scaninfo 已由用户手动删除或新安装不存在时仍可正常初始化。
 -- 限定为完全没有 observation 的 execution，避免把旧双写时期的兼容镜像重复导入。

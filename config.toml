@@ -143,6 +143,12 @@ scan_migration_checkpoint_batches = 100
 # 只影响 postgres/dual 的旧搜索副本；elasticsearch 权威模式始终失败关闭，不回退陈旧事实。
 fallback_to_postgres = true
 
+[analytics_snapshot]
+# realtime 保持旧行为；shadow 后台构建并核验快照；snapshot 让分析接口只读快照。
+mode = "realtime"
+# 每个完整窗口由后台聚合一次。推荐保持 30 分钟。
+interval_minutes = 30
+
 [database]
 host = "127.0.0.1"
 port = 5432

@@ -43,6 +43,8 @@ pub struct Config {
     pub backup: BackupConfig,
     #[serde(default)]
     pub elasticsearch: ElasticsearchConfig,
+    #[serde(default)]
+    pub analytics_snapshot: AnalyticsSnapshotConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -77,6 +79,7 @@ impl SelfChecking for Config {
         let _ = &self.monitor.check();
         let _ = &self.backup.check();
         let _ = &self.elasticsearch.check();
+        let _ = &self.analytics_snapshot.check();
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -98,7 +101,59 @@ impl SelfChecking for Config {
         self.monitor.try_check()?;
         self.backup.try_check()?;
         self.elasticsearch.try_check()?;
+        self.analytics_snapshot.try_check()?;
         self.automatic_target.validate()?;
+        Ok(true)
+    }
+}
+
+/// 扫描分析快照。默认 realtime，确保已有部署升级后不会在历史回填前读到空统计。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsSnapshotMode {
+    #[default]
+    Realtime,
+    Shadow,
+    Snapshot,
+}
+
+impl AnalyticsSnapshotMode {
+    pub fn reads_snapshot(self) -> bool {
+        self == Self::Snapshot
+    }
+
+    pub fn runs_worker(self) -> bool {
+        !matches!(self, Self::Realtime)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsSnapshotConfig {
+    pub mode: AnalyticsSnapshotMode,
+    pub interval_minutes: u64,
+}
+
+impl Default for AnalyticsSnapshotConfig {
+    fn default() -> Self {
+        Self {
+            mode: AnalyticsSnapshotMode::Realtime,
+            interval_minutes: 30,
+        }
+    }
+}
+
+impl SelfChecking for AnalyticsSnapshotConfig {
+    fn check(&self) {
+        if let Err(error) = self.try_check() {
+            panic!("{error}");
+        }
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if !(1..=24 * 60).contains(&self.interval_minutes) {
+            return Err("analytics_snapshot.interval_minutes 必须在 1 到 1440 之间".into());
+        }
         Ok(true)
     }
 }
@@ -1734,4 +1789,8 @@ pub struct Clis {
     /// 将 PostgreSQL 中现有扫描事实幂等迁移到新的 Elasticsearch 扫描索引后退出
     #[arg(long)]
     pub migrate_scan_data_to_elasticsearch: bool,
+
+    /// 从所有已成功的 IP 扫描执行重建分析快照后退出；不会修改扫描原始事实
+    #[arg(long)]
+    pub rebuild_analytics_snapshots: bool,
 }
