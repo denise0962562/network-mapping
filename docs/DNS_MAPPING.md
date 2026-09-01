@@ -28,7 +28,9 @@ query_timeout_seconds = 5
 
 初始 DNS engine 使用系统递归解析器，只主动查询 A/AAAA；服务端 ingestion 模型已能接收 CNAME、NS、MX、PTR、SRV、TXT、CAA、SOA、SVCB、HTTPS 的规范化 payload，扩展扫描器支持时不需改变索引身份规则。
 
-DNS 任务由管理员 API 创建，仅自动分配给 heartbeat 中声明 `dns_records` / `dns_lookup` 能力的 scanner：
+DNS 域名任务支持三种扫描 profile：`dns_records` 仅归档 DNS 记录；`dns_ports` 先解析 A/AAAA、再只扫描解析出的 IP 端口；`dns_full` 同时归档 DNS 记录并扫描解析 IP 的端口。`dns_full` 为后续漏洞扫描阶段预留扩展位置，但当前不会执行漏洞扫描。
+
+DNS 任务由管理员 API 创建，仅自动分配给 heartbeat 中声明对应 DNS profile 与 `dns_lookup` 能力的 scanner：
 
 ```http
 POST /api/task/create-dns

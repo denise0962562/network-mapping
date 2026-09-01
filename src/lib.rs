@@ -565,6 +565,10 @@ mod parse_ip_or_cidr_tests {
         assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
         let dns = build_scan_plan("dns_records").unwrap();
         assert_eq!(dns["stages"][0]["type"], "dns_lookup");
+        let dns_ports = build_scan_plan("dns_ports").unwrap();
+        assert_eq!(dns_ports["stages"][1]["type"], "port_discovery");
+        let dns_full = build_scan_plan("dns_full").unwrap();
+        assert_eq!(dns_full["stages"][0]["type"], "dns_lookup");
         assert!(build_scan_plan("arbitrary_command").is_err());
     }
 
@@ -694,6 +698,14 @@ pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
         ]),
         "dns_records" => serde_json::json!([
             {"type": "dns_lookup", "required": true}
+        ]),
+        "dns_ports" => serde_json::json!([
+            {"type": "dns_lookup", "required": true},
+            {"type": "port_discovery", "required": true}
+        ]),
+        "dns_full" => serde_json::json!([
+            {"type": "dns_lookup", "required": true},
+            {"type": "port_discovery", "required": true}
         ]),
         _ => return Err("unsupported scan profile"),
     };
@@ -1235,7 +1247,7 @@ pub struct ApplyTask {
     pub lease_ttl_ms: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ScannerResultUpload {
     #[serde(default = "default_result_protocol_version")]
     pub protocol_version: u16,
@@ -1254,7 +1266,7 @@ fn default_result_protocol_version() -> u16 {
     1
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScannerObservation {
     Port {
@@ -1949,6 +1961,67 @@ pub async fn save_scanner_results(
             .iter()
             .any(|item| matches!(item, ScannerObservation::Dns { .. }))
     {
+        let contains_non_dns = upload
+            .observations
+            .iter()
+            .any(|item| !matches!(item, ScannerObservation::Dns { .. }));
+        if contains_non_dns {
+            let mut dns_upload = upload.clone();
+            let upload_id = upload
+                .upload_id
+                .expect("protocol v2 upload ID was validated");
+            let dns_upload_id =
+                openssl::sha::sha256(format!("dns-observations:{upload_id}").as_bytes());
+            dns_upload.upload_id = Some(
+                Uuid::from_slice(&dns_upload_id[..16])
+                    .expect("a SHA-256 prefix always has a UUID-compatible length"),
+            );
+            dns_upload.batch_index = upload.batch_index;
+            dns_upload.is_final = Some(false);
+            dns_upload.observations = upload
+                .observations
+                .iter()
+                .filter(|item| matches!(item, ScannerObservation::Dns { .. }))
+                .cloned()
+                .collect();
+            let dns_observations = dns_upload
+                .observations
+                .iter()
+                .map(|item| match item {
+                    ScannerObservation::Dns { observation } => Ok(observation.clone()),
+                    _ => Err(SaveScannerResultsError::InvalidUpload(
+                        "a DNS upload batch may contain only DNS observations".into(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let dns_count = save_dns_scanner_results(
+                pool,
+                elasticsearch,
+                &dns_upload,
+                token,
+                token_pepper,
+                dns_observations,
+            )
+            .await?;
+
+            let mut regular_upload = upload.clone();
+            regular_upload.observations = upload
+                .observations
+                .iter()
+                .filter(|item| !matches!(item, ScannerObservation::Dns { .. }))
+                .cloned()
+                .collect();
+            let regular_count = Box::pin(save_scanner_results(
+                pool,
+                maxmind,
+                elasticsearch,
+                &regular_upload,
+                token,
+                token_pepper,
+            ))
+            .await?;
+            return Ok(dns_count.saturating_add(regular_count));
+        }
         if !upload.results.is_empty()
             || upload
                 .observations

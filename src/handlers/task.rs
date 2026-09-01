@@ -40,6 +40,13 @@ struct CreateDnsTask {
     domains: Vec<String>,
     level: i8,
     remark: Option<String>,
+    #[serde(default = "default_dns_scan_profile")]
+    scan_profile: String,
+    port: Option<String>,
+}
+
+fn default_dns_scan_profile() -> String {
+    "dns_records".into()
 }
 
 #[derive(Serialize)]
@@ -159,7 +166,12 @@ impl ScannerScanCapabilities {
         if self.profiles.iter().any(|value| {
             !matches!(
                 value.as_str(),
-                "legacy" | "port_only" | "service_inventory" | "dns_records"
+                "legacy"
+                    | "port_only"
+                    | "service_inventory"
+                    | "dns_records"
+                    | "dns_ports"
+                    | "dns_full"
             )
         }) || self.stages.iter().any(|value| {
             !matches!(
@@ -1449,6 +1461,23 @@ async fn create_dns_task(
         return HttpResponse::BadRequest()
             .json(json!({"success": false, "message": "domains must contain 1 to 500 entries"}));
     }
+    if !matches!(
+        input.scan_profile.as_str(),
+        "dns_records" | "dns_ports" | "dns_full"
+    ) {
+        return HttpResponse::BadRequest()
+            .json(json!({"success": false, "message": "invalid DNS scan profile"}));
+    }
+    let task_port = if input.scan_profile == "dns_records" {
+        "53".to_owned()
+    } else {
+        let port = input.port.as_deref().unwrap_or("1-65535");
+        if !crate::check_port(port) {
+            return HttpResponse::BadRequest()
+                .json(json!({"success": false, "message": "invalid port range"}));
+        }
+        port.to_owned()
+    };
     let mut domains = match input
         .domains
         .iter()
@@ -1469,9 +1498,9 @@ async fn create_dns_task(
     match connection
         .query(
             "SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
-             AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? 'dns_records' \
+             AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
              LIMIT 1;",
-            &[],
+            &[&input.scan_profile],
         )
         .await
     {
@@ -1496,15 +1525,17 @@ async fn create_dns_task(
         .query_one(
             "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
              dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets) \
-             VALUES ($1, $2, $3, ARRAY[]::INET[], '53', $4, $5, 'automatic', 'ipv4', 'dns_records', \
-             $6, 'dns', $7) RETURNING id;",
+             VALUES ($1, $2, $3, ARRAY[]::INET[], $4, $5, $6, 'automatic', 'ipv4', $7, \
+             $8, 'dns', $9) RETURNING id;",
             &[
                 &user.id,
                 &task_id,
                 &user.username,
+                &task_port,
                 &(i32::from(input.level)),
                 &input.remark,
-                &build_scan_plan("dns_records").expect("DNS scan plan is static"),
+                &input.scan_profile,
+                &build_scan_plan(&input.scan_profile).expect("DNS scan profile was validated"),
                 &domains,
             ],
         )
@@ -1530,7 +1561,8 @@ async fn create_dns_task(
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
         .resource("task", task_id.clone());
     audit_event.response_status = Some(200);
-    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": "dns_records"});
+    audit_event.metadata =
+        json!({"target_count": domains.len(), "scan_profile": input.scan_profile});
     if let Err(error) = audit::write(
         &transaction,
         &AuditContext::from_request(&req),
