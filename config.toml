@@ -70,6 +70,8 @@ repeat_after_seconds = 604800
 # 将 DNS 的 A/AAAA 结果创建为独立端口扫描任务。仅允许明确授权的网段，默认关闭。
 enabled = false
 authorized_cidrs = []
+# 授权范围内仍不应扫描的地址。排除项优先于 authorized_cidrs。
+excluded_cidrs = []
 # 同一 DNS 执行按地址族和此上限拆分子任务。
 max_targets_per_task = 100
 
