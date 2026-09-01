@@ -1714,7 +1714,7 @@ impl SystemConfig {
     pub fn encrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_value = self.value;
         if tmp_value.is_empty() {
-            return Err("空值".into());
+            Err("空值".into())
         } else {
             let (nonce, tag, ciphertext) = encrypt_data(tmp_value.as_bytes(), e_key.as_bytes())?;
 
@@ -1733,13 +1733,19 @@ impl SystemConfig {
     pub fn decrypt(mut self, e_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_value = self.value;
         if tmp_value.is_empty() {
-            return Err("空值".into());
+            Err("空值".into())
         } else {
             let v = openssl::base64::decode_block(&tmp_value)?;
             let t = decrypt_data(&v, e_key.as_bytes())?;
             self.value = openssl::base64::encode_block(&t);
-            return Ok(());
+            Ok(())
         }
+    }
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

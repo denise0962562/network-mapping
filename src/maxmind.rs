@@ -53,40 +53,39 @@ impl MaxMindState {
     pub fn lookup(&self, ip: IpAddr) -> IpIntel {
         let mut intel = IpIntel::default();
 
-        if let Some(reader) = &self.asn {
-            if let Some(asn) = lookup_asn(reader, ip) {
-                intel.asn = asn.autonomous_system_number.map(|n| n.to_string());
-                intel.as_org = asn.autonomous_system_organization.map(str::to_string);
-            }
+        if let Some(reader) = &self.asn
+            && let Some(asn) = lookup_asn(reader, ip)
+        {
+            intel.asn = asn.autonomous_system_number.map(|n| n.to_string());
+            intel.as_org = asn.autonomous_system_organization.map(str::to_string);
         }
 
-        if let Some(reader) = &self.city {
-            if let Some(city) = lookup_city(reader, ip) {
-                intel.country_code = city.country.iso_code.map(str::to_string);
-                intel.country_name = city.country.names.english.map(str::to_string);
-                intel.region_name = city
-                    .subdivisions
-                    .first()
-                    .and_then(|subdivision| subdivision.names.english)
-                    .map(str::to_string);
-                intel.city_name = city.city.names.english.map(str::to_string);
-                intel.latitude = city.location.latitude;
-                intel.longitude = city.location.longitude;
-                intel.accuracy_radius = city.location.accuracy_radius;
-                intel.time_zone = city.location.time_zone.map(str::to_string);
-            }
+        if let Some(reader) = &self.city
+            && let Some(city) = lookup_city(reader, ip)
+        {
+            intel.country_code = city.country.iso_code.map(str::to_string);
+            intel.country_name = city.country.names.english.map(str::to_string);
+            intel.region_name = city
+                .subdivisions
+                .first()
+                .and_then(|subdivision| subdivision.names.english)
+                .map(str::to_string);
+            intel.city_name = city.city.names.english.map(str::to_string);
+            intel.latitude = city.location.latitude;
+            intel.longitude = city.location.longitude;
+            intel.accuracy_radius = city.location.accuracy_radius;
+            intel.time_zone = city.location.time_zone.map(str::to_string);
         }
 
-        if intel.country_code.is_none() || intel.country_name.is_none() {
-            if let Some(reader) = &self.country {
-                if let Some(country) = lookup_country(reader, ip) {
-                    if intel.country_code.is_none() {
-                        intel.country_code = country.country.iso_code.map(str::to_string);
-                    }
-                    if intel.country_name.is_none() {
-                        intel.country_name = country.country.names.english.map(str::to_string);
-                    }
-                }
+        if (intel.country_code.is_none() || intel.country_name.is_none())
+            && let Some(reader) = &self.country
+            && let Some(country) = lookup_country(reader, ip)
+        {
+            if intel.country_code.is_none() {
+                intel.country_code = country.country.iso_code.map(str::to_string);
+            }
+            if intel.country_name.is_none() {
+                intel.country_name = country.country.names.english.map(str::to_string);
             }
         }
 

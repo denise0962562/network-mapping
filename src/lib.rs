@@ -49,7 +49,6 @@ use password_hash::rand_core::OsRng;
 use password_hash::{PasswordHash, SaltString};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -58,7 +57,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
-use sysinfo;
 use tera::{Context, Tera};
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
@@ -84,8 +82,7 @@ pub const TASK_LEASE_MS: i64 = 90_000;
 
 pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
     let mut token_buffer = [0u8; 36];
-    rand::rand_bytes(&mut token_buffer)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    rand::rand_bytes(&mut token_buffer).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(format!(
         "{}_{}",
         prefix,
@@ -94,16 +91,15 @@ pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
 }
 
 pub fn hash_scanner_token(token: &str, pepper: &str) -> Result<String, io::Error> {
-    let key = PKey::hmac(pepper.as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    let mut signer = Signer::new(MessageDigest::sha256(), &key)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let key = PKey::hmac(pepper.as_bytes()).map_err(|e| io::Error::other(e.to_string()))?;
+    let mut signer =
+        Signer::new(MessageDigest::sha256(), &key).map_err(|e| io::Error::other(e.to_string()))?;
     signer
         .update(token.as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let digest = signer
         .sign_to_vec()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(openssl::base64::encode_block(&digest))
 }
 
@@ -206,7 +202,7 @@ pub fn get_unix_epoch_ms() -> i64 {
         Ok(duration) => duration.as_millis() as i64,
         Err(e) => {
             error!(event = "UnixEpochGenerateError", message = e.to_string());
-            -1 as i64
+            -1_i64
         }
     }
 }
@@ -363,7 +359,7 @@ impl SystemDisk {
 
         Self {
             disk_total_space: disk_total,
-            disk_total_usage: disk_total_usage,
+            disk_total_usage,
             disk: d_h,
         }
     }
@@ -408,7 +404,7 @@ impl DbResource {
                 //返回值的单位均为字节
 
                 let db_table_size_sql =
-                    get_sql_from_file(&sql_file_path, "get_table_size.sql").await;
+                    get_sql_from_file(sql_file_path, "get_table_size.sql").await;
                 let db_conn_sql = "SELECT COUNT(*) AS db_conn FROM pg_stat_activity;";
                 let db_table_size = match db_table_size_sql {
                     Ok(sql) => get_db_table_size_byte(&o, &sql, &[]).await,
@@ -636,11 +632,11 @@ fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
                     }
                 }
             }
-            return Ok(n_v);
+            Ok(n_v)
         }
         TargetIP::I(ipadd) => {
             n_v.push(ipadd);
-            return Ok(n_v);
+            Ok(n_v)
         }
     }
 }
@@ -650,16 +646,10 @@ fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
 fn check_port(port: &str) -> bool {
     let re = Regex::new(r"^[0-9,\-]+$");
     match re {
-        Ok(o) => {
-            if o.is_match(port) {
-                return true;
-            } else {
-                return false;
-            }
-        }
+        Ok(o) => o.is_match(port),
         Err(e) => {
             error!(event = "REGEX-ERROR", message = e.to_string());
-            return false;
+            false
         }
     }
 }
@@ -752,13 +742,8 @@ impl<'a> STask<'a> {
         let t_ip = parsing_target(ip)?;
 
         let t_port = match port {
-            Some(p) => {
-                if check_port(p) {
-                    p
-                } else {
-                    "1-65535"
-                }
-            }
+            Some(p) if check_port(p) => p,
+            Some(_) => "1-65535",
             None => "1-65535",
         };
         Ok(Self {
@@ -768,12 +753,13 @@ impl<'a> STask<'a> {
             port: Some(t_port),
             start_at: None,
             end_at: None,
-            remark: remark,
+            remark,
         })
     }
 
     /// 用于向数据库中添加一条扫描任务条目
     /// 返回一个 Result，当执行成功时返回 OK
+    #[allow(clippy::too_many_arguments)]
     pub async fn add(
         &self,
         pool: &deadpool_postgres::Pool,
@@ -788,11 +774,10 @@ impl<'a> STask<'a> {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut p = pool.get().await?;
         let client = p.transaction().await?;
-        let t_id: String;
-        match self.task_id {
-            Some(o) => t_id = o.to_string(),
-            None => return Err("task_id 为 None".into()),
-        };
+        let t_id = self
+            .task_id
+            .map(|task_id| task_id.to_string())
+            .ok_or("task_id 为 None")?;
 
         // 将 ipnet转换为 String
         let tmp_ip: Vec<String> = self.ip.iter().map(|i| i.to_string()).collect();
@@ -823,7 +808,7 @@ impl<'a> STask<'a> {
         audit::write(&client, audit_context, &audit_event).await?;
 
         client.commit().await?;
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -1168,7 +1153,7 @@ pub async fn insert_system_status(
     let transaction = client.transaction().await?;
     let sql = get_sql_from_file("source/database/", "insert_system_status.sql").await?;
     let statement = transaction.prepare(&sql).await?;
-    let server_run_time = s.server_run_time as i64;
+    let server_run_time = s.server_run_time;
     let cpu = serde_json::to_value(s.cpu).unwrap();
     let ram = serde_json::to_value(s.ram).unwrap();
     let disk = serde_json::to_value(s.disk).unwrap();
@@ -3269,10 +3254,12 @@ pub async fn get_system_status_info(
 /// 加密关键数据
 ///
 /// 该函数接受一个参数 明文。返回三个参数，分别为 nonce、tag、密文
+type EncryptedData = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 pub fn encrypt_data(
     plaintext: &[u8],
     key: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), openssl::error::ErrorStack> {
+) -> Result<EncryptedData, openssl::error::ErrorStack> {
     // 32 字节密钥，且初始化为 1
     // let mut key = [1u8; 32];
     // rand::rand_bytes(&mut key)?;
@@ -3283,7 +3270,7 @@ pub fn encrypt_data(
 
     let cipher = Cipher::aes_256_gcm();
 
-    let mut crypter = Crypter::new(cipher, Mode::Encrypt, &key, Some(&nonce))?;
+    let mut crypter = Crypter::new(cipher, Mode::Encrypt, key, Some(&nonce))?;
 
     // GCM 不需要 padding
     crypter.pad(false);
@@ -3306,7 +3293,7 @@ pub fn encrypt_data(
 ///
 pub fn decrypt_data(
     // value: &[u8],
-    value: &Vec<u8>,
+    value: &[u8],
     // ciphertext: &[u8],
     key: &[u8],
     // nonce: &[u8],

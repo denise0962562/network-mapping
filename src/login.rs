@@ -102,7 +102,7 @@ impl LoginToken {
         let session = SessionInfo {
             session: Uuid::new_v4().to_string(),
             create_time: get_unix_epoch_ms(),
-            ttl: ttl,
+            ttl,
             username: u_name,
         };
 
@@ -132,7 +132,7 @@ impl LoginToken {
                     path = "LoginToken => fn create_session => self.save",
                     message = %e
                 );
-                return Err(e.into());
+                Err(e)
             }
         }
     }
@@ -198,7 +198,7 @@ impl LoginToken {
             ]
         ).await? {
             transaction.commit().await?;
-            return Ok((r_rows.get::<_, i32>("id"), r_rows.get::<_, i32>("user_id")))
+            Ok((r_rows.get::<_, i32>("id"), r_rows.get::<_, i32>("user_id")))
         }
         else {
             error!(
@@ -295,7 +295,7 @@ pub async fn user_login(
                 twofa: None,
             };
             // FIXME 当用户不存在时会提供一个默认的校验，但是，如果用户自己调整了密码加密参数，则会导致默认提供的参数实际计算时间与用户其他的密码校验时间不一致
-            (-1 as i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), t)
+            (-1_i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), t)
         }
     };
     let get_pwd_h = start.elapsed();
@@ -331,8 +331,6 @@ pub async fn user_login(
 ///
 /// 我认为该函数不需要做日志，日志就交给调用者了
 pub fn get_session_from_req(req: &HttpRequest, cookie_n: &str) -> Option<String> {
-    match req.cookie(cookie_n) {
-        Some(cookie) => Some(cookie.value().to_string()),
-        None => None,
-    }
+    req.cookie(cookie_n)
+        .map(|cookie| cookie.value().to_string())
 }

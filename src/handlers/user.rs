@@ -296,10 +296,10 @@ async fn bind_twofa_h(
     )
     .await
     {
-        Ok(tmp) => return HttpResponse::Ok().json(json!({"success": true, "data": tmp})),
+        Ok(tmp) => HttpResponse::Ok().json(json!({"success": true, "data": tmp})),
         Err(e) => {
             error_logs(&req, "CreateOptauthUrlError", &e.to_string());
-            return HttpResponse::InternalServerError().finish();
+            HttpResponse::InternalServerError().finish()
         }
     }
 }
@@ -525,7 +525,7 @@ async fn unbind_2fa_h(
         Ok(false) => HttpResponse::NotFound().finish(),
         Err(e) => {
             error_logs(&req, "Unbind2FAfaild", &e.to_string());
-            return HttpResponse::InternalServerError().finish();
+            HttpResponse::InternalServerError().finish()
         }
     }
 }

@@ -55,9 +55,9 @@ pub(crate) fn is_scanner_api_request(method: &Method, path: &str) -> bool {
 ///
 /// 当从 app_data 中获取到 Some 时会自动从连接池中获取一个连接，然后返回这个连接（也有可能返回的是一个向上传递的错误）
 /// 但获取到 None 值时会抛出错误并写入日志
-pub fn get_pool_from_app_data<'a>(
-    req: &'a ServiceRequest,
-) -> Result<&'a deadpool_postgres::Pool, Box<dyn std::error::Error>> {
+pub fn get_pool_from_app_data(
+    req: &ServiceRequest,
+) -> Result<&deadpool_postgres::Pool, Box<dyn std::error::Error>> {
     match req.app_data::<web::Data<deadpool_postgres::Pool>>() {
         Some(p) => Ok(p.get_ref()),
         None => {
@@ -97,7 +97,7 @@ pub fn render_500(req: &HttpRequest, page_template: &TemplatesInit, message: &st
     };
     HttpResponse::InternalServerError()
         .content_type(TEXT_HTML_UTF_8)
-        .body(front_end_error_page(&error_info, &page_template))
+        .body(front_end_error_page(&error_info, page_template))
 }
 
 /// 该函数用于生成一个简单的 500 错误页面，

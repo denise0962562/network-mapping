@@ -164,8 +164,8 @@ pub struct ScannerHealthData {
 /// 该函数通过 cookie 获取用户名与其 ID
 ///
 /// FIXME 需要解决 pool 类型错误问题
-pub async fn get_user_id_and_name<'a>(
-    session: &'a str,
+pub async fn get_user_id_and_name(
+    session: &str,
     pool: &deadpool_postgres::Pool,
 ) -> Result<(i32, i32, String), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
@@ -204,7 +204,7 @@ pub async fn check_system_user(pool: &deadpool_postgres::Pool) {
                 path = "fn check_system_role",
                 message = "没有找到系统用户，正在创建一个新的系统用户"
             );
-            create_system_user(&pool).await;
+            create_system_user(pool).await;
         }
         1 => {
             info!(target: "server::startup", event = "SystemRoleFound", "系统用户检查通过")
@@ -789,7 +789,7 @@ pub async fn check_twofa_bind(
         "SELECT username FROM users WHERE username = $1 AND enable_2fa = true AND totp_secret IS NOT NULL;",
         &[&username]
     ).await? {
-        return Ok(true)
+        Ok(true)
     } else {
         Ok(false)
     }
@@ -1754,8 +1754,8 @@ pub async fn web_add_scanner(
             write_audit(&db_transaction, audit_context, &audit_event).await?;
             db_transaction.commit().await?;
             Ok(ScannerRegisterSecret {
-                scanner_id: scanner_id,
-                registration_token: registration_token
+                scanner_id,
+                registration_token,
             })
         },
         _ => Err("创建影响多行".into())

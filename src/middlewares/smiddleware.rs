@@ -185,8 +185,7 @@ where
                     req.extensions_mut().insert(user);
 
                     // 向通过检查的请求注入 session ，这样就不需要在每个 handler 中都读取一个 session 了
-                    req.extensions_mut()
-                        .insert(UserSession { session: session });
+                    req.extensions_mut().insert(UserSession { session });
                     req.extensions_mut()
                         .insert(ExpectedCsrfToken::new(authentication.csrf_token));
 
@@ -221,7 +220,7 @@ where
                         message = %e
                     );
                     let resp = HttpResponse::InternalServerError().finish();
-                    return Ok(req.into_response(resp).map_into_right_body());
+                    Ok(req.into_response(resp).map_into_right_body())
                 }
             }
         })

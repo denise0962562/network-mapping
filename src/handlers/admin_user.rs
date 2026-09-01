@@ -132,6 +132,9 @@ impl From<tokio_postgres::Error> for ManagementError {
     }
 }
 
+// `HttpResponse` is returned directly by every caller, so boxing it adds an
+// allocation without reducing the size of an externally-visible result.
+#[allow(clippy::result_large_err)]
 fn require_admin(user: &UserBaseI) -> Result<(), HttpResponse> {
     if user.role == 1 {
         Ok(())
