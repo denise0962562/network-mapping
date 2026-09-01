@@ -52,6 +52,7 @@ pub struct ScannerSystemMaintenanceQuery {
 #[derive(Serialize)]
 struct SystemMaintenanceHistoryItem {
     maintenance_id: Uuid,
+    message: String,
     started_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
     expected_end_at: Option<DateTime<Utc>>,
@@ -141,7 +142,7 @@ pub async fn get_maintenance_history(
     };
     let rows = match client
         .query(
-            "SELECT maintenance_id, started_at, ended_at, expected_end_at, \
+            "SELECT maintenance_id, message, started_at, ended_at, expected_end_at, \
              EXTRACT(EPOCH FROM (COALESCE(ended_at, NOW()) - started_at))::BIGINT \
              AS actual_duration_seconds, started_by_username, ended_at IS NULL AS in_progress \
              FROM system_maintenance_history ORDER BY started_at DESC, id DESC LIMIT $1 OFFSET $2;",
@@ -172,6 +173,7 @@ pub async fn get_maintenance_history(
         .iter()
         .map(|row| SystemMaintenanceHistoryItem {
             maintenance_id: row.get("maintenance_id"),
+            message: row.get("message"),
             started_at: row.get("started_at"),
             ended_at: row.get("ended_at"),
             expected_end_at: row.get("expected_end_at"),
