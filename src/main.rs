@@ -326,6 +326,7 @@ async fn main() -> io::Result<()> {
     let sys_2 = sys.clone();
     let maxmind_state = web::Data::new(maxmind_state);
     let automatic_target_service = web::Data::new(automatic_target_service);
+    let dns_follow_up = web::Data::new(config.dns_follow_up.clone());
     let security = web::Data::new(config.security);
     let analytics_snapshot = web::Data::new(analytics_snapshot_config);
     let rate_limiter = RateLimitMiddleware::default();
@@ -433,6 +434,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(ser_con.clone()))
             .app_data(maxmind_state.clone())
             .app_data(automatic_target_service.clone())
+            .app_data(dns_follow_up.clone())
             .app_data(open_source_catalog.clone())
             .app_data(backup_manager.clone())
             .app_data(elasticsearch_data.clone())

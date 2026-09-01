@@ -36,6 +36,8 @@ pub struct Config {
     #[serde(default)]
     pub automatic_target: AutomaticTargetConfig,
     #[serde(default)]
+    pub dns_follow_up: crate::dns_follow_up::DnsFollowUpConfig,
+    #[serde(default)]
     pub requests: RequestsConfig,
     #[serde(default)]
     pub monitor: MonitorConfig,
@@ -83,6 +85,9 @@ impl SelfChecking for Config {
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
+        if let Err(error) = self.dns_follow_up.validate() {
+            panic!("{error}");
+        }
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -103,6 +108,7 @@ impl SelfChecking for Config {
         self.elasticsearch.try_check()?;
         self.analytics_snapshot.try_check()?;
         self.automatic_target.validate()?;
+        self.dns_follow_up.validate()?;
         Ok(true)
     }
 }

@@ -862,6 +862,37 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_family_queue
 CREATE INDEX IF NOT EXISTS idx_scan_task_generation_key
 	ON scan_task (generation_key, task_create_time DESC) WHERE generation_key IS NOT NULL;
 
+-- DNS 解析结果的可扫描地址及其派生端口任务。结果独立于 Elasticsearch，
+-- 以便在多批上传、重试和服务重启后仍能保证子任务只生成一次。
+CREATE TABLE IF NOT EXISTS dns_resolved_address (
+	id SERIAL PRIMARY KEY,
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	task_id INT NOT NULL REFERENCES scan_task(id) ON DELETE CASCADE,
+	ip_address INET NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE (execution_id, ip_address)
+);
+CREATE INDEX IF NOT EXISTS idx_dns_resolved_address_execution
+	ON dns_resolved_address (execution_id, ip_address);
+
+CREATE TABLE IF NOT EXISTS dns_follow_up_generation (
+	execution_id INT PRIMARY KEY REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	status TEXT NOT NULL CHECK (status IN ('succeeded', 'no_eligible_ip', 'blocked_policy')),
+	eligible_ip_count INT NOT NULL DEFAULT 0,
+	created_task_count INT NOT NULL DEFAULT 0,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_lineage (
+	parent_task_id INT NOT NULL REFERENCES scan_task(id) ON DELETE CASCADE,
+	parent_execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	child_task_id INT NOT NULL UNIQUE REFERENCES scan_task(id) ON DELETE CASCADE,
+	source_addresses INET[] NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_scan_task_lineage_parent
+	ON scan_task_lineage (parent_task_id, parent_execution_id);
+
 -- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
 CREATE TABLE IF NOT EXISTS ip_list (
 	id SERIAL PRIMARY KEY,

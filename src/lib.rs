@@ -9,6 +9,7 @@ pub mod client_ip;
 pub mod config;
 pub mod db;
 pub mod dns;
+pub mod dns_follow_up;
 pub mod elasticsearch;
 pub mod frontend;
 pub mod handlers;
@@ -50,9 +51,10 @@ use password_hash::{PasswordHash, SaltString};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1619,6 +1621,7 @@ fn normalize_upload_observations(
 async fn save_dns_scanner_results(
     pool: &deadpool_postgres::Pool,
     elasticsearch: &ElasticsearchService,
+    dns_follow_up: &dns_follow_up::DnsFollowUpConfig,
     upload: &ScannerResultUpload,
     token: &str,
     token_pepper: &str,
@@ -1667,8 +1670,9 @@ async fn save_dns_scanner_results(
     }
     let task = transaction
         .query_opt(
-            "SELECT t.id AS task_id, t.user_id, e.id AS execution_id, e.execution_id AS public_execution_id, \
-             e.execution_status, t.task_source, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name \
+            "SELECT t.id AS task_id, t.user_id, t.task_port, t.task_level, t.remarks, t.generation_metadata, \
+             e.id AS execution_id, e.execution_id AS public_execution_id, e.execution_status, t.task_source, \
+             COALESCE(s.name, e.assigned_scanner_id) AS scanner_name \
              FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id \
              LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id \
              WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
@@ -1700,6 +1704,11 @@ async fn save_dns_scanner_results(
         batch_index,
         is_final,
     };
+    let follow_up_enabled = task
+        .get::<_, Value>("generation_metadata")
+        .pointer("/dns_follow_up/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let payload_checksum = openssl::sha::sha256(
         &serde_json::to_vec(&serde_json::json!({
             "execution_id": context.execution_id,
@@ -1794,6 +1803,24 @@ async fn save_dns_scanner_results(
         )
         .await
         .map_err(scanner_result_database_error)?;
+    if follow_up_enabled {
+        let resolved_ips = resolved_dns_answer_ips(&observations);
+        if !resolved_ips.is_empty() {
+            let values = resolved_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            transaction
+                .execute(
+                    "INSERT INTO dns_resolved_address (execution_id, task_id, ip_address) \
+                     SELECT $1, $2, value::INET FROM UNNEST($3::TEXT[]) AS value \
+                     ON CONFLICT (execution_id, ip_address) DO NOTHING;",
+                    &[&execution_db_id, &task_db_id, &values],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
+        }
+    }
     if is_final {
         transaction
             .execute(
@@ -1808,12 +1835,229 @@ async fn save_dns_scanner_results(
         refresh_task_aggregate(&transaction, task_db_id)
             .await
             .map_err(scanner_result_database_error)?;
+        if follow_up_enabled {
+            create_dns_follow_up_tasks(
+                &transaction,
+                &task,
+                dns_follow_up,
+                task_db_id,
+                execution_db_id,
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        }
     }
     transaction
         .commit()
         .await
         .map_err(scanner_result_database_error)?;
     Ok(usize::try_from(observation_count).expect("non-negative observation count"))
+}
+
+fn resolved_dns_answer_ips(observations: &[dns::DnsObservation]) -> Vec<IpAddr> {
+    observations
+        .iter()
+        .flat_map(|observation| observation.answers.iter())
+        .filter(|answer| matches!(answer.record_type.as_str(), "A" | "AAAA"))
+        .filter_map(|answer| answer.value.parse::<IpAddr>().ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+async fn create_dns_follow_up_tasks(
+    transaction: &deadpool_postgres::Transaction<'_>,
+    parent: &Row,
+    policy: &dns_follow_up::DnsFollowUpConfig,
+    parent_task_id: i32,
+    parent_execution_id: i32,
+) -> Result<(), tokio_postgres::Error> {
+    let metadata: Value = parent.get("generation_metadata");
+    let Some(follow_up) = metadata.get("dns_follow_up") else {
+        return Ok(());
+    };
+    if follow_up.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let scan_profile = follow_up
+        .get("scan_profile")
+        .and_then(Value::as_str)
+        .unwrap_or("port_only");
+    let stored_addresses = transaction
+        .query(
+            "SELECT host(ip_address) AS ip FROM dns_resolved_address WHERE execution_id = $1 ORDER BY ip_address;",
+            &[&parent_execution_id],
+        )
+        .await?;
+    let mut targets = BTreeMap::<&str, Vec<String>>::new();
+    for row in stored_addresses {
+        let ip: String = row.get("ip");
+        let Ok(parsed) = ip.parse::<IpAddr>() else {
+            continue;
+        };
+        if policy.enabled && policy.allows(parsed) {
+            targets
+                .entry(if parsed.is_ipv4() { "ipv4" } else { "ipv6" })
+                .or_default()
+                .push(parsed.to_string());
+        }
+    }
+    let eligible_ip_count = targets.values().map(Vec::len).sum::<usize>();
+    if !policy.enabled {
+        transaction
+            .execute(
+                "INSERT INTO dns_follow_up_generation (execution_id, status, eligible_ip_count, created_task_count) \
+                 VALUES ($1, 'blocked_policy', 0, 0) ON CONFLICT (execution_id) DO NOTHING;",
+                &[&parent_execution_id],
+            )
+            .await?;
+        return Ok(());
+    }
+    if eligible_ip_count == 0 {
+        transaction
+            .execute(
+                "INSERT INTO dns_follow_up_generation (execution_id, status, eligible_ip_count, created_task_count) \
+                 VALUES ($1, 'no_eligible_ip', 0, 0) ON CONFLICT (execution_id) DO NOTHING;",
+                &[&parent_execution_id],
+            )
+            .await?;
+        return Ok(());
+    }
+    let claimed = transaction
+        .execute(
+            "INSERT INTO dns_follow_up_generation (execution_id, status, eligible_ip_count, created_task_count) \
+             VALUES ($1, 'succeeded', $2, 0) ON CONFLICT (execution_id) DO NOTHING;",
+            &[&parent_execution_id, &(eligible_ip_count as i32)],
+        )
+        .await?;
+    if claimed == 0 {
+        return Ok(());
+    }
+
+    let user_id: i32 = parent.get("user_id");
+    let port: String = parent.get("task_port");
+    let level: i32 = parent.get("task_level");
+    let parent_public_execution_id: String = parent.get("public_execution_id");
+    let scan_plan =
+        build_scan_plan(scan_profile).expect("stored DNS follow-up profile was validated");
+    let mut created_task_count = 0_i32;
+    for (family, family_targets) in targets {
+        for (chunk_index, chunk) in family_targets
+            .chunks(usize::from(policy.max_targets_per_task))
+            .enumerate()
+        {
+            let task_id = Uuid::now_v7().to_string();
+            let metadata = serde_json::json!({
+                "dns_follow_up": {
+                    "parent_task_id": parent_task_id,
+                    "parent_execution_id": parent_public_execution_id,
+                    "source": "dns_a_aaaa_answer",
+                }
+            });
+            let task_pk: i32 = transaction
+                .query_one(
+                    "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
+                     dispatch_mode, task_source, generation_strategy, generation_key, generation_metadata, address_family, scan_profile, scan_plan) \
+                     VALUES ($1, $2, 'system', ARRAY(SELECT value::INET FROM UNNEST($3::TEXT[]) AS value), $4, $5, \
+                     'DNS 解析自动生成端口扫描任务', 'automatic', 'dns_follow_up', 'dns_resolution', $6, $7, $8, $9, $10) \
+                     RETURNING id;",
+                    &[
+                        &user_id,
+                        &task_id,
+                        &chunk,
+                        &port,
+                        &level,
+                        &format!("dns:{parent_public_execution_id}:{family}:{chunk_index}"),
+                        &metadata,
+                        &family,
+                        &scan_profile,
+                        &scan_plan,
+                    ],
+                )
+                .await?
+                .get("id");
+            transaction
+                .execute(
+                    "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, NULL);",
+                    &[&Uuid::now_v7().to_string(), &task_pk],
+                )
+                .await?;
+            transaction
+                .execute(
+                    "INSERT INTO scan_task_lineage (parent_task_id, parent_execution_id, child_task_id, source_addresses) \
+                     VALUES ($1, $2, $3, ARRAY(SELECT value::INET FROM UNNEST($4::TEXT[]) AS value));",
+                    &[&parent_task_id, &parent_execution_id, &task_pk, &chunk],
+                )
+                .await?;
+            created_task_count += 1;
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE dns_follow_up_generation SET created_task_count = $2 WHERE execution_id = $1;",
+            &[&parent_execution_id, &created_task_count],
+        )
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod dns_follow_up_tests {
+    use super::resolved_dns_answer_ips;
+    use crate::dns::{DnsAnswer, DnsObservation, DnsQuestion};
+
+    fn observation(answers: Vec<(&str, &str)>) -> DnsObservation {
+        DnsObservation {
+            observed_at: 1,
+            question: DnsQuestion {
+                name: "example.test".into(),
+                record_type: "A".into(),
+                class: "IN".into(),
+            },
+            response_code: "NOERROR".into(),
+            authoritative: false,
+            truncated: false,
+            dnssec_authenticated: false,
+            answers: answers
+                .into_iter()
+                .map(|(record_type, value)| DnsAnswer {
+                    record_type: record_type.into(),
+                    value: value.into(),
+                    ttl: 60,
+                    priority: None,
+                    weight: None,
+                    port: None,
+                })
+                .collect(),
+            authority: Vec::new(),
+            additional: Vec::new(),
+            resolver_ip: None,
+            resolver_id: None,
+            resolver_label: None,
+            resolver_port: None,
+            resolver_transport: None,
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn resolved_dns_addresses_include_only_unique_a_and_aaaa_answers() {
+        let resolved = resolved_dns_answer_ips(&[
+            observation(vec![
+                ("A", "192.0.2.10"),
+                ("AAAA", "2001:db8::10"),
+                ("CNAME", "alias.example.test"),
+            ]),
+            observation(vec![("A", "192.0.2.10"), ("A", "not-an-ip")]),
+        ]);
+        assert_eq!(
+            resolved
+                .into_iter()
+                .map(|address| address.to_string())
+                .collect::<Vec<_>>(),
+            vec!["192.0.2.10", "2001:db8::10"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1914,6 +2158,7 @@ pub async fn save_scanner_results(
     pool: &deadpool_postgres::Pool,
     maxmind: &MaxMindState,
     elasticsearch: &ElasticsearchService,
+    dns_follow_up: &dns_follow_up::DnsFollowUpConfig,
     upload: &ScannerResultUpload,
     token: &str,
     token_pepper: &str,
@@ -1984,6 +2229,7 @@ pub async fn save_scanner_results(
             let dns_count = save_dns_scanner_results(
                 pool,
                 elasticsearch,
+                dns_follow_up,
                 &dns_upload,
                 token,
                 token_pepper,
@@ -2002,6 +2248,7 @@ pub async fn save_scanner_results(
                 pool,
                 maxmind,
                 elasticsearch,
+                dns_follow_up,
                 &regular_upload,
                 token,
                 token_pepper,
@@ -2032,6 +2279,7 @@ pub async fn save_scanner_results(
         return save_dns_scanner_results(
             pool,
             elasticsearch,
+            dns_follow_up,
             upload,
             token,
             token_pepper,

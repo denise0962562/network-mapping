@@ -2,6 +2,7 @@ use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::{self, AuditContext};
 use crate::client_ip::{normalize_ip, request_ip};
 use crate::config::SecurityConfig;
+use crate::dns_follow_up::DnsFollowUpConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
@@ -45,6 +46,10 @@ struct CreateDnsTask {
     #[serde(default = "default_dns_scan_profile")]
     scan_profile: String,
     port: Option<String>,
+    #[serde(default)]
+    follow_up_port_scan: bool,
+    #[serde(default = "default_follow_up_scan_profile")]
+    follow_up_scan_profile: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,6 +96,10 @@ impl CreateDnsResolver {
 
 fn default_dns_scan_profile() -> String {
     "dns_records".into()
+}
+
+fn default_follow_up_scan_profile() -> String {
+    "port_only".into()
 }
 
 #[derive(Serialize)]
@@ -1674,6 +1683,7 @@ async fn create_task(
 async fn create_dns_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    dns_follow_up: web::Data<DnsFollowUpConfig>,
     input: web::Json<CreateDnsTask>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -1717,7 +1727,30 @@ async fn create_dns_task(
         return HttpResponse::BadRequest()
             .json(json!({"success": false, "message": "invalid DNS scan profile"}));
     }
-    let task_port = if input.scan_profile == "dns_records" {
+    if input.follow_up_port_scan {
+        if !dns_follow_up.enabled {
+            return HttpResponse::Conflict().json(json!({
+                "success": false,
+                "message": "DNS 解析后自动创建端口任务未启用"
+            }));
+        }
+        if input.scan_profile != "dns_records" {
+            return HttpResponse::BadRequest().json(json!({
+                "success": false,
+                "message": "启用自动端口任务时 DNS 扫描模式必须为仅 DNS 记录"
+            }));
+        }
+        if !matches!(
+            input.follow_up_scan_profile.as_str(),
+            "legacy" | "port_only" | "service_inventory"
+        ) {
+            return HttpResponse::BadRequest().json(json!({
+                "success": false,
+                "message": "invalid DNS follow-up scan profile"
+            }));
+        }
+    }
+    let task_port = if input.scan_profile == "dns_records" && !input.follow_up_port_scan {
         "53".to_owned()
     } else {
         let port = input.port.as_deref().unwrap_or("1-65535");
@@ -1770,6 +1803,14 @@ async fn create_dns_task(
         }
     };
     let task_id = Uuid::now_v7().to_string();
+    let generation_metadata = if input.follow_up_port_scan {
+        json!({"dns_follow_up": {
+            "enabled": true,
+            "scan_profile": input.follow_up_scan_profile,
+        }})
+    } else {
+        json!({})
+    };
     let transaction = match connection.build_transaction().start().await {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -1780,9 +1821,9 @@ async fn create_dns_task(
     let task = match transaction
         .query_one(
             "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
-             dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets, dns_resolvers) \
+             dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets, dns_resolvers, generation_metadata) \
              VALUES ($1, $2, $3, ARRAY[]::INET[], $4, $5, $6, 'automatic', 'ipv4', $7, \
-             $8, 'dns', $9, $10) RETURNING id;",
+             $8, 'dns', $9, $10, $11) RETURNING id;",
             &[
                 &user.id,
                 &task_id,
@@ -1794,6 +1835,7 @@ async fn create_dns_task(
                 &build_scan_plan(&input.scan_profile).expect("DNS scan profile was validated"),
                 &domains,
                 &serde_json::to_value(&dns_resolvers).expect("DNS resolver input is serializable"),
+                &generation_metadata,
             ],
         )
         .await
@@ -1818,7 +1860,7 @@ async fn create_dns_task(
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
         .resource("task", task_id.clone());
     audit_event.response_status = Some(200);
-    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": input.scan_profile, "dns_resolver_count": dns_resolvers.len()});
+    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": input.scan_profile, "dns_resolver_count": dns_resolvers.len(), "follow_up_port_scan": input.follow_up_port_scan, "follow_up_scan_profile": input.follow_up_scan_profile});
     if let Err(error) = audit::write(
         &transaction,
         &AuditContext::from_request(&req),
@@ -1923,11 +1965,13 @@ async fn apply_task_handler(
 
 /// 用于扫描器上传扫描结果。
 #[post("/api/scanner/result")]
+#[allow(clippy::too_many_arguments)] // request-scoped dependencies supplied by Actix extractors
 async fn upload_scanner_result_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     maxmind: web::Data<MaxMindState>,
     elasticsearch: web::Data<crate::elasticsearch::ElasticsearchService>,
+    dns_follow_up: web::Data<DnsFollowUpConfig>,
     security: web::Data<SecurityConfig>,
     maintenance: web::Data<SystemMaintenanceState>,
     upload_data: web::Json<ScannerResultUpload>,
@@ -1960,6 +2004,7 @@ async fn upload_scanner_result_handler(
         pool.get_ref(),
         maxmind.get_ref(),
         elasticsearch.get_ref(),
+        dns_follow_up.get_ref(),
         &upload_data,
         token,
         &security.scanner_token_pepper,
