@@ -37,7 +37,6 @@ pub mod test; // 测试模块
 
 use actix_web::{HttpRequest, web};
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
-use cidr::IpInet;
 use deadpool_postgres::GenericClient;
 use ipnet::{AddrParseError, IpNet};
 use openssl::hash::MessageDigest;
@@ -2730,7 +2729,8 @@ pub enum Permission {
 #[derive(Serialize)]
 pub struct TaskItem {
     pub task_id: String,
-    pub task_target: Vec<IpInet>,
+    pub task_target: Vec<String>,
+    pub task_kind: String,
     pub task_initiator: String,
     pub task_port: String,
     pub task_create_time: i64,
@@ -2819,8 +2819,11 @@ fn task_list_filter<'a>(
     if let Some(target) = filters.target.as_ref() {
         params.push(target);
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM unnest(t.task_target) AS targets(target) \
-             WHERE targets.target::TEXT ILIKE '%' || ${} || '%')",
+            "(EXISTS (SELECT 1 FROM unnest(t.task_target) AS targets(target) \
+                WHERE targets.target::TEXT ILIKE '%' || ${} || '%') \
+              OR EXISTS (SELECT 1 FROM unnest(t.dns_targets) AS targets(target) \
+                WHERE targets.target ILIKE '%' || ${} || '%'))",
+            params.len(),
             params.len()
         ));
     }
@@ -2945,7 +2948,7 @@ pub async fn get_task_item(
         Permission::Administrator(_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE id <= $1 AND ($2::boolean OR task_source <> 'automatic') \
                      ORDER BY id DESC LIMIT $3;",
                     &[&st, &include_system, &s_count],
@@ -2953,7 +2956,7 @@ pub async fn get_task_item(
                 .await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE $1::boolean OR task_source <> 'automatic' ORDER BY id DESC LIMIT $2;",
                     &[&include_system, &s_count],
                 )
@@ -2963,14 +2966,14 @@ pub async fn get_task_item(
         Permission::Users(u_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE user_id = $1 AND id <= $2 AND ($3::boolean OR task_source <> 'automatic') \
                      ORDER BY id DESC LIMIT $4;",
                     &[&u_id, &st, &include_system, &s_count]
                 ).await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE user_id = $1 AND ($2::boolean OR task_source <> 'automatic') \
                      ORDER BY id DESC LIMIT $3;",
                     &[&u_id, &include_system, &s_count],
@@ -2992,7 +2995,8 @@ pub async fn get_task_item(
         total_count_item = r.get::<_, i64>("total_count");
         let titem = TaskItem {
             task_id: r.get::<_, String>("task_id"),
-            task_target: r.get::<_, Vec<IpInet>>("task_target"),
+            task_target: r.get("display_targets"),
+            task_kind: r.get("task_kind"),
             task_initiator: r.get::<_, String>("task_initiator"),
             task_level: r.get::<_, i32>("task_level"),
             task_port: r.get::<_, String>("task_port"),
@@ -3059,7 +3063,7 @@ pub async fn get_filtered_task_page(
     let (page_filter, mut page_params) = task_list_filter(filters, &owner_id, true);
     page_params.push(&fetch_limit);
     let page_sql = format!(
-        "SELECT t.* FROM scan_task t{page_filter} \
+        "SELECT t.*, CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::TEXT[] END AS display_targets FROM scan_task t{page_filter} \
          ORDER BY t.id DESC LIMIT ${}",
         page_params.len()
     );
@@ -3077,7 +3081,8 @@ pub async fn get_filtered_task_page(
         .into_iter()
         .map(|row| TaskItem {
             task_id: row.get("task_id"),
-            task_target: row.get("task_target"),
+            task_target: row.get("display_targets"),
+            task_kind: row.get("task_kind"),
             task_initiator: row.get("task_initiator"),
             task_port: row.get("task_port"),
             task_create_time: row.get("task_create_time"),

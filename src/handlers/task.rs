@@ -1064,7 +1064,8 @@ async fn get_task(
     let task_id = task_id.into_inner().to_string();
     let task = match connection
         .query_opt(
-            "SELECT t.id, t.task_id, t.task_target::text[], t.task_port, t.task_initiator, \
+            "SELECT t.id, t.task_id, CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::text[] END AS display_targets, \
+             t.task_kind, t.task_port, t.task_initiator, \
              t.task_level, t.task_create_time, t.task_start_time, t.task_end_time, \
              t.task_status, t.lease_expires_at, t.attempt_count, t.failure_reason, t.cancel_requested, \
              t.retry_of_task_id, t.remarks, t.dispatch_mode, t.task_source, \
@@ -1239,7 +1240,8 @@ async fn get_task(
         "success": true,
         "data": {
             "task_id": task.get::<_, String>("task_id"),
-            "task_target": task.get::<_, Vec<String>>("task_target"),
+            "task_target": task.get::<_, Vec<String>>("display_targets"),
+            "task_kind": task.get::<_, String>("task_kind"),
             "task_port": task.get::<_, String>("task_port"),
             "task_initiator": task.get::<_, String>("task_initiator"),
             "task_level": task.get::<_, i32>("task_level"),
@@ -1464,19 +1466,16 @@ async fn create_dns_task(
         Ok(connection) => connection,
         Err(_) => return HttpResponse::InternalServerError().finish(),
     };
-    let scanners = match connection
+    match connection
         .query(
-            "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
+            "SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
              AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? 'dns_records' \
-             ORDER BY scanner_id;",
+             LIMIT 1;",
             &[],
         )
         .await
     {
-        Ok(rows) if !rows.is_empty() => rows
-            .into_iter()
-            .map(|row| row.get::<_, String>("scanner_id"))
-            .collect::<Vec<_>>(),
+        Ok(rows) if !rows.is_empty() => (),
         Ok(_) => return HttpResponse::Conflict().json(
             json!({"success": false, "message": "no DNS-capable scanner is currently available"}),
         ),
@@ -1518,17 +1517,15 @@ async fn create_dns_task(
         }
     };
     let task_db_id: i32 = task.get("id");
-    for scanner_id in scanners {
-        if let Err(error) = transaction
-            .execute(
-                "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, $3);",
-                &[&Uuid::now_v7().to_string(), &task_db_id, &scanner_id],
-            )
-            .await
-        {
-            error_logs(&req, "CreateDnsTaskExecutionError", &error.to_string());
-            return HttpResponse::InternalServerError().finish();
-        }
+    if let Err(error) = transaction
+        .execute(
+            "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, NULL);",
+            &[&Uuid::now_v7().to_string(), &task_db_id],
+        )
+        .await
+    {
+        error_logs(&req, "CreateDnsTaskExecutionError", &error.to_string());
+        return HttpResponse::InternalServerError().finish();
     }
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
         .resource("task", task_id.clone());

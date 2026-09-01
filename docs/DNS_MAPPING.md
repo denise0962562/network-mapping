@@ -39,6 +39,8 @@ Content-Type: application/json
 
 该 API 只接受显式域名列表（1–500）；不会从 DNS answer 自动创建端口扫描任务。自动 IP 扫描必须先增加资产范围 allowlist、私网/保留地址策略、CDN 高扇出抑制、去重与队列上限。
 
+前端“创建扫描”页可在“IP / 网段”和“DNS 域名”之间切换。DNS 模式支持每行一个域名（或用英文逗号分隔），并固定自动分配；任务列表与详情页会以域名和 `A / AAAA` 查询类型展示这类任务。
+
 ## Elasticsearch 配置与保留
 
 ```toml
