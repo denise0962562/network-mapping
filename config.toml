@@ -116,6 +116,10 @@ index = "network-mapping-assets-v1"
 observation_index_prefix = "network-mapping-scan-observations-v1"
 execution_endpoint_index = "network-mapping-execution-endpoints-v1"
 current_endpoint_index = "network-mapping-endpoints-current-v2"
+# DNS 不可变查询历史使用 Data Stream；当前 RR 状态使用独立可更新索引。
+dns_observation_data_stream = "network-mapping-dns-observations"
+dns_record_index = "network-mapping-dns-records-v1"
+dns_observation_retention_days = 180
 # dual 模式的单节点开发环境可设为 0；正式切换为 elasticsearch 时必须至少为 1。
 scan_number_of_replicas = 1
 expected_version = "9.5.2"

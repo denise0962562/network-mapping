@@ -7,6 +7,7 @@
 - `legacy`：兼容旧扫描器，由节点本地配置决定是否识别服务；
 - `port_only`：只执行 `port_discovery`；
 - `service_inventory`：依次执行 `port_discovery` 和 `service_detection`。
+- `dns_records`：只执行 `dns_lookup`，目标为显式 domain 列表。
 
 未传入时默认 `legacy`。服务端将 profile 展开为版本 1 `scan_plan` 并保存，客户端不能传入
 任意命令、二进制路径或 CLI 参数。任务领取响应包含完整计划。
@@ -36,6 +37,8 @@
 [`ELASTICSEARCH.md`](ELASTICSEARCH.md)。
 只有最终批提交后任务执行才进入 `succeeded`。协议版本 1 的 `results` 请求继续支持，便于
 滚动升级旧扫描器。
+
+DNS task 使用同一版本 2 批次/回执机制，但一个批次只能包含 `dns` observations，不能与端口或服务 observation 混合。DNS query 的 `observed_at`、question、rcode、answer sections 和解析器元数据写入 Elasticsearch Data Stream；详情见 [`DNS_MAPPING.md`](DNS_MAPPING.md)。
 
 PostgreSQL 模式下 `scan_observation` 是事实来源，`ips`、`ports` 是资产与端口索引；ES
 权威模式下对应角色分别由月度 observation 索引和 execution/current endpoint 索引承担。

@@ -1,5 +1,5 @@
 use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
-use crate::audit::AuditContext;
+use crate::audit::{self, AuditContext};
 use crate::client_ip::{normalize_ip, request_ip};
 use crate::config::SecurityConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
@@ -33,6 +33,13 @@ struct ScannerHeartbeatLease {
     expires_at_ms: Option<i64>,
     ttl_ms: i64,
     maintenance_hold: bool,
+}
+
+#[derive(Deserialize)]
+struct CreateDnsTask {
+    domains: Vec<String>,
+    level: i8,
+    remark: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -149,15 +156,17 @@ impl ScannerScanCapabilities {
         if self.plan_versions.len() > 8 || self.profiles.len() > 8 || self.stages.len() > 16 {
             return Err("too many scan capabilities");
         }
-        if self
-            .profiles
-            .iter()
-            .any(|value| !matches!(value.as_str(), "legacy" | "port_only" | "service_inventory"))
-            || self
-                .stages
-                .iter()
-                .any(|value| !matches!(value.as_str(), "port_discovery" | "service_detection"))
-        {
+        if self.profiles.iter().any(|value| {
+            !matches!(
+                value.as_str(),
+                "legacy" | "port_only" | "service_inventory" | "dns_records"
+            )
+        }) || self.stages.iter().any(|value| {
+            !matches!(
+                value.as_str(),
+                "port_discovery" | "service_detection" | "dns_lookup"
+            )
+        }) {
             return Err("unsupported scan capability");
         }
         Ok(())
@@ -1418,6 +1427,128 @@ async fn create_task(
             HttpResponse::InternalServerError().body("500")
         }
     }
+}
+
+/// Creates the initial DNS-only task type. DNS tasks intentionally use an
+/// explicit domain list and automatic dispatch only; they do not inherit the
+/// IP/CIDR target generator or automatically expand into port scans.
+#[post("/api/task/create-dns")]
+async fn create_dns_task(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    input: web::Json<CreateDnsTask>,
+    user: UserBaseI,
+) -> impl Responder {
+    if !(0..=4).contains(&input.level) {
+        return HttpResponse::BadRequest()
+            .json(json!({"success": false, "message": "invalid task level"}));
+    }
+    if input.domains.is_empty() || input.domains.len() > 500 {
+        return HttpResponse::BadRequest()
+            .json(json!({"success": false, "message": "domains must contain 1 to 500 entries"}));
+    }
+    let mut domains = match input
+        .domains
+        .iter()
+        .map(|domain| crate::dns::canonical_domain(domain))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(domains) => domains,
+        Err(error) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": error}));
+        }
+    };
+    domains.sort();
+    domains.dedup();
+    let mut connection = match pool.get().await {
+        Ok(connection) => connection,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    let scanners = match connection
+        .query(
+            "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
+             AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? 'dns_records' \
+             ORDER BY scanner_id;",
+            &[],
+        )
+        .await
+    {
+        Ok(rows) if !rows.is_empty() => rows
+            .into_iter()
+            .map(|row| row.get::<_, String>("scanner_id"))
+            .collect::<Vec<_>>(),
+        Ok(_) => return HttpResponse::Conflict().json(
+            json!({"success": false, "message": "no DNS-capable scanner is currently available"}),
+        ),
+        Err(error) => {
+            error_logs(&req, "ResolveDnsTaskScannersError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let task_id = Uuid::now_v7().to_string();
+    let transaction = match connection.build_transaction().start().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            error_logs(&req, "CreateDnsTaskTransactionError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let task = match transaction
+        .query_one(
+            "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
+             dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets) \
+             VALUES ($1, $2, $3, ARRAY[]::INET[], '53', $4, $5, 'automatic', 'ipv4', 'dns_records', \
+             $6, 'dns', $7) RETURNING id;",
+            &[
+                &user.id,
+                &task_id,
+                &user.username,
+                &(i32::from(input.level)),
+                &input.remark,
+                &build_scan_plan("dns_records").expect("DNS scan plan is static"),
+                &domains,
+            ],
+        )
+        .await
+    {
+        Ok(task) => task,
+        Err(error) => {
+            error_logs(&req, "CreateDnsTaskError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    let task_db_id: i32 = task.get("id");
+    for scanner_id in scanners {
+        if let Err(error) = transaction
+            .execute(
+                "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, $3);",
+                &[&Uuid::now_v7().to_string(), &task_db_id, &scanner_id],
+            )
+            .await
+        {
+            error_logs(&req, "CreateDnsTaskExecutionError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
+    let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
+        .resource("task", task_id.clone());
+    audit_event.response_status = Some(200);
+    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": "dns_records"});
+    if let Err(error) = audit::write(
+        &transaction,
+        &AuditContext::from_request(&req),
+        &audit_event,
+    )
+    .await
+    {
+        error_logs(&req, "CreateDnsTaskAuditError", &error.to_string());
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        error_logs(&req, "CreateDnsTaskCommitError", &error.to_string());
+        return HttpResponse::InternalServerError().finish();
+    }
+    HttpResponse::Ok().json(json!({"success": true, "task_id": task_id, "domains": domains}))
 }
 
 /// 用于扫描器申请一个扫描目标

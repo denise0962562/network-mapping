@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	address_family TEXT NOT NULL DEFAULT 'ipv4' CHECK (address_family IN ('ipv4', 'ipv6')),
 	scan_profile TEXT NOT NULL DEFAULT 'legacy',
 	scan_plan JSONB NOT NULL DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb,
+	task_kind TEXT NOT NULL DEFAULT 'ip',
+	dns_targets TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -73,6 +75,8 @@ ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS address_family TEXT NOT NULL DEFA
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_profile TEXT NOT NULL DEFAULT 'legacy';
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_plan JSONB NOT NULL
     DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_kind TEXT NOT NULL DEFAULT 'ip';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS dns_targets TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
 UPDATE scan_task SET address_family = 'ipv6'
 WHERE cardinality(task_target) > 0
   AND NOT EXISTS (SELECT 1 FROM unnest(task_target) AS target WHERE family(target) <> 6);
@@ -85,13 +89,16 @@ BEGIN
             CHECK (address_family IN ('ipv4', 'ipv6'));
     END IF;
 END $$;
+ALTER TABLE scan_task DROP CONSTRAINT IF EXISTS scan_task_profile_check;
+ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
+    CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory', 'dns_records'));
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_profile_check'
+        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_kind_check'
     ) THEN
-        ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
-            CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory'));
+        ALTER TABLE scan_task ADD CONSTRAINT scan_task_kind_check
+            CHECK (task_kind IN ('ip', 'dns'));
     END IF;
 END $$;
 

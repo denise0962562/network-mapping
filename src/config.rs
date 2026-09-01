@@ -220,6 +220,9 @@ pub struct ElasticsearchConfig {
     pub observation_index_prefix: String,
     pub execution_endpoint_index: String,
     pub current_endpoint_index: String,
+    pub dns_observation_data_stream: String,
+    pub dns_record_index: String,
+    pub dns_observation_retention_days: u16,
     pub scan_number_of_replicas: u32,
     pub expected_version: String,
     pub api_key: Option<String>,
@@ -278,6 +281,15 @@ impl fmt::Debug for ElasticsearchConfig {
             .field("observation_index_prefix", &self.observation_index_prefix)
             .field("execution_endpoint_index", &self.execution_endpoint_index)
             .field("current_endpoint_index", &self.current_endpoint_index)
+            .field(
+                "dns_observation_data_stream",
+                &self.dns_observation_data_stream,
+            )
+            .field("dns_record_index", &self.dns_record_index)
+            .field(
+                "dns_observation_retention_days",
+                &self.dns_observation_retention_days,
+            )
             .field("scan_number_of_replicas", &self.scan_number_of_replicas)
             .field("expected_version", &self.expected_version)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
@@ -314,6 +326,9 @@ impl Default for ElasticsearchConfig {
             observation_index_prefix: "network-mapping-scan-observations-v1".to_owned(),
             execution_endpoint_index: "network-mapping-execution-endpoints-v1".to_owned(),
             current_endpoint_index: "network-mapping-endpoints-current-v2".to_owned(),
+            dns_observation_data_stream: "network-mapping-dns-observations".to_owned(),
+            dns_record_index: "network-mapping-dns-records-v1".to_owned(),
+            dns_observation_retention_days: 180,
             scan_number_of_replicas: 1,
             expected_version: "9.5.2".to_owned(),
             api_key: None,
@@ -409,6 +424,11 @@ impl SelfChecking for ElasticsearchConfig {
             ("observation_index_prefix", &self.observation_index_prefix),
             ("execution_endpoint_index", &self.execution_endpoint_index),
             ("current_endpoint_index", &self.current_endpoint_index),
+            (
+                "dns_observation_data_stream",
+                &self.dns_observation_data_stream,
+            ),
+            ("dns_record_index", &self.dns_record_index),
         ] {
             if value.is_empty()
                 || value.len() > 240
@@ -461,6 +481,11 @@ impl SelfChecking for ElasticsearchConfig {
         }
         if self.scan_number_of_replicas > 5 {
             return Err("elasticsearch.scan_number_of_replicas 必须在 0 到 5 之间".into());
+        }
+        if !(30..=365).contains(&self.dns_observation_retention_days) {
+            return Err(
+                "elasticsearch.dns_observation_retention_days 必须在 30 到 365 之间".into(),
+            );
         }
         if self.scan_storage.reads_elasticsearch() && self.scan_number_of_replicas == 0 {
             return Err(
@@ -1517,6 +1542,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::tags::remove_tag)
         .service(crate::target_generated::automatic_target_status)
         .service(handlers::task::create_task)
+        .service(handlers::task::create_dns_task)
         .service(handlers::task::apply_task_handler) //更换了 apply_task_handler 和 get_task的注册顺序
         .service(handlers::task::scanner_public_ip_handler)
         .service(handlers::task::scanner_heartbeat_handler)

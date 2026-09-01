@@ -22,6 +22,8 @@ Elasticsearch 可以从可选搜索副本升级为扫描事实的权威存储。
 - `network-mapping-execution-endpoints-v1`：每次执行的 `(execution, IP, port)` 当前投影。
 - `network-mapping-endpoints-current-v2`：`global/user` 权限范围内的当前端点投影。
 - `network-mapping-assets-v1`：旧 PostgreSQL 搜索副本，仅兼容模式使用。
+- `network-mapping-dns-observations`：DNS 查询证据 Data Stream；由 data-stream lifecycle 自动保留。
+- `network-mapping-dns-records-v1`：按完整 RR RDATA 去重的当前 DNS 记录。
 
 原始观察使用 `create` 和确定性 `_id = SHA-256(execution_id + observation_key)`。Bulk 响应
 逐项检查：非 2xx 立即失败；409 通过 `_mget` 回读并比较文档校验和，只有内容完全相同才
@@ -49,6 +51,9 @@ index = "network-mapping-assets-v1"
 observation_index_prefix = "network-mapping-scan-observations-v1"
 execution_endpoint_index = "network-mapping-execution-endpoints-v1"
 current_endpoint_index = "network-mapping-endpoints-current-v2"
+dns_observation_data_stream = "network-mapping-dns-observations"
+dns_record_index = "network-mapping-dns-records-v1"
+dns_observation_retention_days = 180
 scan_number_of_replicas = 1
 expected_version = "9.5.2"
 api_key = "base64-encoded-api-key"
