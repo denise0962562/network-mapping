@@ -1843,7 +1843,7 @@ async fn create_dns_task(
     {
         Ok(task) => task,
         Err(error) => {
-            error_logs(&req, "CreateDnsTaskError", &error.to_string());
+            error_logs_error(&req, "CreateDnsTaskError", "insert_scan_task", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -2273,6 +2273,18 @@ mod tests {
             explicit_dns_resolvers: false,
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn database_schema_allows_all_dns_scan_profiles() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+
+        for profile in ["dns_records", "dns_ports", "dns_full"] {
+            assert!(
+                initialization_sql.contains(&format!("'{profile}'")),
+                "database schema must allow {profile}"
+            );
+        }
     }
 
     #[test]

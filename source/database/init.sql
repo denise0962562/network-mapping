@@ -92,7 +92,14 @@ BEGIN
 END $$;
 ALTER TABLE scan_task DROP CONSTRAINT IF EXISTS scan_task_profile_check;
 ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
-    CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory', 'dns_records'));
+    CHECK (scan_profile IN (
+        'legacy',
+        'port_only',
+        'service_inventory',
+        'dns_records',
+        'dns_ports',
+        'dns_full'
+    ));
 DO $$
 BEGIN
     IF NOT EXISTS (
