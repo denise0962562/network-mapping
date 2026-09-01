@@ -2,7 +2,7 @@ use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::SecurityConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
-use crate::logs::write::error_logs;
+use crate::logs::write::{error_logs, error_logs_error};
 use crate::{generate_scanner_token, hash_scanner_token};
 use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, post, put, web};
 use deadpool_postgres::Pool;
@@ -13,6 +13,10 @@ use uuid::Uuid;
 
 fn is_admin(user: &UserBaseI) -> bool {
     user.role == 1
+}
+
+fn log_database_error(req: &HttpRequest, event: &str, error: &(dyn std::error::Error + 'static)) {
+    error_logs_error(req, event, "database_operation", error);
 }
 
 fn push_task_owner_scope<'a>(
@@ -56,14 +60,14 @@ pub(crate) async fn cancel_task(
     let mut connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "CancelTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "CancelTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -82,7 +86,7 @@ pub(crate) async fn cancel_task(
                 .json(json!({"success": false, "message": "task not found"}));
         }
         Err(error) => {
-            error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "CancelTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -101,11 +105,11 @@ pub(crate) async fn cancel_task(
          cancel_requested = (execution_status = 'running'), task_end_time = CASE WHEN execution_status = 'pending' THEN $1::BIGINT ELSE task_end_time END, \
          lease_expires_at = CASE WHEN execution_status = 'pending' THEN NULL ELSE lease_expires_at END \
          WHERE task_id = $2 AND execution_status IN ('pending', 'running');", &[&now, &task_pk]).await {
-        error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+        log_database_error(&req, "CancelTaskDatabaseError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     if let Err(error) = crate::refresh_task_aggregate(&transaction, task_pk).await {
-        error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+        log_database_error(&req, "CancelTaskDatabaseError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     let aggregate = match transaction
@@ -117,7 +121,7 @@ pub(crate) async fn cancel_task(
     {
         Ok(row) => row,
         Err(error) => {
-            error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "CancelTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -134,11 +138,11 @@ pub(crate) async fn cancel_task(
     )
     .await
     {
-        error_logs(&req, "CancelTaskAuditError", &error.to_string());
+        log_database_error(&req, "CancelTaskAuditError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     if let Err(error) = transaction.commit().await {
-        error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
+        log_database_error(&req, "CancelTaskDatabaseError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(
@@ -156,14 +160,14 @@ pub(crate) async fn retry_task(
     let mut connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "RetryTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "RetryTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -184,7 +188,7 @@ pub(crate) async fn retry_task(
                 .json(json!({"success": false, "message": "task not found"}));
         }
         Err(error) => {
-            error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "RetryTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -215,7 +219,7 @@ pub(crate) async fn retry_task(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id;",
         &[&owner_id, &new_id, &user.username, &targets, &dns_targets, &dns_resolvers, &task_kind, &port, &level, &remarks, &source_id, &dispatch_mode, &address_family, &scan_profile, &scan_plan]).await {
         Ok(row) => row.get("id"),
-        Err(error) => { error_logs(&req, "RetryTaskDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => { log_database_error(&req, "RetryTaskDatabaseError", &error); return HttpResponse::InternalServerError().finish(); }
     };
     let source_executions = match transaction
         .query(
@@ -227,7 +231,7 @@ pub(crate) async fn retry_task(
     {
         Ok(rows) => rows,
         Err(error) => {
-            error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "RetryTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -241,7 +245,7 @@ pub(crate) async fn retry_task(
             )
             .await
         {
-            error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "RetryTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     }
@@ -256,11 +260,11 @@ pub(crate) async fn retry_task(
     )
     .await
     {
-        error_logs(&req, "RetryTaskAuditError", &error.to_string());
+        log_database_error(&req, "RetryTaskAuditError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     if let Err(error) = transaction.commit().await {
-        error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
+        log_database_error(&req, "RetryTaskDatabaseError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true, "data": {"task_id": new_id}}))
@@ -298,7 +302,7 @@ pub(crate) async fn export_task(
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "ExportTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "ExportTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -329,7 +333,7 @@ pub(crate) async fn export_task(
     let rows = match connection.query(&sql, &params).await {
         Ok(rows) => rows,
         Err(error) => {
-            error_logs(&req, "ExportTaskDatabaseError", &error.to_string());
+            log_database_error(&req, "ExportTaskDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -514,7 +518,7 @@ pub(crate) async fn dashboard_overview(
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "DashboardDatabaseError", &error.to_string());
+            log_database_error(&req, "DashboardDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -543,7 +547,7 @@ pub(crate) async fn dashboard_overview(
     let summary = match connection.query_one(&summary_sql, &summary_params).await {
         Ok(row) => row,
         Err(error) => {
-            error_logs(&req, "DashboardDatabaseError", &error.to_string());
+            log_database_error(&req, "DashboardDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -551,7 +555,7 @@ pub(crate) async fn dashboard_overview(
         "SELECT COUNT(*)::BIGINT AS count FROM scanner_info WHERE deleted_at IS NULL AND is_enable = true \
          AND runtime_state <> 'stopping' AND last_seen_at >= NOW() - INTERVAL '90 seconds';", &[]).await {
         Ok(row) => row.get("count"),
-        Err(error) => { error_logs(&req, "DashboardDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => { log_database_error(&req, "DashboardDatabaseError", &error); return HttpResponse::InternalServerError().finish(); }
     };
     let mut trend_conditions =
         vec!["to_timestamp(t.task_create_time / 1000.0)::date = days.day::date".to_owned()];
@@ -567,7 +571,7 @@ pub(crate) async fn dashboard_overview(
     let trend_rows = match connection.query(&trend_sql, &trend_params).await {
         Ok(rows) => rows,
         Err(error) => {
-            error_logs(&req, "DashboardDatabaseError", &error.to_string());
+            log_database_error(&req, "DashboardDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -583,7 +587,7 @@ pub(crate) async fn dashboard_overview(
     let task_rows = match connection.query(&task_sql, &task_params).await {
         Ok(rows) => rows,
         Err(error) => {
-            error_logs(&req, "DashboardDatabaseError", &error.to_string());
+            log_database_error(&req, "DashboardDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -627,14 +631,14 @@ pub(crate) async fn update_scanner(
     let mut connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "UpdateScannerDatabaseError", &error.to_string());
+            log_database_error(&req, "UpdateScannerDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "UpdateScannerDatabaseError", &error.to_string());
+            log_database_error(&req, "UpdateScannerDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -644,7 +648,7 @@ pub(crate) async fn update_scanner(
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
         Err(error) => {
-            error_logs(&req, "UpdateScannerDatabaseError", &error.to_string());
+            log_database_error(&req, "UpdateScannerDatabaseError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     }
@@ -703,7 +707,7 @@ pub(crate) async fn set_scanner_enabled(
     let mut connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "SetScannerEnabledError", &error.to_string());
+            log_database_error(&req, "SetScannerEnabledError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -717,7 +721,7 @@ pub(crate) async fn set_scanner_enabled(
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
         Err(error) => {
-            error_logs(&req, "SetScannerEnabledError", &error.to_string());
+            log_database_error(&req, "SetScannerEnabledError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     }
@@ -773,7 +777,7 @@ pub(crate) async fn reissue_scanner_token(
     let mut connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "ReissueScannerTokenError", &error.to_string());
+            log_database_error(&req, "ReissueScannerTokenError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -788,7 +792,7 @@ pub(crate) async fn reissue_scanner_token(
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
         Err(error) => {
-            error_logs(&req, "ReissueScannerTokenError", &error.to_string());
+            log_database_error(&req, "ReissueScannerTokenError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     }
@@ -829,7 +833,7 @@ pub(crate) async fn delete_scanner(
     let mut connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "DeleteScannerError", &error.to_string());
+            log_database_error(&req, "DeleteScannerError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -848,7 +852,7 @@ pub(crate) async fn delete_scanner(
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
         Err(error) => {
-            error_logs(&req, "DeleteScannerError", &error.to_string());
+            log_database_error(&req, "DeleteScannerError", &error);
             return HttpResponse::InternalServerError().finish();
         }
     }

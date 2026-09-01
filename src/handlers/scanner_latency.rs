@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::admin::UserBaseI;
-use crate::logs::write::error_logs;
+use crate::logs::write::error_logs_error;
 
 const MAX_RANGE_DAYS: i64 = 30;
 const MAX_BUCKETS: i64 = 1_500;
@@ -126,7 +126,12 @@ pub(crate) async fn get_scanner_latency_history(
     let connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error_value) => {
-            error_logs(&req, "ScannerLatencyPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "ScannerLatencyPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -140,7 +145,7 @@ pub(crate) async fn get_scanner_latency_history(
     {
         Ok(row) => row.get::<_, bool>(0),
         Err(error_value) => {
-            error_logs(&req, "ScannerLatencyLookupError", &error_value.to_string());
+            error_logs_error(&req, "ScannerLatencyLookupError", "database_operation", &error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -170,7 +175,7 @@ pub(crate) async fn get_scanner_latency_history(
     {
         Ok(rows) => rows,
         Err(error_value) => {
-            error_logs(&req, "ScannerLatencyHistoryError", &error_value.to_string());
+            error_logs_error(&req, "ScannerLatencyHistoryError", "database_operation", &error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
 use crate::admin::UserBaseI;
-use crate::logs::write::error_logs;
+use crate::logs::write::error_logs_error;
 
 #[derive(Deserialize)]
 pub struct HealthAlertQuery {
@@ -73,7 +73,12 @@ pub(crate) async fn list_health_alerts(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "HealthAlertPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "HealthAlertPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -84,7 +89,12 @@ pub(crate) async fn list_health_alerts(
     let total: i64 = match client.query_one(&count_sql, &params).await {
         Ok(row) => row.get(0),
         Err(error_value) => {
-            error_logs(&req, "HealthAlertQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "HealthAlertQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -102,7 +112,12 @@ pub(crate) async fn list_health_alerts(
     let rows = match client.query(&list_sql, &list_params).await {
         Ok(rows) => rows,
         Err(error_value) => {
-            error_logs(&req, "HealthAlertQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "HealthAlertQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };

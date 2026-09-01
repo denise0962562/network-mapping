@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::admin::UserBaseI;
 use crate::client_ip::display_ip;
 use crate::handlers::system_resources::{Granularity, MAX_BUCKETS};
-use crate::logs::write::error_logs;
+use crate::logs::write::{error_logs, error_logs_error};
 
 #[derive(Deserialize)]
 pub struct RequestQuery {
@@ -460,7 +460,12 @@ pub(crate) async fn list_requests(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "RequestsQueryPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "RequestsQueryPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -470,7 +475,12 @@ pub(crate) async fn list_requests(
     let total: i64 = match client.query_one(&count_sql, &params).await {
         Ok(row) => row.get(0),
         Err(error_value) => {
-            error_logs(&req, "RequestsQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "RequestsQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -489,7 +499,12 @@ pub(crate) async fn list_requests(
     let rows = match client.query(&list_sql, &list_params).await {
         Ok(rows) => rows,
         Err(error_value) => {
-            error_logs(&req, "RequestsQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "RequestsQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -532,7 +547,12 @@ pub(crate) async fn request_summary(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "RequestsSummaryPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "RequestsSummaryPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -549,7 +569,12 @@ pub(crate) async fn request_summary(
         match client.query_one(&counts_sql, &params).await {
             Ok(row) => (row.get(0), row.get(1), row.get(2)),
             Err(error_value) => {
-                error_logs(&req, "RequestsSummaryError", &error_value.to_string());
+                error_logs_error(
+                    &req,
+                    "RequestsSummaryError",
+                    "database_operation",
+                    &error_value,
+                );
                 return HttpResponse::InternalServerError().finish();
             }
         };
@@ -577,7 +602,12 @@ pub(crate) async fn request_summary(
             })
             .collect(),
         Err(error_value) => {
-            error_logs(&req, "RequestsSummaryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "RequestsSummaryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -675,7 +705,12 @@ pub(crate) async fn request_summary(
             })
             .collect(),
         Err(error_value) => {
-            error_logs(&req, "RequestsSummaryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "RequestsSummaryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -692,7 +727,12 @@ pub(crate) async fn request_summary(
             match client.query_one(&percentile_sql, &params).await {
                 Ok(row) => (row.get::<_, Option<f64>>(0), row.get::<_, Option<f64>>(1)),
                 Err(error_value) => {
-                    error_logs(&req, "RequestsSummaryError", &error_value.to_string());
+                    error_logs_error(
+                        &req,
+                        "RequestsSummaryError",
+                        "database_operation",
+                        &error_value,
+                    );
                     return HttpResponse::InternalServerError().finish();
                 }
             }

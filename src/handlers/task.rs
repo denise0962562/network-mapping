@@ -1126,7 +1126,12 @@ async fn get_task(
     let connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
-            error_logs(&req, "GetTaskDatabaseError", &error.to_string());
+            error_logs_error(
+                &req,
+                "GetTaskDatabaseError",
+                "acquire_database_connection",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -1153,7 +1158,7 @@ async fn get_task(
             }));
         }
         Err(error) => {
-            error_logs(&req, "GetTaskDatabaseError", &error.to_string());
+            error_logs_error(&req, "GetTaskDatabaseError", "load_task", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -1170,7 +1175,7 @@ async fn get_task(
          WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
          ORDER BY e.id;", &[&task_pk]).await {
         Ok(rows) => rows,
-        Err(error) => { error_logs(&req, "GetTaskExecutionsError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => { error_logs_error(&req, "GetTaskExecutionsError", "load_task_executions", &error); return HttpResponse::InternalServerError().finish(); }
     };
     let selected_execution = query
         .execution_id
@@ -1236,7 +1241,7 @@ async fn get_task(
         {
             Ok(rows) => rows,
             Err(error) => {
-                error_logs(&req, "GetTaskResultsError", &error.to_string());
+                error_logs_error(&req, "GetTaskResultsError", "load_task_results", &error);
                 return HttpResponse::InternalServerError().finish();
             }
         };
@@ -1269,7 +1274,7 @@ async fn get_task(
             {
                 Ok(rows) => rows,
                 Err(error) => {
-                    error_logs(&req, "GetTaskPortsError", &error.to_string());
+                    error_logs_error(&req, "GetTaskPortsError", "load_task_ports", &error);
                     return HttpResponse::InternalServerError().finish();
                 }
             };
@@ -1508,7 +1513,7 @@ async fn get_dns_comparison(
     ).await {
         Ok(Some(task)) => task.get::<_, String>("task_kind"),
         Ok(None) => return HttpResponse::NotFound().json(json!({"success": false, "message": "task not found"})),
-        Err(error) => { error_logs(&req, "GetDnsComparisonDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => { error_logs_error(&req, "GetDnsComparisonDatabaseError", "load_dns_task", &error); return HttpResponse::InternalServerError().finish(); }
     };
     if task_kind != "dns" {
         return HttpResponse::BadRequest()
@@ -1594,6 +1599,12 @@ async fn create_task(
             }
         },
     };
+    if !crate::is_ip_scan_profile(&scan_profile) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "message": "DNS scan profiles require the domain task endpoint"
+        }));
+    }
     let scan_plan = match build_scan_plan(&scan_profile) {
         Ok(plan) => plan,
         Err(message) => {
@@ -1624,7 +1635,7 @@ async fn create_task(
             );
             let rows = match connection.query(&query, &[&values, &scan_profile]).await {
                 Ok(rows) => rows,
-                Err(error) => { error_logs(&req, "ResolveTaskScannersError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+                Err(error) => { error_logs_error(&req, "ResolveTaskScannersError", "resolve_selected_scanners", &error); return HttpResponse::InternalServerError().finish(); }
             };
             if rows.len() != values.len() {
                 return HttpResponse::BadRequest().json(serde_json::json!({"success": false, "message": format!("selected scanner is unavailable or does not support {address_family}/{scan_profile}")}));
@@ -1643,7 +1654,7 @@ async fn create_task(
             );
             let rows = match connection.query(&query, &[&scan_profile]).await {
                 Ok(rows) => rows,
-                Err(error) => { error_logs(&req, "ResolveTaskScannersError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+                Err(error) => { error_logs_error(&req, "ResolveTaskScannersError", "resolve_all_scanners", &error); return HttpResponse::InternalServerError().finish(); }
             };
             if rows.is_empty() {
                 return HttpResponse::Conflict().json(serde_json::json!({"success": false, "message": format!("no scanner supporting {address_family}/{scan_profile} is currently available")}));
@@ -1670,8 +1681,8 @@ async fn create_task(
         Ok(()) => HttpResponse::Ok()
             .content_type(TEXT_HTML_UTF_8)
             .body("创建成功"),
-        Err(e) => {
-            error_logs(&req, "AddTaskError", e.to_string().as_str());
+        Err(error) => {
+            error_logs_error(&req, "AddTaskError", "insert_scan_task", error.as_ref());
             HttpResponse::InternalServerError().body("500")
         }
     }
@@ -1799,7 +1810,7 @@ async fn create_dns_task(
             }),
         ),
         Err(error) => {
-            error_logs(&req, "ResolveDnsTaskScannersError", &error.to_string());
+            error_logs_error(&req, "ResolveDnsTaskScannersError", "resolve_dns_scanners", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -1815,7 +1826,12 @@ async fn create_dns_task(
     let transaction = match connection.build_transaction().start().await {
         Ok(transaction) => transaction,
         Err(error) => {
-            error_logs(&req, "CreateDnsTaskTransactionError", &error.to_string());
+            error_logs_error(
+                &req,
+                "CreateDnsTaskTransactionError",
+                "start_transaction",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -1855,7 +1871,7 @@ async fn create_dns_task(
         )
         .await
     {
-        error_logs(&req, "CreateDnsTaskExecutionError", &error.to_string());
+        error_logs_error(&req, "CreateDnsTaskExecutionError", "insert_task_execution", &error);
         return HttpResponse::InternalServerError().finish();
     }
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
@@ -1869,11 +1885,16 @@ async fn create_dns_task(
     )
     .await
     {
-        error_logs(&req, "CreateDnsTaskAuditError", &error.to_string());
+        error_logs_error(&req, "CreateDnsTaskAuditError", "write_audit_event", &error);
         return HttpResponse::InternalServerError().finish();
     }
     if let Err(error) = transaction.commit().await {
-        error_logs(&req, "CreateDnsTaskCommitError", &error.to_string());
+        error_logs_error(
+            &req,
+            "CreateDnsTaskCommitError",
+            "commit_transaction",
+            &error,
+        );
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true, "task_id": task_id, "domains": domains, "dns_resolvers": dns_resolvers}))

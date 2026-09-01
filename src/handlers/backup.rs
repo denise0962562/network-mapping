@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::backup::{BackupManager, CommandResult};
-use crate::logs::write::error_logs;
+use crate::logs::write::error_logs_error;
 
 #[derive(Clone, Copy, Debug)]
 enum BackupOperation {
@@ -181,7 +181,12 @@ pub(crate) async fn list_backup_jobs(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "BackupJobPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "BackupJobPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -191,7 +196,12 @@ pub(crate) async fn list_backup_jobs(
     {
         Ok(row) => row.get(0),
         Err(error_value) => {
-            error_logs(&req, "BackupJobQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "BackupJobQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -208,7 +218,12 @@ pub(crate) async fn list_backup_jobs(
     {
         Ok(rows) => rows,
         Err(error_value) => {
-            error_logs(&req, "BackupJobQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "BackupJobQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -236,7 +251,12 @@ pub(crate) async fn get_backup_job(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "BackupJobPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "BackupJobPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -257,7 +277,12 @@ pub(crate) async fn get_backup_job(
             HttpResponse::NotFound().json(json!({"success": false, "message": "备份任务不存在"}))
         }
         Err(error_value) => {
-            error_logs(&req, "BackupJobQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "BackupJobQueryError",
+                "database_operation",
+                &error_value,
+            );
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -324,7 +349,12 @@ async fn enqueue_job(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "BackupJobPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "BackupJobPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -336,7 +366,12 @@ async fn enqueue_job(
         )
         .await
     {
-        error_logs(&req, "BackupJobInsertError", &error_value.to_string());
+        error_logs_error(
+            &req,
+            "BackupJobInsertError",
+            "database_operation",
+            &error_value,
+        );
         return if error_value
             .as_db_error()
             .is_some_and(|value| value.constraint() == Some("idx_backup_job_single_active"))

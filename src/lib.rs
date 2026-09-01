@@ -507,7 +507,7 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
 mod parse_ip_or_cidr_tests {
     use super::{
         CreateTask, STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan,
-        parse_ip_or_cidr,
+        is_ip_scan_profile, parse_ip_or_cidr,
     };
 
     #[test]
@@ -570,6 +570,16 @@ mod parse_ip_or_cidr_tests {
         let dns_full = build_scan_plan("dns_full").unwrap();
         assert_eq!(dns_full["stages"][0]["type"], "dns_lookup");
         assert!(build_scan_plan("arbitrary_command").is_err());
+    }
+
+    #[test]
+    fn only_ip_profiles_can_be_used_as_the_system_default() {
+        for profile in ["legacy", "port_only", "service_inventory"] {
+            assert!(is_ip_scan_profile(profile));
+        }
+        for profile in ["dns_records", "dns_ports", "dns_full"] {
+            assert!(!is_ip_scan_profile(profile));
+        }
     }
 
     #[test]
@@ -708,6 +718,13 @@ pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
         "profile": profile,
         "stages": stages,
     }))
+}
+
+/// Profiles valid for IP/CIDR tasks and the system-wide default. DNS profiles
+/// require the dedicated domain-task endpoint and must never be inherited by
+/// an IP task.
+pub fn is_ip_scan_profile(profile: &str) -> bool {
+    matches!(profile, "legacy" | "port_only" | "service_inventory")
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据

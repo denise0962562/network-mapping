@@ -12,7 +12,7 @@ use crate::ReceiveSystemStatusInfo;
 use crate::admin::UserBaseI;
 use crate::config::AnalyticsSnapshotConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
-use crate::logs::write::error_logs;
+use crate::logs::write::{error_logs, error_logs_error};
 use crate::runtime_config::RuntimeConfig;
 use crate::{SystemDetails, SystemStatusJson, Systems, get_system_status_info};
 
@@ -378,7 +378,12 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error_value) => {
-            error_logs(&req, "AnalysisHeatmapPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "AnalysisHeatmapPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -410,7 +415,12 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error_value) => {
-            error_logs(&req, "AnalysisHeatmapQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "AnalysisHeatmapQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -452,7 +462,12 @@ async fn analysis_distribution_from_snapshot(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotPoolError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotPoolError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -463,7 +478,12 @@ async fn analysis_distribution_from_snapshot(
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotWatermarkError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotWatermarkError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::ServiceUnavailable()
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
@@ -501,7 +521,12 @@ async fn analysis_distribution_from_snapshot(
     let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotDistributionError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotDistributionError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -544,7 +569,12 @@ async fn analysis_heatmap_from_snapshot(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotPoolError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotPoolError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -555,7 +585,12 @@ async fn analysis_heatmap_from_snapshot(
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotWatermarkError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotWatermarkError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::ServiceUnavailable()
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
@@ -585,7 +620,12 @@ async fn analysis_heatmap_from_snapshot(
     let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotHeatmapError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotHeatmapError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
