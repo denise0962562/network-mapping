@@ -491,6 +491,7 @@ pub async fn automatic_target_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn family_generator(
     family: &'static str,
     enabled: bool,

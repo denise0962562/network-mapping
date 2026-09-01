@@ -20,6 +20,9 @@ pub struct TemplateTestRequest {
     source: MailTemplateSource,
 }
 
+// Callers immediately return the response, so preserving the unboxed type
+// avoids an allocation on authorization failures.
+#[allow(clippy::result_large_err)]
 fn require_admin(user: &UserBaseI) -> Result<(), HttpResponse> {
     if user.role == 1 {
         Ok(())

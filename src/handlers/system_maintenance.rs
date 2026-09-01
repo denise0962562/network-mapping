@@ -61,6 +61,9 @@ struct SystemMaintenanceHistoryItem {
     in_progress: bool,
 }
 
+// Callers immediately return the response, so preserving the unboxed type
+// avoids an allocation on authorization failures.
+#[allow(clippy::result_large_err)]
 fn require_admin(user: &UserBaseI) -> Result<(), HttpResponse> {
     if user.role == 1 {
         Ok(())
@@ -72,6 +75,8 @@ fn require_admin(user: &UserBaseI) -> Result<(), HttpResponse> {
     }
 }
 
+// Validation errors are returned directly by the request handlers.
+#[allow(clippy::result_large_err)]
 fn validate_message(message: &str) -> Result<String, HttpResponse> {
     let message = message.trim();
     if message.is_empty() {

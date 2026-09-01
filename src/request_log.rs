@@ -51,7 +51,7 @@ pub fn classify_status(status: u16) -> (&'static str, Option<&'static str>) {
         409 => ("client_error", Some("conflict")),
         422 => ("client_error", Some("validation")),
         429 => ("client_error", Some("rate_limited")),
-        400..=499 => ("client_error", Some("client_error")),
+        _ if (400..500).contains(&status) => ("client_error", Some("client_error")),
         500..=599 => ("server_error", Some("server_error")),
         _ => ("ok", None),
     }
