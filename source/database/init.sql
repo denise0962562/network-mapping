@@ -77,6 +77,7 @@ ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_plan JSONB NOT NULL
     DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_kind TEXT NOT NULL DEFAULT 'ip';
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS dns_targets TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS dns_resolvers JSONB NOT NULL DEFAULT '[]'::JSONB;
 UPDATE scan_task SET address_family = 'ipv6'
 WHERE cardinality(task_target) > 0
   AND NOT EXISTS (SELECT 1 FROM unnest(task_target) AS target WHERE family(target) <> 6);

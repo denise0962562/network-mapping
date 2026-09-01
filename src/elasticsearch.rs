@@ -21,7 +21,7 @@ use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, Monit
 const INDEX_SCHEMA_VERSION: &str = "2";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
 const SCAN_INDEX_SCHEMA_VERSION: &str = "2";
-const DNS_INDEX_SCHEMA_VERSION: &str = "1";
+const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
 const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
      ON asset_endpoint_current(projection_version);";
@@ -416,6 +416,31 @@ impl ElasticsearchService {
                 Method::POST,
                 &format!("/{index}"),
                 |request| request.json(body),
+            )
+            .await?;
+        self.mark_success();
+        Ok(result)
+    }
+
+    /// Returns the immutable DNS observations for one task. Comparison is
+    /// intentionally derived from these source observations, never from the
+    /// mutable current-record projection.
+    pub(crate) async fn dns_task_observations(&self, task_id: &str) -> Result<Value, String> {
+        if !self.inner.config.scan_storage.reads_elasticsearch() || !self.can_read() {
+            return Err("Elasticsearch DNS 查询读路径尚未就绪".to_owned());
+        }
+        let body = json!({
+            "size": 10_000,
+            "track_total_hits": false,
+            "query": {"term": {"scan.task_id": task_id}},
+            "sort": [{"@timestamp": {"order": "desc"}}]
+        });
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::ScanQuery,
+                Method::POST,
+                &format!("{}/_search", self.inner.config.dns_observation_data_stream),
+                |request| request.json(&body),
             )
             .await?;
         self.mark_success();
@@ -916,6 +941,16 @@ impl ElasticsearchService {
         .await?;
         self.ensure_data_stream(&self.inner.config.dns_observation_data_stream)
             .await?;
+        // Existing installations already have a strict mapping on the DNS data
+        // stream. Additive mapping updates make the new resolver attribution
+        // fields writable before the first explicit-resolver upload.
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            &format!("{}/_mapping", self.inner.config.dns_observation_data_stream),
+            |request| request.json(&json!({"properties": {"resolver": dns_resolver_mapping()}})),
+        )
+        .await?;
         self.ensure_named_index(
             &self.inner.config.dns_record_index,
             &dns_record_index_definition(self.inner.config.scan_number_of_replicas),
@@ -995,14 +1030,13 @@ impl ElasticsearchService {
         &self,
         context: &ScanBatchContext,
         tenant_id: &str,
-        dns_view_id: &str,
         observations: &[DnsObservation],
     ) -> Result<(), String> {
         if !self.enabled() {
             return Err("Elasticsearch 未启用，无法保存 DNS 观察".to_owned());
         }
-        if tenant_id.trim().is_empty() || dns_view_id.trim().is_empty() {
-            return Err("tenant_id 和 dns_view_id 不能为空".to_owned());
+        if tenant_id.trim().is_empty() {
+            return Err("tenant_id 不能为空".to_owned());
         }
         self.ensure_dns_indices().await?;
 
@@ -1010,6 +1044,7 @@ impl ElasticsearchService {
         let mut record_bulk = String::new();
         for (position, input) in observations.iter().cloned().enumerate() {
             let observation = input.normalize()?;
+            let dns_view_id = observation.resolver_id.as_deref().unwrap_or("system");
             let timestamp = DateTime::<Utc>::from_timestamp_millis(observation.observed_at)
                 .ok_or_else(|| format!("无效 DNS observed_at：{}", observation.observed_at))?;
             let immutable = serde_json::to_vec(&observation).map_err(|error| error.to_string())?;
@@ -1043,7 +1078,11 @@ impl ElasticsearchService {
                     "authority": observation.authority,
                     "additional": observation.additional
                 },
-                "resolver": {"ip": observation.resolver_ip, "transport": observation.resolver_transport},
+                "resolver": {
+                    "id": observation.resolver_id, "label": observation.resolver_label,
+                    "ip": observation.resolver_ip, "port": observation.resolver_port,
+                    "transport": observation.resolver_transport
+                },
                 "latency_ms": observation.latency_ms
             });
             observation_bulk.push_str(
@@ -3219,12 +3258,19 @@ fn dns_observation_template(data_stream: &str, replicas: u32, retention_days: u1
                         "authority": {"type": "object", "enabled": false},
                         "additional": {"type": "object", "enabled": false}
                     }},
-                    "resolver": {"properties": {"ip": {"type": "ip"}, "transport": {"type": "keyword"}}},
+                    "resolver": dns_resolver_mapping(),
                     "latency_ms": {"type": "integer"}
                 }
             }
         }
     })
+}
+
+fn dns_resolver_mapping() -> Value {
+    json!({"properties": {
+        "id": {"type": "keyword"}, "label": {"type": "keyword", "ignore_above": 256},
+        "ip": {"type": "ip"}, "port": {"type": "integer"}, "transport": {"type": "keyword"}
+    }})
 }
 
 fn dns_record_index_definition(replicas: u32) -> Value {

@@ -172,7 +172,7 @@ pub(crate) async fn retry_task(
     let mut params: Vec<&(dyn ToSql + Sync)> = vec![&source_id];
     push_task_owner_scope(&mut conditions, &mut params, &user, "user_id");
     let sql = format!(
-        "SELECT id, user_id, task_target, dns_targets, task_kind, task_port, task_level, remarks, task_status, \
+        "SELECT id, user_id, task_target, dns_targets, dns_resolvers, task_kind, task_port, task_level, remarks, task_status, \
                 dispatch_mode, address_family, scan_profile, scan_plan FROM scan_task \
          WHERE {} FOR UPDATE;",
         conditions.join(" AND ")
@@ -200,6 +200,7 @@ pub(crate) async fn retry_task(
     let owner_id: i32 = source.get("user_id");
     let targets: Vec<cidr::IpInet> = source.get("task_target");
     let dns_targets: Vec<String> = source.get("dns_targets");
+    let dns_resolvers: serde_json::Value = source.get("dns_resolvers");
     let task_kind: String = source.get("task_kind");
     let port: String = source.get("task_port");
     let level: i32 = source.get("task_level");
@@ -210,9 +211,9 @@ pub(crate) async fn retry_task(
     let scan_profile: String = source.get("scan_profile");
     let scan_plan: serde_json::Value = source.get("scan_plan");
     let new_task_pk: i32 = match transaction.query_one(
-        "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, dns_targets, task_kind, task_port, task_level, remarks, retry_of_task_id, dispatch_mode, address_family, scan_profile, scan_plan) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id;",
-        &[&owner_id, &new_id, &user.username, &targets, &dns_targets, &task_kind, &port, &level, &remarks, &source_id, &dispatch_mode, &address_family, &scan_profile, &scan_plan]).await {
+        "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, dns_targets, dns_resolvers, task_kind, task_port, task_level, remarks, retry_of_task_id, dispatch_mode, address_family, scan_profile, scan_plan) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id;",
+        &[&owner_id, &new_id, &user.username, &targets, &dns_targets, &dns_resolvers, &task_kind, &port, &level, &remarks, &source_id, &dispatch_mode, &address_family, &scan_profile, &scan_plan]).await {
         Ok(row) => row.get("id"),
         Err(error) => { error_logs(&req, "RetryTaskDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
     };

@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use tracing::error;
 use uuid::Uuid;
@@ -38,11 +38,55 @@ struct ScannerHeartbeatLease {
 #[derive(Deserialize)]
 struct CreateDnsTask {
     domains: Vec<String>,
+    #[serde(default)]
+    dns_resolvers: Vec<CreateDnsResolver>,
     level: i8,
     remark: Option<String>,
     #[serde(default = "default_dns_scan_profile")]
     scan_profile: String,
     port: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CreateDnsResolver {
+    id: String,
+    label: String,
+    ip: String,
+    port: u16,
+    transport: String,
+}
+
+impl CreateDnsResolver {
+    fn normalize(mut self) -> Result<Self, &'static str> {
+        self.id = self.id.trim().to_ascii_lowercase();
+        self.label = self.label.trim().to_owned();
+        self.ip = self
+            .ip
+            .trim()
+            .parse::<IpAddr>()
+            .map_err(|_| "DNS server IP is invalid")?
+            .to_string();
+        self.transport = self.transport.trim().to_ascii_lowercase();
+        if self.id.is_empty()
+            || self.id.len() > 64
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("DNS server ID must contain 1 to 64 letters, numbers, - or _");
+        }
+        if self.label.is_empty() || self.label.len() > 128 {
+            return Err("DNS server name must contain 1 to 128 characters");
+        }
+        if self.port == 0 {
+            return Err("DNS server port must be between 1 and 65535");
+        }
+        if !matches!(self.transport.as_str(), "udp" | "tcp") {
+            return Err("DNS server transport must be udp or tcp");
+        }
+        Ok(self)
+    }
 }
 
 fn default_dns_scan_profile() -> String {
@@ -146,6 +190,8 @@ pub struct ScannerScanCapabilities {
     plan_versions: Vec<u16>,
     profiles: Vec<String>,
     stages: Vec<String>,
+    #[serde(default)]
+    explicit_dns_resolvers: bool,
 }
 
 impl Default for ScannerScanCapabilities {
@@ -154,6 +200,7 @@ impl Default for ScannerScanCapabilities {
             plan_versions: Vec::new(),
             profiles: vec!["legacy".into()],
             stages: vec!["port_discovery".into()],
+            explicit_dns_resolvers: false,
         }
     }
 }
@@ -1081,7 +1128,7 @@ async fn get_task(
              t.task_level, t.task_create_time, t.task_start_time, t.task_end_time, \
              t.task_status, t.lease_expires_at, t.attempt_count, t.failure_reason, t.cancel_requested, \
              t.retry_of_task_id, t.remarks, t.dispatch_mode, t.task_source, \
-             t.generation_strategy, t.generation_metadata, t.address_family, t.scan_profile, t.scan_plan \
+             t.generation_strategy, t.generation_metadata, t.address_family, t.scan_profile, t.scan_plan, t.dns_resolvers \
              FROM scan_task t \
              WHERE t.task_id = $1 AND ($2 = 1 OR t.user_id = $3) LIMIT 1;",
             &[&task_id, &user.role, &user.id],
@@ -1268,6 +1315,7 @@ async fn get_task(
             "address_family": task.get::<_, String>("address_family"),
             "scan_profile": task.get::<_, String>("scan_profile"),
             "scan_plan": task.get::<_, Value>("scan_plan"),
+            "dns_resolvers": task.get::<_, Value>("dns_resolvers"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
             "executions": executions,
             "scanner_id": selected_execution.get::<_, Option<String>>("assigned_scanner_id"),
@@ -1292,6 +1340,182 @@ async fn get_task(
             }
         }
     }))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DnsComparisonResolverResult {
+    id: String,
+    label: String,
+    ip: Option<String>,
+    port: Option<u16>,
+    transport: Option<String>,
+    response_code: String,
+    latency_ms: Option<u32>,
+    answers: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DnsComparisonRecord {
+    name: String,
+    record_type: String,
+    resolvers: Vec<DnsComparisonResolverResult>,
+    common_answers: Vec<Value>,
+    differences: Vec<Value>,
+    response_code_difference: bool,
+}
+
+fn build_dns_comparison(payload: &Value) -> Vec<DnsComparisonRecord> {
+    let mut latest =
+        BTreeMap::<(String, String, String), (String, DnsComparisonResolverResult)>::new();
+    for hit in payload
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let source = hit.get("_source").unwrap_or(hit);
+        let Some(name) = source.pointer("/dns/question/name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(record_type) = source.pointer("/dns/question/type").and_then(Value::as_str) else {
+            continue;
+        };
+        let resolver_id = source
+            .pointer("/resolver/id")
+            .and_then(Value::as_str)
+            .or_else(|| source.pointer("/dns_view/id").and_then(Value::as_str))
+            .unwrap_or("system");
+        let observed_at = source
+            .get("@timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let answers = source
+            .pointer("/dns/answers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let item = DnsComparisonResolverResult {
+            id: resolver_id.to_owned(),
+            label: source
+                .pointer("/resolver/label")
+                .and_then(Value::as_str)
+                .unwrap_or(resolver_id)
+                .to_owned(),
+            ip: source
+                .pointer("/resolver/ip")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            port: source
+                .pointer("/resolver/port")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok()),
+            transport: source
+                .pointer("/resolver/transport")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            response_code: source
+                .pointer("/dns/response_code")
+                .and_then(Value::as_str)
+                .unwrap_or("SERVFAIL")
+                .to_owned(),
+            latency_ms: source
+                .get("latency_ms")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
+            answers,
+        };
+        let key = (
+            name.to_owned(),
+            record_type.to_owned(),
+            resolver_id.to_owned(),
+        );
+        if latest
+            .get(&key)
+            .is_none_or(|(current, _)| observed_at > *current)
+        {
+            latest.insert(key, (observed_at, item));
+        }
+    }
+    let mut groups = BTreeMap::<(String, String), Vec<DnsComparisonResolverResult>>::new();
+    for ((name, record_type, _), (_, resolver)) in latest {
+        groups
+            .entry((name, record_type))
+            .or_default()
+            .push(resolver);
+    }
+    groups.into_iter().map(|((name, record_type), mut resolvers)| {
+        resolvers.sort_by(|left, right| left.id.cmp(&right.id));
+        let resolver_count = resolvers.len();
+        let response_code_difference = resolvers
+            .iter()
+            .map(|resolver| resolver.response_code.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1;
+        let mut occurrences = BTreeMap::<String, (Value, BTreeSet<String>)>::new();
+        for resolver in &resolvers {
+            for answer in &resolver.answers {
+                let identity = format!("{}\u{0}{}", answer.get("type").and_then(Value::as_str).unwrap_or(""), answer.get("value").and_then(Value::as_str).unwrap_or(""));
+                let entry = occurrences.entry(identity).or_insert_with(|| (answer.clone(), BTreeSet::new()));
+                entry.1.insert(resolver.id.clone());
+            }
+        }
+        let common_answers = occurrences.values()
+            .filter(|(_, resolver_ids)| resolver_count > 0 && resolver_ids.len() == resolver_count)
+            .map(|(answer, _)| answer.clone()).collect();
+        let differences = occurrences.into_values()
+            .filter(|(_, resolver_ids)| resolver_ids.len() != resolver_count)
+            .map(|(answer, resolver_ids)| json!({"answer": answer, "resolver_ids": resolver_ids.into_iter().collect::<Vec<_>>() }))
+            .collect();
+        DnsComparisonRecord {
+            name,
+            record_type,
+            resolvers,
+            common_answers,
+            differences,
+            response_code_difference,
+        }
+    }).collect()
+}
+
+#[get("/api/task/{task_id}/dns-comparison")]
+async fn get_dns_comparison(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    elasticsearch: web::Data<ElasticsearchService>,
+    task_id: web::Path<Uuid>,
+    user: UserBaseI,
+) -> impl Responder {
+    let task_id = task_id.into_inner().to_string();
+    let connection = match pool.get().await {
+        Ok(connection) => connection,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    let task_kind = match connection.query_opt(
+        "SELECT task_kind FROM scan_task WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) LIMIT 1;",
+        &[&task_id, &user.role, &user.id],
+    ).await {
+        Ok(Some(task)) => task.get::<_, String>("task_kind"),
+        Ok(None) => return HttpResponse::NotFound().json(json!({"success": false, "message": "task not found"})),
+        Err(error) => { error_logs(&req, "GetDnsComparisonDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+    };
+    if task_kind != "dns" {
+        return HttpResponse::BadRequest()
+            .json(json!({"success": false, "message": "task is not a DNS task"}));
+    }
+    match elasticsearch.dns_task_observations(&task_id).await {
+        Ok(payload) => {
+            let records = build_dns_comparison(&payload);
+            HttpResponse::Ok().json(json!({"success": true, "data": {"records": records}}))
+        }
+        Err(error) => {
+            error_logs(&req, "GetDnsComparisonElasticsearchError", &error);
+            HttpResponse::ServiceUnavailable().json(
+                json!({"success": false, "message": "DNS comparison is temporarily unavailable"}),
+            )
+        }
+    }
 }
 
 #[post("/api/task/create")]
@@ -1461,6 +1685,31 @@ async fn create_dns_task(
         return HttpResponse::BadRequest()
             .json(json!({"success": false, "message": "domains must contain 1 to 500 entries"}));
     }
+    if input.dns_resolvers.len() > 8 {
+        return HttpResponse::BadRequest().json(
+            json!({"success": false, "message": "dns_resolvers must contain at most 8 entries"}),
+        );
+    }
+    let mut dns_resolvers = match input
+        .dns_resolvers
+        .iter()
+        .cloned()
+        .map(CreateDnsResolver::normalize)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(resolvers) => resolvers,
+        Err(error) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": error}));
+        }
+    };
+    dns_resolvers.sort_by(|left, right| left.id.cmp(&right.id));
+    if dns_resolvers
+        .windows(2)
+        .any(|pair| pair[0].id == pair[1].id)
+    {
+        return HttpResponse::BadRequest()
+            .json(json!({"success": false, "message": "dns_resolvers contains duplicate IDs"}));
+    }
     if !matches!(
         input.scan_profile.as_str(),
         "dns_records" | "dns_ports" | "dns_full"
@@ -1499,8 +1748,9 @@ async fn create_dns_task(
         .query(
             "SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
              AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
+             AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
              LIMIT 1;",
-            &[&input.scan_profile],
+            &[&input.scan_profile, &!dns_resolvers.is_empty()],
         )
         .await
     {
@@ -1524,9 +1774,9 @@ async fn create_dns_task(
     let task = match transaction
         .query_one(
             "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
-             dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets) \
+             dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets, dns_resolvers) \
              VALUES ($1, $2, $3, ARRAY[]::INET[], $4, $5, $6, 'automatic', 'ipv4', $7, \
-             $8, 'dns', $9) RETURNING id;",
+             $8, 'dns', $9, $10) RETURNING id;",
             &[
                 &user.id,
                 &task_id,
@@ -1537,6 +1787,7 @@ async fn create_dns_task(
                 &input.scan_profile,
                 &build_scan_plan(&input.scan_profile).expect("DNS scan profile was validated"),
                 &domains,
+                &serde_json::to_value(&dns_resolvers).expect("DNS resolver input is serializable"),
             ],
         )
         .await
@@ -1561,8 +1812,7 @@ async fn create_dns_task(
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
         .resource("task", task_id.clone());
     audit_event.response_status = Some(200);
-    audit_event.metadata =
-        json!({"target_count": domains.len(), "scan_profile": input.scan_profile});
+    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": input.scan_profile, "dns_resolver_count": dns_resolvers.len()});
     if let Err(error) = audit::write(
         &transaction,
         &AuditContext::from_request(&req),
@@ -1577,7 +1827,7 @@ async fn create_dns_task(
         error_logs(&req, "CreateDnsTaskCommitError", &error.to_string());
         return HttpResponse::InternalServerError().finish();
     }
-    HttpResponse::Ok().json(json!({"success": true, "task_id": task_id, "domains": domains}))
+    HttpResponse::Ok().json(json!({"success": true, "task_id": task_id, "domains": domains, "dns_resolvers": dns_resolvers}))
 }
 
 /// 用于扫描器申请一个扫描目标
@@ -1861,12 +2111,13 @@ async fn get_all_task_handler(
 mod tests {
     use super::{
         ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
-        ScannerScanCapabilities, normalize_task_list_query, task_result_pagination,
-        validate_latency_report, validate_public_ip,
+        ScannerScanCapabilities, build_dns_comparison, normalize_task_list_query,
+        task_result_pagination, validate_latency_report, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
     use chrono::Utc;
+    use serde_json::json;
     use uuid::Uuid;
 
     #[test]
@@ -1958,6 +2209,7 @@ mod tests {
             plan_versions: vec![1],
             profiles: vec!["legacy".into(), "port_only".into()],
             stages: vec!["port_discovery".into()],
+            explicit_dns_resolvers: false,
         };
         assert!(valid.validate().is_ok());
 
@@ -1965,8 +2217,31 @@ mod tests {
             plan_versions: vec![1],
             profiles: vec!["run_arbitrary_command".into()],
             stages: vec!["port_discovery".into()],
+            explicit_dns_resolvers: false,
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn dns_comparison_groups_answers_by_resolver_and_question() {
+        let comparison = build_dns_comparison(&json!({
+            "hits": {"hits": [
+                {"_source": {
+                    "@timestamp": "2026-01-01T00:00:00Z", "dns_view": {"id": "dns-a"},
+                    "resolver": {"id": "dns-a", "label": "DNS A", "ip": "192.0.2.53", "port": 53, "transport": "udp"},
+                    "dns": {"question": {"name": "example.com", "type": "A"}, "response_code": "NOERROR", "answers": [{"type": "A", "value": "192.0.2.10", "ttl": 60}]}
+                }},
+                {"_source": {
+                    "@timestamp": "2026-01-01T00:00:01Z", "dns_view": {"id": "dns-b"},
+                    "resolver": {"id": "dns-b", "label": "DNS B", "ip": "192.0.2.54", "port": 53, "transport": "udp"},
+                    "dns": {"question": {"name": "example.com", "type": "A"}, "response_code": "NOERROR", "answers": [{"type": "A", "value": "192.0.2.10", "ttl": 55}, {"type": "A", "value": "192.0.2.11", "ttl": 60}]}
+                }}
+            ]}
+        }));
+        assert_eq!(comparison.len(), 1);
+        assert_eq!(comparison[0].resolvers.len(), 2);
+        assert_eq!(comparison[0].common_answers.len(), 1);
+        assert_eq!(comparison[0].differences.len(), 1);
     }
 
     #[test]

@@ -1606,6 +1606,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::task::upload_scanner_result_handler)
         .service(handlers::task::get_all_task_handler)
         .service(handlers::task::get_task)
+        .service(handlers::task::get_dns_comparison)
         .service(handlers::operations::cancel_task)
         .service(handlers::operations::retry_task)
         .service(handlers::operations::export_task)

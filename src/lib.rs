@@ -1244,6 +1244,7 @@ pub struct ApplyTask {
     pub task_port: String,
     pub address_family: String,
     pub scan_plan: Value,
+    pub dns_resolvers: Value,
     pub lease_expires_at_ms: i64,
     pub lease_ttl_ms: i64,
 }
@@ -1788,7 +1789,7 @@ async fn save_dns_scanner_results(
     // The control-plane receipt is only written after the idempotent ES writes
     // have succeeded. A retry repeats harmless create/upsert operations.
     elasticsearch
-        .persist_dns_observations(&context, "default", "default", &observations)
+        .persist_dns_observations(&context, "default", &observations)
         .await
         .map_err(SaveScannerResultsError::Storage)?;
     transaction
@@ -2681,7 +2682,7 @@ pub async fn apply_task(
         .query_opt(
             "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, \
              CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::text[] END AS task_target, \
-             t.task_port, t.address_family, t.scan_plan \
+             t.task_port, t.address_family, t.scan_plan, t.dns_resolvers \
          FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
          JOIN scanner_info s ON s.scanner_id = $2 \
          WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.maintenance_hold = FALSE AND e.cancel_requested = false \
@@ -2690,6 +2691,8 @@ pub async fn apply_task(
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
              OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
            AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
+           AND (jsonb_array_length(t.dns_resolvers) = 0 \
+             OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
          ORDER BY t.task_level DESC, t.task_create_time, e.id \
          FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",
@@ -2738,6 +2741,7 @@ pub async fn apply_task(
         task_port: row.get("task_port"),
         address_family: row.get("address_family"),
         scan_plan: row.get("scan_plan"),
+        dns_resolvers: row.get("dns_resolvers"),
         lease_expires_at_ms: lease_expires_at,
         lease_ttl_ms: TASK_LEASE_MS,
     };

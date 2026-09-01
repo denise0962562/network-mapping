@@ -23,6 +23,12 @@ pub struct DnsObservation {
     #[serde(default)]
     pub additional: Vec<DnsAnswer>,
     pub resolver_ip: Option<String>,
+    #[serde(default)]
+    pub resolver_id: Option<String>,
+    #[serde(default)]
+    pub resolver_label: Option<String>,
+    #[serde(default)]
+    pub resolver_port: Option<u16>,
     pub resolver_transport: Option<String>,
     pub latency_ms: Option<u32>,
 }
@@ -134,6 +140,36 @@ impl DnsObservation {
                     .map_err(|_| "resolver_ip must be an IP address".to_owned())?
                     .to_string(),
             );
+        }
+        self.resolver_id = self
+            .resolver_id
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        if self.resolver_id.as_deref().is_some_and(|value| {
+            value.len() > 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        }) {
+            return Err(
+                "DNS resolver_id must contain up to 64 letters, numbers, - or _".to_owned(),
+            );
+        }
+        self.resolver_label = self
+            .resolver_label
+            .as_deref()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if self
+            .resolver_label
+            .as_deref()
+            .is_some_and(|value| value.len() > 128)
+        {
+            return Err("DNS resolver_label must contain up to 128 characters".to_owned());
+        }
+        if self.resolver_port == Some(0) {
+            return Err("DNS resolver_port must be between 1 and 65535".to_owned());
         }
         self.resolver_transport = self
             .resolver_transport
@@ -315,6 +351,9 @@ mod tests {
             authority: vec![],
             additional: vec![],
             resolver_ip: Some("192.0.2.53".into()),
+            resolver_id: Some("resolver-a".into()),
+            resolver_label: Some("Resolver A".into()),
+            resolver_port: Some(53),
             resolver_transport: Some("UDP".into()),
             latency_ms: Some(23),
         }
