@@ -8,10 +8,23 @@ use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, post, put, we
 use deadpool_postgres::Pool;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 fn is_admin(user: &UserBaseI) -> bool {
     user.role == 1
+}
+
+fn push_task_owner_scope<'a>(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<&'a (dyn ToSql + Sync)>,
+    user: &'a UserBaseI,
+    column: &str,
+) {
+    if !is_admin(user) {
+        params.push(&user.id);
+        conditions.push(format!("{column} = ${}", params.len()));
+    }
 }
 
 async fn audit(
@@ -55,20 +68,25 @@ pub(crate) async fn cancel_task(
         }
     };
     let id = task_id.into_inner().to_string();
-    let row = match transaction
-        .query_opt(
-            "SELECT task_status FROM scan_task WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) FOR UPDATE;",
-            &[&id, &user.role, &user.id],
-        )
-        .await
-    {
+    let mut conditions = vec!["task_id = $1".to_owned()];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id];
+    push_task_owner_scope(&mut conditions, &mut params, &user, "user_id");
+    let sql = format!(
+        "SELECT id, task_status FROM scan_task WHERE {} FOR UPDATE;",
+        conditions.join(" AND ")
+    );
+    let row = match transaction.query_opt(&sql, &params).await {
         Ok(Some(row)) => row,
-        Ok(None) => return HttpResponse::NotFound().json(json!({"success": false, "message": "task not found"})),
+        Ok(None) => {
+            return HttpResponse::NotFound()
+                .json(json!({"success": false, "message": "task not found"}));
+        }
         Err(error) => {
             error_logs(&req, "CancelTaskDatabaseError", &error.to_string());
             return HttpResponse::InternalServerError().finish();
         }
     };
+    let task_pk: i32 = row.get("id");
     let status: String = row.get("task_status");
     match status.as_str() {
         "pending" | "running" => {}
@@ -78,13 +96,6 @@ pub(crate) async fn cancel_task(
         }
     }
     let now = crate::get_unix_epoch_ms();
-    let task_pk: i32 = match transaction
-        .query_one("SELECT id FROM scan_task WHERE task_id = $1", &[&id])
-        .await
-    {
-        Ok(row) => row.get("id"),
-        Err(_) => return HttpResponse::InternalServerError().finish(),
-    };
     if let Err(error) = transaction.execute(
         "UPDATE scan_task_execution SET execution_status = CASE WHEN execution_status = 'pending' THEN 'cancelled' ELSE execution_status END, \
          cancel_requested = (execution_status = 'running'), task_end_time = CASE WHEN execution_status = 'pending' THEN $1::BIGINT ELSE task_end_time END, \
@@ -157,16 +168,21 @@ pub(crate) async fn retry_task(
         }
     };
     let source_id = task_id.into_inner().to_string();
-    let source = match transaction
-        .query_opt(
-            "SELECT id, user_id, task_target, task_port, task_level, remarks, task_status, dispatch_mode, address_family, scan_profile, scan_plan FROM scan_task \
-             WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) FOR UPDATE;",
-            &[&source_id, &user.role, &user.id],
-        )
-        .await
-    {
+    let mut conditions = vec!["task_id = $1".to_owned()];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&source_id];
+    push_task_owner_scope(&mut conditions, &mut params, &user, "user_id");
+    let sql = format!(
+        "SELECT id, user_id, task_target, dns_targets, dns_resolvers, task_kind, task_port, task_level, remarks, task_status, \
+                dispatch_mode, address_family, scan_profile, scan_plan FROM scan_task \
+         WHERE {} FOR UPDATE;",
+        conditions.join(" AND ")
+    );
+    let source = match transaction.query_opt(&sql, &params).await {
         Ok(Some(row)) => row,
-        Ok(None) => return HttpResponse::NotFound().json(json!({"success": false, "message": "task not found"})),
+        Ok(None) => {
+            return HttpResponse::NotFound()
+                .json(json!({"success": false, "message": "task not found"}));
+        }
         Err(error) => {
             error_logs(&req, "RetryTaskDatabaseError", &error.to_string());
             return HttpResponse::InternalServerError().finish();
@@ -183,6 +199,9 @@ pub(crate) async fn retry_task(
     let new_id = Uuid::now_v7().to_string();
     let owner_id: i32 = source.get("user_id");
     let targets: Vec<cidr::IpInet> = source.get("task_target");
+    let dns_targets: Vec<String> = source.get("dns_targets");
+    let dns_resolvers: serde_json::Value = source.get("dns_resolvers");
+    let task_kind: String = source.get("task_kind");
     let port: String = source.get("task_port");
     let level: i32 = source.get("task_level");
     let remarks: Option<String> = source.get("remarks");
@@ -192,9 +211,9 @@ pub(crate) async fn retry_task(
     let scan_profile: String = source.get("scan_profile");
     let scan_plan: serde_json::Value = source.get("scan_plan");
     let new_task_pk: i32 = match transaction.query_one(
-        "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, retry_of_task_id, dispatch_mode, address_family, scan_profile, scan_plan) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id;",
-        &[&owner_id, &new_id, &user.username, &targets, &port, &level, &remarks, &source_id, &dispatch_mode, &address_family, &scan_profile, &scan_plan]).await {
+        "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, dns_targets, dns_resolvers, task_kind, task_port, task_level, remarks, retry_of_task_id, dispatch_mode, address_family, scan_profile, scan_plan) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id;",
+        &[&owner_id, &new_id, &user.username, &targets, &dns_targets, &dns_resolvers, &task_kind, &port, &level, &remarks, &source_id, &dispatch_mode, &address_family, &scan_profile, &scan_plan]).await {
         Ok(row) => row.get("id"),
         Err(error) => { error_logs(&req, "RetryTaskDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
     };
@@ -283,28 +302,31 @@ pub(crate) async fn export_task(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let rows = match connection
-        .query(
-            "SELECT e.execution_id, e.assigned_scanner_id, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name, \
-             host(i.ip_address) AS ip, i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name, \
-             p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
-             FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id JOIN ips i ON i.execution_id = e.id \
-             LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id LEFT JOIN ports p ON p.ip_id = i.ip_id \
-             LEFT JOIN LATERAL ( \
-                SELECT o.protocol, o.service, o.banner, \
-                    FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
-                FROM scan_observation o \
-                WHERE o.execution_id = e.id AND o.ip_address = i.ip_address AND o.port = p.port \
-                ORDER BY (o.kind = 'service') DESC, \
-                    (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
-                    o.observed_at DESC, o.id DESC LIMIT 1 \
-             ) latest ON true \
-             WHERE t.task_id = $1 AND e.execution_status <> 'superseded' \
-             AND ($2 = 1 OR t.user_id = $3) ORDER BY i.ip_address, p.port;",
-            &[&id, &user.role, &user.id],
-        )
-        .await
-    {
+    let mut conditions = vec![
+        "t.task_id = $1".to_owned(),
+        "e.execution_status <> 'superseded'".to_owned(),
+    ];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id];
+    push_task_owner_scope(&mut conditions, &mut params, &user, "t.user_id");
+    let sql = format!(
+        "SELECT e.execution_id, e.assigned_scanner_id, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name, \
+         host(i.ip_address) AS ip, i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name, \
+         p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
+         FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id JOIN ips i ON i.execution_id = e.id \
+         LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id LEFT JOIN ports p ON p.ip_id = i.ip_id \
+         LEFT JOIN LATERAL ( \
+            SELECT o.protocol, o.service, o.banner, \
+                FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
+            FROM scan_observation o \
+            WHERE o.execution_id = e.id AND o.ip_address = i.ip_address AND o.port = p.port \
+            ORDER BY (o.kind = 'service') DESC, \
+                (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
+                o.observed_at DESC, o.id DESC LIMIT 1 \
+         ) latest ON true \
+         WHERE {} ORDER BY i.ip_address, p.port;",
+        conditions.join(" AND ")
+    );
+    let rows = match connection.query(&sql, &params).await {
         Ok(rows) => rows,
         Err(error) => {
             error_logs(&req, "ExportTaskDatabaseError", &error.to_string());
@@ -496,16 +518,34 @@ pub(crate) async fn dashboard_overview(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let summary = match connection.query_one(
+    let mut summary_conditions = Vec::new();
+    let mut summary_params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    push_task_owner_scope(
+        &mut summary_conditions,
+        &mut summary_params,
+        &user,
+        "user_id",
+    );
+    let summary_filter = if summary_conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", summary_conditions.join(" AND "))
+    };
+    let summary_sql = format!(
         "SELECT COUNT(*) FILTER (WHERE task_status = 'pending')::BIGINT AS pending, \
          COUNT(*) FILTER (WHERE task_status = 'running')::BIGINT AS running, \
          COUNT(*) FILTER (WHERE task_status = 'succeeded')::BIGINT AS succeeded, \
          COUNT(*) FILTER (WHERE task_status = 'failed')::BIGINT AS failed, \
          COUNT(*) FILTER (WHERE task_status = 'cancelled')::BIGINT AS cancelled, \
          COALESCE(AVG(task_end_time - task_start_time) FILTER (WHERE task_status = 'succeeded'), 0)::BIGINT AS avg_duration_ms \
-         FROM scan_task WHERE ($1 = 1 OR user_id = $2);", &[&user.role, &user.id]).await {
+         FROM scan_task{summary_filter};"
+    );
+    let summary = match connection.query_one(&summary_sql, &summary_params).await {
         Ok(row) => row,
-        Err(error) => { error_logs(&req, "DashboardDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => {
+            error_logs(&req, "DashboardDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let online: i64 = match connection.query_one(
         "SELECT COUNT(*)::BIGINT AS count FROM scanner_info WHERE deleted_at IS NULL AND is_enable = true \
@@ -513,22 +553,39 @@ pub(crate) async fn dashboard_overview(
         Ok(row) => row.get("count"),
         Err(error) => { error_logs(&req, "DashboardDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
     };
-    let trend_rows = match connection.query(
+    let mut trend_conditions =
+        vec!["to_timestamp(t.task_create_time / 1000.0)::date = days.day::date".to_owned()];
+    let mut trend_params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    push_task_owner_scope(&mut trend_conditions, &mut trend_params, &user, "t.user_id");
+    let trend_sql = format!(
         "SELECT to_char(days.day, 'YYYY-MM-DD') AS day, COALESCE(s.name, t.assigned_scanner_id, '未分配') AS scanner, COUNT(t.id)::BIGINT AS count \
          FROM generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day') days(day) \
-         LEFT JOIN scan_task t ON to_timestamp(t.task_create_time / 1000.0)::date = days.day::date AND ($1 = 1 OR t.user_id = $2) \
+         LEFT JOIN scan_task t ON {} \
          LEFT JOIN scanner_info s ON s.scanner_id = t.assigned_scanner_id GROUP BY days.day, scanner ORDER BY days.day, scanner;",
-        &[&user.role, &user.id]).await {
+        trend_conditions.join(" AND ")
+    );
+    let trend_rows = match connection.query(&trend_sql, &trend_params).await {
         Ok(rows) => rows,
-        Err(error) => { error_logs(&req, "DashboardDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => {
+            error_logs(&req, "DashboardDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
     };
-    let task_rows = match connection.query(
+    let mut task_conditions = vec!["t.task_status IN ('pending', 'running')".to_owned()];
+    let mut task_params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    push_task_owner_scope(&mut task_conditions, &mut task_params, &user, "t.user_id");
+    let task_sql = format!(
         "SELECT t.task_id, t.task_target::text[], t.task_initiator, t.task_status, t.remarks, COALESCE(s.name, t.assigned_scanner_id) AS scanner_name \
          FROM scan_task t LEFT JOIN scanner_info s ON s.scanner_id = t.assigned_scanner_id \
-         WHERE t.task_status IN ('pending', 'running') AND ($1 = 1 OR t.user_id = $2) ORDER BY t.task_level DESC, t.task_create_time LIMIT 10;",
-        &[&user.role, &user.id]).await {
+         WHERE {} ORDER BY t.task_level DESC, t.task_create_time LIMIT 10;",
+        task_conditions.join(" AND ")
+    );
+    let task_rows = match connection.query(&task_sql, &task_params).await {
         Ok(rows) => rows,
-        Err(error) => { error_logs(&req, "DashboardDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => {
+            error_logs(&req, "DashboardDatabaseError", &error.to_string());
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let trend: Vec<Value> = trend_rows.iter().map(|row| json!({"day": row.get::<_, String>("day"), "scanner": row.get::<_, String>("scanner"), "count": row.get::<_, i64>("count")})).collect();
     let tasks: Vec<Value> = task_rows.iter().map(|row| json!({
@@ -815,11 +872,51 @@ pub(crate) async fn delete_scanner(
 
 #[cfg(test)]
 mod tests {
-    use super::csv_cell;
+    use tokio_postgres::types::ToSql;
+
+    use super::{UserBaseI, csv_cell, push_task_owner_scope};
+
+    fn user(role: i32) -> UserBaseI {
+        UserBaseI {
+            id: 7,
+            username: "operator".to_owned(),
+            role,
+            email: None,
+            limit_login: false,
+            enable_2fa: false,
+        }
+    }
 
     #[test]
     fn csv_cell_escapes_quotes_and_commas() {
         assert_eq!(csv_cell("a,b"), "\"a,b\"");
         assert_eq!(csv_cell("say \"hello\""), "\"say \"\"hello\"\"\"");
+    }
+
+    #[test]
+    fn administrator_scope_adds_no_predicate() {
+        let user = user(1);
+        let mut conditions = vec!["task_id = $1".to_owned()];
+        let task_id = "task-a".to_owned();
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&task_id];
+
+        push_task_owner_scope(&mut conditions, &mut params, &user, "t.user_id");
+
+        assert_eq!(conditions, ["task_id = $1"]);
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn user_scope_adds_direct_owner_predicate() {
+        let user = user(2);
+        let mut conditions = vec!["task_id = $1".to_owned()];
+        let task_id = "task-a".to_owned();
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&task_id];
+
+        push_task_owner_scope(&mut conditions, &mut params, &user, "t.user_id");
+
+        assert_eq!(conditions[1], "t.user_id = $2");
+        assert_eq!(params.len(), 2);
+        assert!(conditions.iter().all(|condition| !condition.contains("OR")));
     }
 }

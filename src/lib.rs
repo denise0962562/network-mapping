@@ -1,12 +1,14 @@
 #![recursion_limit = "256"]
 
 pub mod admin;
+pub mod analytics_snapshot;
 pub mod audit;
 pub mod backup;
 pub mod cli_progress;
 pub mod client_ip;
 pub mod config;
 pub mod db;
+pub mod dns;
 pub mod elasticsearch;
 pub mod frontend;
 pub mod handlers;
@@ -27,16 +29,15 @@ pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
 pub mod scanner_latency;
-pub mod scanner_maintenance;
 mod search_content;
 pub mod search_projection;
+pub mod system_maintenance;
 
 #[cfg(test)]
 pub mod test; // 测试模块
 
 use actix_web::{HttpRequest, web};
 use argon2::{Algorithm, Argon2, Params, PasswordHasher, PasswordVerifier, Version};
-use cidr::IpInet;
 use deadpool_postgres::GenericClient;
 use ipnet::{AddrParseError, IpNet};
 use openssl::hash::MessageDigest;
@@ -563,6 +564,12 @@ mod parse_ip_or_cidr_tests {
 
         let inventory = build_scan_plan("service_inventory").unwrap();
         assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
+        let dns = build_scan_plan("dns_records").unwrap();
+        assert_eq!(dns["stages"][0]["type"], "dns_lookup");
+        let dns_ports = build_scan_plan("dns_ports").unwrap();
+        assert_eq!(dns_ports["stages"][1]["type"], "port_discovery");
+        let dns_full = build_scan_plan("dns_full").unwrap();
+        assert_eq!(dns_full["stages"][0]["type"], "dns_lookup");
         assert!(build_scan_plan("arbitrary_command").is_err());
     }
 
@@ -689,6 +696,17 @@ pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
         "service_inventory" => serde_json::json!([
             {"type": "port_discovery", "required": true},
             {"type": "service_detection", "required": true}
+        ]),
+        "dns_records" => serde_json::json!([
+            {"type": "dns_lookup", "required": true}
+        ]),
+        "dns_ports" => serde_json::json!([
+            {"type": "dns_lookup", "required": true},
+            {"type": "port_discovery", "required": true}
+        ]),
+        "dns_full" => serde_json::json!([
+            {"type": "dns_lookup", "required": true},
+            {"type": "port_discovery", "required": true}
         ]),
         _ => return Err("unsupported scan profile"),
     };
@@ -1226,11 +1244,12 @@ pub struct ApplyTask {
     pub task_port: String,
     pub address_family: String,
     pub scan_plan: Value,
+    pub dns_resolvers: Value,
     pub lease_expires_at_ms: i64,
     pub lease_ttl_ms: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ScannerResultUpload {
     #[serde(default = "default_result_protocol_version")]
     pub protocol_version: u16,
@@ -1249,7 +1268,7 @@ fn default_result_protocol_version() -> u16 {
     1
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScannerObservation {
     Port {
@@ -1271,6 +1290,10 @@ pub enum ScannerObservation {
         data: Option<Value>,
         #[serde(default)]
         observed_at: Option<i64>,
+    },
+    Dns {
+        #[serde(flatten)]
+        observation: dns::DnsObservation,
     },
 }
 
@@ -1515,6 +1538,9 @@ fn normalize_upload_observations(
                         observed_at: *observed_at,
                     }
                 }
+                ScannerObservation::Dns { .. } => {
+                    unreachable!("DNS observations are handled before endpoint normalization")
+                }
             })
             .collect()
     } else {
@@ -1603,6 +1629,206 @@ fn normalize_upload_observations(
     }
 
     Ok(observations)
+}
+
+async fn save_dns_scanner_results(
+    pool: &deadpool_postgres::Pool,
+    elasticsearch: &ElasticsearchService,
+    upload: &ScannerResultUpload,
+    token: &str,
+    token_pepper: &str,
+    observations: Vec<dns::DnsObservation>,
+) -> Result<usize, SaveScannerResultsError> {
+    if !elasticsearch.enabled() {
+        return Err(SaveScannerResultsError::Storage(
+            "DNS observations require elasticsearch.enabled=true".into(),
+        ));
+    }
+    let observations = observations
+        .into_iter()
+        .map(dns::DnsObservation::normalize)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SaveScannerResultsError::InvalidUpload)?;
+    let observation_count = i32::try_from(observations.len())
+        .map_err(|_| SaveScannerResultsError::InvalidUpload("too many DNS observations".into()))?;
+    let upload_id = upload
+        .upload_id
+        .expect("protocol v2 upload ID was validated")
+        .to_string();
+    let batch_index = i32::try_from(upload.batch_index.expect("protocol v2 batch was validated"))
+        .map_err(|_| {
+        SaveScannerResultsError::InvalidUpload("batch_index is too large".into())
+    })?;
+    let is_final = upload
+        .is_final
+        .expect("protocol v2 final flag was validated");
+    let mut client = pool.get().await.map_err(scanner_result_database_error)?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(scanner_result_database_error)?;
+    let token_hash =
+        hash_scanner_token(token, token_pepper).map_err(scanner_result_database_error)?;
+    let scanner_id = upload.scanner_id.to_string();
+    let scanner = transaction
+        .query_opt(
+            "SELECT id FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
+            &[&scanner_id, &token_hash],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    if scanner.is_none() {
+        return Err(SaveScannerResultsError::ScannerUnauthorized);
+    }
+    let task = transaction
+        .query_opt(
+            "SELECT t.id AS task_id, t.user_id, e.id AS execution_id, e.execution_id AS public_execution_id, \
+             e.execution_status, t.task_source, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name \
+             FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id \
+             LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id \
+             WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
+             AND e.execution_status IN ('running', 'succeeded') LIMIT 1 FOR UPDATE OF e;",
+            &[&upload.task_id.to_string(), &scanner_id],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    let Some(task) = task else {
+        return Err(SaveScannerResultsError::TaskNotFound);
+    };
+    if task.get::<_, String>("execution_status") == "succeeded" {
+        transaction
+            .commit()
+            .await
+            .map_err(scanner_result_database_error)?;
+        return Ok(0);
+    }
+    let task_db_id: i32 = task.get("task_id");
+    let execution_db_id: i32 = task.get("execution_id");
+    let context = ScanBatchContext {
+        task_id: upload.task_id.to_string(),
+        execution_id: task.get("public_execution_id"),
+        user_id: task.get("user_id"),
+        task_source: task.get("task_source"),
+        scanner_id: scanner_id.clone(),
+        scanner_name: task.get("scanner_name"),
+        upload_id: upload_id.clone(),
+        batch_index,
+        is_final,
+    };
+    let payload_checksum = openssl::sha::sha256(
+        &serde_json::to_vec(&serde_json::json!({
+            "execution_id": context.execution_id,
+            "upload_id": upload_id,
+            "batch_index": batch_index,
+            "is_final": is_final,
+            "observations": observations,
+        }))
+        .map_err(scanner_result_database_error)?,
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+    if is_final {
+        let sequence = transaction
+            .query_one(
+                "SELECT COUNT(*) FILTER (WHERE batch_index < $3)::BIGINT AS prior_count, \
+                 MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
+                 MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
+                 COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
+                 COUNT(*) FILTER (WHERE is_final)::BIGINT AS final_count \
+                 FROM scan_result_batch WHERE execution_id = $1 AND upload_id = $2;",
+                &[&execution_db_id, &upload_id, &batch_index],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let prior_count: i64 = sequence.get("prior_count");
+        let first_prior: Option<i32> = sequence.get("first_prior");
+        let last_prior: Option<i32> = sequence.get("last_prior");
+        let complete_prior_sequence = if batch_index == 0 {
+            prior_count == 0 && first_prior.is_none() && last_prior.is_none()
+        } else {
+            prior_count == i64::from(batch_index)
+                && first_prior == Some(0)
+                && last_prior == Some(batch_index - 1)
+        };
+        if !complete_prior_sequence
+            || sequence.get::<_, i64>("later_count") != 0
+            || sequence.get::<_, i64>("final_count") != 0
+        {
+            return Err(SaveScannerResultsError::InvalidUpload(
+                "final DNS batch requires one contiguous sequence starting at batch_index 0".into(),
+            ));
+        }
+    }
+    if let Some(existing) = transaction
+        .query_opt(
+            "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+             WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
+            &[&execution_db_id, &upload_id, &batch_index],
+        )
+        .await
+        .map_err(scanner_result_database_error)?
+    {
+        let matches = existing.get::<_, bool>("is_final") == is_final
+            && existing.get::<_, i32>("observation_count") == observation_count
+            && existing
+                .get::<_, Option<String>>("payload_checksum")
+                .as_deref()
+                == Some(payload_checksum.as_str());
+        if !matches {
+            return Err(SaveScannerResultsError::InvalidUpload(
+                "batch identity was already used with different content".into(),
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(scanner_result_database_error)?;
+        return Ok(0);
+    }
+    // The control-plane receipt is only written after the idempotent ES writes
+    // have succeeded. A retry repeats harmless create/upsert operations.
+    elasticsearch
+        .persist_dns_observations(&context, "default", &observations)
+        .await
+        .map_err(SaveScannerResultsError::Storage)?;
+    transaction
+        .execute(
+            "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
+             protocol_version, payload_checksum, storage_backend, storage_references) \
+             VALUES ($1, $2, $3, $4, $5, 2, $6, 'elasticsearch', $7);",
+            &[
+                &execution_db_id,
+                &upload_id,
+                &batch_index,
+                &is_final,
+                &observation_count,
+                &payload_checksum,
+                &serde_json::json!(["dns-observations", "dns-records"]),
+            ],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    if is_final {
+        transaction
+            .execute(
+                "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
+                 lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false, \
+                 maintenance_hold = FALSE, maintenance_hold_until = NULL, \
+                 result_ip_count = 0, result_port_count = 0, result_observation_count = $3 WHERE id = $2;",
+                &[&get_unix_epoch_ms(), &execution_db_id, &i64::from(observation_count)],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        refresh_task_aggregate(&transaction, task_db_id)
+            .await
+            .map_err(scanner_result_database_error)?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(scanner_result_database_error)?;
+    Ok(usize::try_from(observation_count).expect("non-negative observation count"))
 }
 
 #[cfg(test)]
@@ -1729,6 +1955,104 @@ pub async fn save_scanner_results(
         return Err(SaveScannerResultsError::InvalidUpload(
             "typed observations require protocol_version 2".into(),
         ));
+    }
+
+    if is_v2
+        && upload
+            .observations
+            .iter()
+            .any(|item| matches!(item, ScannerObservation::Dns { .. }))
+    {
+        let contains_non_dns = upload
+            .observations
+            .iter()
+            .any(|item| !matches!(item, ScannerObservation::Dns { .. }));
+        if contains_non_dns {
+            let mut dns_upload = upload.clone();
+            let upload_id = upload
+                .upload_id
+                .expect("protocol v2 upload ID was validated");
+            let dns_upload_id =
+                openssl::sha::sha256(format!("dns-observations:{upload_id}").as_bytes());
+            dns_upload.upload_id = Some(
+                Uuid::from_slice(&dns_upload_id[..16])
+                    .expect("a SHA-256 prefix always has a UUID-compatible length"),
+            );
+            dns_upload.batch_index = upload.batch_index;
+            dns_upload.is_final = Some(false);
+            dns_upload.observations = upload
+                .observations
+                .iter()
+                .filter(|item| matches!(item, ScannerObservation::Dns { .. }))
+                .cloned()
+                .collect();
+            let dns_observations = dns_upload
+                .observations
+                .iter()
+                .map(|item| match item {
+                    ScannerObservation::Dns { observation } => Ok(observation.clone()),
+                    _ => Err(SaveScannerResultsError::InvalidUpload(
+                        "a DNS upload batch may contain only DNS observations".into(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let dns_count = save_dns_scanner_results(
+                pool,
+                elasticsearch,
+                &dns_upload,
+                token,
+                token_pepper,
+                dns_observations,
+            )
+            .await?;
+
+            let mut regular_upload = upload.clone();
+            regular_upload.observations = upload
+                .observations
+                .iter()
+                .filter(|item| !matches!(item, ScannerObservation::Dns { .. }))
+                .cloned()
+                .collect();
+            let regular_count = Box::pin(save_scanner_results(
+                pool,
+                maxmind,
+                elasticsearch,
+                &regular_upload,
+                token,
+                token_pepper,
+            ))
+            .await?;
+            return Ok(dns_count.saturating_add(regular_count));
+        }
+        if !upload.results.is_empty()
+            || upload
+                .observations
+                .iter()
+                .any(|item| !matches!(item, ScannerObservation::Dns { .. }))
+        {
+            return Err(SaveScannerResultsError::InvalidUpload(
+                "a DNS upload batch may contain only DNS observations".into(),
+            ));
+        }
+        let dns_observations = upload
+            .observations
+            .iter()
+            .map(|item| match item {
+                ScannerObservation::Dns { observation } => Ok(observation.clone()),
+                _ => Err(SaveScannerResultsError::InvalidUpload(
+                    "a DNS upload batch may contain only DNS observations".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return save_dns_scanner_results(
+            pool,
+            elasticsearch,
+            upload,
+            token,
+            token_pepper,
+            dns_observations,
+        )
+        .await;
     }
 
     let normalized_observations = normalize_upload_observations(upload)?;
@@ -1981,10 +2305,12 @@ pub async fn save_scanner_results(
         let tag_rows = transaction
             .query(
                 "SELECT host(assignment.ip_address) AS ip, JSONB_AGG(JSONB_BUILD_OBJECT( \
-                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description) \
-                    ORDER BY tag.id) AS tags \
+                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+                    'category_id', category.id, 'category_name', category.name) \
+                    ORDER BY category.sort_order, LOWER(category.name), tag.id) AS tags \
                  FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                 WHERE tag.is_active AND assignment.ip_address IN \
+                 JOIN asset_tag_category category ON category.id = tag.category_id \
+                 WHERE tag.is_active AND category.is_active AND assignment.ip_address IN \
                     (SELECT address::INET FROM UNNEST($1::TEXT[]) address) \
                  GROUP BY assignment.ip_address;",
                 &[&addresses],
@@ -2243,6 +2569,18 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
+        // New servers enqueue analytics in the same transaction as successful completion.
+        // The analytics worker still reconciles older completed executions during upgrades.
+        transaction
+            .execute(
+                "INSERT INTO analytics_outbox (execution_id, status, available_at, locked_at, completed_at, last_error) \
+                 VALUES ($1, 'pending', NOW(), NULL, NULL, NULL) \
+                 ON CONFLICT (execution_id) DO UPDATE SET status = 'pending', available_at = NOW(), \
+                    locked_at = NULL, completed_at = NULL, last_error = NULL, updated_at = NOW();",
+                &[&execution_db_id],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
         if storage_mode.writes_postgres() {
             search_projection::refresh_for_execution(&transaction, execution_db_id)
                 .await
@@ -2342,7 +2680,9 @@ pub async fn apply_task(
 
     let row = transaction
         .query_opt(
-            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, t.task_target::text[], t.task_port, t.address_family, t.scan_plan \
+            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, \
+             CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::text[] END AS task_target, \
+             t.task_port, t.address_family, t.scan_plan, t.dns_resolvers \
          FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
          JOIN scanner_info s ON s.scanner_id = $2 \
          WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.maintenance_hold = FALSE AND e.cancel_requested = false \
@@ -2351,6 +2691,8 @@ pub async fn apply_task(
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
              OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
            AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
+           AND (jsonb_array_length(t.dns_resolvers) = 0 \
+             OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
          ORDER BY t.task_level DESC, t.task_create_time, e.id \
          FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",
@@ -2399,6 +2741,7 @@ pub async fn apply_task(
         task_port: row.get("task_port"),
         address_family: row.get("address_family"),
         scan_plan: row.get("scan_plan"),
+        dns_resolvers: row.get("dns_resolvers"),
         lease_expires_at_ms: lease_expires_at,
         lease_ttl_ms: TASK_LEASE_MS,
     };
@@ -2476,7 +2819,8 @@ pub enum Permission {
 #[derive(Serialize)]
 pub struct TaskItem {
     pub task_id: String,
-    pub task_target: Vec<IpInet>,
+    pub task_target: Vec<String>,
+    pub task_kind: String,
     pub task_initiator: String,
     pub task_port: String,
     pub task_create_time: i64,
@@ -2543,6 +2887,124 @@ pub struct TaskListPage {
     pub has_more: bool,
 }
 
+fn task_list_filter<'a>(
+    filters: &'a TaskListFilters,
+    owner_id: &'a Option<i32>,
+    include_cursor: bool,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut conditions = Vec::new();
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+
+    if let Some(owner_id) = owner_id {
+        params.push(owner_id);
+        conditions.push(format!("t.user_id = ${}", params.len()));
+    }
+    if !filters.include_system {
+        conditions.push("t.task_source <> 'automatic'".to_owned());
+    }
+    if let Some(task_id) = filters.task_id.as_ref() {
+        params.push(task_id);
+        conditions.push(format!("t.task_id ILIKE '%' || ${} || '%'", params.len()));
+    }
+    if let Some(target) = filters.target.as_ref() {
+        params.push(target);
+        conditions.push(format!(
+            "(EXISTS (SELECT 1 FROM unnest(t.task_target) AS targets(target) \
+                WHERE targets.target::TEXT ILIKE '%' || ${} || '%') \
+              OR EXISTS (SELECT 1 FROM unnest(t.dns_targets) AS targets(target) \
+                WHERE targets.target ILIKE '%' || ${} || '%'))",
+            params.len(),
+            params.len()
+        ));
+    }
+    if let Some(status) = filters.status.as_ref() {
+        params.push(status);
+        conditions.push(format!("t.task_status = ${}", params.len()));
+    }
+    if let Some(operator) = filters.operator.as_ref() {
+        params.push(operator);
+        conditions.push(format!(
+            "t.task_initiator ILIKE '%' || ${} || '%'",
+            params.len()
+        ));
+    }
+    if let Some(start_time) = filters.start_time.as_ref() {
+        params.push(start_time);
+        conditions.push(format!("t.task_create_time >= ${}", params.len()));
+    }
+    if let Some(end_time) = filters.end_time.as_ref() {
+        params.push(end_time);
+        conditions.push(format!("t.task_create_time <= ${}", params.len()));
+    }
+    if let Some(scanner_id) = filters.scanner_id.as_ref() {
+        params.push(scanner_id);
+        conditions.push(format!(
+            "COALESCE(t.assigned_scanner_id, '') ILIKE '%' || ${} || '%'",
+            params.len()
+        ));
+    }
+    if include_cursor && let Some(cursor) = filters.cursor.as_ref() {
+        params.push(cursor);
+        conditions.push(format!("t.id < ${}", params.len()));
+    }
+
+    let clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    (clause, params)
+}
+
+#[cfg(test)]
+mod task_list_filter_tests {
+    use super::{TaskListFilters, task_list_filter};
+
+    fn filters() -> TaskListFilters {
+        TaskListFilters {
+            cursor: None,
+            limit: 20,
+            include_system: true,
+            task_id: None,
+            target: None,
+            status: None,
+            operator: None,
+            start_time: None,
+            end_time: None,
+            scanner_id: None,
+        }
+    }
+
+    #[test]
+    fn administrator_without_filters_has_no_where_clause() {
+        let filters = filters();
+        let owner_id = None;
+        let (sql, params) = task_list_filter(&filters, &owner_id, false);
+        assert!(sql.is_empty());
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn user_filters_use_contiguous_parameters() {
+        let mut filters = filters();
+        filters.include_system = false;
+        filters.status = Some("running".to_owned());
+        filters.scanner_id = Some("scanner-a".to_owned());
+        filters.cursor = Some(100);
+        let owner_id = Some(7);
+
+        let (sql, params) = task_list_filter(&filters, &owner_id, true);
+
+        assert_eq!(params.len(), 4);
+        assert!(sql.contains("t.user_id = $1"));
+        assert!(sql.contains("t.task_source <> 'automatic'"));
+        assert!(sql.contains("t.task_status = $2"));
+        assert!(sql.contains("assigned_scanner_id, '') ILIKE '%' || $3 || '%'"));
+        assert!(sql.contains("t.id < $4"));
+        assert!(!sql.contains("OR"));
+    }
+}
+
 /// 该函数用于获取所有的扫描任务记录，需要鉴权，普通用户只能获取到自己创建的任务，管理员则可以获取所有的
 ///
 /// 接收多个参数，分别为
@@ -2576,7 +3038,7 @@ pub async fn get_task_item(
         Permission::Administrator(_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE id <= $1 AND ($2::boolean OR task_source <> 'automatic') \
                      ORDER BY id DESC LIMIT $3;",
                     &[&st, &include_system, &s_count],
@@ -2584,7 +3046,7 @@ pub async fn get_task_item(
                 .await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE $1::boolean OR task_source <> 'automatic' ORDER BY id DESC LIMIT $2;",
                     &[&include_system, &s_count],
                 )
@@ -2594,14 +3056,14 @@ pub async fn get_task_item(
         Permission::Users(u_id) => {
             if let Some(st) = start_id {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE user_id = $1 AND id <= $2 AND ($3::boolean OR task_source <> 'automatic') \
                      ORDER BY id DESC LIMIT $4;",
                     &[&u_id, &st, &include_system, &s_count]
                 ).await?
             } else {
                 c.query(
-                    "SELECT *, COUNT(*) OVER() AS total_count FROM scan_task \
+                    "SELECT scan_task.*, CASE WHEN task_kind = 'dns' THEN dns_targets ELSE task_target::TEXT[] END AS display_targets, COUNT(*) OVER() AS total_count FROM scan_task \
                      WHERE user_id = $1 AND ($2::boolean OR task_source <> 'automatic') \
                      ORDER BY id DESC LIMIT $3;",
                     &[&u_id, &include_system, &s_count],
@@ -2623,7 +3085,8 @@ pub async fn get_task_item(
         total_count_item = r.get::<_, i64>("total_count");
         let titem = TaskItem {
             task_id: r.get::<_, String>("task_id"),
-            task_target: r.get::<_, Vec<IpInet>>("task_target"),
+            task_target: r.get("display_targets"),
+            task_kind: r.get("task_kind"),
             task_initiator: r.get::<_, String>("task_initiator"),
             task_level: r.get::<_, i32>("task_level"),
             task_port: r.get::<_, String>("task_port"),
@@ -2674,66 +3137,27 @@ pub async fn get_filtered_task_page(
     }
     transaction.commit().await?;
 
-    let (role, user_id) = match permissions {
-        Permission::Administrator(id) => (1_i32, id),
-        Permission::Users(id) => (2_i32, id),
+    let owner_id = match permissions {
+        Permission::Administrator(_) => None,
+        Permission::Users(id) => Some(id),
     };
-    const FILTER_SQL: &str = "($1 = 1 OR t.user_id = $2) \
-        AND ($3::BOOLEAN OR t.task_source <> 'automatic') \
-        AND ($4::TEXT IS NULL OR t.task_id ILIKE '%' || $4 || '%') \
-        AND ($5::TEXT IS NULL OR EXISTS (\
-            SELECT 1 FROM unnest(t.task_target) AS targets(target) \
-            WHERE targets.target::TEXT ILIKE '%' || $5 || '%'\
-        )) \
-        AND ($6::TEXT IS NULL OR t.task_status = $6) \
-        AND ($7::TEXT IS NULL OR t.task_initiator ILIKE '%' || $7 || '%') \
-        AND ($8::BIGINT IS NULL OR t.task_create_time >= $8) \
-        AND ($9::BIGINT IS NULL OR t.task_create_time <= $9) \
-        AND ($10::TEXT IS NULL OR COALESCE(t.assigned_scanner_id, '') ILIKE '%' || $10 || '%')";
-    let count_sql = format!("SELECT COUNT(*)::BIGINT AS total FROM scan_task t WHERE {FILTER_SQL}");
-    let count_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-        &role,
-        &user_id,
-        &filters.include_system,
-        &filters.task_id,
-        &filters.target,
-        &filters.status,
-        &filters.operator,
-        &filters.start_time,
-        &filters.end_time,
-        &filters.scanner_id,
-    ];
+    let (count_filter, count_params) = task_list_filter(filters, &owner_id, false);
+    let count_sql = format!("SELECT COUNT(*)::BIGINT AS total FROM scan_task t{count_filter}");
     let total = connection
-        .query_one(&count_sql, count_params)
+        .query_one(&count_sql, &count_params)
         .await?
         .get("total");
 
     let page_size = filters.limit.clamp(1, 100);
     let fetch_limit = page_size + 1;
+    let (page_filter, mut page_params) = task_list_filter(filters, &owner_id, true);
+    page_params.push(&fetch_limit);
     let page_sql = format!(
-        "SELECT t.* FROM scan_task t WHERE {FILTER_SQL} \
-         AND ($11::INTEGER IS NULL OR t.id < $11) \
-         ORDER BY t.id DESC LIMIT $12"
+        "SELECT t.*, CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::TEXT[] END AS display_targets FROM scan_task t{page_filter} \
+         ORDER BY t.id DESC LIMIT ${}",
+        page_params.len()
     );
-    let mut rows = connection
-        .query(
-            &page_sql,
-            &[
-                &role,
-                &user_id,
-                &filters.include_system,
-                &filters.task_id,
-                &filters.target,
-                &filters.status,
-                &filters.operator,
-                &filters.start_time,
-                &filters.end_time,
-                &filters.scanner_id,
-                &filters.cursor,
-                &fetch_limit,
-            ],
-        )
-        .await?;
+    let mut rows = connection.query(&page_sql, &page_params).await?;
     let has_more = rows.len() > page_size as usize;
     if has_more {
         rows.truncate(page_size as usize);
@@ -2747,7 +3171,8 @@ pub async fn get_filtered_task_page(
         .into_iter()
         .map(|row| TaskItem {
             task_id: row.get("task_id"),
-            task_target: row.get("task_target"),
+            task_target: row.get("display_targets"),
+            task_kind: row.get("task_kind"),
             task_initiator: row.get("task_initiator"),
             task_port: row.get("task_port"),
             task_create_time: row.get("task_create_time"),

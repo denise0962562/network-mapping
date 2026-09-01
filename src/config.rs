@@ -43,6 +43,8 @@ pub struct Config {
     pub backup: BackupConfig,
     #[serde(default)]
     pub elasticsearch: ElasticsearchConfig,
+    #[serde(default)]
+    pub analytics_snapshot: AnalyticsSnapshotConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -77,6 +79,7 @@ impl SelfChecking for Config {
         let _ = &self.monitor.check();
         let _ = &self.backup.check();
         let _ = &self.elasticsearch.check();
+        let _ = &self.analytics_snapshot.check();
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -98,7 +101,59 @@ impl SelfChecking for Config {
         self.monitor.try_check()?;
         self.backup.try_check()?;
         self.elasticsearch.try_check()?;
+        self.analytics_snapshot.try_check()?;
         self.automatic_target.validate()?;
+        Ok(true)
+    }
+}
+
+/// 扫描分析快照。默认 realtime，确保已有部署升级后不会在历史回填前读到空统计。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsSnapshotMode {
+    #[default]
+    Realtime,
+    Shadow,
+    Snapshot,
+}
+
+impl AnalyticsSnapshotMode {
+    pub fn reads_snapshot(self) -> bool {
+        self == Self::Snapshot
+    }
+
+    pub fn runs_worker(self) -> bool {
+        !matches!(self, Self::Realtime)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsSnapshotConfig {
+    pub mode: AnalyticsSnapshotMode,
+    pub interval_minutes: u64,
+}
+
+impl Default for AnalyticsSnapshotConfig {
+    fn default() -> Self {
+        Self {
+            mode: AnalyticsSnapshotMode::Realtime,
+            interval_minutes: 30,
+        }
+    }
+}
+
+impl SelfChecking for AnalyticsSnapshotConfig {
+    fn check(&self) {
+        if let Err(error) = self.try_check() {
+            panic!("{error}");
+        }
+    }
+
+    fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        if !(1..=24 * 60).contains(&self.interval_minutes) {
+            return Err("analytics_snapshot.interval_minutes 必须在 1 到 1440 之间".into());
+        }
         Ok(true)
     }
 }
@@ -220,6 +275,9 @@ pub struct ElasticsearchConfig {
     pub observation_index_prefix: String,
     pub execution_endpoint_index: String,
     pub current_endpoint_index: String,
+    pub dns_observation_data_stream: String,
+    pub dns_record_index: String,
+    pub dns_observation_retention_days: u16,
     pub scan_number_of_replicas: u32,
     pub expected_version: String,
     pub api_key: Option<String>,
@@ -278,6 +336,15 @@ impl fmt::Debug for ElasticsearchConfig {
             .field("observation_index_prefix", &self.observation_index_prefix)
             .field("execution_endpoint_index", &self.execution_endpoint_index)
             .field("current_endpoint_index", &self.current_endpoint_index)
+            .field(
+                "dns_observation_data_stream",
+                &self.dns_observation_data_stream,
+            )
+            .field("dns_record_index", &self.dns_record_index)
+            .field(
+                "dns_observation_retention_days",
+                &self.dns_observation_retention_days,
+            )
             .field("scan_number_of_replicas", &self.scan_number_of_replicas)
             .field("expected_version", &self.expected_version)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
@@ -314,6 +381,9 @@ impl Default for ElasticsearchConfig {
             observation_index_prefix: "network-mapping-scan-observations-v1".to_owned(),
             execution_endpoint_index: "network-mapping-execution-endpoints-v1".to_owned(),
             current_endpoint_index: "network-mapping-endpoints-current-v2".to_owned(),
+            dns_observation_data_stream: "network-mapping-dns-observations".to_owned(),
+            dns_record_index: "network-mapping-dns-records-v1".to_owned(),
+            dns_observation_retention_days: 180,
             scan_number_of_replicas: 1,
             expected_version: "9.5.2".to_owned(),
             api_key: None,
@@ -409,6 +479,11 @@ impl SelfChecking for ElasticsearchConfig {
             ("observation_index_prefix", &self.observation_index_prefix),
             ("execution_endpoint_index", &self.execution_endpoint_index),
             ("current_endpoint_index", &self.current_endpoint_index),
+            (
+                "dns_observation_data_stream",
+                &self.dns_observation_data_stream,
+            ),
+            ("dns_record_index", &self.dns_record_index),
         ] {
             if value.is_empty()
                 || value.len() > 240
@@ -461,6 +536,11 @@ impl SelfChecking for ElasticsearchConfig {
         }
         if self.scan_number_of_replicas > 5 {
             return Err("elasticsearch.scan_number_of_replicas 必须在 0 到 5 之间".into());
+        }
+        if !(30..=365).contains(&self.dns_observation_retention_days) {
+            return Err(
+                "elasticsearch.dns_observation_retention_days 必须在 30 到 365 之间".into(),
+            );
         }
         if self.scan_storage.reads_elasticsearch() && self.scan_number_of_replicas == 0 {
             return Err(
@@ -554,6 +634,14 @@ pub struct MonitorConfig {
     pub slow_sql_threshold_ms: i64,
     /// 慢 SQL 轮询间隔（秒）。
     pub slow_sql_check_interval_seconds: u64,
+    /// Elasticsearch 查询告警阈值（毫秒）。
+    pub elasticsearch_query_warning_threshold_ms: i64,
+    /// Elasticsearch 查询严重告警阈值（毫秒）。
+    pub elasticsearch_query_critical_threshold_ms: i64,
+    /// Elasticsearch 写入告警阈值（毫秒）。
+    pub elasticsearch_write_warning_threshold_ms: i64,
+    /// Elasticsearch 写入严重告警阈值（毫秒）。
+    pub elasticsearch_write_critical_threshold_ms: i64,
     /// 同一告警 key 的冷却时间（秒），冷却窗口内的重复事件被合并丢弃。
     pub alert_cooldown_seconds: u64,
 }
@@ -566,6 +654,10 @@ impl Default for MonitorConfig {
             server_error_enabled: true,
             slow_sql_threshold_ms: 3000,
             slow_sql_check_interval_seconds: 60,
+            elasticsearch_query_warning_threshold_ms: 1000,
+            elasticsearch_query_critical_threshold_ms: 3000,
+            elasticsearch_write_warning_threshold_ms: 5000,
+            elasticsearch_write_critical_threshold_ms: 15000,
             alert_cooldown_seconds: 300,
         }
     }
@@ -588,6 +680,38 @@ impl SelfChecking for MonitorConfig {
         }
         if self.slow_sql_check_interval_seconds == 0 {
             return Err("monitor.slow_sql_check_interval_seconds 必须大于 0".into());
+        }
+        for (name, value) in [
+            (
+                "monitor.elasticsearch_query_warning_threshold_ms",
+                self.elasticsearch_query_warning_threshold_ms,
+            ),
+            (
+                "monitor.elasticsearch_query_critical_threshold_ms",
+                self.elasticsearch_query_critical_threshold_ms,
+            ),
+            (
+                "monitor.elasticsearch_write_warning_threshold_ms",
+                self.elasticsearch_write_warning_threshold_ms,
+            ),
+            (
+                "monitor.elasticsearch_write_critical_threshold_ms",
+                self.elasticsearch_write_critical_threshold_ms,
+            ),
+        ] {
+            if value <= 0 {
+                return Err(format!("{name} 必须大于 0").into());
+            }
+        }
+        if self.elasticsearch_query_critical_threshold_ms
+            < self.elasticsearch_query_warning_threshold_ms
+        {
+            return Err("Elasticsearch 查询严重阈值不能小于告警阈值".into());
+        }
+        if self.elasticsearch_write_critical_threshold_ms
+            < self.elasticsearch_write_warning_threshold_ms
+        {
+            return Err("Elasticsearch 写入严重阈值不能小于告警阈值".into());
         }
         if self.alert_cooldown_seconds == 0 {
             return Err("monitor.alert_cooldown_seconds 必须大于 0".into());
@@ -1119,8 +1243,8 @@ impl Config {
 mod tests {
     use super::{
         AutomaticTargetConfig, BackupConfig, Clis, ElasticsearchConfig, FrontendConfig,
-        MaxMindConfig, NotificationPreferences, SecurityConfig, SelfChecking, TlsConfig,
-        session_ttl_seconds_from_minutes,
+        MaxMindConfig, MonitorConfig, NotificationPreferences, SecurityConfig, SelfChecking,
+        TlsConfig, session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -1333,6 +1457,20 @@ mod tests {
     }
 
     #[test]
+    fn monitor_config_orders_elasticsearch_warning_and_critical_thresholds() {
+        let mut config = MonitorConfig::default();
+        assert!(config.try_check().is_ok());
+
+        config.elasticsearch_query_critical_threshold_ms =
+            config.elasticsearch_query_warning_threshold_ms - 1;
+        assert!(config.try_check().is_err());
+
+        config = MonitorConfig::default();
+        config.elasticsearch_write_warning_threshold_ms = 0;
+        assert!(config.try_check().is_err());
+    }
+
+    #[test]
     fn rebuild_elasticsearch_flag_enables_one_off_rebuild() {
         let cli = Clis::try_parse_from(["networkm", "--rebuild-elasticsearch"])
             .expect("rebuild Elasticsearch CLI flag should parse");
@@ -1428,11 +1566,12 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::system_resources::get_system_resource_history)
         .service(handlers::system_resources::get_database_size_history)
         .service(handlers::scanner_latency::get_scanner_latency_history)
-        .service(handlers::scanner_maintenance::get_maintenance_status)
-        .service(handlers::scanner_maintenance::enter_maintenance)
-        .service(handlers::scanner_maintenance::update_maintenance)
-        .service(handlers::scanner_maintenance::exit_maintenance)
-        .service(handlers::scanner_maintenance::scanner_maintenance_probe)
+        .service(handlers::system_maintenance::get_maintenance_status)
+        .service(handlers::system_maintenance::get_maintenance_history)
+        .service(handlers::system_maintenance::enter_maintenance)
+        .service(handlers::system_maintenance::update_maintenance)
+        .service(handlers::system_maintenance::exit_maintenance)
+        .service(handlers::system_maintenance::scanner_system_maintenance_probe)
         .service(handlers::utils::benchmark_route)
         .service(handlers::open_source::get_open_source_projects)
         .service(handlers::search::search_ip)
@@ -1445,14 +1584,20 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::assets::get_asset_summary)
         .service(handlers::assets::get_asset_ports)
         .service(handlers::assets::get_asset_port_history)
+        .service(handlers::tags::list_tag_categories)
+        .service(handlers::tags::create_tag_category)
+        .service(handlers::tags::update_tag_category)
+        .service(handlers::tags::delete_tag_category)
         .service(handlers::tags::list_tags)
         .service(handlers::tags::create_tag)
         .service(handlers::tags::update_tag)
         .service(handlers::tags::delete_tag)
+        .service(handlers::tags::get_asset_tags)
         .service(handlers::tags::assign_tag)
         .service(handlers::tags::remove_tag)
         .service(crate::target_generated::automatic_target_status)
         .service(handlers::task::create_task)
+        .service(handlers::task::create_dns_task)
         .service(handlers::task::apply_task_handler) //更换了 apply_task_handler 和 get_task的注册顺序
         .service(handlers::task::scanner_public_ip_handler)
         .service(handlers::task::scanner_heartbeat_handler)
@@ -1461,6 +1606,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::task::upload_scanner_result_handler)
         .service(handlers::task::get_all_task_handler)
         .service(handlers::task::get_task)
+        .service(handlers::task::get_dns_comparison)
         .service(handlers::operations::cancel_task)
         .service(handlers::operations::retry_task)
         .service(handlers::operations::export_task)
@@ -1644,4 +1790,8 @@ pub struct Clis {
     /// 将 PostgreSQL 中现有扫描事实幂等迁移到新的 Elasticsearch 扫描索引后退出
     #[arg(long)]
     pub migrate_scan_data_to_elasticsearch: bool,
+
+    /// 从所有已成功的 IP 扫描执行重建分析快照后退出；不会修改扫描原始事实
+    #[arg(long)]
+    pub rebuild_analytics_snapshots: bool,
 }

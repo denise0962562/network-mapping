@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{GenericClient, Pool};
@@ -10,14 +10,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
 use crate::config::{ElasticsearchConfig, ScanStorageMode};
+use crate::dns::DnsObservation;
 use crate::handlers::tags::{AssetTag, tags_from_json};
+use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
 
-const INDEX_SCHEMA_VERSION: &str = "1";
+const INDEX_SCHEMA_VERSION: &str = "2";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
-const SCAN_INDEX_SCHEMA_VERSION: &str = "1";
+const SCAN_INDEX_SCHEMA_VERSION: &str = "2";
+const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
 const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
      ON asset_endpoint_current(projection_version);";
@@ -73,6 +77,7 @@ struct ElasticsearchInner {
     config: ElasticsearchConfig,
     client: reqwest::Client,
     runtime: RwLock<ElasticsearchRuntime>,
+    monitor: RwLock<Option<MonitorHandle>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -95,6 +100,8 @@ pub(crate) struct ElasticsearchStatus {
     pub observation_index_prefix: String,
     pub execution_endpoint_index: String,
     pub current_endpoint_index: String,
+    pub dns_observation_data_stream: String,
+    pub dns_record_index: String,
     pub expected_version: String,
     #[serde(flatten)]
     pub runtime: ElasticsearchRuntime,
@@ -230,6 +237,54 @@ enum IndexState {
     Created,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ElasticsearchOperation {
+    StorageMetrics,
+    ScanQuery,
+    RefreshTags,
+    BulkWrite,
+    ClusterInfo,
+    IndexAdmin,
+    ExecutionSummary,
+    ConflictCheck,
+    ProjectionSearch,
+    AssetSearch,
+    EndpointFilter,
+}
+
+impl ElasticsearchOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::StorageMetrics => "storage-metrics",
+            Self::ScanQuery => "scan-query",
+            Self::RefreshTags => "refresh-tags",
+            Self::BulkWrite => "bulk-write",
+            Self::ClusterInfo => "cluster-info",
+            Self::IndexAdmin => "index-admin",
+            Self::ExecutionSummary => "execution-summary",
+            Self::ConflictCheck => "conflict-check",
+            Self::ProjectionSearch => "projection-search",
+            Self::AssetSearch => "asset-search",
+            Self::EndpointFilter => "endpoint-filter",
+        }
+    }
+
+    fn kind(self) -> ElasticsearchOperationKind {
+        match self {
+            Self::ScanQuery
+            | Self::ExecutionSummary
+            | Self::ConflictCheck
+            | Self::ProjectionSearch
+            | Self::AssetSearch
+            | Self::EndpointFilter => ElasticsearchOperationKind::Query,
+            Self::RefreshTags | Self::BulkWrite => ElasticsearchOperationKind::Write,
+            Self::StorageMetrics | Self::ClusterInfo | Self::IndexAdmin => {
+                ElasticsearchOperationKind::Maintenance
+            }
+        }
+    }
+}
+
 impl ElasticsearchService {
     pub fn new(config: ElasticsearchConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let mut builder =
@@ -246,8 +301,17 @@ impl ElasticsearchService {
                 config,
                 client: builder.build()?,
                 runtime: RwLock::new(ElasticsearchRuntime::default()),
+                monitor: RwLock::new(None),
             }),
         })
+    }
+
+    pub fn set_monitor(&self, monitor: Option<MonitorHandle>) {
+        *self
+            .inner
+            .monitor
+            .write()
+            .expect("elasticsearch monitor lock poisoned") = monitor;
     }
 
     pub fn enabled(&self) -> bool {
@@ -283,12 +347,19 @@ impl ElasticsearchService {
             format!("{}-*", self.inner.config.observation_index_prefix),
             self.inner.config.execution_endpoint_index.clone(),
             self.inner.config.current_endpoint_index.clone(),
+            self.inner.config.dns_observation_data_stream.clone(),
+            self.inner.config.dns_record_index.clone(),
         ];
         targets.sort();
         targets.dedup();
+        let path = format!("/{}/_stats/store", targets.join(","));
         let response = match self
-            .request(Method::GET, &format!("/{}/_stats/store", targets.join(",")))
-            .query(&[
+            .send_json_request(
+                ElasticsearchOperation::StorageMetrics,
+                Method::GET,
+                &path,
+                |request| {
+                    request.query(&[
                 ("level", "indices"),
                 ("ignore_unavailable", "true"),
                 ("allow_no_indices", "true"),
@@ -298,19 +369,13 @@ impl ElasticsearchService {
                     "indices.*.primaries.store.size_in_bytes,indices.*.total.store.size_in_bytes",
                 ),
             ])
-            .send()
+                },
+            )
             .await
         {
             Ok(response) => response,
             Err(error) => {
                 warn!(event = "ElasticsearchStorageMetricsRequestError", message = %error);
-                return ElasticsearchStorageMetrics::unavailable(true);
-            }
-        };
-        let response = match response_json(response).await {
-            Ok(value) => value,
-            Err(message) => {
-                warn!(event = "ElasticsearchStorageMetricsResponseError", message = %message);
                 return ElasticsearchStorageMetrics::unavailable(true);
             }
         };
@@ -345,13 +410,39 @@ impl ElasticsearchService {
                 format!("{}/_search", self.inner.config.current_endpoint_index)
             }
         };
-        let response = self
-            .request(Method::POST, &format!("/{index}"))
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let result = response_json(response).await?;
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::ScanQuery,
+                Method::POST,
+                &format!("/{index}"),
+                |request| request.json(body),
+            )
+            .await?;
+        self.mark_success();
+        Ok(result)
+    }
+
+    /// Returns the immutable DNS observations for one task. Comparison is
+    /// intentionally derived from these source observations, never from the
+    /// mutable current-record projection.
+    pub(crate) async fn dns_task_observations(&self, task_id: &str) -> Result<Value, String> {
+        if !self.inner.config.scan_storage.reads_elasticsearch() || !self.can_read() {
+            return Err("Elasticsearch DNS 查询读路径尚未就绪".to_owned());
+        }
+        let body = json!({
+            "size": 10_000,
+            "track_total_hits": false,
+            "query": {"term": {"scan.task_id": task_id}},
+            "sort": [{"@timestamp": {"order": "desc"}}]
+        });
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::ScanQuery,
+                Method::POST,
+                &format!("{}/_search", self.inner.config.dns_observation_data_stream),
+                |request| request.json(&body),
+            )
+            .await?;
         self.mark_success();
         Ok(result)
     }
@@ -388,24 +479,22 @@ impl ElasticsearchService {
         let tag_names = tags.iter().map(|tag| tag.name.clone()).collect::<Vec<_>>();
         let tag_ids = tags.iter().map(|tag| tag.id).collect::<Vec<_>>();
         let tag_kinds = tags.iter().map(|tag| tag.kind.clone()).collect::<Vec<_>>();
-        let response = self
-            .request(
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::RefreshTags,
                 Method::POST,
                 &format!(
                     "/{}/_update_by_query?conflicts=proceed&refresh=true&wait_for_completion=true",
                     self.inner.config.current_endpoint_index
                 ),
+                |request| request.json(&json!({
+                    "query": {"term": {"ip": ip}},
+                    "script": {"lang": "painless", "source":
+                        "ctx._source.tags=params.tags; ctx._source.tag_names=params.names; ctx._source.tag_ids=params.ids; ctx._source.tag_kinds=params.kinds;",
+                        "params": {"tags": tags, "names": tag_names, "ids": tag_ids, "kinds": tag_kinds}}
+                })),
             )
-            .json(&json!({
-                "query": {"term": {"ip": ip}},
-                "script": {"lang": "painless", "source":
-                    "ctx._source.tags=params.tags; ctx._source.tag_names=params.names; ctx._source.tag_ids=params.ids; ctx._source.tag_kinds=params.kinds;",
-                    "params": {"tags": tags, "names": tag_names, "ids": tag_ids, "kinds": tag_kinds}}
-            }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let result = response_json(response).await?;
+            .await?;
         let failures = result
             .get("failures")
             .and_then(Value::as_array)
@@ -434,8 +523,22 @@ impl ElasticsearchService {
         )
     }
 
-    fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
-        let request = self.inner.client.request(method, self.endpoint(path));
+    fn request(
+        &self,
+        method: Method,
+        path: &str,
+        operation: ElasticsearchOperation,
+        traceparent: &str,
+    ) -> reqwest::RequestBuilder {
+        let request = self
+            .inner
+            .client
+            .request(method, self.endpoint(path))
+            .header(
+                "x-opaque-id",
+                format!("network-mapping:{}", operation.name()),
+            )
+            .header("traceparent", traceparent);
         if let Some(api_key) = self.inner.config.api_key.as_deref() {
             request.header(reqwest::header::AUTHORIZATION, format!("ApiKey {api_key}"))
         } else if let (Some(username), Some(password)) = (
@@ -448,16 +551,180 @@ impl ElasticsearchService {
         }
     }
 
+    async fn send_json_request<F>(
+        &self,
+        operation: ElasticsearchOperation,
+        method: Method,
+        path: &str,
+        configure: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    {
+        let (trace_id, traceparent) = new_trace_context();
+        let started = Instant::now();
+        let response = configure(self.request(method, path, operation, &traceparent))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.observe_elasticsearch(
+                    operation,
+                    started,
+                    trace_id,
+                    None,
+                    None,
+                    Some("network"),
+                );
+                return Err(error.to_string());
+            }
+        };
+        let status = response.status();
+        let result = response_json(response).await;
+        let failure_kind = if !status.is_success() {
+            Some("http")
+        } else if result.is_err() {
+            Some("response_decode")
+        } else {
+            None
+        };
+        self.observe_elasticsearch(
+            operation,
+            started,
+            trace_id,
+            Some(status.as_u16()),
+            result.as_ref().ok(),
+            failure_kind,
+        );
+        result
+    }
+
+    async fn send_request<F>(
+        &self,
+        operation: ElasticsearchOperation,
+        method: Method,
+        path: &str,
+        configure: F,
+    ) -> Result<reqwest::Response, String>
+    where
+        F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    {
+        let (trace_id, traceparent) = new_trace_context();
+        let started = Instant::now();
+        match configure(self.request(method, path, operation, &traceparent))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                self.observe_elasticsearch(
+                    operation,
+                    started,
+                    trace_id,
+                    Some(status.as_u16()),
+                    None,
+                    (!status.is_success()).then_some("http"),
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                self.observe_elasticsearch(
+                    operation,
+                    started,
+                    trace_id,
+                    None,
+                    None,
+                    Some("network"),
+                );
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn observe_elasticsearch(
+        &self,
+        operation: ElasticsearchOperation,
+        started: Instant,
+        trace_id: String,
+        http_status: Option<u16>,
+        response: Option<&Value>,
+        failure_kind: Option<&'static str>,
+    ) {
+        let monitor = self
+            .inner
+            .monitor
+            .read()
+            .expect("elasticsearch monitor lock poisoned")
+            .clone();
+        let Some(monitor) = monitor else { return };
+        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        monitor.observe_elasticsearch(ElasticsearchObservation {
+            operation: operation.name(),
+            kind: operation.kind(),
+            duration_ms,
+            es_took_ms: response
+                .and_then(|value| value.get("took"))
+                .and_then(Value::as_i64),
+            http_status,
+            timed_out: response
+                .and_then(|value| value.get("timed_out"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            failed_shards: response
+                .and_then(|value| value.pointer("/_shards/failed"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            trace_id,
+            failure_kind,
+        });
+    }
+
     async fn send_bulk_with_retry(
         &self,
         path: &str,
         body: &str,
         create_conflict_is_success: bool,
     ) -> Result<Value, String> {
+        let (trace_id, traceparent) = new_trace_context();
+        let started = Instant::now();
+        let result = self
+            .send_bulk_with_retry_inner(path, body, create_conflict_is_success, &traceparent)
+            .await;
+        let failure_kind = match result.as_ref() {
+            Ok(value) if value.get("errors").and_then(Value::as_bool) == Some(true) => {
+                Some("bulk_items")
+            }
+            Ok(_) => None,
+            Err(_) => Some("bulk_request"),
+        };
+        self.observe_elasticsearch(
+            ElasticsearchOperation::BulkWrite,
+            started,
+            trace_id,
+            result.as_ref().ok().map(|_| StatusCode::OK.as_u16()),
+            result.as_ref().ok(),
+            failure_kind,
+        );
+        result
+    }
+
+    async fn send_bulk_with_retry_inner(
+        &self,
+        path: &str,
+        body: &str,
+        create_conflict_is_success: bool,
+        traceparent: &str,
+    ) -> Result<Value, String> {
         let max_retries = self.inner.config.bulk_max_retries;
         for attempt in 0..=max_retries {
             let response = self
-                .request(Method::POST, path)
+                .request(
+                    Method::POST,
+                    path,
+                    ElasticsearchOperation::BulkWrite,
+                    traceparent,
+                )
                 .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
                 .body(body.to_owned())
                 .send()
@@ -517,12 +784,14 @@ impl ElasticsearchService {
         if !self.enabled() {
             return Ok(IndexState::Existing);
         }
-        let response = self
-            .request(Method::GET, "/")
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let root = response_json(response).await?;
+        let root = self
+            .send_json_request(
+                ElasticsearchOperation::ClusterInfo,
+                Method::GET,
+                "/",
+                |request| request,
+            )
+            .await?;
         let version = root
             .pointer("/version/number")
             .and_then(Value::as_str)
@@ -609,10 +878,13 @@ impl ElasticsearchService {
 
     async fn ensure_index(&self) -> Result<IndexState, String> {
         let response = self
-            .request(Method::HEAD, &self.inner.config.index)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::HEAD,
+                &self.inner.config.index,
+                |request| request,
+            )
+            .await?;
         if response.status().is_success() {
             return Ok(IndexState::Existing);
         }
@@ -628,16 +900,18 @@ impl ElasticsearchService {
             return Ok(());
         }
         let template_name = format!("{}-template", self.inner.config.observation_index_prefix);
-        let response = self
-            .request(Method::PUT, &format!("/_index_template/{template_name}"))
-            .json(&scan_observation_template(
-                &self.inner.config.observation_index_prefix,
-                self.inner.config.scan_number_of_replicas,
-            ))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        response_json(response).await?;
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            &format!("/_index_template/{template_name}"),
+            |request| {
+                request.json(&scan_observation_template(
+                    &self.inner.config.observation_index_prefix,
+                    self.inner.config.scan_number_of_replicas,
+                ))
+            },
+        )
+        .await?;
         self.ensure_named_index(
             &self.inner.config.execution_endpoint_index,
             &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
@@ -650,25 +924,88 @@ impl ElasticsearchService {
         .await
     }
 
-    async fn ensure_named_index(&self, index: &str, definition: &Value) -> Result<(), String> {
+    async fn ensure_dns_indices(&self) -> Result<(), String> {
+        let template_name = format!("{}-template", self.inner.config.dns_observation_data_stream);
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            &format!("/_index_template/{template_name}"),
+            |request| {
+                request.json(&dns_observation_template(
+                    &self.inner.config.dns_observation_data_stream,
+                    self.inner.config.scan_number_of_replicas,
+                    self.inner.config.dns_observation_retention_days,
+                ))
+            },
+        )
+        .await?;
+        self.ensure_data_stream(&self.inner.config.dns_observation_data_stream)
+            .await?;
+        // Existing installations already have a strict mapping on the DNS data
+        // stream. Additive mapping updates make the new resolver attribution
+        // fields writable before the first explicit-resolver upload.
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            &format!("{}/_mapping", self.inner.config.dns_observation_data_stream),
+            |request| request.json(&json!({"properties": {"resolver": dns_resolver_mapping()}})),
+        )
+        .await?;
+        self.ensure_named_index(
+            &self.inner.config.dns_record_index,
+            &dns_record_index_definition(self.inner.config.scan_number_of_replicas),
+        )
+        .await
+    }
+
+    async fn ensure_data_stream(&self, name: &str) -> Result<(), String> {
         let response = self
-            .request(Method::HEAD, index)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::HEAD,
+                &format!("/_data_stream/{name}"),
+                |request| request,
+            )
+            .await?;
         if response.status().is_success() {
             return Ok(());
         }
         if response.status() != StatusCode::NOT_FOUND {
             return Err(response_error(response).await);
         }
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            &format!("/_data_stream/{name}"),
+            |request| request,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn ensure_named_index(&self, index: &str, definition: &Value) -> Result<(), String> {
         let response = self
-            .request(Method::PUT, index)
-            .json(definition)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        response_json(response).await.map(|_| ())
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::HEAD,
+                index,
+                |request| request,
+            )
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        if response.status() != StatusCode::NOT_FOUND {
+            return Err(response_error(response).await);
+        }
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            index,
+            |request| request.json(definition),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn persist_scan_batch(
@@ -683,6 +1020,134 @@ impl ElasticsearchService {
 
         self.persist_scan_batch_prepared(context, observations)
             .await
+    }
+
+    /// Persists immutable DNS query observations and projects successful answer
+    /// RRs into the mutable current-record index.  The caller supplies a DNS
+    /// view because the same owner can legitimately resolve differently in
+    /// distinct recursive or split-horizon views.
+    pub(crate) async fn persist_dns_observations(
+        &self,
+        context: &ScanBatchContext,
+        tenant_id: &str,
+        observations: &[DnsObservation],
+    ) -> Result<(), String> {
+        if !self.enabled() {
+            return Err("Elasticsearch 未启用，无法保存 DNS 观察".to_owned());
+        }
+        if tenant_id.trim().is_empty() {
+            return Err("tenant_id 不能为空".to_owned());
+        }
+        self.ensure_dns_indices().await?;
+
+        let mut observation_bulk = String::new();
+        let mut record_bulk = String::new();
+        for (position, input) in observations.iter().cloned().enumerate() {
+            let observation = input.normalize()?;
+            let dns_view_id = observation.resolver_id.as_deref().unwrap_or("system");
+            let timestamp = DateTime::<Utc>::from_timestamp_millis(observation.observed_at)
+                .ok_or_else(|| format!("无效 DNS observed_at：{}", observation.observed_at))?;
+            let immutable = serde_json::to_vec(&observation).map_err(|error| error.to_string())?;
+            let document_id = sha256_hex(
+                format!(
+                    "dns-observation-v1\0{}\0{}\0{}\0{position}\0{}",
+                    context.execution_id,
+                    context.upload_id,
+                    context.batch_index,
+                    sha256_hex(&immutable),
+                )
+                .as_bytes(),
+            );
+            let observation_document = json!({
+                "@timestamp": timestamp.to_rfc3339(),
+                "event_id": document_id,
+                "scan": {
+                    "task_id": context.task_id, "execution_id": context.execution_id,
+                    "scanner_id": context.scanner_id, "scanner_name": context.scanner_name,
+                    "upload_id": context.upload_id, "batch_index": context.batch_index
+                },
+                "tenant_id": tenant_id,
+                "dns_view": {"id": dns_view_id},
+                "dns": {
+                    "question": observation.question,
+                    "response_code": observation.response_code,
+                    "authoritative": observation.authoritative,
+                    "truncated": observation.truncated,
+                    "dnssec_authenticated": observation.dnssec_authenticated,
+                    "answers": observation.answers,
+                    "authority": observation.authority,
+                    "additional": observation.additional
+                },
+                "resolver": {
+                    "id": observation.resolver_id, "label": observation.resolver_label,
+                    "ip": observation.resolver_ip, "port": observation.resolver_port,
+                    "transport": observation.resolver_transport
+                },
+                "latency_ms": observation.latency_ms
+            });
+            observation_bulk.push_str(
+                &serde_json::to_string(&json!({"create": {
+                    "_index": self.inner.config.dns_observation_data_stream, "_id": document_id
+                }}))
+                .map_err(|error| error.to_string())?,
+            );
+            observation_bulk.push('\n');
+            observation_bulk.push_str(
+                &serde_json::to_string(&observation_document).map_err(|error| error.to_string())?,
+            );
+            observation_bulk.push('\n');
+
+            if observation.response_code != "NOERROR" {
+                continue;
+            }
+            for record in observation.answer_records(tenant_id, dns_view_id)? {
+                append_dns_record_update(
+                    &mut record_bulk,
+                    &self.inner.config.dns_record_index,
+                    &record.id,
+                    &json!({
+                        "tenant_id": tenant_id,
+                        "dns_view_id": dns_view_id,
+                        "domain": record.domain,
+                        "record_type": record.record_type,
+                        "value": record.value,
+                        "canonical_rdata": record.canonical_rdata,
+                        "ip": record.ip,
+                        "target_domain": record.target_domain,
+                        "ttl": record.ttl,
+                        "priority": record.priority,
+                        "weight": record.weight,
+                        "port": record.port,
+                        "state": "active",
+                        "missing_completed_scans": 0,
+                        "first_seen_at": timestamp.to_rfc3339(),
+                        "first_seen_ms": observation.observed_at,
+                        "last_seen_at": timestamp.to_rfc3339(),
+                        "last_seen_ms": observation.observed_at,
+                        "last_successful_query_at": timestamp.to_rfc3339(),
+                        "last_successful_query_ms": observation.observed_at,
+                        "last_response_code": "NOERROR",
+                        "evidence_sources": ["dns"],
+                        "last_scanner_id": context.scanner_id,
+                        "last_task_id": context.task_id
+                    }),
+                )?;
+            }
+        }
+        if !observation_bulk.is_empty() {
+            let response = self
+                .send_bulk_with_retry("/_bulk?wait_for_active_shards=all", &observation_bulk, true)
+                .await?;
+            validate_dns_bulk_result(&response)?;
+        }
+        if !record_bulk.is_empty() {
+            let response = self
+                .send_bulk_with_retry("/_bulk?wait_for_active_shards=all", &record_bulk, false)
+                .await?;
+            validate_dns_bulk_result(&response)?;
+        }
+        self.mark_success();
+        Ok(())
     }
 
     async fn persist_scan_batch_prepared(
@@ -795,19 +1260,19 @@ impl ElasticsearchService {
                     .insert("after".to_owned(), after);
             }
             let endpoints = self
-                .request(
+                .send_json_request(
+                    ElasticsearchOperation::ExecutionSummary,
                     Method::POST,
                     &format!("/{}/_search", self.inner.config.execution_endpoint_index),
+                    |request| {
+                        request.json(&json!({
+                            "size": 0, "track_total_hits": true,
+                            "query": {"term": {"execution_id": execution_id}},
+                            "aggs": {"ips": {"composite": composite}}
+                        }))
+                    },
                 )
-                .json(&json!({
-                    "size": 0, "track_total_hits": true,
-                    "query": {"term": {"execution_id": execution_id}},
-                    "aggs": {"ips": {"composite": composite}}
-                }))
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let endpoints = response_json(endpoints).await?;
+                .await?;
             port_count = endpoints
                 .pointer("/hits/total/value")
                 .and_then(Value::as_i64)
@@ -823,18 +1288,16 @@ impl ElasticsearchService {
             }
         }
         let observations = self
-            .request(
+            .send_json_request(
+                ElasticsearchOperation::ExecutionSummary,
                 Method::POST,
                 &format!(
                     "/{}-*/_count?allow_no_indices=true&ignore_unavailable=true",
                     self.inner.config.observation_index_prefix
                 ),
+                |request| request.json(&json!({"query": {"term": {"execution_id": execution_id}}})),
             )
-            .json(&json!({"query": {"term": {"execution_id": execution_id}}}))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let observations = response_json(observations).await?;
+            .await?;
         Ok(ScanExecutionSummary {
             ip_count,
             port_count,
@@ -885,13 +1348,14 @@ impl ElasticsearchService {
             .iter()
             .map(|(index, id, _, _)| json!({"_index": index, "_id": id}))
             .collect::<Vec<_>>();
-        let response = self
-            .request(Method::POST, "/_mget")
-            .json(&json!({"docs": docs}))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let result = response_json(response).await?;
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::ConflictCheck,
+                Method::POST,
+                "/_mget",
+                |request| request.json(&json!({"docs": docs})),
+            )
+            .await?;
         let actual = result
             .get("docs")
             .and_then(Value::as_array)
@@ -1030,15 +1494,13 @@ impl ElasticsearchService {
                     .insert("search_after".to_owned(), value);
             }
             let response = self
-                .request(
+                .send_json_request(
+                    ElasticsearchOperation::ProjectionSearch,
                     Method::POST,
                     &format!("/{}/_search", self.inner.config.execution_endpoint_index),
+                    |request| request.json(&query),
                 )
-                .json(&query)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let response = response_json(response).await?;
+                .await?;
             let hits = response
                 .pointer("/hits/hits")
                 .and_then(Value::as_array)
@@ -1157,11 +1619,13 @@ impl ElasticsearchService {
 
     async fn create_index(&self) -> Result<(), String> {
         let response = self
-            .request(Method::PUT, &self.inner.config.index)
-            .json(&index_definition())
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::PUT,
+                &self.inner.config.index,
+                |request| request.json(&index_definition()),
+            )
+            .await?;
         if response.status().is_success() {
             return Ok(());
         }
@@ -1171,10 +1635,13 @@ impl ElasticsearchService {
     async fn reset_index(&self) -> Result<(), String> {
         self.update_runtime(|runtime| runtime.read_ready = false);
         let response = self
-            .request(Method::DELETE, &self.inner.config.index)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::DELETE,
+                &self.inner.config.index,
+                |request| request,
+            )
+            .await?;
         if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
             return Err(response_error(response).await);
         }
@@ -1278,20 +1745,15 @@ impl ElasticsearchService {
         } else {
             &self.inner.config.index
         };
-        let response = match self
-            .request(Method::POST, &format!("{search_index}/_search"))
-            .json(&body)
-            .send()
+        let result = match self
+            .send_json_request(
+                ElasticsearchOperation::AssetSearch,
+                Method::POST,
+                &format!("{search_index}/_search"),
+                |request| request.json(&body),
+            )
             .await
         {
-            Ok(response) => response,
-            Err(error) => {
-                let message = error.to_string();
-                self.mark_error(&message);
-                return Err(message);
-            }
-        };
-        let result = match response_json(response).await {
             Ok(result) => result,
             Err(message) => {
                 self.mark_error(&message);
@@ -1365,23 +1827,23 @@ impl ElasticsearchService {
                         .insert("after".to_owned(), after);
                 }
                 let response = self
-                    .request(
+                    .send_json_request(
+                        ElasticsearchOperation::EndpointFilter,
                         Method::POST,
                         &format!("/{}/_search", self.inner.config.current_endpoint_index),
+                        |request| {
+                            request.json(&json!({
+                                "size": 0,
+                                "query": {"bool": {"filter": [
+                                    {"term": {"scope_type": scope_type}},
+                                    {"term": {"scope_id": scope_id}},
+                                    endpoint_filter
+                                ]}},
+                                "aggs": {"addresses": {"composite": composite}}
+                            }))
+                        },
                     )
-                    .json(&json!({
-                        "size": 0,
-                        "query": {"bool": {"filter": [
-                            {"term": {"scope_type": scope_type}},
-                            {"term": {"scope_id": scope_id}},
-                            endpoint_filter
-                        ]}},
-                        "aggs": {"addresses": {"composite": composite}}
-                    }))
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let response = response_json(response).await?;
+                    .await?;
                 let buckets = response
                     .pointer("/aggregations/addresses/buckets")
                     .and_then(Value::as_array)
@@ -1454,6 +1916,8 @@ impl ElasticsearchService {
             observation_index_prefix: self.inner.config.observation_index_prefix.clone(),
             execution_endpoint_index: self.inner.config.execution_endpoint_index.clone(),
             current_endpoint_index: self.inner.config.current_endpoint_index.clone(),
+            dns_observation_data_stream: self.inner.config.dns_observation_data_stream.clone(),
+            dns_record_index: self.inner.config.dns_record_index.clone(),
             expected_version: self.inner.config.expected_version.clone(),
             runtime: self.runtime(),
             pending_events: row.get("pending"),
@@ -1885,10 +2349,12 @@ impl ElasticsearchService {
                      FROM scan_observation o \
                      LEFT JOIN ips i ON i.execution_id = o.execution_id AND i.ip_address = o.ip_address \
                      LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT( \
-                        'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description) \
-                        ORDER BY tag.id) AS tags FROM asset_ip_tag assignment \
+                        'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+                        'category_id', category.id, 'category_name', category.name) \
+                        ORDER BY category.sort_order, LOWER(category.name), tag.id) AS tags FROM asset_ip_tag assignment \
                         JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                        WHERE assignment.ip_address = o.ip_address AND tag.is_active) tags ON true \
+                        JOIN asset_tag_category category ON category.id = tag.category_id \
+                        WHERE assignment.ip_address = o.ip_address AND tag.is_active AND category.is_active) tags ON true \
                      WHERE o.batch_id = $1 ORDER BY o.id;",
                     &[&batch_id],
                 )
@@ -2182,9 +2648,12 @@ async fn process_scan_tag_event(
     let connection = pool.get().await.map_err(|error| error.to_string())?;
     let rows = connection
         .query(
-            "SELECT tag.id, tag.name, tag.kind, tag.description \
+            "SELECT tag.id, tag.name, tag.kind, tag.description, category.id AS category_id, \
+                    category.name AS category_name \
              FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-             WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active ORDER BY tag.id;",
+             JOIN asset_tag_category category ON category.id = tag.category_id \
+             WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active AND category.is_active \
+             ORDER BY category.sort_order, LOWER(category.name), tag.id;",
             &[&event.aggregate_key],
         )
         .await
@@ -2196,6 +2665,8 @@ async fn process_scan_tag_event(
             name: row.get("name"),
             kind: row.get("kind"),
             description: row.get("description"),
+            category_id: row.try_get("category_id").ok(),
+            category_name: row.try_get("category_name").ok(),
         })
         .collect::<Vec<_>>();
     service
@@ -2314,10 +2785,12 @@ async fn load_documents(
                 COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
          FROM asset_endpoint_current current \
          LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT(\
-             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
-             ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
+             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+             'category_id', category.id, 'category_name', category.name\
+             ) ORDER BY category.sort_order, LOWER(category.name), CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
              FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-             WHERE assignment.ip_address = current.ip_address AND tag.is_active) tag_data ON true \
+             JOIN asset_tag_category category ON category.id = tag.category_id \
+             WHERE assignment.ip_address = current.ip_address AND tag.is_active AND category.is_active) tag_data ON true \
          WHERE current.projection_version > $1 AND {filter} \
          ORDER BY current.projection_version LIMIT $2"
     );
@@ -2537,6 +3010,13 @@ async fn response_json(response: reqwest::Response) -> Result<Value, String> {
     response.json().await.map_err(|error| error.to_string())
 }
 
+fn new_trace_context() -> (String, String) {
+    let trace_id = Uuid::new_v4().simple().to_string();
+    let span_source = Uuid::new_v4().simple().to_string();
+    let traceparent = format!("00-{trace_id}-{}-01", &span_source[..16]);
+    (trace_id, traceparent)
+}
+
 fn is_retryable_bulk_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -2729,12 +3209,171 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "city_name": {"type": "keyword"},
                     "tags": {"type": "object", "properties": {
                         "id": {"type": "long"}, "name": {"type": "keyword"},
-                        "kind": {"type": "keyword"}, "description": {"type": "text", "index": false}
+                        "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
+                        "category_id": {"type": "long"}, "category_name": {"type": "keyword"}
                     }}
                 }
             }
         }
     })
+}
+
+fn dns_observation_template(data_stream: &str, replicas: u32, retention_days: u16) -> Value {
+    json!({
+        "index_patterns": [data_stream],
+        "priority": 600,
+        "data_stream": {},
+        "_meta": {
+            "application": "network-mapping",
+            "schema_version": DNS_INDEX_SCHEMA_VERSION,
+            "purpose": "append-only DNS query observations"
+        },
+        "template": {
+            "settings": scan_index_settings(replicas),
+            "lifecycle": {"data_retention": format!("{retention_days}d")},
+            "mappings": {
+                "dynamic": "strict",
+                "properties": {
+                    "@timestamp": {"type": "date"},
+                    "event_id": {"type": "keyword"},
+                    "tenant_id": {"type": "keyword"},
+                    "dns_view": {"properties": {"id": {"type": "keyword"}}},
+                    "scan": {"properties": {
+                        "task_id": {"type": "keyword"}, "execution_id": {"type": "keyword"},
+                        "scanner_id": {"type": "keyword"}, "scanner_name": {"type": "keyword"},
+                        "upload_id": {"type": "keyword"}, "batch_index": {"type": "integer"}
+                    }},
+                    "dns": {"properties": {
+                        "question": {"properties": {
+                            "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                            "type": {"type": "keyword"}, "class": {"type": "keyword"}
+                        }},
+                        "response_code": {"type": "keyword"}, "authoritative": {"type": "boolean"},
+                        "truncated": {"type": "boolean"}, "dnssec_authenticated": {"type": "boolean"},
+                        "answers": {"type": "object", "properties": {
+                            "type": {"type": "keyword"}, "value": {"type": "keyword", "ignore_above": 4096},
+                            "ttl": {"type": "integer"}, "priority": {"type": "integer"},
+                            "weight": {"type": "integer"}, "port": {"type": "integer"}
+                        }},
+                        "authority": {"type": "object", "enabled": false},
+                        "additional": {"type": "object", "enabled": false}
+                    }},
+                    "resolver": dns_resolver_mapping(),
+                    "latency_ms": {"type": "integer"}
+                }
+            }
+        }
+    })
+}
+
+fn dns_resolver_mapping() -> Value {
+    json!({"properties": {
+        "id": {"type": "keyword"}, "label": {"type": "keyword", "ignore_above": 256},
+        "ip": {"type": "ip"}, "port": {"type": "integer"}, "transport": {"type": "keyword"}
+    }})
+}
+
+fn dns_record_index_definition(replicas: u32) -> Value {
+    json!({
+        "settings": scan_index_settings(replicas),
+        "mappings": {
+            "dynamic": "strict",
+            "_meta": {
+                "application": "network-mapping",
+                "schema_version": DNS_INDEX_SCHEMA_VERSION,
+                "purpose": "current DNS resource records"
+            },
+            "properties": {
+                "tenant_id": {"type": "keyword"}, "dns_view_id": {"type": "keyword"},
+                "domain": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "record_type": {"type": "keyword"}, "value": {"type": "keyword", "ignore_above": 4096},
+                "canonical_rdata": {"type": "keyword", "index": false},
+                "ip": {"type": "ip"}, "target_domain": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "ttl": {"type": "integer"}, "priority": {"type": "integer"},
+                "weight": {"type": "integer"}, "port": {"type": "integer"},
+                "state": {"type": "keyword"}, "missing_completed_scans": {"type": "short"},
+                "first_seen_at": {"type": "date"}, "first_seen_ms": {"type": "long"},
+                "last_seen_at": {"type": "date"}, "last_seen_ms": {"type": "long"},
+                "last_successful_query_at": {"type": "date"}, "last_successful_query_ms": {"type": "long"},
+                "last_response_code": {"type": "keyword"}, "evidence_sources": {"type": "keyword"},
+                "last_scanner_id": {"type": "keyword"}, "last_task_id": {"type": "keyword"}
+            }
+        }
+    })
+}
+
+fn append_dns_record_update(
+    body: &mut String,
+    index: &str,
+    document_id: &str,
+    document: &Value,
+) -> Result<(), String> {
+    const SCRIPT: &str = r#"
+        if (ctx._source.last_seen_ms == null || params.doc.last_seen_ms >= ctx._source.last_seen_ms) {
+            def firstSeenAt = ctx._source.first_seen_at;
+            def firstSeenMs = ctx._source.first_seen_ms;
+            ctx._source.putAll(params.doc);
+            if (firstSeenMs != null) {
+                ctx._source.first_seen_at = firstSeenAt;
+                ctx._source.first_seen_ms = firstSeenMs;
+            }
+        }
+        if (ctx._source.first_seen_ms == null || params.doc.first_seen_ms < ctx._source.first_seen_ms) {
+            ctx._source.first_seen_at = params.doc.first_seen_at;
+            ctx._source.first_seen_ms = params.doc.first_seen_ms;
+        }
+        ctx._source.state = 'active';
+        ctx._source.missing_completed_scans = 0;
+    "#;
+    body.push_str(
+        &serde_json::to_string(&json!({"update": {
+            "_index": index, "_id": document_id, "retry_on_conflict": 5
+        }}))
+        .map_err(|error| error.to_string())?,
+    );
+    body.push('\n');
+    body.push_str(
+        &serde_json::to_string(&json!({
+            "scripted_upsert": true,
+            "script": {"lang": "painless", "source": SCRIPT, "params": {"doc": document}},
+            "upsert": document
+        }))
+        .map_err(|error| error.to_string())?,
+    );
+    body.push('\n');
+    Ok(())
+}
+
+fn validate_dns_bulk_result(result: &Value) -> Result<(), String> {
+    if result.get("errors").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    for item in result
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for operation in ["create", "update"] {
+            let Some(status) = item
+                .pointer(&format!("/{operation}/status"))
+                .and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            if (200..300).contains(&status) || (operation == "create" && status == 409) {
+                continue;
+            }
+            let reason = item
+                .pointer(&format!("/{operation}/error/reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown Elasticsearch bulk error");
+            return Err(format!(
+                "DNS Elasticsearch bulk {operation} failed with HTTP {status}: {reason}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn scan_index_settings(replicas: u32) -> Value {
@@ -2797,7 +3436,8 @@ fn scan_endpoint_index_definition(replicas: u32) -> Value {
                 "city_name": {"type": "wildcard"},
                 "tags": {"type": "object", "properties": {
                     "id": {"type": "long"}, "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "kind": {"type": "keyword"}, "description": {"type": "text", "index": false}
+                    "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
+                    "category_id": {"type": "long"}, "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
                 }},
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tag_ids": {"type": "long"},
@@ -3006,7 +3646,9 @@ fn index_definition() -> Value {
                         "id": {"type": "long"},
                         "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                         "kind": {"type": "keyword"},
-                        "description": {"type": "text", "index": false}
+                        "description": {"type": "text", "index": false},
+                        "category_id": {"type": "long"},
+                        "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
                     }
                 },
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
@@ -3024,9 +3666,9 @@ fn index_definition() -> Value {
 mod tests {
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
-        ElasticsearchService, ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay,
-        index_definition, parse_asn, parse_storage_metrics, scan_batch_payload_checksum,
-        scan_endpoint_index_definition,
+        ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
+        bulk_retry_delay, index_definition, new_trace_context, parse_asn, parse_storage_metrics,
+        scan_batch_payload_checksum, scan_endpoint_index_definition,
     };
     use crate::config::ElasticsearchConfig;
     use std::time::Duration;
@@ -3050,6 +3692,29 @@ mod tests {
             mapping.pointer("/mappings/properties/http_body/type"),
             Some(&serde_json::json!("match_only_text"))
         );
+    }
+
+    #[test]
+    fn correlation_headers_use_bounded_operation_and_valid_trace_context() {
+        let service = ElasticsearchService::new(ElasticsearchConfig::default()).unwrap();
+        let (trace_id, traceparent) = new_trace_context();
+        let request = service
+            .request(
+                reqwest::Method::POST,
+                "/index/_search",
+                ElasticsearchOperation::AssetSearch,
+                &traceparent,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(trace_id.len(), 32);
+        assert_eq!(traceparent.len(), 55);
+        assert_eq!(
+            request.headers().get("x-opaque-id").unwrap(),
+            "network-mapping:asset-search"
+        );
+        assert_eq!(request.headers().get("traceparent").unwrap(), &traceparent);
     }
 
     #[test]

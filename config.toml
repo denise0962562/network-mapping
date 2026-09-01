@@ -77,9 +77,15 @@ server_error_enabled = true
 # 注意：慢 SQL 检测依赖 pg_stat_statements 扩展，需在 postgresql.conf 配置
 # shared_preload_libraries = 'pg_stat_statements' 并重启后执行
 # CREATE EXTENSION pg_stat_statements; 未启用时该检测会跳过并记录警告日志。
-slow_sql_threshold_ms = 3000
+slow_sql_threshold_ms = 3000                 # 当前轮询窗口内的平均执行耗时阈值
 # 慢 SQL 轮询间隔（秒）。
 slow_sql_check_interval_seconds = 60
+# Elasticsearch Query DSL 请求的 warning / critical 阈值（毫秒）。
+elasticsearch_query_warning_threshold_ms = 1000
+elasticsearch_query_critical_threshold_ms = 3000
+# Elasticsearch Bulk、update_by_query 等写入请求的 warning / critical 阈值（毫秒）。
+elasticsearch_write_warning_threshold_ms = 5000
+elasticsearch_write_critical_threshold_ms = 15000
 # 同一告警 key 的冷却时间（秒），冷却窗口内的重复告警被合并丢弃。
 alert_cooldown_seconds = 300
 
@@ -110,6 +116,10 @@ index = "network-mapping-assets-v1"
 observation_index_prefix = "network-mapping-scan-observations-v1"
 execution_endpoint_index = "network-mapping-execution-endpoints-v1"
 current_endpoint_index = "network-mapping-endpoints-current-v2"
+# DNS 不可变查询历史使用 Data Stream；当前 RR 状态使用独立可更新索引。
+dns_observation_data_stream = "network-mapping-dns-observations"
+dns_record_index = "network-mapping-dns-records-v1"
+dns_observation_retention_days = 180
 # dual 模式的单节点开发环境可设为 0；正式切换为 elasticsearch 时必须至少为 1。
 scan_number_of_replicas = 1
 expected_version = "9.5.2"
@@ -132,6 +142,12 @@ bulk_retry_initial_ms = 200
 scan_migration_checkpoint_batches = 100
 # 只影响 postgres/dual 的旧搜索副本；elasticsearch 权威模式始终失败关闭，不回退陈旧事实。
 fallback_to_postgres = true
+
+[analytics_snapshot]
+# realtime 保持旧行为；shadow 后台构建并核验快照；snapshot 让分析接口只读快照。
+mode = "realtime"
+# 每个完整窗口由后台聚合一次。推荐保持 30 分钟。
+interval_minutes = 30
 
 [database]
 host = "127.0.0.1"

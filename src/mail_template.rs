@@ -161,7 +161,7 @@ fn template_variables(template_key: &str) -> Vec<MailTemplateVariable> {
             MailTemplateVariable {
                 key: "alert_type",
                 label: "告警类型",
-                example: "slow_request / server_error / slow_sql",
+                example: "slow_request / server_error / slow_sql / slow_elasticsearch_query",
             },
             MailTemplateVariable {
                 key: "severity",

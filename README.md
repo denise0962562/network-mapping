@@ -169,8 +169,8 @@ repeat_after_seconds = 604800
 
 ## 健康监控与告警
 
-服务端内置健康监控，实时检测慢请求、5xx 服务端错误，并轮询 `pg_stat_statements`
-检测慢 SQL，命中阈值后通过邮件通知所有启用中的管理员。`[monitor]` 配置段控制阈值、
+服务端内置健康监控，实时检测慢请求、5xx 服务端错误和 Elasticsearch 慢查询/写入，并轮询
+`pg_stat_statements` 检测 PostgreSQL 慢 SQL，命中阈值后通过邮件通知所有启用中的管理员。`[monitor]` 配置段控制阈值、
 轮询间隔与冷却时间，通知偏好中的 `health_alert_enabled`（默认开启）控制是否发送。
 慢 SQL 检测需要数据库预先启用 `pg_stat_statements` 扩展。完整的使用方法、前提与
 注意事项参见

@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	address_family TEXT NOT NULL DEFAULT 'ipv4' CHECK (address_family IN ('ipv4', 'ipv6')),
 	scan_profile TEXT NOT NULL DEFAULT 'legacy',
 	scan_plan JSONB NOT NULL DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb,
+	task_kind TEXT NOT NULL DEFAULT 'ip',
+	dns_targets TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
 	remarks TEXT DEFAULT NULL ,                                                               -- 扫描任务的备注
 	CONSTRAINT fk_user
 		FOREIGN KEY (user_id)
@@ -73,6 +75,9 @@ ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS address_family TEXT NOT NULL DEFA
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_profile TEXT NOT NULL DEFAULT 'legacy';
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS scan_plan JSONB NOT NULL
     DEFAULT '{"version":1,"profile":"legacy","stages":[{"type":"port_discovery","required":true},{"type":"service_detection","required":false}]}'::jsonb;
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_kind TEXT NOT NULL DEFAULT 'ip';
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS dns_targets TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS dns_resolvers JSONB NOT NULL DEFAULT '[]'::JSONB;
 UPDATE scan_task SET address_family = 'ipv6'
 WHERE cardinality(task_target) > 0
   AND NOT EXISTS (SELECT 1 FROM unnest(task_target) AS target WHERE family(target) <> 6);
@@ -85,13 +90,16 @@ BEGIN
             CHECK (address_family IN ('ipv4', 'ipv6'));
     END IF;
 END $$;
+ALTER TABLE scan_task DROP CONSTRAINT IF EXISTS scan_task_profile_check;
+ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
+    CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory', 'dns_records'));
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_profile_check'
+        SELECT 1 FROM pg_constraint WHERE conname = 'scan_task_kind_check'
     ) THEN
-        ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
-            CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory'));
+        ALTER TABLE scan_task ADD CONSTRAINT scan_task_kind_check
+            CHECK (task_kind IN ('ip', 'dns'));
     END IF;
 END $$;
 
@@ -164,22 +172,70 @@ ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_name TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS region_name TEXT DEFAULT NULL;
 ALTER TABLE ips ADD COLUMN IF NOT EXISTS city_name TEXT DEFAULT NULL;
 
--- 资产标签独立于扫描执行保存。同一个 IP 的标签会应用到所有任务与历史结果。
-CREATE TABLE IF NOT EXISTS asset_tag (
+-- 标签分类用于在 Web 端组织标签；风险语义仍由 asset_tag.kind 控制。
+CREATE TABLE IF NOT EXISTS asset_tag_category (
 	id BIGSERIAL PRIMARY KEY,
 	name VARCHAR(32) NOT NULL,
-	kind TEXT NOT NULL CHECK (kind IN ('info', 'malicious', 'benign')),
 	description VARCHAR(256),
+	sort_order INT NOT NULL DEFAULT 0,
 	is_active BOOLEAN NOT NULL DEFAULT TRUE,
 	created_by INT REFERENCES users(id) ON DELETE SET NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_tag_category_active_name
+	ON asset_tag_category (LOWER(name)) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_asset_tag_category_active_sort
+	ON asset_tag_category (is_active, sort_order, id);
+
+INSERT INTO asset_tag_category (name, description, sort_order)
+SELECT '未分类', '系统升级时用于接收已有标签的默认分类', 0
+WHERE NOT EXISTS (
+	SELECT 1 FROM asset_tag_category WHERE is_active AND LOWER(name) = LOWER('未分类')
+);
+
+-- 资产标签独立于扫描执行保存。同一个 IP 的标签会应用到所有任务与历史结果。
+CREATE TABLE IF NOT EXISTS asset_tag (
+	id BIGSERIAL PRIMARY KEY,
+	name VARCHAR(32) NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('info', 'malicious', 'benign')),
+	description VARCHAR(256),
+	category_id BIGINT CONSTRAINT fk_asset_tag_category REFERENCES asset_tag_category(id),
+	is_active BOOLEAN NOT NULL DEFAULT TRUE,
+	created_by INT REFERENCES users(id) ON DELETE SET NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 兼容已有标签表：补列、回填默认分类，再收紧约束。
+ALTER TABLE asset_tag ADD COLUMN IF NOT EXISTS category_id BIGINT;
+UPDATE asset_tag
+SET category_id = (
+	SELECT id FROM asset_tag_category
+	WHERE is_active AND LOWER(name) = LOWER('未分类')
+	ORDER BY id LIMIT 1
+)
+WHERE category_id IS NULL;
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint
+		WHERE conname = 'fk_asset_tag_category' AND conrelid = 'asset_tag'::REGCLASS
+	) THEN
+		ALTER TABLE asset_tag
+			ADD CONSTRAINT fk_asset_tag_category
+			FOREIGN KEY (category_id) REFERENCES asset_tag_category(id);
+	END IF;
+END $$;
+ALTER TABLE asset_tag ALTER COLUMN category_id SET NOT NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_tag_active_name
 	ON asset_tag (LOWER(name)) WHERE is_active;
 CREATE INDEX IF NOT EXISTS idx_asset_tag_kind_active
 	ON asset_tag (kind, is_active);
+CREATE INDEX IF NOT EXISTS idx_asset_tag_category_active
+	ON asset_tag (category_id, is_active);
 
 CREATE TABLE IF NOT EXISTS asset_ip_tag (
 	ip_address INET NOT NULL,
@@ -322,6 +378,58 @@ CREATE INDEX IF NOT EXISTS idx_scan_observation_port_latest
 CREATE INDEX IF NOT EXISTS idx_scan_observation_service_lower
 	ON scan_observation(LOWER(service))
 	WHERE kind = 'service' AND service IS NOT NULL;
+
+-- Analysis snapshots are deliberately independent from scan facts. Existing installations can
+-- upgrade safely: the worker reconciles already succeeded executions into this outbox.
+CREATE TABLE IF NOT EXISTS analytics_outbox (
+	execution_id INT PRIMARY KEY REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed')),
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	locked_at TIMESTAMPTZ,
+	completed_at TIMESTAMPTZ,
+	last_error TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_pending
+	ON analytics_outbox(available_at, execution_id) WHERE status <> 'completed';
+
+-- One compact, additive row per execution/window/dimension/label. It avoids repeatedly
+-- aggregating the raw observation history on interactive requests.
+CREATE TABLE IF NOT EXISTS analytics_distribution_30m (
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	bucket_start TIMESTAMPTZ NOT NULL,
+	owner_id INT NOT NULL,
+	scanner_id TEXT NOT NULL,
+	task_source TEXT NOT NULL,
+	dimension TEXT NOT NULL CHECK (dimension IN ('service', 'port')),
+	label TEXT NOT NULL,
+	endpoint_count BIGINT NOT NULL CHECK (endpoint_count >= 0),
+	PRIMARY KEY (execution_id, bucket_start, dimension, label)
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_distribution_query
+	ON analytics_distribution_30m(bucket_start, owner_id, scanner_id, task_source, dimension);
+
+-- IP facts are already deduplicated per execution/day. Queries only need to deduplicate this
+-- much smaller set, never the full observation corpus.
+CREATE TABLE IF NOT EXISTS analytics_discovery_fact (
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	day_start DATE NOT NULL,
+	owner_id INT NOT NULL,
+	scanner_id TEXT NOT NULL,
+	task_source TEXT NOT NULL,
+	ip_address INET NOT NULL,
+	PRIMARY KEY (execution_id, day_start, ip_address)
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_discovery_query
+	ON analytics_discovery_fact(day_start, owner_id, scanner_id, task_source);
+
+CREATE TABLE IF NOT EXISTS analytics_watermark (
+	watermark_key TEXT PRIMARY KEY,
+	data_as_of TIMESTAMPTZ NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- 将尚未进入 typed observation 模型的 v1 scaninfo 历史记录回填到合成批次。
 -- 使用动态 SQL，确保 scaninfo 已由用户手动删除或新安装不存在时仍可正常初始化。
@@ -576,9 +684,17 @@ CREATE INDEX IF NOT EXISTS idx_scanner_latency_scanner_time
 CREATE INDEX IF NOT EXISTS idx_scanner_latency_time
 	ON scanner_latency_sample(measured_at);
 
--- 扫描服务维护状态。单行表用于跨进程重启恢复；预计结束时间仅用于提示，
+-- 系统维护状态。单行表用于跨进程重启恢复；预计结束时间仅用于提示，
 -- enabled 只能由管理员通过 Web 控制接口显式关闭。
-CREATE TABLE IF NOT EXISTS scanner_maintenance_state (
+DO $$
+BEGIN
+	IF to_regclass('public.scanner_maintenance_state') IS NOT NULL
+		AND to_regclass('public.system_maintenance_state') IS NULL THEN
+		ALTER TABLE scanner_maintenance_state RENAME TO system_maintenance_state;
+	END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS system_maintenance_state (
 	singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
 	enabled BOOLEAN NOT NULL DEFAULT FALSE,
 	phase TEXT NOT NULL DEFAULT 'off' CHECK (phase IN ('off', 'draining', 'active')),
@@ -594,9 +710,41 @@ CREATE TABLE IF NOT EXISTS scanner_maintenance_state (
 	revision BIGINT NOT NULL DEFAULT 0
 );
 
-INSERT INTO scanner_maintenance_state (singleton)
+INSERT INTO system_maintenance_state (singleton)
 VALUES (TRUE)
 ON CONFLICT (singleton) DO NOTHING;
+
+-- 系统维护历史。每次进入维护即创建记录；退出维护时补齐结束信息，
+-- 以便服务重启或操作者变更后仍可完整追溯维护窗口。
+CREATE TABLE IF NOT EXISTS system_maintenance_history (
+	id BIGSERIAL PRIMARY KEY,
+	maintenance_id UUID NOT NULL UNIQUE,
+	message TEXT NOT NULL DEFAULT '',
+	expected_end_at TIMESTAMPTZ,
+	started_at TIMESTAMPTZ NOT NULL,
+	ended_at TIMESTAMPTZ,
+	started_by_user_id INT REFERENCES users(id) ON DELETE SET NULL,
+	started_by_username VARCHAR(200) NOT NULL,
+	ended_by_user_id INT REFERENCES users(id) ON DELETE SET NULL,
+	ended_by_username VARCHAR(200),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	CHECK (ended_at IS NULL OR ended_at >= started_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_maintenance_history_started_at
+	ON system_maintenance_history (started_at DESC, id DESC);
+
+-- 升级期间若系统已处于维护模式，补建未完成的历史记录。
+INSERT INTO system_maintenance_history (
+	maintenance_id, message, expected_end_at, started_at, started_by_user_id,
+	started_by_username, updated_at
+)
+SELECT s.maintenance_id, s.message, s.expected_end_at, s.started_at, s.started_by,
+	COALESCE(u.username, '未知操作者'), s.updated_at
+FROM system_maintenance_state s
+LEFT JOIN users u ON u.id = s.started_by
+WHERE s.enabled = TRUE AND s.maintenance_id IS NOT NULL AND s.started_at IS NOT NULL
+ON CONFLICT (maintenance_id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS operation_audit (
 	id BIGSERIAL PRIMARY KEY,
@@ -943,6 +1091,8 @@ CREATE TABLE IF NOT EXISTS health_alert (
 
 CREATE INDEX IF NOT EXISTS idx_health_alert_key_time
 	ON health_alert (alert_type, alert_key, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_health_alert_time
+	ON health_alert (occurred_at DESC, id DESC);
 
 -- pgBackRest Web 管理任务。仓库中的 backup.info 仍是备份集的权威数据源；
 -- 本表只保存手动操作的执行状态、日志和审计关联。

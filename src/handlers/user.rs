@@ -21,7 +21,7 @@ use crate::login::user_login;
 use crate::logs::write::{error_logs, info_logs};
 use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
-use crate::scanner_maintenance::{ScannerMaintenanceState, maintenance_response};
+use crate::system_maintenance::{SystemMaintenanceState, maintenance_response};
 use crate::{generate_hash_password, get_conn_ip, log_out, verify_password};
 use uuid::Uuid;
 
@@ -817,7 +817,7 @@ async fn web_add_scanner_h(
 async fn get_scanners_h(
     req: HttpRequest,
     pool: web::Data<Pool>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
     _user_base_i: UserBaseI,
 ) -> impl Responder {
     match get_scanners(pool.get_ref()).await {
@@ -866,7 +866,7 @@ async fn scanner_register_h(
     req: HttpRequest,
     pool: web::Data<Pool>,
     security: web::Data<SecurityConfig>,
-    maintenance: web::Data<ScannerMaintenanceState>,
+    maintenance: web::Data<SystemMaintenanceState>,
     register_data: web::Json<ScannerRegisterData>,
 ) -> impl Responder {
     let registration_token = req

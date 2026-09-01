@@ -16,6 +16,7 @@ const SPA_ROUTES: &[&str] = &[
     "/analysis/scan",
     "/analysis/performance",
     "/admin/users",
+    "/admin/tags",
     "/admin/backups",
     "/audit",
     "/requests",
@@ -322,6 +323,7 @@ mod tests {
         assert!(is_spa_path("/requests"));
         assert!(is_spa_path("/health"));
         assert!(is_spa_path("/admin/backups"));
+        assert!(is_spa_path("/admin/tags"));
         assert!(is_spa_path("/analysis/scan"));
         assert!(is_spa_path("/analysis/performance"));
         assert!(is_spa_path("/setting/maintenance"));

@@ -5,6 +5,7 @@ use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_postgres::error::SqlState;
+use tokio_postgres::types::ToSql;
 use tracing::error;
 
 use crate::admin::UserBaseI;
@@ -32,6 +33,38 @@ struct NormalizedUserListQuery {
     search: Option<String>,
     role: Option<i32>,
     status: String,
+}
+
+fn user_list_filter<'a>(
+    search: &'a Option<String>,
+    role: &'a Option<i32>,
+    status: &str,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut conditions = vec!["u.role IN (1, 2)".to_owned()];
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    if let Some(value) = search.as_ref() {
+        params.push(value);
+        let index = params.len();
+        conditions.push(format!(
+            "(u.username ILIKE '%' || ${index} || '%' \
+             OR COALESCE(u.email, '') ILIKE '%' || ${index} || '%')"
+        ));
+    }
+    if let Some(value) = role.as_ref() {
+        params.push(value);
+        conditions.push(format!("u.role = ${}", params.len()));
+    }
+    conditions.push(
+        match status {
+            "deleted" => "u.deleted_at IS NOT NULL",
+            "active" => "u.deleted_at IS NULL AND u.disabled_at IS NULL AND u.limit_login = FALSE",
+            "disabled" => "u.deleted_at IS NULL AND u.disabled_at IS NOT NULL",
+            "locked" => "u.deleted_at IS NULL AND u.disabled_at IS NULL AND u.limit_login = TRUE",
+            _ => "u.deleted_at IS NULL",
+        }
+        .to_owned(),
+    );
+    (conditions.join(" AND "), params)
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,17 +227,9 @@ pub async fn list_users(
             );
         }
     };
-    const FILTER: &str = "u.role IN (1, 2) \
-        AND ($1::TEXT IS NULL OR u.username ILIKE '%' || $1 || '%' \
-             OR COALESCE(u.email, '') ILIKE '%' || $1 || '%') \
-        AND ($2::INT IS NULL OR u.role = $2) \
-        AND (($3 = 'deleted' AND u.deleted_at IS NOT NULL) OR \
-             ($3 <> 'deleted' AND u.deleted_at IS NULL AND \
-              ($3 = 'all' OR ($3 = 'active' AND u.disabled_at IS NULL AND u.limit_login = FALSE) \
-               OR ($3 = 'disabled' AND u.disabled_at IS NOT NULL) \
-               OR ($3 = 'locked' AND u.disabled_at IS NULL AND u.limit_login = TRUE))))";
-    let total_sql = format!("SELECT COUNT(*) AS total FROM users u WHERE {FILTER};");
-    let total = match conn.query_one(&total_sql, &[&search, &role, &status]).await {
+    let (filter_sql, filter_params) = user_list_filter(&search, &role, &status);
+    let total_sql = format!("SELECT COUNT(*) AS total FROM users u WHERE {filter_sql};");
+    let total = match conn.query_one(&total_sql, &filter_params).await {
         Ok(row) => row.get::<_, i64>("total"),
         Err(error_value) => {
             return error_response("ListManagedUsersCountError", error_value.into());
@@ -222,12 +247,14 @@ pub async fn list_users(
           AND s.deleted_at IS NULL \
           AND s.create_time + s.ttl::BIGINT * 1000 > \
               (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT) AS active_session_count \
-         FROM users u WHERE {FILTER} ORDER BY u.id DESC LIMIT $4 OFFSET $5;"
+         FROM users u WHERE {filter_sql} ORDER BY u.id DESC LIMIT ${} OFFSET ${};",
+        filter_params.len() + 1,
+        filter_params.len() + 2,
     );
-    let rows = match conn
-        .query(&list_sql, &[&search, &role, &status, &limit, &offset])
-        .await
-    {
+    let mut list_params = filter_params;
+    list_params.push(&limit);
+    list_params.push(&offset);
+    let rows = match conn.query(&list_sql, &list_params).await {
         Ok(value) => value,
         Err(error_value) => return error_response("ListManagedUsersError", error_value.into()),
     };
@@ -700,7 +727,7 @@ pub async fn delete_user(
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateUserRequest, ManagementError, UserListQuery, normalize_list_query,
+        CreateUserRequest, ManagementError, UserListQuery, normalize_list_query, user_list_filter,
         validate_create_request,
     };
 
@@ -742,5 +769,25 @@ mod tests {
             status: None,
         };
         assert!(normalize_list_query(&invalid_role).is_err());
+    }
+
+    #[test]
+    fn user_list_filter_only_binds_present_search_and_role() {
+        let search = Some("alice".to_owned());
+        let role = Some(2);
+        let (sql, params) = user_list_filter(&search, &role, "active");
+        assert_eq!(sql.matches("$1").count(), 2);
+        assert!(sql.contains("u.role = $2"));
+        assert!(sql.contains("u.deleted_at IS NULL"));
+        assert!(sql.contains("u.disabled_at IS NULL"));
+        assert!(sql.contains("u.limit_login = FALSE"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn user_list_filter_has_no_optional_parameters_by_default() {
+        let (sql, params) = user_list_filter(&None, &None, "all");
+        assert_eq!(sql, "u.role IN (1, 2) AND u.deleted_at IS NULL");
+        assert!(params.is_empty());
     }
 }

@@ -28,8 +28,8 @@ use network_mapping_server::monitor::{self, HealthEvent};
 use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
 use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
-use network_mapping_server::scanner_maintenance::{
-    ScannerMaintenanceState, run_reconciler as run_scanner_maintenance_reconciler,
+use network_mapping_server::system_maintenance::{
+    SystemMaintenanceState, run_reconciler as run_system_maintenance_reconciler,
 };
 use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
 use network_mapping_server::tls::build_acceptor;
@@ -66,6 +66,7 @@ async fn main() -> io::Result<()> {
     let request_log_config = config.requests.clone();
     let monitor_config = config.monitor.clone();
     let elasticsearch_config = config.elasticsearch.clone();
+    let analytics_snapshot_config = config.analytics_snapshot.clone();
     let frontend_directory = config.frontend.directory.clone();
     let maxmind_directory = config.maxmind.directory.clone();
     let automatic_target_service = AutomaticTargetService::new(config.automatic_target.clone())
@@ -127,6 +128,7 @@ async fn main() -> io::Result<()> {
     if !args.rebuild_elasticsearch
         && !args.refresh_ip_intel
         && !args.migrate_scan_data_to_elasticsearch
+        && !args.rebuild_analytics_snapshots
         && !elasticsearch_config.scan_storage.reads_elasticsearch()
     {
         match network_mapping_server::search_projection::ensure_initialized(&db_pool).await {
@@ -201,18 +203,28 @@ async fn main() -> io::Result<()> {
         .validate_scan_cutover(&db_pool)
         .await
         .map_err(|error| io::Error::other(format!("扫描存储切换检查失败：{error}")))?;
+    if args.rebuild_analytics_snapshots {
+        let processed = network_mapping_server::analytics_snapshot::rebuild_all(
+            &db_pool,
+            &elasticsearch_service,
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("重建分析快照失败：{error}")))?;
+        println!("分析快照重建完成：已处理 {processed} 个扫描执行");
+        return Ok(());
+    }
     let trusted_proxy_state = web::Data::new(
         TrustedProxyState::from_database(&db_pool)
             .await
             .map_err(|error| io::Error::other(format!("加载可信代理配置失败：{error}")))?,
     );
-    let scanner_maintenance_state = web::Data::new(
-        ScannerMaintenanceState::from_database(&db_pool)
+    let system_maintenance_state = web::Data::new(
+        SystemMaintenanceState::from_database(&db_pool)
             .await
-            .map_err(|error| io::Error::other(format!("加载扫描服务维护状态失败：{error}")))?,
+            .map_err(|error| io::Error::other(format!("加载系统维护状态失败：{error}")))?,
     );
-    tokio::spawn(run_scanner_maintenance_reconciler(
-        scanner_maintenance_state.clone(),
+    tokio::spawn(run_system_maintenance_reconciler(
+        system_maintenance_state.clone(),
         db_pool.clone(),
     ));
     if let Ok(client) = db_pool.get().await
@@ -274,6 +286,13 @@ async fn main() -> io::Result<()> {
             db_pool.clone(),
         ));
     }
+    if analytics_snapshot_config.mode.runs_worker() {
+        tokio::spawn(network_mapping_server::analytics_snapshot::run_worker(
+            analytics_snapshot_config.clone(),
+            db_pool.clone(),
+            elasticsearch_service.clone(),
+        ));
+    }
 
     info!(target: "server::startup", "正在检查系统账户");
 
@@ -296,6 +315,7 @@ async fn main() -> io::Result<()> {
         db_pool.clone(),
         ser_con.encrypt_key.clone(),
     );
+    elasticsearch_service.set_monitor(monitor_handle.clone());
 
     let tls = build_acceptor(&config.tls)?;
     let frontend_assets = FrontendAssets::new(frontend_directory);
@@ -307,6 +327,7 @@ async fn main() -> io::Result<()> {
     let maxmind_state = web::Data::new(maxmind_state);
     let automatic_target_service = web::Data::new(automatic_target_service);
     let security = web::Data::new(config.security);
+    let analytics_snapshot = web::Data::new(analytics_snapshot_config);
     let rate_limiter = RateLimitMiddleware::default();
     let open_source_catalog = web::Data::new(
         OpenSourceCatalog::from_embedded()
@@ -416,8 +437,9 @@ async fn main() -> io::Result<()> {
             .app_data(backup_manager.clone())
             .app_data(elasticsearch_data.clone())
             .app_data(trusted_proxy_state.clone())
-            .app_data(scanner_maintenance_state.clone())
+            .app_data(system_maintenance_state.clone())
             .app_data(security.clone())
+            .app_data(analytics_snapshot.clone())
             .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())
             .app_data(web::JsonConfig::default().limit(server_max_body))

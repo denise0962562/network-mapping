@@ -261,11 +261,13 @@ pub async fn search_v2(
          FROM filtered \
          LEFT JOIN LATERAL (\
             SELECT JSONB_AGG(JSONB_BUILD_OBJECT(\
-                'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
-            ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
+                'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+                'category_id', category.id, 'category_name', category.name\
+            ) ORDER BY category.sort_order, LOWER(category.name), CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
             FROM asset_ip_tag assignment \
             JOIN asset_tag tag ON tag.id = assignment.tag_id \
-            WHERE assignment.ip_address = filtered.ip_address AND tag.is_active\
+            JOIN asset_tag_category category ON category.id = tag.category_id \
+            WHERE assignment.ip_address = filtered.ip_address AND tag.is_active AND category.is_active\
          ) tag_data ON true \
          ORDER BY filtered.last_seen_at DESC, filtered.ip_address, filtered.port",
         compiled.sql, limit_parameter, offset_parameter
@@ -353,10 +355,12 @@ async fn search_assets(
          COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
          FROM asset_endpoint_current s \
          LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT(\
-             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description\
-             ) ORDER BY CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
+             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
+             'category_id', category.id, 'category_name', category.name\
+             ) ORDER BY category.sort_order, LOWER(category.name), CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
              FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-             WHERE assignment.ip_address = s.ip_address AND tag.is_active) tag_data ON true \
+             JOIN asset_tag_category category ON category.id = tag.category_id \
+             WHERE assignment.ip_address = s.ip_address AND tag.is_active AND category.is_active) tag_data ON true \
          WHERE {where_clause} AND (($2 = 1 AND s.scope_type = 'global' AND s.scope_id = 0) \
              OR ($2 <> 1 AND s.scope_type = 'user' AND s.scope_id = $3)) \
          ) latest ORDER BY latest.ip_address, latest.port LIMIT $4 OFFSET $5"

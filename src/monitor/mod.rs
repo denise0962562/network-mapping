@@ -1,19 +1,22 @@
-//! 健康监控与告警：慢请求、5xx 错误、慢 SQL 的检测与邮件通知。
+//! 健康监控与告警：慢请求、5xx、PostgreSQL 慢 SQL 和 Elasticsearch 慢操作。
 //!
-//! 检测分两类来源：
+//! 检测分三类来源：
 //! - 请求级：`main.rs` 的请求中间件在响应后按状态码与耗时实时判定，投递到有界 channel；
 //! - 数据库级：[`slow_sql`] 后台任务轮询 `pg_stat_statements` 视图。
-//! 两者统一由 [`run_notifier`] 消费，做冷却去重后复用邮件模板系统发送给管理员。
+//! - Elasticsearch：统一请求入口上报端到端耗时、响应状态和分片结果。
+//!
+//! 三类信号统一由 [`run_notifier`] 消费，做冷却去重后复用邮件模板系统发送给管理员。
 
 mod slow_sql;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deadpool_postgres::Pool;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::MonitorConfig;
@@ -21,6 +24,26 @@ use crate::logs::write::error_chain_diagnostics;
 use crate::mail_template;
 
 pub const CHANNEL_CAPACITY: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElasticsearchOperationKind {
+    Query,
+    Write,
+    Maintenance,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ElasticsearchObservation {
+    pub operation: &'static str,
+    pub kind: ElasticsearchOperationKind,
+    pub duration_ms: i64,
+    pub es_took_ms: Option<i64>,
+    pub http_status: Option<u16>,
+    pub timed_out: bool,
+    pub failed_shards: i64,
+    pub trace_id: String,
+    pub failure_kind: Option<&'static str>,
+}
 
 /// 一条健康告警事件。去重 key 相同的事件在冷却窗口内会被合并丢弃。
 #[derive(Debug, Clone)]
@@ -30,6 +53,20 @@ pub struct HealthEvent {
     pub key: String,
     pub summary: String,
     pub details: Vec<(String, String)>,
+}
+
+struct SlowSqlObservation<'a> {
+    queryid: i64,
+    query: &'a str,
+    mean_exec_time_ms: f64,
+    max_exec_time_ms: f64,
+    calls_delta: i64,
+    total_exec_time_ms: f64,
+    rows_delta: i64,
+    shared_blks_hit_delta: i64,
+    shared_blks_read_delta: i64,
+    temp_blks_read_delta: i64,
+    temp_blks_written_delta: i64,
 }
 
 impl HealthEvent {
@@ -85,13 +122,20 @@ impl HealthEvent {
         }
     }
 
-    pub fn slow_sql(
-        queryid: i64,
-        query: &str,
-        mean_exec_time_ms: f64,
-        max_exec_time_ms: f64,
-        calls_delta: i64,
-    ) -> Self {
+    fn slow_sql(observation: &SlowSqlObservation<'_>) -> Self {
+        let SlowSqlObservation {
+            queryid,
+            query,
+            mean_exec_time_ms,
+            max_exec_time_ms,
+            calls_delta,
+            total_exec_time_ms,
+            rows_delta,
+            shared_blks_hit_delta,
+            shared_blks_read_delta,
+            temp_blks_read_delta,
+            temp_blks_written_delta,
+        } = observation;
         let query_text = if query.is_empty() {
             format!("queryid={queryid}")
         } else {
@@ -102,14 +146,118 @@ impl HealthEvent {
             severity: "warning",
             key: format!("slow_sql:{queryid}"),
             summary: format!(
-                "检测到慢 SQL（平均 {mean_exec_time_ms:.1}ms，峰值 {max_exec_time_ms:.1}ms）"
+                "检测到慢 SQL（本周期平均 {mean_exec_time_ms:.1}ms，历史峰值 {max_exec_time_ms:.1}ms）"
             ),
             details: vec![
                 ("查询".to_owned(), query_text),
-                ("平均耗时".to_owned(), format!("{mean_exec_time_ms:.1} ms")),
-                ("峰值耗时".to_owned(), format!("{max_exec_time_ms:.1} ms")),
+                (
+                    "本周期平均耗时".to_owned(),
+                    format!("{mean_exec_time_ms:.1} ms"),
+                ),
+                (
+                    "本周期总耗时".to_owned(),
+                    format!("{total_exec_time_ms:.1} ms"),
+                ),
+                (
+                    "历史峰值耗时".to_owned(),
+                    format!("{max_exec_time_ms:.1} ms"),
+                ),
                 ("本周期调用次数".to_owned(), calls_delta.to_string()),
+                ("本周期返回行数".to_owned(), rows_delta.to_string()),
+                (
+                    "本周期共享块命中".to_owned(),
+                    shared_blks_hit_delta.to_string(),
+                ),
+                (
+                    "本周期共享块读取".to_owned(),
+                    shared_blks_read_delta.to_string(),
+                ),
+                (
+                    "本周期临时块读取".to_owned(),
+                    temp_blks_read_delta.to_string(),
+                ),
+                (
+                    "本周期临时块写入".to_owned(),
+                    temp_blks_written_delta.to_string(),
+                ),
             ],
+        }
+    }
+
+    fn elasticsearch(observation: &ElasticsearchObservation, severity: &'static str) -> Self {
+        let operation_kind = match observation.kind {
+            ElasticsearchOperationKind::Query => "query",
+            ElasticsearchOperationKind::Write => "write",
+            ElasticsearchOperationKind::Maintenance => "maintenance",
+        };
+        let failed = observation.failure_kind.is_some()
+            || observation.http_status.is_some_and(|status| status >= 400)
+            || observation.timed_out
+            || observation.failed_shards > 0;
+        let alert_type = match (operation_kind, failed) {
+            ("query", false) => "slow_elasticsearch_query",
+            ("write", false) => "slow_elasticsearch_write",
+            ("query", true) => "elasticsearch_query_error",
+            ("write", true) => "elasticsearch_write_error",
+            (_, _) => "elasticsearch_error",
+        };
+        let summary = if failed {
+            format!(
+                "Elasticsearch {} {} 失败或返回异常（{}ms）",
+                operation_kind, observation.operation, observation.duration_ms
+            )
+        } else {
+            format!(
+                "Elasticsearch {} {} 耗时 {}ms",
+                operation_kind, observation.operation, observation.duration_ms
+            )
+        };
+        let mut details = vec![
+            ("操作".to_owned(), observation.operation.to_owned()),
+            ("类型".to_owned(), operation_kind.to_owned()),
+            (
+                "服务端总耗时".to_owned(),
+                format!("{} ms", observation.duration_ms),
+            ),
+            (
+                "Elasticsearch took".to_owned(),
+                observation
+                    .es_took_ms
+                    .map(|value| format!("{value} ms"))
+                    .unwrap_or_else(|| "未知".to_owned()),
+            ),
+            (
+                "应用额外耗时".to_owned(),
+                observation
+                    .es_took_ms
+                    .map(|value| {
+                        format!(
+                            "{} ms",
+                            observation.duration_ms.saturating_sub(value).max(0)
+                        )
+                    })
+                    .unwrap_or_else(|| "未知".to_owned()),
+            ),
+            (
+                "HTTP 状态".to_owned(),
+                observation
+                    .http_status
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "无响应".to_owned()),
+            ),
+            ("是否超时".to_owned(), observation.timed_out.to_string()),
+            ("失败分片".to_owned(), observation.failed_shards.to_string()),
+            ("Trace ID".to_owned(), observation.trace_id.clone()),
+        ];
+        if let Some(failure_kind) = observation.failure_kind {
+            details.push(("失败类型".to_owned(), failure_kind.to_owned()));
+        }
+        Self {
+            alert_type,
+            severity,
+            key: format!("{alert_type}:{}", observation.operation),
+            summary,
+            details,
         }
     }
 }
@@ -151,6 +299,11 @@ pub struct MonitorHandle {
     tx: mpsc::Sender<HealthEvent>,
     slow_request_threshold_ms: i64,
     server_error_enabled: bool,
+    elasticsearch_query_warning_threshold_ms: i64,
+    elasticsearch_query_critical_threshold_ms: i64,
+    elasticsearch_write_warning_threshold_ms: i64,
+    elasticsearch_write_critical_threshold_ms: i64,
+    dropped_events: Arc<AtomicU64>,
 }
 
 impl MonitorHandle {
@@ -172,6 +325,15 @@ impl MonitorHandle {
             tx,
             slow_request_threshold_ms: config.slow_request_threshold_ms,
             server_error_enabled: config.server_error_enabled,
+            elasticsearch_query_warning_threshold_ms: config
+                .elasticsearch_query_warning_threshold_ms,
+            elasticsearch_query_critical_threshold_ms: config
+                .elasticsearch_query_critical_threshold_ms,
+            elasticsearch_write_warning_threshold_ms: config
+                .elasticsearch_write_warning_threshold_ms,
+            elasticsearch_write_critical_threshold_ms: config
+                .elasticsearch_write_critical_threshold_ms,
+            dropped_events: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -187,7 +349,59 @@ impl MonitorHandle {
 
     /// 非阻塞投递一条告警事件；channel 满时直接丢弃，绝不阻塞请求路径。
     pub fn emit(&self, event: HealthEvent) {
-        let _ = self.tx.try_send(event);
+        if self.tx.try_send(event).is_err() {
+            let dropped = self.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                warn!(
+                    event = "HealthAlertChannelFull",
+                    dropped_events = dropped,
+                    "健康告警队列已满，事件被丢弃"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn observe_elasticsearch(&self, observation: ElasticsearchObservation) {
+        if observation.kind == ElasticsearchOperationKind::Maintenance {
+            return;
+        }
+        let (warning_threshold, critical_threshold) = match observation.kind {
+            ElasticsearchOperationKind::Query => (
+                self.elasticsearch_query_warning_threshold_ms,
+                self.elasticsearch_query_critical_threshold_ms,
+            ),
+            ElasticsearchOperationKind::Write => (
+                self.elasticsearch_write_warning_threshold_ms,
+                self.elasticsearch_write_critical_threshold_ms,
+            ),
+            ElasticsearchOperationKind::Maintenance => return,
+        };
+        let failed = observation.failure_kind.is_some()
+            || observation.http_status.is_some_and(|status| status >= 400)
+            || observation.timed_out
+            || observation.failed_shards > 0;
+        if !failed && observation.duration_ms < warning_threshold {
+            return;
+        }
+        let severity = if failed || observation.duration_ms >= critical_threshold {
+            "critical"
+        } else {
+            "warning"
+        };
+        warn!(
+            event = "ElasticsearchSlowOperation",
+            operation = observation.operation,
+            operation_kind = ?observation.kind,
+            duration_ms = observation.duration_ms,
+            es_took_ms = observation.es_took_ms,
+            http_status = observation.http_status,
+            timed_out = observation.timed_out,
+            failed_shards = observation.failed_shards,
+            trace_id = %observation.trace_id,
+            failure_kind = observation.failure_kind,
+            "Elasticsearch 操作达到告警条件"
+        );
+        self.emit(HealthEvent::elasticsearch(&observation, severity));
     }
 }
 
@@ -234,16 +448,16 @@ async fn run_notifier(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let now = Instant::now();
-            if let Some(previous) = last.get(&event.key) {
-                if now.duration_since(*previous) < cooldown {
-                    debug!(
-                        event = "HealthAlertCooldown",
-                        alert_type = event.alert_type,
-                        key = %event.key,
-                        "告警处于冷却期，已合并丢弃"
-                    );
-                    continue;
-                }
+            if let Some(previous) = last.get(&event.key)
+                && now.duration_since(*previous) < cooldown
+            {
+                debug!(
+                    event = "HealthAlertCooldown",
+                    alert_type = event.alert_type,
+                    key = %event.key,
+                    "告警处于冷却期，已合并丢弃"
+                );
+                continue;
             }
             last.insert(event.key.clone(), now);
         }
@@ -267,5 +481,75 @@ async fn run_notifier(
                 "健康告警邮件发送失败"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    fn handle() -> (
+        MonitorHandle,
+        tokio::sync::mpsc::Receiver<super::HealthEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        (
+            MonitorHandle {
+                tx,
+                slow_request_threshold_ms: 3_000,
+                server_error_enabled: true,
+                elasticsearch_query_warning_threshold_ms: 1_000,
+                elasticsearch_query_critical_threshold_ms: 3_000,
+                elasticsearch_write_warning_threshold_ms: 5_000,
+                elasticsearch_write_critical_threshold_ms: 15_000,
+                dropped_events: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    fn query_observation(duration_ms: i64) -> ElasticsearchObservation {
+        ElasticsearchObservation {
+            operation: "asset-search",
+            kind: ElasticsearchOperationKind::Query,
+            duration_ms,
+            es_took_ms: Some(duration_ms.saturating_sub(20)),
+            http_status: Some(200),
+            timed_out: false,
+            failed_shards: 0,
+            trace_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            failure_kind: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_observer_ignores_fast_queries_and_emits_slow_queries() {
+        let (handle, mut rx) = handle();
+        handle.observe_elasticsearch(query_observation(999));
+        assert!(rx.try_recv().is_err());
+
+        handle.observe_elasticsearch(query_observation(1_000));
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.alert_type, "slow_elasticsearch_query");
+        assert_eq!(event.severity, "warning");
+        assert_eq!(event.key, "slow_elasticsearch_query:asset-search");
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_failures_are_critical_without_sensitive_details() {
+        let (handle, mut rx) = handle();
+        let mut observation = query_observation(10);
+        observation.http_status = Some(429);
+        observation.failure_kind = Some("http");
+        handle.observe_elasticsearch(observation);
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.alert_type, "elasticsearch_query_error");
+        assert_eq!(event.severity, "critical");
+        let rendered = format!("{event:?}");
+        assert!(!rendered.contains("SELECT "));
+        assert!(!rendered.contains("password="));
     }
 }

@@ -13,18 +13,6 @@ use crate::client_ip::display_ip;
 use crate::handlers::system_resources::{Granularity, MAX_BUCKETS};
 use crate::logs::write::error_logs;
 
-/// 请求日志查询过滤。`$9` 为「仅看错误」开关：开启时过滤 `error_level <> 'ok'`。
-const FILTER_SQL: &str = "
-    WHERE ($1::TEXT IS NULL OR http_method = $1)
-      AND ($2::TEXT IS NULL OR request_path ILIKE '%' || $2 || '%')
-      AND ($3::SMALLINT IS NULL OR status_code = $3)
-      AND ($4::TEXT IS NULL OR error_level = $4)
-      AND ($5::TEXT IS NULL OR error_type = $5)
-      AND ($6::UUID IS NULL OR request_id = $6)
-      AND ($7::TIMESTAMPTZ IS NULL OR occurred_at >= $7)
-      AND ($8::TIMESTAMPTZ IS NULL OR occurred_at <= $8)
-      AND ($9::BOOLEAN IS NULL OR error_level <> 'ok')";
-
 #[derive(Deserialize)]
 pub struct RequestQuery {
     method: Option<String>,
@@ -100,17 +88,6 @@ struct EventPerformance {
 }
 
 const PERFORMANCE_DURATION_SQL: &str = "COALESCE(duration_us, duration_ms::BIGINT * 1000)";
-const PERFORMANCE_FILTER_SQL: &str = "
-    WHERE ($1::TEXT IS NULL OR http_method = $1)
-      AND ($2::TEXT IS NULL OR COALESCE(route_pattern, '（历史未标准化）') ILIKE '%' || $2 || '%')
-      AND ($3::TEXT IS NULL
-           OR ($3 = 'success' AND status_code < 400)
-           OR ($3 = '4xx' AND status_code BETWEEN 400 AND 499)
-           OR ($3 = '5xx' AND status_code BETWEEN 500 AND 599))
-      AND occurred_at >= $4
-      AND occurred_at < $5
-      AND request_path <> '/api/requests/performance'
-      AND COALESCE(duration_us, duration_ms::BIGINT * 1000) IS NOT NULL";
 const SLOW_REQUEST_US: i64 = 1_000_000;
 
 fn is_admin(user: &UserBaseI) -> bool {
@@ -124,22 +101,81 @@ fn pagination(page: Option<i64>, page_size: Option<i64>) -> (i64, i64) {
     )
 }
 
-fn filter_params<'a>(
+fn request_filter<'a>(
     query: &'a dyn RequestFilter,
     start: &'a Option<DateTime<Utc>>,
     end: &'a Option<DateTime<Utc>>,
-) -> Vec<&'a (dyn ToSql + Sync)> {
-    vec![
-        query.method(),
-        query.path(),
-        query.status(),
-        query.error_level(),
-        query.error_type(),
-        query.request_id(),
-        start,
-        end,
-        query.only_errors(),
-    ]
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut conditions = Vec::new();
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    macro_rules! push_filter {
+        ($value:expr, $predicate:expr) => {
+            if let Some(value) = $value.as_ref() {
+                params.push(value);
+                conditions.push(format!($predicate, params.len()));
+            }
+        };
+    }
+    push_filter!(query.method(), "http_method = ${}");
+    push_filter!(query.path(), "request_path ILIKE '%' || ${} || '%'");
+    push_filter!(query.status(), "status_code = ${}");
+    push_filter!(query.error_level(), "error_level = ${}");
+    push_filter!(query.error_type(), "error_type = ${}");
+    push_filter!(query.request_id(), "request_id = ${}");
+    push_filter!(start, "occurred_at >= ${}");
+    push_filter!(end, "occurred_at <= ${}");
+    if query.only_errors().is_some() {
+        conditions.push("error_level <> 'ok'".to_owned());
+    }
+    let sql = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    (sql, params)
+}
+
+fn add_filter_condition(filter_sql: &str, condition: &str) -> String {
+    if filter_sql.is_empty() {
+        format!(" WHERE {condition}")
+    } else {
+        format!("{filter_sql} AND {condition}")
+    }
+}
+
+fn performance_filter<'a>(
+    filters: &'a PerformanceFilters,
+    start: &'a DateTime<Utc>,
+    end: &'a DateTime<Utc>,
+) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut conditions = Vec::new();
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    if let Some(value) = filters.method.as_ref() {
+        params.push(value);
+        conditions.push(format!("http_method = ${}", params.len()));
+    }
+    if let Some(value) = filters.route.as_ref() {
+        params.push(value);
+        conditions.push(format!(
+            "COALESCE(route_pattern, '（历史未标准化）') ILIKE '%' || ${} || '%'",
+            params.len()
+        ));
+    }
+    if let Some(condition) = match filters.status_class.as_deref() {
+        Some("success") => Some("status_code < 400"),
+        Some("4xx") => Some("status_code BETWEEN 400 AND 499"),
+        Some("5xx") => Some("status_code BETWEEN 500 AND 599"),
+        _ => None,
+    } {
+        conditions.push(condition.to_owned());
+    }
+    params.push(start);
+    conditions.push(format!("occurred_at >= ${}", params.len()));
+    params.push(end);
+    conditions.push(format!("occurred_at < ${}", params.len()));
+    conditions.push("request_path <> '/api/requests/performance'".to_owned());
+    conditions.push(format!("{PERFORMANCE_DURATION_SQL} IS NOT NULL"));
+    (format!(" WHERE {}", conditions.join(" AND ")), params)
 }
 
 /// 两个查询结构体共享过滤字段的读取接口，避免手写两遍参数列表。
@@ -272,6 +308,7 @@ async fn query_performance_summary(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<PerformanceSummary, tokio_postgres::Error> {
+    let (filter_sql, params) = performance_filter(filters, &start, &end);
     let sql = format!(
         "SELECT COUNT(*)::BIGINT AS sample_count, \
                 AVG(({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS avg_ms, \
@@ -282,15 +319,8 @@ async fn query_performance_summary(
                 COALESCE(COUNT(*) FILTER (WHERE status_code >= 400)::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS error_rate, \
                 COALESCE(COUNT(*) FILTER (WHERE {PERFORMANCE_DURATION_SQL} >= {SLOW_REQUEST_US})::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS slow_rate, \
                 COALESCE(COUNT(*) FILTER (WHERE route_pattern IS NOT NULL)::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS normalized_coverage \
-         FROM request_log {PERFORMANCE_FILTER_SQL}"
+         FROM request_log{filter_sql}"
     );
-    let params: [&(dyn ToSql + Sync); 5] = [
-        &filters.method,
-        &filters.route,
-        &filters.status_class,
-        &start,
-        &end,
-    ];
     client
         .query_one(&sql, &params)
         .await
@@ -304,23 +334,18 @@ async fn query_performance_trend(
     end: DateTime<Utc>,
     bucket_seconds: i64,
 ) -> Result<Vec<Value>, tokio_postgres::Error> {
+    let (filter_sql, mut params) = performance_filter(filters, &start, &end);
+    let bucket_index = params.len() + 1;
     let sql = format!(
-        "SELECT to_timestamp((EXTRACT(EPOCH FROM occurred_at)::BIGINT / $6::BIGINT) * $6::BIGINT) AS bucket, \
+        "SELECT to_timestamp((EXTRACT(EPOCH FROM occurred_at)::BIGINT / ${bucket_index}::BIGINT) * ${bucket_index}::BIGINT) AS bucket, \
                 COUNT(*)::BIGINT AS sample_count, \
                 percentile_cont(0.50) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p50_ms, \
                 percentile_cont(0.95) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p95_ms, \
                 percentile_cont(0.99) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p99_ms \
-         FROM request_log {PERFORMANCE_FILTER_SQL} \
+         FROM request_log{filter_sql} \
          GROUP BY bucket ORDER BY bucket"
     );
-    let params: [&(dyn ToSql + Sync); 6] = [
-        &filters.method,
-        &filters.route,
-        &filters.status_class,
-        &start,
-        &end,
-        &bucket_seconds,
-    ];
+    params.push(&bucket_seconds);
     client.query(&sql, &params).await.map(|rows| {
         rows.iter()
             .map(|row| {
@@ -357,6 +382,8 @@ async fn query_event_performance(
     end: DateTime<Utc>,
     limit: i64,
 ) -> Result<Vec<EventPerformance>, tokio_postgres::Error> {
+    let (filter_sql, mut params) = performance_filter(filters, &start, &end);
+    let limit_index = params.len() + 1;
     let sql = format!(
         "SELECT http_method, COALESCE(route_pattern, '（历史未标准化）') AS event_route, \
                 BOOL_AND(route_pattern IS NOT NULL) AS normalized, \
@@ -366,18 +393,11 @@ async fn query_event_performance(
                 percentile_cont(0.95) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p95_ms, \
                 percentile_cont(0.99) WITHIN GROUP (ORDER BY ({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS p99_ms, \
                 MAX({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION / 1000.0 AS max_ms \
-         FROM request_log {PERFORMANCE_FILTER_SQL} \
+         FROM request_log{filter_sql} \
          GROUP BY http_method, event_route \
-         ORDER BY p95_ms DESC NULLS LAST, sample_count DESC LIMIT $6"
+         ORDER BY p95_ms DESC NULLS LAST, sample_count DESC LIMIT ${limit_index}"
     );
-    let params: [&(dyn ToSql + Sync); 6] = [
-        &filters.method,
-        &filters.route,
-        &filters.status_class,
-        &start,
-        &end,
-        &limit,
-    ];
+    params.push(&limit);
     client
         .query(&sql, &params)
         .await
@@ -445,8 +465,8 @@ pub(crate) async fn list_requests(
         }
     };
 
-    let params = filter_params(&*query, &query.start, &query.end);
-    let count_sql = format!("SELECT COUNT(*) FROM request_log {FILTER_SQL}");
+    let (filter_sql, params) = request_filter(&*query, &query.start, &query.end);
+    let count_sql = format!("SELECT COUNT(*) FROM request_log{filter_sql}");
     let total: i64 = match client.query_one(&count_sql, &params).await {
         Ok(row) => row.get(0),
         Err(error_value) => {
@@ -458,7 +478,10 @@ pub(crate) async fn list_requests(
     let list_sql = format!(
         "SELECT id, request_id, occurred_at, http_method, request_path, status_code, duration_ms, \
          client_ip, user_agent, actor_id, actor_name, error_level, error_type \
-         FROM request_log {FILTER_SQL} ORDER BY occurred_at DESC, id DESC LIMIT $10 OFFSET $11"
+         FROM request_log{filter_sql} ORDER BY occurred_at DESC, id DESC \
+         LIMIT ${} OFFSET ${}",
+        params.len() + 1,
+        params.len() + 2,
     );
     let mut list_params = params;
     list_params.push(&page_size);
@@ -513,14 +536,14 @@ pub(crate) async fn request_summary(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let params = filter_params(&*query, &start, &end);
+    let (filter_sql, params) = request_filter(&*query, &start, &end);
 
     // 计数聚合（任意范围 + 过滤）。
     let counts_sql = format!(
         "SELECT COUNT(*) AS total, \
                 COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
                 COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
-         FROM request_log {FILTER_SQL}"
+         FROM request_log{filter_sql}"
     );
     let (total, client_errors, server_errors): (i64, i64, i64) =
         match client.query_one(&counts_sql, &params).await {
@@ -539,8 +562,9 @@ pub(crate) async fn request_summary(
 
     // 错误类型分布。
     let dist_sql = format!(
-        "SELECT error_type, COUNT(*) AS count FROM request_log \
-         {FILTER_SQL} AND error_type IS NOT NULL GROUP BY error_type ORDER BY count DESC LIMIT 20"
+        "SELECT error_type, COUNT(*) AS count FROM request_log{} \
+         GROUP BY error_type ORDER BY count DESC LIMIT 20",
+        add_filter_condition(&filter_sql, "error_type IS NOT NULL")
     );
     let error_types: Vec<Value> = match client.query(&dist_sql, &params).await {
         Ok(rows) => rows
@@ -560,26 +584,32 @@ pub(crate) async fn request_summary(
 
     // 趋势（epoch 算术分桶），粒度由 granularity 决定。
     // 有界范围用 generate_series 补齐空桶，保证时间轴连续；无界（全部时间）退化为稀疏分桶。
-    let trend_sql = if start.is_some() && end.is_some() {
-        format!(
+    let (trend_sql, trend_params) = if let (Some(series_start), Some(series_end)) =
+        (start.as_ref(), end.as_ref())
+    {
+        let start_index = params.len() + 1;
+        let end_index = params.len() + 2;
+        let bucket_index = params.len() + 3;
+        let error_filter_sql = add_filter_condition(&filter_sql, "status_code >= 400");
+        let sql = format!(
             "WITH bucket_range AS ( \
                  SELECT generate_series( \
-                     (EXTRACT(EPOCH FROM $7::TIMESTAMPTZ)::BIGINT / $10::BIGINT) * $10::BIGINT, \
-                     ((EXTRACT(EPOCH FROM $8::TIMESTAMPTZ)::BIGINT - 1) / $10::BIGINT) * $10::BIGINT, \
-                     $10::BIGINT)::BIGINT AS bucket_start \
+                     (EXTRACT(EPOCH FROM ${start_index}::TIMESTAMPTZ)::BIGINT / ${bucket_index}::BIGINT) * ${bucket_index}::BIGINT, \
+                     ((EXTRACT(EPOCH FROM ${end_index}::TIMESTAMPTZ)::BIGINT - 1) / ${bucket_index}::BIGINT) * ${bucket_index}::BIGINT, \
+                     ${bucket_index}::BIGINT)::BIGINT AS bucket_start \
              ), aggregated AS ( \
-                 SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                 SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / ${bucket_index}::BIGINT) * ${bucket_index}::BIGINT AS bucket_start, \
                         COUNT(*) AS total, \
                         COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
                         COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
-                 FROM request_log {FILTER_SQL} \
+                 FROM request_log{filter_sql} \
                  GROUP BY bucket_start \
              ), status_agg AS ( \
                  SELECT bucket_start, jsonb_object_agg(status_code::TEXT, cnt) AS status_codes \
                  FROM ( \
-                     SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                     SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / ${bucket_index}::BIGINT) * ${bucket_index}::BIGINT AS bucket_start, \
                             status_code, COUNT(*) AS cnt \
-                     FROM request_log {FILTER_SQL} AND status_code >= 400 \
+                     FROM request_log{error_filter_sql} \
                      GROUP BY bucket_start, status_code \
                  ) grouped \
                  GROUP BY bucket_start \
@@ -593,22 +623,29 @@ pub(crate) async fn request_summary(
              LEFT JOIN aggregated a USING (bucket_start) \
              LEFT JOIN status_agg sa USING (bucket_start) \
              ORDER BY b.bucket_start"
-        )
+        );
+        let mut trend_params = params.clone();
+        trend_params.push(series_start);
+        trend_params.push(series_end);
+        trend_params.push(&bucket_seconds);
+        (sql, trend_params)
     } else {
-        format!(
+        let bucket_index = params.len() + 1;
+        let error_filter_sql = add_filter_condition(&filter_sql, "status_code >= 400");
+        let sql = format!(
             "WITH aggregated AS ( \
-                 SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                 SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / ${bucket_index}::BIGINT) * ${bucket_index}::BIGINT AS bucket_start, \
                         COUNT(*) AS total, \
                         COUNT(*) FILTER (WHERE error_level = 'client_error') AS client_errors, \
                         COUNT(*) FILTER (WHERE error_level = 'server_error') AS server_errors \
-                 FROM request_log {FILTER_SQL} \
+                 FROM request_log{filter_sql} \
                  GROUP BY bucket_start \
              ), status_agg AS ( \
                  SELECT bucket_start, jsonb_object_agg(status_code::TEXT, cnt) AS status_codes \
                  FROM ( \
-                     SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / $10::BIGINT) * $10::BIGINT AS bucket_start, \
+                     SELECT (EXTRACT(EPOCH FROM occurred_at)::BIGINT / ${bucket_index}::BIGINT) * ${bucket_index}::BIGINT AS bucket_start, \
                             status_code, COUNT(*) AS cnt \
-                     FROM request_log {FILTER_SQL} AND status_code >= 400 \
+                     FROM request_log{error_filter_sql} \
                      GROUP BY bucket_start, status_code \
                  ) grouped \
                  GROUP BY bucket_start \
@@ -619,10 +656,11 @@ pub(crate) async fn request_summary(
              FROM aggregated a \
              LEFT JOIN status_agg sa USING (bucket_start) \
              ORDER BY a.bucket_start"
-        )
+        );
+        let mut trend_params = params.clone();
+        trend_params.push(&bucket_seconds);
+        (sql, trend_params)
     };
-    let mut trend_params = params.clone();
-    trend_params.push(&bucket_seconds);
     let trend: Vec<Value> = match client.query(&trend_sql, &trend_params).await {
         Ok(rows) => rows
             .iter()
@@ -648,7 +686,8 @@ pub(crate) async fn request_summary(
             let percentile_sql = format!(
                 "SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95, \
                         percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) AS p99 \
-                 FROM request_log {FILTER_SQL} AND duration_ms IS NOT NULL"
+                 FROM request_log{}",
+                add_filter_condition(&filter_sql, "duration_ms IS NOT NULL")
             );
             match client.query_one(&percentile_sql, &params).await {
                 Ok(row) => (row.get::<_, Option<f64>>(0), row.get::<_, Option<f64>>(1)),
@@ -827,8 +866,94 @@ pub(crate) async fn request_performance(
 
 #[cfg(test)]
 mod tests {
-    use super::{metric_delta, performance_window, resolve_granularity, window_range};
+    use super::{
+        PerformanceFilters, RequestQuery, add_filter_condition, metric_delta, performance_filter,
+        performance_window, request_filter, resolve_granularity, window_range,
+    };
     use chrono::{Duration, Utc};
+
+    fn request_query() -> RequestQuery {
+        RequestQuery {
+            method: None,
+            path: None,
+            status: None,
+            error_level: None,
+            error_type: None,
+            request_id: None,
+            start: None,
+            end: None,
+            only_errors: None,
+            page: None,
+            page_size: None,
+        }
+    }
+
+    #[test]
+    fn request_filter_omits_absent_predicates() {
+        let value = request_query();
+        let (sql, params) = request_filter(&value, &value.start, &value.end);
+        assert!(sql.is_empty());
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn request_filter_numbers_present_parameters() {
+        let mut value = request_query();
+        value.method = Some("GET".to_owned());
+        value.status = Some(500);
+        value.only_errors = Some(true);
+        let (sql, params) = request_filter(&value, &value.start, &value.end);
+        assert_eq!(
+            sql,
+            " WHERE http_method = $1 AND status_code = $2 AND error_level <> 'ok'"
+        );
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn extra_conditions_create_or_extend_where_clause() {
+        assert_eq!(
+            add_filter_condition("", "status_code >= 400"),
+            " WHERE status_code >= 400"
+        );
+        assert_eq!(
+            add_filter_condition(" WHERE http_method = $1", "status_code >= 400"),
+            " WHERE http_method = $1 AND status_code >= 400"
+        );
+    }
+
+    #[test]
+    fn performance_filter_keeps_time_bounds_and_omits_absent_options() {
+        let filters = PerformanceFilters {
+            method: None,
+            route: None,
+            status_class: None,
+        };
+        let end = Utc::now();
+        let start = end - Duration::hours(1);
+        let (sql, params) = performance_filter(&filters, &start, &end);
+        assert!(sql.contains("occurred_at >= $1"));
+        assert!(sql.contains("occurred_at < $2"));
+        assert!(!sql.contains(" IS NULL OR "));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn performance_filter_inlines_validated_status_class() {
+        let filters = PerformanceFilters {
+            method: Some("GET".to_owned()),
+            route: None,
+            status_class: Some("5xx".to_owned()),
+        };
+        let end = Utc::now();
+        let start = end - Duration::hours(1);
+        let (sql, params) = performance_filter(&filters, &start, &end);
+        assert!(sql.contains("http_method = $1"));
+        assert!(sql.contains("status_code BETWEEN 500 AND 599"));
+        assert!(sql.contains("occurred_at >= $2"));
+        assert!(sql.contains("occurred_at < $3"));
+        assert_eq!(params.len(), 3);
+    }
 
     #[test]
     fn window_range_only_accepts_presets() {
