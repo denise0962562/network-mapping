@@ -1755,8 +1755,14 @@ async fn create_dns_task(
         .await
     {
         Ok(rows) if !rows.is_empty() => (),
-        Ok(_) => return HttpResponse::Conflict().json(
-            json!({"success": false, "message": "no DNS-capable scanner is currently available"}),
+        // A DNS task cannot be queued until a scanner can actually accept it.
+        // This is a transient service-capacity/configuration condition, rather
+        // than a conflict with a resource the caller submitted.
+        Ok(_) => return HttpResponse::ServiceUnavailable().json(
+            json!({
+                "success": false,
+                "message": "no DNS-capable scanner is currently available; enable DNS on a scanner and wait for its next heartbeat"
+            }),
         ),
         Err(error) => {
             error_logs(&req, "ResolveDnsTaskScannersError", &error.to_string());
