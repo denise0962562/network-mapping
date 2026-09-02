@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashMap};
 use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
-use crate::ReceiveSystemStatusInfo;
 use crate::admin::UserBaseI;
 use crate::config::AnalyticsSnapshotConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
@@ -188,15 +187,10 @@ fn bad_request(message: &'static str) -> HttpResponse {
 #[get("/api/data/system-data")]
 async fn get_system_data_handler(
     _req: HttpRequest,
-    query_info: web::Query<ReceiveSystemStatusInfo>,
     cache: web::Data<SystemResourceCache>,
     systems: web::Data<Systems>,
 ) -> impl Responder {
-    let status_item = cache.details(
-        query_info.start_at,
-        query_info.end_at,
-        query_info.count.unwrap_or(1),
-    );
+    let status_item: Vec<_> = cache.latest().into_iter().collect();
 
     let t_json = SystemStatusJson {
         total_c: status_item.len() as i32,

@@ -21,13 +21,12 @@ Elasticsearch。Elasticsearch 写入又使用 `wait_for_active_shards=all`；在
 
 若一次采集超过周期，定时器会跳过错过的 tick，不会在依赖恢复后突发补跑。
 
-`GET /api/data/system-data` 与 `GET /api/data/system-resource-history` 只读内存，不申请
-PostgreSQL 连接。`system_status` 仍是持久化、审计和重启恢复的数据源；启动后后台按
-10,000 行一页恢复最近 30 天的轻量 CPU/RAM/磁盘样本，页间释放连接。数据库容量历史
-仍读取 PostgreSQL，因为它属于低频持久化报表，不是实时系统资源接口。
+`GET /api/data/system-data` 只读内存中的最新完整快照，不申请 PostgreSQL 连接。
+`GET /api/data/system-resource-history` 和数据库容量历史按请求范围从 PostgreSQL 的
+`system_status` 聚合，以避免长期趋势数据占用进程内存。
 
-缓存边界：详细快照最多保存 720 条，趋势样本最多保存 30 天。缓存为空时接口返回空
-数据而不是等待数据库；第一个采集周期完成后自动可用。
+缓存边界：仅保存一条最新完整快照。缓存为空时 `system-data` 返回空数据而不是等待
+数据库；第一个采集周期完成后自动可用。
 
 ## 扫描上传事务边界
 

@@ -3,16 +3,13 @@
 //! 历史趋势由 PostgreSQL 的 `system_status` 聚合提供；这里只保留仪表盘近期请求所需的
 //! 完整快照，并使用固定容量避免服务长时间运行后无界增长。
 
-use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 use crate::SystemResource;
 
-const DETAIL_CAPACITY: usize = 720;
-
 #[derive(Default)]
 struct CacheInner {
-    details: VecDeque<SystemResource>,
+    latest: Option<SystemResource>,
 }
 
 #[derive(Clone, Default)]
@@ -25,7 +22,7 @@ impl SystemResourceCache {
         Self::default()
     }
 
-    /// 写入近期完整快照。
+    /// 替换为最新的完整快照。
     pub fn record(&self, resource: SystemResource) {
         if resource.create_at.is_none() {
             return;
@@ -34,32 +31,12 @@ impl SystemResourceCache {
             .inner
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        inner.details.push_back(resource);
-        while inner.details.len() > DETAIL_CAPACITY {
-            inner.details.pop_front();
-        }
+        inner.latest = Some(resource);
     }
 
-    pub fn details(
-        &self,
-        start_at: Option<i64>,
-        end_at: Option<i64>,
-        count: i64,
-    ) -> Vec<SystemResource> {
-        let limit = count.clamp(1, DETAIL_CAPACITY as i64) as usize;
+    pub fn latest(&self) -> Option<SystemResource> {
         let inner = self.inner.read().unwrap_or_else(|error| error.into_inner());
-        inner
-            .details
-            .iter()
-            .rev()
-            .filter(|resource| {
-                let timestamp = resource.create_at.unwrap_or_default();
-                start_at.is_none_or(|start| timestamp >= start)
-                    && end_at.is_none_or(|end| timestamp <= end)
-            })
-            .take(limit)
-            .cloned()
-            .collect()
+        inner.latest.clone()
     }
 }
 
@@ -98,11 +75,11 @@ mod tests {
     }
 
     #[test]
-    fn newest_details_are_read_from_memory() {
+    fn newest_snapshot_is_read_from_memory() {
         let cache = SystemResourceCache::new();
         cache.record(resource(100, 10.0, 20.0, 30));
         cache.record(resource(105, 30.0, 40.0, 50));
 
-        assert_eq!(cache.details(None, None, 1)[0].create_at, Some(105));
+        assert_eq!(cache.latest().unwrap().create_at, Some(105));
     }
 }

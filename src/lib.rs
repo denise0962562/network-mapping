@@ -3665,14 +3665,6 @@ pub async fn get_filtered_task_page(
     })
 }
 
-/// 用于接收系统信息查询
-#[derive(Deserialize)]
-pub struct ReceiveSystemStatusInfo {
-    pub count: Option<i64>,
-    pub start_at: Option<i64>,
-    pub end_at: Option<i64>,
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct SystemStatusJson {
     pub total_c: i32,
