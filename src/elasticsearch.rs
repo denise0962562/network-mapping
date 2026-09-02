@@ -844,6 +844,9 @@ impl ElasticsearchService {
         } else {
             self.ensure_index().await?
         };
+        if !self.inner.config.scan_storage.reads_elasticsearch() {
+            self.ensure_index_mapping().await?;
+        }
         if state == IndexState::Created {
             let mut connection = pool.get().await.map_err(|error| error.to_string())?;
             let transaction = connection
@@ -926,6 +929,27 @@ impl ElasticsearchService {
         }
         self.create_index().await?;
         Ok(IndexState::Created)
+    }
+
+    /// Adds compatible fields to an existing legacy search index.
+    ///
+    /// `dynamic: strict` rejects documents as soon as a newly introduced tag
+    /// property is written, but index creation only happens when the index is
+    /// absent. Keep this migration idempotent so deployments that add tag
+    /// attributes also work with an already-created index.
+    async fn ensure_index_mapping(&self) -> Result<(), String> {
+        let response = self
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::PUT,
+                &format!("/{}/_mapping", self.inner.config.index),
+                |request| request.json(&index_mapping_update()),
+            )
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(response_error(response).await)
     }
 
     async fn ensure_scan_indices(&self) -> Result<(), String> {
@@ -3949,6 +3973,25 @@ fn append_projection_update(
     Ok(())
 }
 
+fn tag_mapping_properties() -> Value {
+    json!({
+        "id": {"type": "long"},
+        "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "kind": {"type": "keyword"},
+        "description": {"type": "text", "index": false},
+        "category_id": {"type": "long"},
+        "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
+    })
+}
+
+fn index_mapping_update() -> Value {
+    json!({
+        "properties": {
+            "tags": {"properties": tag_mapping_properties()}
+        }
+    })
+}
+
 fn index_definition() -> Value {
     json!({
         "settings": {
@@ -4001,14 +4044,7 @@ fn index_definition() -> Value {
                 "city_name": {"type": "wildcard"},
                 "tags": {
                     "type": "object",
-                    "properties": {
-                        "id": {"type": "long"},
-                        "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                        "kind": {"type": "keyword"},
-                        "description": {"type": "text", "index": false},
-                        "category_id": {"type": "long"},
-                        "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
-                    }
+                    "properties": tag_mapping_properties()
                 },
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tag_ids": {"type": "long"},
@@ -4026,9 +4062,9 @@ mod tests {
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
-        bulk_retry_delay, collect_domain_addresses, index_definition, initialization_retry_delay,
-        new_trace_context, parse_asn, parse_storage_metrics, replace_domain_filters,
-        scan_batch_payload_checksum, scan_endpoint_index_definition,
+        bulk_retry_delay, collect_domain_addresses, index_definition, index_mapping_update,
+        initialization_retry_delay, new_trace_context, parse_asn, parse_storage_metrics,
+        replace_domain_filters, scan_batch_payload_checksum, scan_endpoint_index_definition,
         scan_observation_compatibility_mapping, scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
@@ -4053,6 +4089,27 @@ mod tests {
         assert_eq!(
             mapping.pointer("/mappings/properties/http_body/type"),
             Some(&serde_json::json!("match_only_text"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/tags/properties/category_id/type"),
+            Some(&serde_json::json!("long"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/tags/properties/category_name/type"),
+            Some(&serde_json::json!("keyword"))
+        );
+    }
+
+    #[test]
+    fn existing_index_mapping_update_adds_tag_category_fields() {
+        let mapping = index_mapping_update();
+        assert_eq!(
+            mapping.pointer("/properties/tags/properties/category_id/type"),
+            Some(&serde_json::json!("long"))
+        );
+        assert_eq!(
+            mapping.pointer("/properties/tags/properties/category_name/type"),
+            Some(&serde_json::json!("keyword"))
         );
     }
 
