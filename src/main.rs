@@ -372,11 +372,6 @@ async fn main() -> io::Result<()> {
     let sys_2 = sys.clone();
     let system_resource_cache = SystemResourceCache::new();
     let system_resource_cache_data = web::Data::new(system_resource_cache.clone());
-    tokio::spawn({
-        let cache = system_resource_cache.clone();
-        let pool = db_pool.clone();
-        async move { cache.hydrate_from_database(&pool).await }
-    });
     let maxmind_state = web::Data::new(maxmind_state);
     let runtime_settings = web::Data::new(runtime_settings);
     let automatic_target_service = web::Data::new(runtime_settings.automatic_target.clone());
