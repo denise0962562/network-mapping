@@ -103,6 +103,25 @@ fn default_follow_up_scan_profile() -> String {
     "port_only".into()
 }
 
+fn resolve_dns_task_port(
+    scan_profile: &str,
+    follow_up_port_scan: bool,
+    port: Option<&str>,
+) -> Result<String, &'static str> {
+    if scan_profile == "dns_records" && !follow_up_port_scan {
+        return Ok("53".to_owned());
+    }
+
+    let port = port
+        .map(str::trim)
+        .filter(|port| !port.is_empty())
+        .unwrap_or("1-65535");
+    if !crate::check_port(port) {
+        return Err("invalid port range");
+    }
+    Ok(port.to_owned())
+}
+
 #[derive(Serialize)]
 struct ScannerHeartbeatCommand {
     #[serde(rename = "type")]
@@ -1804,15 +1823,15 @@ async fn create_dns_task(
             }));
         }
     }
-    let task_port = if input.scan_profile == "dns_records" && !input.follow_up_port_scan {
-        "53".to_owned()
-    } else {
-        let port = input.port.as_deref().unwrap_or("1-65535");
-        if !crate::check_port(port) {
-            return HttpResponse::BadRequest()
-                .json(json!({"success": false, "message": "invalid port range"}));
+    let task_port = match resolve_dns_task_port(
+        &input.scan_profile,
+        input.follow_up_port_scan,
+        input.port.as_deref(),
+    ) {
+        Ok(port) => port,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
         }
-        port.to_owned()
     };
     let mut domains = match input
         .domains
@@ -2228,7 +2247,7 @@ mod tests {
     use super::{
         ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
         ScannerScanCapabilities, build_dns_comparison, normalize_task_list_query,
-        task_result_pagination, validate_latency_report, validate_public_ip,
+        resolve_dns_task_port, task_result_pagination, validate_latency_report, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
@@ -2348,6 +2367,24 @@ mod tests {
                 "database schema must allow {profile}"
             );
         }
+    }
+
+    #[test]
+    fn dns_port_scan_uses_all_ports_when_port_is_blank() {
+        for port in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                resolve_dns_task_port("dns_full", false, port).unwrap(),
+                "1-65535"
+            );
+        }
+        assert_eq!(
+            resolve_dns_task_port("dns_ports", false, Some("80,443")).unwrap(),
+            "80,443"
+        );
+        assert_eq!(
+            resolve_dns_task_port("dns_ports", false, Some("80,abc")).unwrap_err(),
+            "invalid port range"
+        );
     }
 
     #[test]
