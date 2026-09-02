@@ -835,6 +835,10 @@ impl ElasticsearchService {
             self.ensure_legacy_search_projection_index(pool).await?;
         }
         self.ensure_scan_indices().await?;
+        // Domain search reads the current DNS RR index even before the first DNS
+        // upload. Create its template, data stream, and empty current-record
+        // index during startup so a valid no-result search is not a 404.
+        self.ensure_dns_indices().await?;
         let state = if self.inner.config.scan_storage.reads_elasticsearch() {
             IndexState::Existing
         } else {
