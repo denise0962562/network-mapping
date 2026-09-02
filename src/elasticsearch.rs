@@ -3484,6 +3484,8 @@ fn immutable_scan_observation(value: &Value) -> Value {
             "country_name",
             "region_name",
             "city_name",
+            "latitude",
+            "longitude",
             "tags",
         ] {
             object.remove(field);

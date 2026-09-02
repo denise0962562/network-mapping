@@ -1560,6 +1560,8 @@ fn immutable_scan_observation(value: &Value) -> Value {
             "country_name",
             "region_name",
             "city_name",
+            "latitude",
+            "longitude",
             "tags",
         ] {
             object.remove(field);
@@ -2680,6 +2682,8 @@ pub async fn save_scanner_results(
             "country_name": intel.country_name,
             "region_name": intel.region_name,
             "city_name": intel.city_name,
+            "latitude": intel.latitude,
+            "longitude": intel.longitude,
         }));
     }
     if storage_mode.writes_elasticsearch() && !observation_rows.is_empty() {
@@ -2915,7 +2919,8 @@ pub async fn save_scanner_results(
                     http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
                     search_content_extracted BOOLEAN, observed_at BIGINT, \
                     asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
-                    country_name TEXT, region_name TEXT, city_name TEXT) \
+                    country_name TEXT, region_name TEXT, city_name TEXT, \
+                    latitude DOUBLE PRECISION, longitude DOUBLE PRECISION) \
              ), inserted_observations AS ( \
                 INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
                     ip_address, port, protocol, service, banner, title, http_body, \
@@ -2931,10 +2936,10 @@ pub async fn save_scanner_results(
                 SELECT DISTINCT ip_address FROM inserted_endpoints \
              ), upserted_ips AS ( \
                 INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
-                    country_code, country_name, region_name, city_name) \
+                    country_code, country_name, region_name, city_name, latitude, longitude) \
                 SELECT DISTINCT ON (item.storage_ip_address) $1, $2, item.storage_ip_address, item.asn, \
                     item.isp, item.as_org, item.country_code, item.country_name, \
-                    item.region_name, item.city_name \
+                    item.region_name, item.city_name, item.latitude, item.longitude \
                 FROM input item \
                 JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.storage_ip_address \
                 ORDER BY item.storage_ip_address \
@@ -2946,6 +2951,8 @@ pub async fn save_scanner_results(
                     country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
                     region_name = COALESCE(EXCLUDED.region_name, ips.region_name), \
                     city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
+                    latitude = COALESCE(EXCLUDED.latitude, ips.latitude), \
+                    longitude = COALESCE(EXCLUDED.longitude, ips.longitude), \
                     update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
                 RETURNING ip_id, ip_address \
              ), upserted_ports AS ( \

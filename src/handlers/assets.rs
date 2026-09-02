@@ -62,6 +62,8 @@ struct AssetSummary {
     country_name: Option<String>,
     region_name: Option<String>,
     city_name: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
     port_count: i64,
     service_count: i64,
     scanner_count: i64,
@@ -183,7 +185,7 @@ pub(crate) async fn get_asset_summary(
                 FROM endpoints\
              ), latest_intel AS (\
                 SELECT i.asn, i.isp, i.as_org, i.country_code, i.country_name, \
-                       i.region_name, i.city_name \
+                       i.region_name, i.city_name, i.latitude, i.longitude \
                 FROM ips i \
                 JOIN scan_task_execution e ON e.id = i.execution_id \
                 JOIN scan_task t ON t.id = e.task_id \
@@ -209,6 +211,7 @@ pub(crate) async fn get_asset_summary(
                     latest_intel.asn, latest_intel.isp, latest_intel.as_org, \
                     latest_intel.country_code, latest_intel.country_name, \
                     latest_intel.region_name, latest_intel.city_name, \
+                    latest_intel.latitude, latest_intel.longitude, \
                     asset_tags.tags \
              FROM stats LEFT JOIN latest_intel ON true CROSS JOIN asset_tags;",
             &[&ip, &user.role, &user.id],
@@ -238,6 +241,8 @@ pub(crate) async fn get_asset_summary(
         country_name: row.get("country_name"),
         region_name: row.get("region_name"),
         city_name: row.get("city_name"),
+        latitude: row.get("latitude"),
+        longitude: row.get("longitude"),
         port_count: row.get("port_count"),
         service_count: row.get("service_count"),
         scanner_count: row.get("scanner_count"),
@@ -539,7 +544,7 @@ async fn get_asset_summary_from_elasticsearch(
                     "services": {"cardinality": {"field": "service", "precision_threshold": 40000}},
                     "scanners": {"cardinality": {"field": "scanner_id", "precision_threshold": 40000}},
                     "latest": {"top_hits": {"size": 1, "sort": [{"observed_at_ms": "desc"}],
-                        "_source": ["asn", "isp", "as_org", "country_code", "country_name", "region_name", "city_name"]}}
+                        "_source": ["asn", "isp", "as_org", "country_code", "country_name", "region_name", "city_name", "latitude", "longitude"]}}
                 }
             }),
         )
@@ -592,6 +597,11 @@ async fn get_asset_summary_from_elasticsearch(
             .and_then(Value::as_str)
             .map(str::to_owned)
     };
+    let number = |field: &str| {
+        latest
+            .and_then(|source| source.get(field))
+            .and_then(Value::as_f64)
+    };
     let summary = AssetSummary {
         ip: ip.to_owned(),
         asn: text("asn"),
@@ -601,6 +611,8 @@ async fn get_asset_summary_from_elasticsearch(
         country_name: text("country_name"),
         region_name: text("region_name"),
         city_name: text("city_name"),
+        latitude: number("latitude"),
+        longitude: number("longitude"),
         port_count: es_total(&current),
         service_count: current
             .pointer("/aggregations/services/value")
