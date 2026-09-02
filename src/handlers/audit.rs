@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::client_ip::display_ip;
-use crate::logs::write::error_logs;
+use crate::logs::write::error_logs_error;
 
 #[derive(Deserialize)]
 pub struct AuditQuery {
@@ -144,7 +144,12 @@ pub(crate) async fn list_audit_events(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "AuditQueryPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "AuditQueryPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -153,7 +158,7 @@ pub(crate) async fn list_audit_events(
     let total: i64 = match client.query_one(&count_sql, &filter_params).await {
         Ok(row) => row.get(0),
         Err(error_value) => {
-            error_logs(&req, "AuditQueryError", &error_value.to_string());
+            error_logs_error(&req, "AuditQueryError", "database_operation", &error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -172,7 +177,7 @@ pub(crate) async fn list_audit_events(
     let rows = match client.query(&list_sql, &params).await {
         Ok(rows) => rows,
         Err(error_value) => {
-            error_logs(&req, "AuditQueryError", &error_value.to_string());
+            error_logs_error(&req, "AuditQueryError", "database_operation", &error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -184,7 +189,12 @@ pub(crate) async fn list_audit_events(
     if let Err(error_value) =
         crate::audit::write(&client, &AuditContext::from_request(&req), &event).await
     {
-        error_logs(&req, "AuditQueryAuditError", &error_value.to_string());
+        error_logs_error(
+            &req,
+            "AuditQueryAuditError",
+            "database_operation",
+            &error_value,
+        );
     }
 
     HttpResponse::Ok().json(json!({
@@ -207,7 +217,12 @@ pub(crate) async fn get_audit_event(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "AuditDetailPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "AuditDetailPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -224,7 +239,7 @@ pub(crate) async fn get_audit_event(
         Ok(Some(row)) => row,
         Ok(None) => return HttpResponse::NotFound().finish(),
         Err(error_value) => {
-            error_logs(&req, "AuditDetailError", &error_value.to_string());
+            error_logs_error(&req, "AuditDetailError", "database_operation", &error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -250,7 +265,12 @@ pub(crate) async fn export_audit_events(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error_logs(&req, "AuditExportPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "AuditExportPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -264,7 +284,7 @@ pub(crate) async fn export_audit_events(
     let rows = match client.query(&sql, &params).await {
         Ok(rows) => rows,
         Err(error_value) => {
-            error_logs(&req, "AuditExportError", &error_value.to_string());
+            error_logs_error(&req, "AuditExportError", "database_operation", &error_value);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -320,7 +340,12 @@ pub(crate) async fn export_audit_events(
     if let Err(error_value) =
         crate::audit::write(&client, &AuditContext::from_request(&req), &event).await
     {
-        error_logs(&req, "AuditExportAuditError", &error_value.to_string());
+        error_logs_error(
+            &req,
+            "AuditExportAuditError",
+            "database_operation",
+            &error_value,
+        );
     }
     HttpResponse::Ok()
         .insert_header(("Content-Type", "text/csv; charset=utf-8"))

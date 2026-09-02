@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::admin::UserBaseI;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::handlers::tags::{AssetTag, tags_from_json};
-use crate::logs::write::error_logs;
+use crate::logs::write::{error_logs, error_logs_error};
 
 const DEFAULT_PORT_LIMIT: i64 = 20;
 const MAX_PORT_LIMIT: i64 = 100;
@@ -155,7 +155,7 @@ pub(crate) async fn get_asset_summary(
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "AssetSummaryPoolError", &error.to_string());
+            error_logs_error(&req, "AssetSummaryPoolError", "database_operation", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -217,7 +217,7 @@ pub(crate) async fn get_asset_summary(
     {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "AssetSummaryQueryError", &error.to_string());
+            error_logs_error(&req, "AssetSummaryQueryError", "database_operation", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -286,7 +286,7 @@ pub(crate) async fn get_asset_ports(
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "AssetPortsPoolError", &error.to_string());
+            error_logs_error(&req, "AssetPortsPoolError", "database_operation", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -331,7 +331,7 @@ pub(crate) async fn get_asset_ports(
     {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "AssetPortsQueryError", &error.to_string());
+            error_logs_error(&req, "AssetPortsQueryError", "database_operation", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -408,7 +408,12 @@ pub(crate) async fn get_asset_port_history(
     let connection = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "AssetPortHistoryPoolError", &error.to_string());
+            error_logs_error(
+                &req,
+                "AssetPortHistoryPoolError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -437,7 +442,7 @@ pub(crate) async fn get_asset_port_history(
     {
         Ok(value) => value,
         Err(error) => {
-            error_logs(&req, "AssetPortHistoryQueryError", &error.to_string());
+            error_logs_error(&req, "AssetPortHistoryQueryError", "database_operation", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };

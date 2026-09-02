@@ -92,7 +92,14 @@ BEGIN
 END $$;
 ALTER TABLE scan_task DROP CONSTRAINT IF EXISTS scan_task_profile_check;
 ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
-    CHECK (scan_profile IN ('legacy', 'port_only', 'service_inventory', 'dns_records'));
+    CHECK (scan_profile IN (
+        'legacy',
+        'port_only',
+        'service_inventory',
+        'dns_records',
+        'dns_ports',
+        'dns_full'
+    ));
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -279,6 +286,8 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	observation_count INT NOT NULL CHECK (observation_count >= 0),
 	protocol_version SMALLINT NOT NULL DEFAULT 2 CHECK (protocol_version IN (1, 2)),
 	payload_checksum VARCHAR(64),
+	-- `pending` reserves an upload while its idempotent Elasticsearch write runs outside
+	-- the PostgreSQL transaction. A retry resumes the same receipt after a crash/timeout.
 	storage_backend TEXT NOT NULL DEFAULT 'postgres',
 	storage_references JSONB NOT NULL DEFAULT '[]'::JSONB,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -862,6 +871,37 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_automatic_family_queue
 CREATE INDEX IF NOT EXISTS idx_scan_task_generation_key
 	ON scan_task (generation_key, task_create_time DESC) WHERE generation_key IS NOT NULL;
 
+-- DNS 解析结果的可扫描地址及其派生端口任务。结果独立于 Elasticsearch，
+-- 以便在多批上传、重试和服务重启后仍能保证子任务只生成一次。
+CREATE TABLE IF NOT EXISTS dns_resolved_address (
+	id SERIAL PRIMARY KEY,
+	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	task_id INT NOT NULL REFERENCES scan_task(id) ON DELETE CASCADE,
+	ip_address INET NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE (execution_id, ip_address)
+);
+CREATE INDEX IF NOT EXISTS idx_dns_resolved_address_execution
+	ON dns_resolved_address (execution_id, ip_address);
+
+CREATE TABLE IF NOT EXISTS dns_follow_up_generation (
+	execution_id INT PRIMARY KEY REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	status TEXT NOT NULL CHECK (status IN ('succeeded', 'no_eligible_ip', 'blocked_policy')),
+	eligible_ip_count INT NOT NULL DEFAULT 0,
+	created_task_count INT NOT NULL DEFAULT 0,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scan_task_lineage (
+	parent_task_id INT NOT NULL REFERENCES scan_task(id) ON DELETE CASCADE,
+	parent_execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
+	child_task_id INT NOT NULL UNIQUE REFERENCES scan_task(id) ON DELETE CASCADE,
+	source_addresses INET[] NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_scan_task_lineage_parent
+	ON scan_task_lineage (parent_task_id, parent_execution_id);
+
 -- 表 ip_list 用于存储 IP 名单信息，这个 IP 名单可用于多处，如：扫描白名单，访问白名单（黑名单）等···
 CREATE TABLE IF NOT EXISTS ip_list (
 	id SERIAL PRIMARY KEY,
@@ -995,6 +1035,29 @@ CREATE TABLE IF NOT EXISTS setting (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_item_type_key ON setting (item_type, key);
+
+-- 可在线发布的服务运行策略。setting 保留给旧的简单键值配置；这里以完整 JSON
+-- 文档、revision 与不可变历史确保校验、审计和并发更新可以原子完成。
+CREATE TABLE IF NOT EXISTS runtime_configuration (
+	namespace TEXT PRIMARY KEY,
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+	schema_version INT NOT NULL DEFAULT 1 CHECK (schema_version > 0),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_by_user_id INT REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS runtime_configuration_revision (
+	id BIGSERIAL PRIMARY KEY,
+	namespace TEXT NOT NULL,
+	revision BIGINT NOT NULL CHECK (revision > 0),
+	schema_version INT NOT NULL CHECK (schema_version > 0),
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	changed_by_user_id INT REFERENCES users(id),
+	change_reason TEXT NOT NULL DEFAULT '',
+	UNIQUE(namespace, revision)
+);
 
 INSERT INTO setting (item_type, key, value)
 VALUES ('security', 'session_ttl_seconds', '2700')

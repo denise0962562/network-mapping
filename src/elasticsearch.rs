@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,8 @@ use futures_util::{StreamExt, stream};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::{interval, sleep};
+use tokio::sync::Semaphore;
+use tokio::time::{interval, sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -20,7 +22,7 @@ use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, Monit
 
 const INDEX_SCHEMA_VERSION: &str = "2";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
-const SCAN_INDEX_SCHEMA_VERSION: &str = "2";
+const SCAN_INDEX_SCHEMA_VERSION: &str = "3";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
 const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
@@ -78,6 +80,8 @@ struct ElasticsearchInner {
     client: reqwest::Client,
     runtime: RwLock<ElasticsearchRuntime>,
     monitor: RwLock<Option<MonitorHandle>>,
+    bulk_semaphore: Semaphore,
+    observation_compatibility_ready: AtomicBool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -127,7 +131,7 @@ pub(crate) struct ElasticsearchStorageMetrics {
 }
 
 impl ElasticsearchStorageMetrics {
-    fn unavailable(enabled: bool) -> Self {
+    pub(crate) fn unavailable(enabled: bool) -> Self {
         Self {
             enabled,
             available: false,
@@ -296,12 +300,15 @@ impl ElasticsearchService {
             let certificate = reqwest::Certificate::from_pem(&pem)?;
             builder = builder.add_root_certificate(certificate);
         }
+        let bulk_max_concurrency = config.bulk_max_concurrency;
         Ok(Self {
             inner: Arc::new(ElasticsearchInner {
                 config,
                 client: builder.build()?,
                 runtime: RwLock::new(ElasticsearchRuntime::default()),
                 monitor: RwLock::new(None),
+                bulk_semaphore: Semaphore::new(bulk_max_concurrency),
+                observation_compatibility_ready: AtomicBool::new(false),
             }),
         })
     }
@@ -688,9 +695,25 @@ impl ElasticsearchService {
     ) -> Result<Value, String> {
         let (trace_id, traceparent) = new_trace_context();
         let started = Instant::now();
-        let result = self
-            .send_bulk_with_retry_inner(path, body, create_conflict_is_success, &traceparent)
-            .await;
+        let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
+        let result = match timeout(budget, async {
+            let _permit = self
+                .inner
+                .bulk_semaphore
+                .acquire()
+                .await
+                .map_err(|_| "Elasticsearch Bulk 并发控制器已关闭".to_owned())?;
+            self.send_bulk_with_retry_inner(path, body, create_conflict_is_success, &traceparent)
+                .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Elasticsearch Bulk 超过总时间预算 {} 秒",
+                self.inner.config.bulk_total_timeout_seconds
+            )),
+        };
         let failure_kind = match result.as_ref() {
             Ok(value) if value.get("errors").and_then(Value::as_bool) == Some(true) => {
                 Some("bulk_items")
@@ -912,6 +935,45 @@ impl ElasticsearchService {
             },
         )
         .await?;
+        // Templates only affect newly-created monthly indices. Existing strict
+        // indices need this additive field before a dual IP/CIDR document lands.
+        if !self
+            .inner
+            .observation_compatibility_ready
+            .load(Ordering::Acquire)
+        {
+            let observation_pattern = format!("{}-*", self.inner.config.observation_index_prefix);
+            let response = self
+                .send_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::HEAD,
+                    &observation_pattern,
+                    |request| request,
+                )
+                .await?;
+            if response.status().is_success() {
+                // 索引通配符在节点状态切换或索引刚被删除时可能在 HEAD 与 PUT
+                // 之间不再匹配任何索引。此时没有旧映射需要升级，不应阻断服务初始化。
+                let response = self
+                    .send_request(
+                        ElasticsearchOperation::IndexAdmin,
+                        Method::PUT,
+                        &format!(
+                            "{observation_pattern}/_mapping?allow_no_indices=true&ignore_unavailable=true"
+                        ),
+                        |request| request.json(&scan_observation_compatibility_mapping()),
+                    )
+                    .await?;
+                if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
+                    return Err(response_error(response).await);
+                }
+            } else if response.status() != StatusCode::NOT_FOUND {
+                return Err(response_error(response).await);
+            }
+            self.inner
+                .observation_compatibility_ready
+                .store(true, Ordering::Release);
+        }
         self.ensure_named_index(
             &self.inner.config.execution_endpoint_index,
             &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
@@ -1136,13 +1198,27 @@ impl ElasticsearchService {
         }
         if !observation_bulk.is_empty() {
             let response = self
-                .send_bulk_with_retry("/_bulk?wait_for_active_shards=all", &observation_bulk, true)
+                .send_bulk_with_retry(
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
+                    &observation_bulk,
+                    true,
+                )
                 .await?;
             validate_dns_bulk_result(&response)?;
         }
         if !record_bulk.is_empty() {
             let response = self
-                .send_bulk_with_retry("/_bulk?wait_for_active_shards=all", &record_bulk, false)
+                .send_bulk_with_retry(
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
+                    &record_bulk,
+                    false,
+                )
                 .await?;
             validate_dns_bulk_result(&response)?;
         }
@@ -1221,7 +1297,10 @@ impl ElasticsearchService {
             };
             let result = self
                 .send_bulk_with_retry(
-                    &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}{refresh}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
                     &body,
                     true,
                 )
@@ -1419,7 +1498,10 @@ impl ElasticsearchService {
         };
         let result = self
             .send_bulk_with_retry(
-                &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+                &format!(
+                    "/_bulk?wait_for_active_shards={}{refresh}",
+                    self.inner.config.write_wait_for_active_shards
+                ),
                 &body,
                 false,
             )
@@ -1539,7 +1621,10 @@ impl ElasticsearchService {
             }
             let bulk = self
                 .send_bulk_with_retry(
-                    "/_bulk?wait_for_active_shards=all&refresh=wait_for",
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}&refresh=wait_for",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
                     &body,
                     false,
                 )
@@ -2076,7 +2161,7 @@ impl ElasticsearchService {
                     "SELECT e.id FROM scan_task_execution e \
                      WHERE e.id > $1 AND EXISTS (SELECT 1 FROM scan_result_batch b \
                         WHERE b.execution_id = e.id AND b.id <= $2 \
-                          AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres')) \
+                          AND (b.payload_checksum IS NULL OR b.storage_backend IN ('postgres', 'pending'))) \
                      ORDER BY e.id LIMIT $3;",
                     &[
                         &execution_cursor,
@@ -2166,7 +2251,7 @@ impl ElasticsearchService {
             .map_err(|error| error.to_string())?
             .query_one(
                 "SELECT COUNT(*)::BIGINT AS remaining FROM scan_result_batch \
-                 WHERE id <= $1 AND (payload_checksum IS NULL OR storage_backend = 'postgres');",
+                 WHERE id <= $1 AND (payload_checksum IS NULL OR storage_backend IN ('postgres', 'pending'));",
                 &[&high_watermark],
             )
             .await
@@ -2230,10 +2315,10 @@ impl ElasticsearchService {
                 "SELECT batch_counts.batches, batch_counts.completed_batches, \
                         observation_counts.observations, observation_counts.completed_observations \
                  FROM (SELECT COUNT(*)::BIGINT AS batches, \
-                              COUNT(*) FILTER (WHERE payload_checksum IS NOT NULL AND storage_backend <> 'postgres')::BIGINT AS completed_batches \
+                              COUNT(*) FILTER (WHERE payload_checksum IS NOT NULL AND storage_backend IN ('dual', 'elasticsearch'))::BIGINT AS completed_batches \
                        FROM scan_result_batch WHERE id <= $1) batch_counts \
                  CROSS JOIN (SELECT COUNT(*)::BIGINT AS observations, \
-                                    COUNT(*) FILTER (WHERE b.payload_checksum IS NOT NULL AND b.storage_backend <> 'postgres')::BIGINT AS completed_observations \
+                                    COUNT(*) FILTER (WHERE b.payload_checksum IS NOT NULL AND b.storage_backend IN ('dual', 'elasticsearch'))::BIGINT AS completed_observations \
                              FROM scan_observation o JOIN scan_result_batch b ON b.id = o.batch_id \
                              WHERE b.id <= $1) observation_counts;",
                 &[&high_watermark],
@@ -2328,7 +2413,7 @@ impl ElasticsearchService {
                  LEFT JOIN scanner_info scanner ON scanner.scanner_id = \
                     COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
                  WHERE b.execution_id = $1 AND b.id <= $2 \
-                   AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres') \
+                   AND (b.payload_checksum IS NULL OR b.storage_backend IN ('postgres', 'pending')) \
                  ORDER BY b.batch_index, b.id;",
                 &[&execution_db_id, &high_watermark],
             )
@@ -2340,7 +2425,8 @@ impl ElasticsearchService {
             let execution_id: String = batch.get("execution_id");
             let rows = connection
                 .query(
-                    "SELECT o.observation_key, o.kind, host(o.ip_address) AS ip_address, o.port, \
+                    "SELECT o.observation_key, o.kind, host(o.ip_address) AS ip_address, \
+                        o.ip_address::TEXT AS ip_network, o.port, \
                         o.protocol, o.service, o.banner, o.title, o.http_body, o.http_body_truncated, \
                         o.tls_subject, o.search_content_extracted, o.source, o.data, \
                         FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS observed_at, \
@@ -2364,13 +2450,15 @@ impl ElasticsearchService {
                 .into_iter()
                 .map(|row| {
                     let ip: String = row.get("ip_address");
+                    let network: String = row.get("ip_network");
                     let port: i32 = row.get("port");
                     let endpoint_id =
-                        sha256_hex(format!("{execution_id}\0{ip}\0{port}").as_bytes());
+                        sha256_hex(format!("{execution_id}\0{network}\0{port}").as_bytes());
                     json!({
                         "observation_key": row.get::<_, String>("observation_key"),
                         "endpoint_id": endpoint_id,
-                        "kind": row.get::<_, String>("kind"), "ip_address": ip, "port": port,
+                        "kind": row.get::<_, String>("kind"), "ip_address": ip,
+                        "ip_network": network, "port": port,
                         "protocol": row.get::<_, Option<String>>("protocol"),
                         "service": row.get::<_, Option<String>>("service"),
                         "banner": row.get::<_, Option<String>>("banner"),
@@ -2481,7 +2569,7 @@ impl ElasticsearchService {
                   AND state_value->>'execution_endpoint_index' = $2 \
                   AND state_value->>'current_endpoint_index' = $3) AS migration_ready, \
                 (SELECT COUNT(*)::BIGINT FROM scan_result_batch \
-                    WHERE payload_checksum IS NULL OR storage_backend = 'postgres') AS incomplete_batches, \
+                    WHERE payload_checksum IS NULL OR storage_backend IN ('postgres', 'pending')) AS incomplete_batches, \
                 (SELECT COUNT(*)::BIGINT FROM scan_task_execution \
                     WHERE execution_status = 'succeeded' AND (result_ip_count IS NULL \
                         OR result_port_count IS NULL OR result_observation_count IS NULL)) AS incomplete_executions, \
@@ -2535,14 +2623,43 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
         return;
     }
     let mut ticker = interval(Duration::from_millis(service.inner.config.poll_interval_ms));
+    let mut initialization_failures = 0_u32;
     loop {
         ticker.tick().await;
-        if !service.runtime().connected
-            && let Err(message) = service.initialize(&pool).await
-        {
-            service.mark_error(&message);
-            warn!(event = "ElasticsearchInitializeError", message = %message);
-            continue;
+        if !service.runtime().connected {
+            match service.initialize(&pool).await {
+                Ok(_) => {
+                    if initialization_failures > 0 {
+                        info!(
+                            event = "ElasticsearchInitializeRecovered",
+                            failed_attempts = initialization_failures,
+                            "Elasticsearch 初始化已恢复"
+                        );
+                    }
+                    initialization_failures = 0;
+                }
+                Err(message) => {
+                    service.mark_error(&message);
+                    initialization_failures = initialization_failures.saturating_add(1);
+                    let retry_after = initialization_retry_delay(
+                        service.inner.config.poll_interval_ms,
+                        initialization_failures,
+                    );
+                    // 首次失败和指数退避的边界都保留完整日志，避免配置错误时每个轮询
+                    // 周期重复同一条错误。
+                    if initialization_failures == 1 || initialization_failures.is_power_of_two() {
+                        warn!(
+                            event = "ElasticsearchInitializeError",
+                            attempt = initialization_failures,
+                            retry_after_ms = retry_after.as_millis(),
+                            message = %message,
+                            "Elasticsearch 初始化失败，稍后重试"
+                        );
+                    }
+                    sleep(retry_after).await;
+                    continue;
+                }
+            }
         }
         match service.process_scan_projection_outbox(&pool).await {
             Ok(true) => continue,
@@ -3065,6 +3182,13 @@ fn bulk_retry_delay(initial_ms: u64, attempt: u32) -> Duration {
     Duration::from_millis(initial_ms.saturating_mul(multiplier).min(30_000))
 }
 
+fn initialization_retry_delay(poll_interval_ms: u64, failures: u32) -> Duration {
+    let initial_ms = poll_interval_ms.max(500);
+    let exponent = failures.saturating_sub(1).min(6);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    Duration::from_millis(initial_ms.saturating_mul(multiplier).min(30_000))
+}
+
 async fn response_error(response: reqwest::Response) -> String {
     let status = response.status();
     let body = response
@@ -3124,6 +3248,11 @@ fn replace_has_endpoint_filters(
 fn immutable_scan_observation(value: &Value) -> Value {
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
+        // Preserve checksums written by the legacy representation, which kept
+        // CIDR (including /32 and /128) directly in `ip_address`.
+        if let Some(network) = object.remove("ip_network") {
+            object.insert("ip_address".to_owned(), network);
+        }
         for field in [
             "asn",
             "isp",
@@ -3188,6 +3317,7 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "endpoint_id": {"type": "keyword"},
                     "kind": {"type": "keyword"},
                     "ip_address": {"type": "ip"},
+                    "ip_network": {"type": "ip_range"},
                     "port": {"type": "integer"},
                     "protocol": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                     "service": {"type": "keyword", "normalizer": "lowercase_normalizer"},
@@ -3216,6 +3346,10 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
             }
         }
     })
+}
+
+fn scan_observation_compatibility_mapping() -> Value {
+    json!({"properties": {"ip_network": {"type": "ip_range"}}})
 }
 
 fn dns_observation_template(data_stream: &str, replicas: u32, retention_days: u16) -> Value {
@@ -3667,8 +3801,10 @@ mod tests {
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
-        bulk_retry_delay, index_definition, new_trace_context, parse_asn, parse_storage_metrics,
-        scan_batch_payload_checksum, scan_endpoint_index_definition,
+        bulk_retry_delay, index_definition, initialization_retry_delay, new_trace_context,
+        parse_asn, parse_storage_metrics, scan_batch_payload_checksum,
+        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
+        scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::time::Duration;
@@ -3691,6 +3827,23 @@ mod tests {
         assert_eq!(
             mapping.pointer("/mappings/properties/http_body/type"),
             Some(&serde_json::json!("match_only_text"))
+        );
+    }
+
+    #[test]
+    fn scan_observation_mapping_keeps_ip_and_cidr_as_distinct_types() {
+        let template = scan_observation_template("observations", 0);
+        assert_eq!(
+            template.pointer("/template/mappings/properties/ip_address/type"),
+            Some(&serde_json::json!("ip"))
+        );
+        assert_eq!(
+            template.pointer("/template/mappings/properties/ip_network/type"),
+            Some(&serde_json::json!("ip_range"))
+        );
+        assert_eq!(
+            scan_observation_compatibility_mapping().pointer("/properties/ip_network/type"),
+            Some(&serde_json::json!("ip_range"))
         );
     }
 
@@ -3796,6 +3949,22 @@ mod tests {
     }
 
     #[test]
+    fn initialization_retry_delay_is_exponential_and_capped() {
+        assert_eq!(
+            initialization_retry_delay(500, 1),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            initialization_retry_delay(500, 2),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            initialization_retry_delay(500, 20),
+            Duration::from_millis(30_000)
+        );
+    }
+
+    #[test]
     fn scan_batch_checksum_ignores_mutable_enrichment_but_not_evidence() {
         let context = ScanBatchContext {
             task_id: "task".into(),
@@ -3818,6 +3987,20 @@ mod tests {
         assert_eq!(
             scan_batch_payload_checksum(&context, std::slice::from_ref(&original)).unwrap(),
             scan_batch_payload_checksum(&context, &[enriched]).unwrap()
+        );
+        let legacy_cidr = serde_json::json!({
+            "observation_key": "key", "ip_address": "192.0.2.1/32", "port": 443,
+            "banner": "first", "observed_at": 1, "asn": "4134", "tags": []
+        });
+        let compatible_dual_fields = serde_json::json!({
+            "observation_key": "key", "ip_address": "192.0.2.1",
+            "ip_network": "192.0.2.1/32", "port": 443,
+            "banner": "first", "observed_at": 1, "asn": "AS4134",
+            "tags": [{"id": 1, "name": "prod"}]
+        });
+        assert_eq!(
+            scan_batch_payload_checksum(&context, &[legacy_cidr]).unwrap(),
+            scan_batch_payload_checksum(&context, &[compatible_dual_fields]).unwrap()
         );
         let mut changed = original.clone();
         changed["banner"] = serde_json::json!("different");

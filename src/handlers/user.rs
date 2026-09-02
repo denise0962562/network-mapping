@@ -18,7 +18,7 @@ use crate::config::{PasswordHashConfig, SecurityConfig, ServerConfig};
 use crate::handlers::ReceiveLoginInfo;
 use crate::handlers::login_record::{login_failure_event, record_completed_login};
 use crate::login::user_login;
-use crate::logs::write::{error_logs, info_logs};
+use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
 use crate::system_maintenance::{SystemMaintenanceState, maintenance_response};
@@ -242,7 +242,7 @@ async fn user_logout(
                 .finish()
         }
         Err(e) => {
-            error_logs(&req, "注销会话错误", e.to_string().as_str());
+            error_logs_error(&req, "注销会话错误", "delete_session", e.as_ref());
             let page = page_template.get_ref();
             render_500(&req, page, "注销会话错误")
         }
@@ -269,7 +269,7 @@ async fn totp_config_h(
             "message": "未绑定"
         })),
         Err(e) => {
-            error_logs(&req, "CheckTwofa", &e.to_string());
+            error_logs_error(&req, "CheckTwofa", "read_two_factor_status", e.as_ref());
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -298,7 +298,12 @@ async fn bind_twofa_h(
     {
         Ok(tmp) => HttpResponse::Ok().json(json!({"success": true, "data": tmp})),
         Err(e) => {
-            error_logs(&req, "CreateOptauthUrlError", &e.to_string());
+            error_logs_error(
+                &req,
+                "CreateOptauthUrlError",
+                "create_totp_binding",
+                e.as_ref(),
+            );
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -365,7 +370,12 @@ async fn verify_totp_h(
                     .json(json!({"success": false, "message": "验证码无效或绑定已过期"}))
             }
             Err(e) => {
-                error_logs(&req, "ConfirmTotpBindingError", &e.to_string());
+                error_logs_error(
+                    &req,
+                    "ConfirmTotpBindingError",
+                    "confirm_totp_binding",
+                    e.as_ref(),
+                );
                 HttpResponse::InternalServerError().finish()
             }
         };
@@ -378,7 +388,7 @@ async fn verify_totp_h(
             return HttpResponse::NotFound().finish();
         }
         Err(e) => {
-            error_logs(&req, "生成 TOTP 结构体错误", &e.to_string());
+            error_logs_error(&req, "生成 TOTP 结构体错误", "load_totp_secret", e.as_ref());
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -442,7 +452,12 @@ async fn verify_totp_h(
                 HttpResponse::Ok().finish()
             }
             Err(error_value) => {
-                error_logs(&req, "TotpSessionUpdateError", &error_value.to_string());
+                error_logs_error(
+                    &req,
+                    "TotpSessionUpdateError",
+                    "update_totp_session",
+                    error_value.as_ref(),
+                );
                 HttpResponse::InternalServerError().finish()
             }
         },
@@ -477,7 +492,12 @@ async fn verify_totp_h(
             HttpResponse::Unauthorized().finish()
         }
         Err(e) => {
-            error_logs(&req, "TOTPTokenVerifyError", &e.to_string());
+            error_logs_error(
+                &req,
+                "TOTPTokenVerifyError",
+                "verify_totp_token",
+                e.as_ref(),
+            );
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -524,7 +544,7 @@ async fn unbind_2fa_h(
         }
         Ok(false) => HttpResponse::NotFound().finish(),
         Err(e) => {
-            error_logs(&req, "Unbind2FAfaild", &e.to_string());
+            error_logs_error(&req, "Unbind2FAfaild", "unbind_totp", e.as_ref());
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -564,7 +584,12 @@ async fn get_user_info_h(
     match get_user_info(u_role, t_username, info.count.map(|c| c as i64), pool_ref).await {
         Ok(data) => HttpResponse::Ok().json(data),
         Err(e) => {
-            error_logs(&req, "GetUserInfoError", &e.to_string());
+            error_logs_error(
+                &req,
+                "GetUserInfoError",
+                "load_user_information",
+                e.as_ref(),
+            );
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -591,7 +616,12 @@ async fn update_user_info_h(
     {
         Ok(()) => HttpResponse::Ok(),
         Err(e) => {
-            error_logs(&req, "UpdateUserInfoError", &e.to_string());
+            error_logs_error(
+                &req,
+                "UpdateUserInfoError",
+                "update_user_information",
+                e.as_ref(),
+            );
             HttpResponse::InternalServerError()
         }
     }
@@ -674,7 +704,12 @@ async fn change_password_h(
     {
         Ok(row) => row,
         Err(error_value) => {
-            error_logs(&req, "ChangePasswordQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "ChangePasswordQueryError",
+                "load_password_for_update",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().json(json!({
                 "success": false,
                 "message": "密码修改服务暂时不可用"
@@ -718,7 +753,12 @@ async fn change_password_h(
         )
         .await
     {
-        error_logs(&req, "ChangePasswordUpdateError", &error_value.to_string());
+        error_logs_error(
+            &req,
+            "ChangePasswordUpdateError",
+            "update_password",
+            &error_value,
+        );
         return HttpResponse::InternalServerError().json(json!({
             "success": false,
             "message": "密码修改服务暂时不可用"
@@ -733,7 +773,12 @@ async fn change_password_h(
         )
         .await
     {
-        error_logs(&req, "ChangePasswordSessionError", &error_value.to_string());
+        error_logs_error(
+            &req,
+            "ChangePasswordSessionError",
+            "invalidate_sessions",
+            &error_value,
+        );
         return HttpResponse::InternalServerError().json(json!({
             "success": false,
             "message": "密码修改服务暂时不可用"
@@ -755,14 +800,24 @@ async fn change_password_h(
     )
     .await
     {
-        error_logs(&req, "ChangePasswordAuditError", &error_value.to_string());
+        error_logs_error(
+            &req,
+            "ChangePasswordAuditError",
+            "write_audit_event",
+            &error_value,
+        );
         return HttpResponse::InternalServerError().json(json!({
             "success": false,
             "message": "密码修改服务暂时不可用"
         }));
     }
     if let Err(error_value) = transaction.commit().await {
-        error_logs(&req, "ChangePasswordCommitError", &error_value.to_string());
+        error_logs_error(
+            &req,
+            "ChangePasswordCommitError",
+            "commit_transaction",
+            &error_value,
+        );
         return HttpResponse::InternalServerError().json(json!({
             "success": false,
             "message": "密码修改服务暂时不可用"
@@ -802,7 +857,7 @@ async fn web_add_scanner_h(
     {
         Ok(ok) => ok,
         Err(e) => {
-            error_logs(&req, "AddScannerError", &e.to_string());
+            error_logs_error(&req, "AddScannerError", "insert_scanner", e.as_ref());
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -830,7 +885,7 @@ async fn get_scanners_h(
             }))
         }
         Err(error) => {
-            error_logs(&req, "GetScannersError", &error.to_string());
+            error_logs_error(&req, "GetScannersError", "list_scanners", error.as_ref());
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -853,7 +908,7 @@ async fn get_scanner_h(
             "message": "scanner not found",
         })),
         Err(error) => {
-            error_logs(&req, "GetScannerError", &error.to_string());
+            error_logs_error(&req, "GetScannerError", "load_scanner", error.as_ref());
             HttpResponse::InternalServerError().finish()
         }
     }
@@ -937,7 +992,7 @@ async fn scanner_register_h(
                 &audit_event,
             )
             .await;
-            error_logs(&req, "ScannerRegister", &e.to_string());
+            error_logs_error(&req, "ScannerRegister", "register_scanner", e.as_ref());
             if e.to_string() == "scanner unauthorized" {
                 return HttpResponse::Unauthorized().finish();
             }

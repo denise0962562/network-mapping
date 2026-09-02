@@ -2,7 +2,7 @@ use actix_web::{App, HttpMessage, HttpServer, dev::Service, http::header, web};
 use clap::Parser;
 use core::panic;
 use std::io;
-use tokio::time::{Duration, Instant, interval_at};
+use tokio::time::{Duration, Instant, MissedTickBehavior, interval_at};
 use tracing::{Instrument, error, info};
 
 use network_mapping_server::admin::{
@@ -27,11 +27,13 @@ use network_mapping_server::middlewares::{
 use network_mapping_server::monitor::{self, HealthEvent};
 use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
+use network_mapping_server::runtime_config::{RuntimeSettings, RuntimeSettingsBootstrap};
 use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
 use network_mapping_server::system_maintenance::{
     SystemMaintenanceState, run_reconciler as run_system_maintenance_reconciler,
 };
-use network_mapping_server::target_generated::{AutomaticTargetService, run_generator};
+use network_mapping_server::system_resource_cache::SystemResourceCache;
+use network_mapping_server::target_generated::run_generator;
 use network_mapping_server::tls::build_acceptor;
 use network_mapping_server::trusted_proxy::TrustedProxyState;
 use network_mapping_server::{Systems, TemplatesInit, config, db, insert_system_status};
@@ -67,11 +69,10 @@ async fn main() -> io::Result<()> {
     let monitor_config = config.monitor.clone();
     let elasticsearch_config = config.elasticsearch.clone();
     let analytics_snapshot_config = config.analytics_snapshot.clone();
+    let automatic_target_config = config.automatic_target.clone();
+    let dns_follow_up_config = config.dns_follow_up.clone();
     let frontend_directory = config.frontend.directory.clone();
     let maxmind_directory = config.maxmind.directory.clone();
-    let automatic_target_service = AutomaticTargetService::new(config.automatic_target.clone())
-        .map_err(|error| io::Error::other(format!("自动目标生成配置错误：{error}")))?;
-
     let ser_con = config.server.clone();
     let server = config.server;
     let server_host = server.host;
@@ -94,15 +95,23 @@ async fn main() -> io::Result<()> {
     let database_c = db_config.clone();
     let database_c2 = db_config.clone();
 
-    let db_pool = db::create_postgresql_pool(
-        db_config.host,
-        db_config.port,
-        db_config.username,
-        db_config.password,
-        db_config.db_name,
-    )
-    .await
-    .expect("创建连接池错误");
+    let db_pool = db::create_postgresql_pool(&db_config)
+        .await
+        .unwrap_or_else(|error_value| {
+            let diagnostics = error_chain_diagnostics(error_value.as_ref());
+            error!(
+                target: "server::startup",
+                event = "DatabaseStartupFailed",
+                startup_stage = "connection_pool",
+                database_host = %db_config.host,
+                database_port = db_config.port,
+                database_name = %db_config.db_name,
+                message = %diagnostics,
+                error = ?error_value,
+                "数据库初始化失败，服务即将终止"
+            );
+            panic!("数据库初始化失败：{diagnostics}");
+        });
     let pool = db_pool.clone();
     let request_log_pool = db_pool.clone();
     let scanner_latency_pool = db_pool.clone();
@@ -123,7 +132,22 @@ async fn main() -> io::Result<()> {
 
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
-        Err(e) => panic!("初始化数据库错误{}", e),
+        Err(error_value) => {
+            let diagnostics = error_chain_diagnostics(error_value.as_ref());
+            error!(
+                target: "server::startup",
+                event = "DatabaseStartupFailed",
+                startup_stage = "schema_initialization",
+                database_host = %db_config.host,
+                database_port = db_config.port,
+                database_name = %db_config.db_name,
+                init_database_file = %db_config.init_database_file,
+                message = %diagnostics,
+                error = ?error_value,
+                "数据库结构初始化失败，服务即将终止"
+            );
+            panic!("初始化数据库错误：{diagnostics}");
+        }
     };
     if !args.rebuild_elasticsearch
         && !args.refresh_ip_intel
@@ -134,8 +158,20 @@ async fn main() -> io::Result<()> {
         match network_mapping_server::search_projection::ensure_initialized(&db_pool).await {
             Ok(true) => info!(target: "server::startup", "历史数据已生成 PostgreSQL 当前端点投影"),
             Ok(false) => {}
-            Err(error) => {
-                return Err(io::Error::other(format!("初始化当前端点投影失败：{error}")));
+            Err(error_value) => {
+                let diagnostics = error_chain_diagnostics(error_value.as_ref());
+                error!(
+                    target: "server::startup",
+                    event = "DatabaseStartupFailed",
+                    startup_stage = "search_projection_initialization",
+                    database_host = %db_config.host,
+                    database_port = db_config.port,
+                    database_name = %db_config.db_name,
+                    message = %diagnostics,
+                    error = ?error_value,
+                    "PostgreSQL 当前端点投影初始化失败，服务即将终止"
+                );
+                panic!("初始化当前端点投影失败：{diagnostics}");
             }
         }
     }
@@ -213,6 +249,18 @@ async fn main() -> io::Result<()> {
         println!("分析快照重建完成：已处理 {processed} 个扫描执行");
         return Ok(());
     }
+    let runtime_settings = RuntimeSettings::load(
+        &db_pool,
+        RuntimeSettingsBootstrap {
+            requests: request_log_config,
+            monitor: monitor_config,
+            automatic_target: automatic_target_config,
+            dns_follow_up: dns_follow_up_config,
+            analytics_snapshot: analytics_snapshot_config,
+        },
+    )
+    .await
+    .map_err(|error| io::Error::other(format!("加载运行时配置失败：{error}")))?;
     let trusted_proxy_state = web::Data::new(
         TrustedProxyState::from_database(&db_pool)
             .await
@@ -286,20 +334,18 @@ async fn main() -> io::Result<()> {
             db_pool.clone(),
         ));
     }
-    if analytics_snapshot_config.mode.runs_worker() {
-        tokio::spawn(network_mapping_server::analytics_snapshot::run_worker(
-            analytics_snapshot_config.clone(),
-            db_pool.clone(),
-            elasticsearch_service.clone(),
-        ));
-    }
+    tokio::spawn(network_mapping_server::analytics_snapshot::run_worker(
+        runtime_settings.analytics_snapshot.clone(),
+        db_pool.clone(),
+        elasticsearch_service.clone(),
+    ));
 
     info!(target: "server::startup", "正在检查系统账户");
 
     check_system_user(&db_pool).await;
 
     tokio::spawn(run_generator(
-        automatic_target_service.clone(),
+        runtime_settings.automatic_target.clone(),
         db_pool.clone(),
     ));
 
@@ -311,11 +357,11 @@ async fn main() -> io::Result<()> {
     let mail_c = config.email_config;
 
     let monitor_handle = monitor::MonitorHandle::new(
-        &monitor_config,
+        runtime_settings.monitor.get().await.value,
         db_pool.clone(),
         ser_con.encrypt_key.clone(),
     );
-    elasticsearch_service.set_monitor(monitor_handle.clone());
+    elasticsearch_service.set_monitor(Some(monitor_handle.clone()));
 
     let tls = build_acceptor(&config.tls)?;
     let frontend_assets = FrontendAssets::new(frontend_directory);
@@ -324,10 +370,14 @@ async fn main() -> io::Result<()> {
 
     let sys = Systems::new();
     let sys_2 = sys.clone();
+    let system_resource_cache = SystemResourceCache::new();
+    let system_resource_cache_data = web::Data::new(system_resource_cache.clone());
     let maxmind_state = web::Data::new(maxmind_state);
-    let automatic_target_service = web::Data::new(automatic_target_service);
+    let runtime_settings = web::Data::new(runtime_settings);
+    let automatic_target_service = web::Data::new(runtime_settings.automatic_target.clone());
+    let dns_follow_up = web::Data::new(runtime_settings.dns_follow_up.clone());
     let security = web::Data::new(config.security);
-    let analytics_snapshot = web::Data::new(analytics_snapshot_config);
+    let analytics_snapshot = web::Data::new(runtime_settings.analytics_snapshot.clone());
     let rate_limiter = RateLimitMiddleware::default();
     let open_source_catalog = web::Data::new(
         OpenSourceCatalog::from_embedded()
@@ -345,7 +395,7 @@ async fn main() -> io::Result<()> {
         template_name = %template_info.templates_name,
         frontend_directory = %frontend_directory.display(),
         maxmind_directory = %maxmind_directory.display(),
-        automatic_target_enabled = automatic_target_service.enabled(),
+        automatic_target_enabled = automatic_target_service.get().await.value.enabled,
         status_interval_seconds = log.status_duration,
         "服务配置就绪"
     );
@@ -371,6 +421,8 @@ async fn main() -> io::Result<()> {
             Instant::now() + Duration::from_millis(0),
             Duration::from_secs(log.status_duration),
         );
+        // 依赖偶发变慢时跳过已错过的周期，避免恢复后立即突发执行多次采集。
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             ticker.tick().await;
@@ -379,6 +431,7 @@ async fn main() -> io::Result<()> {
                 database_c.db_name.clone(),
                 sys.clone(),
                 &elasticsearch_service,
+                &system_resource_cache,
             )
             .await
             {
@@ -397,17 +450,16 @@ async fn main() -> io::Result<()> {
     });
 
     // 请求日志采集：有界 channel + 后台 writer（永不退出）+ 定期清理。
-    let request_log_tx = if request_log_config.enabled {
-        let (tx, rx) = tokio::sync::mpsc::channel(request_log::CHANNEL_CAPACITY);
-        tokio::spawn(request_log::run_writer(request_log_pool.clone(), rx));
-        tokio::spawn(request_log::run_retention(
-            request_log_pool.clone(),
-            request_log_config.retention_days,
-        ));
-        Some(tx)
-    } else {
-        None
-    };
+    let (request_log_tx, request_log_rx) =
+        tokio::sync::mpsc::channel(request_log::CHANNEL_CAPACITY);
+    tokio::spawn(request_log::run_writer(
+        request_log_pool.clone(),
+        request_log_rx,
+    ));
+    tokio::spawn(request_log::run_retention(
+        request_log_pool.clone(),
+        runtime_settings.requests.clone(),
+    ));
 
     let (scanner_latency_history, scanner_latency_rx) = ScannerLatencyHistory::channel();
     tokio::spawn(scanner_latency::run_writer(
@@ -421,18 +473,22 @@ async fn main() -> io::Result<()> {
 
     HttpServer::new(move || {
         let request_log_tx = request_log_tx.clone();
+        let runtime_settings = runtime_settings.clone();
         let monitor_handle = monitor_handle.clone();
 
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(template_info.clone()))
             .app_data(web::Data::new(sys_2.clone()))
+            .app_data(system_resource_cache_data.clone())
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
             .app_data(web::Data::new(mail_c.clone()))
             .app_data(web::Data::new(ser_con.clone()))
+            .app_data(web::Data::new(monitor_handle.clone()))
             .app_data(maxmind_state.clone())
             .app_data(automatic_target_service.clone())
+            .app_data(dns_follow_up.clone())
             .app_data(open_source_catalog.clone())
             .app_data(backup_manager.clone())
             .app_data(elasticsearch_data.clone())
@@ -440,6 +496,7 @@ async fn main() -> io::Result<()> {
             .app_data(system_maintenance_state.clone())
             .app_data(security.clone())
             .app_data(analytics_snapshot.clone())
+            .app_data(runtime_settings.clone())
             .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())
             .app_data(web::JsonConfig::default().limit(server_max_body))
@@ -475,8 +532,7 @@ async fn main() -> io::Result<()> {
                         .and_then(|value| uuid::Uuid::parse_str(value).ok())
                 })
                 .flatten();
-                let capture = request_log_tx.is_some()
-                    && !network_mapping_server::frontend::is_frontend_resource_path(&path)
+                let capture = !network_mapping_server::frontend::is_frontend_resource_path(&path)
                     && !is_scanner_heartbeat;
                 let actor = std::sync::Arc::new(std::sync::Mutex::new(None));
                 req.extensions_mut()
@@ -495,6 +551,7 @@ async fn main() -> io::Result<()> {
                 let span = tracing::info_span!("http_request", request_id = %request_id);
                 let future = service.call(req).instrument(span);
                 let request_log_tx = request_log_tx.clone();
+                let runtime_settings = runtime_settings.clone();
                 let monitor_handle = monitor_handle.clone();
                 async move {
                     let mut response = future.await?;
@@ -527,7 +584,8 @@ async fn main() -> io::Result<()> {
                                 .expect("integer is a valid header value"),
                         );
                     }
-                    if capture {
+                    // 健康告警与请求日志独立：关闭访问日志不得关闭 5xx/慢请求监控。
+                    {
                         let status = response.status().as_u16();
                         let (error_level, error_type) = request_log::classify_status(status);
                         let elapsed = started.elapsed();
@@ -544,7 +602,8 @@ async fn main() -> io::Result<()> {
                         };
 
                         // 健康告警：慢请求与 5xx 错误实时判定，仅在命中阈值时才分配/克隆字符串。
-                        if let Some(monitor) = &monitor_handle {
+                        {
+                            let monitor = &monitor_handle;
                             let slow_duration = duration_ms
                                 .map(i64::from)
                                 .filter(|value| monitor.is_slow_request(*value));
@@ -581,24 +640,24 @@ async fn main() -> io::Result<()> {
                             }
                         }
 
-                        let entry = request_log::RequestLogEntry {
-                            request_id,
-                            occurred_at: chrono::Utc::now(),
-                            http_method: method,
-                            request_path: path,
-                            route_pattern,
-                            status_code: status as i16,
-                            duration_ms,
-                            duration_us,
-                            client_ip,
-                            user_agent,
-                            actor_id,
-                            actor_name,
-                            error_level: error_level.to_owned(),
-                            error_type: error_type.map(str::to_owned),
-                        };
-                        if let Some(tx) = &request_log_tx {
-                            let _ = tx.try_send(entry);
+                        if capture && runtime_settings.requests.get().await.value.enabled {
+                            let entry = request_log::RequestLogEntry {
+                                request_id,
+                                occurred_at: chrono::Utc::now(),
+                                http_method: method,
+                                request_path: path,
+                                route_pattern,
+                                status_code: status as i16,
+                                duration_ms,
+                                duration_us,
+                                client_ip,
+                                user_agent,
+                                actor_id,
+                                actor_name,
+                                error_level: error_level.to_owned(),
+                                error_type: error_type.map(str::to_owned),
+                            };
+                            let _ = request_log_tx.try_send(entry);
                         }
                     }
                     Ok(response)

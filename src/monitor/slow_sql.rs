@@ -4,6 +4,7 @@
 //! 首轮失败记录一次警告后不再重复告警，后续失败仅记录 error 日志。
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use deadpool_postgres::Pool;
@@ -81,17 +82,24 @@ impl StatementStats {
 }
 
 /// 后台轮询任务：首轮仅建立累计统计基线，之后按相邻轮询窗口的增量产生告警。
-pub async fn run_monitor(pool: Pool, tx: mpsc::Sender<HealthEvent>, config: MonitorConfig) {
-    let mut ticker =
-        tokio::time::interval(Duration::from_secs(config.slow_sql_check_interval_seconds));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+pub async fn run_monitor(
+    pool: Pool,
+    tx: mpsc::Sender<HealthEvent>,
+    config: Arc<RwLock<MonitorConfig>>,
+) {
     let mut baselines: HashMap<i64, StatementStats> = HashMap::new();
     let mut baseline_ready = false;
     let mut warned_unavailable = false;
 
     loop {
-        ticker.tick().await;
+        let settings = config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if !settings.enabled {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
         match poll(&pool).await {
             Ok(rows) => {
                 if !baseline_ready {
@@ -113,7 +121,7 @@ pub async fn run_monitor(pool: Pool, tx: mpsc::Sender<HealthEvent>, config: Moni
                     let Some(window) = row.stats.since(previous) else {
                         continue;
                     };
-                    if window.mean_exec_time_ms >= config.slow_sql_threshold_ms as f64 {
+                    if window.mean_exec_time_ms >= settings.slow_sql_threshold_ms as f64 {
                         let event = HealthEvent::slow_sql(&SlowSqlObservation {
                             queryid,
                             query: &row.query,
@@ -148,6 +156,10 @@ pub async fn run_monitor(pool: Pool, tx: mpsc::Sender<HealthEvent>, config: Moni
                 }
             }
         }
+        tokio::time::sleep(Duration::from_secs(
+            settings.slow_sql_check_interval_seconds,
+        ))
+        .await;
     }
 }
 

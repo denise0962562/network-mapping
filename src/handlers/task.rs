@@ -2,9 +2,11 @@ use crate::admin::{UserBaseI, get_default_scan_profile_from_database};
 use crate::audit::{self, AuditContext};
 use crate::client_ip::{normalize_ip, request_ip};
 use crate::config::SecurityConfig;
+use crate::dns_follow_up::DnsFollowUpConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
+use crate::runtime_config::RuntimeConfig;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
 use crate::system_maintenance::{
     MaintenanceSnapshot, SystemMaintenanceState, maintenance_response,
@@ -45,6 +47,10 @@ struct CreateDnsTask {
     #[serde(default = "default_dns_scan_profile")]
     scan_profile: String,
     port: Option<String>,
+    #[serde(default)]
+    follow_up_port_scan: bool,
+    #[serde(default = "default_follow_up_scan_profile")]
+    follow_up_scan_profile: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,6 +97,10 @@ impl CreateDnsResolver {
 
 fn default_dns_scan_profile() -> String {
     "dns_records".into()
+}
+
+fn default_follow_up_scan_profile() -> String {
+    "port_only".into()
 }
 
 #[derive(Serialize)]
@@ -593,7 +603,7 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let transaction = match connection.transaction().await {
+    let scanner_transaction = match connection.transaction().await {
         Ok(transaction) => transaction,
         Err(error) => {
             error_logs_error(
@@ -605,6 +615,18 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     };
+    if let Err(error) = scanner_transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '5s';")
+        .await
+    {
+        error_logs_error(
+            &req,
+            "ScannerHeartbeatTimeoutSetupError",
+            "set_local_timeouts",
+            &error,
+        );
+        return HttpResponse::ServiceUnavailable().finish();
+    }
     let scanner_id = heartbeat.scanner_id.to_string();
     let system_version = format!(
         "{} {}",
@@ -654,7 +676,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     let latency_server_processing_us = latency.as_ref().map(|value| value.server_processing_us);
     let latency_measured_at = latency.as_ref().map(|value| value.measured_at);
     let latency_probe_id = latency.as_ref().map(|value| value.probe_id);
-    let update = transaction
+    let update = scanner_transaction
         .query_opt(
             "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
              cpus = $4, ram = $5, uptime = $6, runtime_state = $7, last_seen_at = NOW(), \
@@ -721,9 +743,44 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     }
+    // 扫描器状态行与任务执行行使用两个短事务。过去这里会在等待任务租约锁时一直
+    // 持有 scanner_info 行锁，导致同一扫描器后续心跳形成分钟级锁队列。
+    if let Err(error) = scanner_transaction.commit().await {
+        error_logs_error(
+            &req,
+            "ScannerHeartbeatCommitError",
+            "commit_scanner_state",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
     let mut lease = None;
     let mut cancel_task_id = None;
     if let Some(task_id) = heartbeat.active_task_id {
+        let transaction = match connection.transaction().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                error_logs_error(
+                    &req,
+                    "ScannerLeaseTransactionError",
+                    "begin_transaction",
+                    &error,
+                );
+                return HttpResponse::ServiceUnavailable().finish();
+            }
+        };
+        if let Err(error) = transaction
+            .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '5s';")
+            .await
+        {
+            error_logs_error(
+                &req,
+                "ScannerLeaseTimeoutSetupError",
+                "set_local_timeouts",
+                &error,
+            );
+            return HttpResponse::ServiceUnavailable().finish();
+        }
         let lease_expires_at = crate::get_unix_epoch_ms() + crate::TASK_LEASE_MS;
         let renewed = match transaction
             .query_opt(
@@ -737,7 +794,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         {
             Err(error) => {
                 error_logs_error(&req, "ScannerLeaseRenewError", "renew_task_lease", &error);
-                return HttpResponse::InternalServerError().finish();
+                return HttpResponse::ServiceUnavailable().finish();
             }
             Ok(row) => row,
         };
@@ -772,7 +829,7 @@ pub(crate) async fn scanner_heartbeat_handler(
                         "read_cancel_command",
                         &error,
                     );
-                    return HttpResponse::InternalServerError().finish();
+                    return HttpResponse::ServiceUnavailable().finish();
                 }
             }
         } else {
@@ -784,15 +841,10 @@ pub(crate) async fn scanner_heartbeat_handler(
                 maintenance_hold: false,
             });
         }
-    }
-    if let Err(error) = transaction.commit().await {
-        error_logs_error(
-            &req,
-            "ScannerHeartbeatCommitError",
-            "commit_heartbeat",
-            &error,
-        );
-        return HttpResponse::InternalServerError().finish();
+        if let Err(error) = transaction.commit().await {
+            error_logs_error(&req, "ScannerLeaseCommitError", "commit_task_lease", &error);
+            return HttpResponse::ServiceUnavailable().finish();
+        }
     }
     if let Some(latency) = latency {
         latency_history.record(ScannerLatencyHistoryEntry {
@@ -1116,7 +1168,12 @@ async fn get_task(
     let connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error) => {
-            error_logs(&req, "GetTaskDatabaseError", &error.to_string());
+            error_logs_error(
+                &req,
+                "GetTaskDatabaseError",
+                "acquire_database_connection",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -1143,7 +1200,7 @@ async fn get_task(
             }));
         }
         Err(error) => {
-            error_logs(&req, "GetTaskDatabaseError", &error.to_string());
+            error_logs_error(&req, "GetTaskDatabaseError", "load_task", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -1160,7 +1217,7 @@ async fn get_task(
          WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
          ORDER BY e.id;", &[&task_pk]).await {
         Ok(rows) => rows,
-        Err(error) => { error_logs(&req, "GetTaskExecutionsError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => { error_logs_error(&req, "GetTaskExecutionsError", "load_task_executions", &error); return HttpResponse::InternalServerError().finish(); }
     };
     let selected_execution = query
         .execution_id
@@ -1226,7 +1283,7 @@ async fn get_task(
         {
             Ok(rows) => rows,
             Err(error) => {
-                error_logs(&req, "GetTaskResultsError", &error.to_string());
+                error_logs_error(&req, "GetTaskResultsError", "load_task_results", &error);
                 return HttpResponse::InternalServerError().finish();
             }
         };
@@ -1259,7 +1316,7 @@ async fn get_task(
             {
                 Ok(rows) => rows,
                 Err(error) => {
-                    error_logs(&req, "GetTaskPortsError", &error.to_string());
+                    error_logs_error(&req, "GetTaskPortsError", "load_task_ports", &error);
                     return HttpResponse::InternalServerError().finish();
                 }
             };
@@ -1498,7 +1555,7 @@ async fn get_dns_comparison(
     ).await {
         Ok(Some(task)) => task.get::<_, String>("task_kind"),
         Ok(None) => return HttpResponse::NotFound().json(json!({"success": false, "message": "task not found"})),
-        Err(error) => { error_logs(&req, "GetDnsComparisonDatabaseError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => { error_logs_error(&req, "GetDnsComparisonDatabaseError", "load_dns_task", &error); return HttpResponse::InternalServerError().finish(); }
     };
     if task_kind != "dns" {
         return HttpResponse::BadRequest()
@@ -1584,6 +1641,12 @@ async fn create_task(
             }
         },
     };
+    if !crate::is_ip_scan_profile(&scan_profile) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "success": false,
+            "message": "DNS scan profiles require the domain task endpoint"
+        }));
+    }
     let scan_plan = match build_scan_plan(&scan_profile) {
         Ok(plan) => plan,
         Err(message) => {
@@ -1614,7 +1677,7 @@ async fn create_task(
             );
             let rows = match connection.query(&query, &[&values, &scan_profile]).await {
                 Ok(rows) => rows,
-                Err(error) => { error_logs(&req, "ResolveTaskScannersError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+                Err(error) => { error_logs_error(&req, "ResolveTaskScannersError", "resolve_selected_scanners", &error); return HttpResponse::InternalServerError().finish(); }
             };
             if rows.len() != values.len() {
                 return HttpResponse::BadRequest().json(serde_json::json!({"success": false, "message": format!("selected scanner is unavailable or does not support {address_family}/{scan_profile}")}));
@@ -1633,7 +1696,7 @@ async fn create_task(
             );
             let rows = match connection.query(&query, &[&scan_profile]).await {
                 Ok(rows) => rows,
-                Err(error) => { error_logs(&req, "ResolveTaskScannersError", &error.to_string()); return HttpResponse::InternalServerError().finish(); }
+                Err(error) => { error_logs_error(&req, "ResolveTaskScannersError", "resolve_all_scanners", &error); return HttpResponse::InternalServerError().finish(); }
             };
             if rows.is_empty() {
                 return HttpResponse::Conflict().json(serde_json::json!({"success": false, "message": format!("no scanner supporting {address_family}/{scan_profile} is currently available")}));
@@ -1660,8 +1723,8 @@ async fn create_task(
         Ok(()) => HttpResponse::Ok()
             .content_type(TEXT_HTML_UTF_8)
             .body("创建成功"),
-        Err(e) => {
-            error_logs(&req, "AddTaskError", e.to_string().as_str());
+        Err(error) => {
+            error_logs_error(&req, "AddTaskError", "insert_scan_task", error.as_ref());
             HttpResponse::InternalServerError().body("500")
         }
     }
@@ -1674,6 +1737,7 @@ async fn create_task(
 async fn create_dns_task(
     req: HttpRequest,
     pool: web::Data<Pool>,
+    dns_follow_up: web::Data<RuntimeConfig<DnsFollowUpConfig>>,
     input: web::Json<CreateDnsTask>,
     user: UserBaseI,
 ) -> impl Responder {
@@ -1717,7 +1781,30 @@ async fn create_dns_task(
         return HttpResponse::BadRequest()
             .json(json!({"success": false, "message": "invalid DNS scan profile"}));
     }
-    let task_port = if input.scan_profile == "dns_records" {
+    if input.follow_up_port_scan {
+        if !dns_follow_up.get().await.value.enabled {
+            return HttpResponse::Conflict().json(json!({
+                "success": false,
+                "message": "DNS 解析后自动创建端口任务未启用"
+            }));
+        }
+        if input.scan_profile != "dns_records" {
+            return HttpResponse::BadRequest().json(json!({
+                "success": false,
+                "message": "启用自动端口任务时 DNS 扫描模式必须为仅 DNS 记录"
+            }));
+        }
+        if !matches!(
+            input.follow_up_scan_profile.as_str(),
+            "legacy" | "port_only" | "service_inventory"
+        ) {
+            return HttpResponse::BadRequest().json(json!({
+                "success": false,
+                "message": "invalid DNS follow-up scan profile"
+            }));
+        }
+    }
+    let task_port = if input.scan_profile == "dns_records" && !input.follow_up_port_scan {
         "53".to_owned()
     } else {
         let port = input.port.as_deref().unwrap_or("1-65535");
@@ -1765,24 +1852,37 @@ async fn create_dns_task(
             }),
         ),
         Err(error) => {
-            error_logs(&req, "ResolveDnsTaskScannersError", &error.to_string());
+            error_logs_error(&req, "ResolveDnsTaskScannersError", "resolve_dns_scanners", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
     let task_id = Uuid::now_v7().to_string();
+    let generation_metadata = if input.follow_up_port_scan {
+        json!({"dns_follow_up": {
+            "enabled": true,
+            "scan_profile": input.follow_up_scan_profile,
+        }})
+    } else {
+        json!({})
+    };
     let transaction = match connection.build_transaction().start().await {
         Ok(transaction) => transaction,
         Err(error) => {
-            error_logs(&req, "CreateDnsTaskTransactionError", &error.to_string());
+            error_logs_error(
+                &req,
+                "CreateDnsTaskTransactionError",
+                "start_transaction",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
     let task = match transaction
         .query_one(
             "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
-             dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets, dns_resolvers) \
+             dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets, dns_resolvers, generation_metadata) \
              VALUES ($1, $2, $3, ARRAY[]::INET[], $4, $5, $6, 'automatic', 'ipv4', $7, \
-             $8, 'dns', $9, $10) RETURNING id;",
+             $8, 'dns', $9, $10, $11) RETURNING id;",
             &[
                 &user.id,
                 &task_id,
@@ -1794,13 +1894,14 @@ async fn create_dns_task(
                 &build_scan_plan(&input.scan_profile).expect("DNS scan profile was validated"),
                 &domains,
                 &serde_json::to_value(&dns_resolvers).expect("DNS resolver input is serializable"),
+                &generation_metadata,
             ],
         )
         .await
     {
         Ok(task) => task,
         Err(error) => {
-            error_logs(&req, "CreateDnsTaskError", &error.to_string());
+            error_logs_error(&req, "CreateDnsTaskError", "insert_scan_task", &error);
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -1812,13 +1913,13 @@ async fn create_dns_task(
         )
         .await
     {
-        error_logs(&req, "CreateDnsTaskExecutionError", &error.to_string());
+        error_logs_error(&req, "CreateDnsTaskExecutionError", "insert_task_execution", &error);
         return HttpResponse::InternalServerError().finish();
     }
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
         .resource("task", task_id.clone());
     audit_event.response_status = Some(200);
-    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": input.scan_profile, "dns_resolver_count": dns_resolvers.len()});
+    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": input.scan_profile, "dns_resolver_count": dns_resolvers.len(), "follow_up_port_scan": input.follow_up_port_scan, "follow_up_scan_profile": input.follow_up_scan_profile});
     if let Err(error) = audit::write(
         &transaction,
         &AuditContext::from_request(&req),
@@ -1826,11 +1927,16 @@ async fn create_dns_task(
     )
     .await
     {
-        error_logs(&req, "CreateDnsTaskAuditError", &error.to_string());
+        error_logs_error(&req, "CreateDnsTaskAuditError", "write_audit_event", &error);
         return HttpResponse::InternalServerError().finish();
     }
     if let Err(error) = transaction.commit().await {
-        error_logs(&req, "CreateDnsTaskCommitError", &error.to_string());
+        error_logs_error(
+            &req,
+            "CreateDnsTaskCommitError",
+            "commit_transaction",
+            &error,
+        );
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true, "task_id": task_id, "domains": domains, "dns_resolvers": dns_resolvers}))
@@ -1923,11 +2029,13 @@ async fn apply_task_handler(
 
 /// 用于扫描器上传扫描结果。
 #[post("/api/scanner/result")]
+#[allow(clippy::too_many_arguments)] // request-scoped dependencies supplied by Actix extractors
 async fn upload_scanner_result_handler(
     req: HttpRequest,
     pool: web::Data<Pool>,
     maxmind: web::Data<MaxMindState>,
     elasticsearch: web::Data<crate::elasticsearch::ElasticsearchService>,
+    dns_follow_up: web::Data<RuntimeConfig<DnsFollowUpConfig>>,
     security: web::Data<SecurityConfig>,
     maintenance: web::Data<SystemMaintenanceState>,
     upload_data: web::Json<ScannerResultUpload>,
@@ -1956,10 +2064,12 @@ async fn upload_scanner_result_handler(
         return response;
     }
 
+    let dns_follow_up = dns_follow_up.get().await.value;
     match save_scanner_results(
         pool.get_ref(),
         maxmind.get_ref(),
         elasticsearch.get_ref(),
+        &dns_follow_up,
         &upload_data,
         token,
         &security.scanner_token_pepper,
@@ -2226,6 +2336,18 @@ mod tests {
             explicit_dns_resolvers: false,
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn database_schema_allows_all_dns_scan_profiles() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+
+        for profile in ["dns_records", "dns_ports", "dns_full"] {
+            assert!(
+                initialization_sql.contains(&format!("'{profile}'")),
+                "database schema must allow {profile}"
+            );
+        }
     }
 
     #[test]

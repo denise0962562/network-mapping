@@ -1269,7 +1269,7 @@ pub async fn get_default_scan_profile_from_database(
         .await?;
     Ok(row
         .map(|row| row.get::<_, String>("value").trim().to_lowercase())
-        .filter(|profile| crate::build_scan_plan(profile).is_ok())
+        .filter(|profile| crate::is_ip_scan_profile(profile))
         .unwrap_or_else(|| FALLBACK_SCAN_PROFILE.to_owned()))
 }
 
@@ -1286,7 +1286,9 @@ pub async fn write_scan_settings_to_database(
     settings: &ScanSettingsRequest,
 ) -> Result<ScanSettingsResponse, Box<dyn std::error::Error>> {
     let profile = settings.default_scan_profile.trim().to_lowercase();
-    crate::build_scan_plan(&profile)?;
+    if !crate::is_ip_scan_profile(&profile) {
+        return Err("unsupported default IP scan profile".into());
+    }
     let conn = pool.get().await?;
     conn.execute(
         "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \

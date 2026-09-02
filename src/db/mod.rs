@@ -1,8 +1,12 @@
+use crate::config::DatabaseConfig;
 use crate::path_secure_join;
 use actix_web::web;
-use deadpool_postgres::{ManagerConfig, RecyclingMethod};
+use deadpool_postgres::{ManagerConfig, RecyclingMethod, Runtime};
+use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, error, info};
+
+use crate::logs::write::error_chain_diagnostics;
 
 pub struct SqlFile {
     pub root_path: String,
@@ -19,39 +23,89 @@ impl SqlFile {
 }
 
 pub async fn create_postgresql_pool(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    dbname: String,
+    config: &DatabaseConfig,
 ) -> Result<deadpool_postgres::Pool, Box<dyn std::error::Error>> {
     let mut db_poll_cfg = deadpool_postgres::Config::new();
-    db_poll_cfg.user = Some(username);
-    db_poll_cfg.password = Some(password);
-    db_poll_cfg.dbname = Some(dbname);
-    db_poll_cfg.host = Some(host);
-    db_poll_cfg.port = Some(port);
+    db_poll_cfg.user = Some(config.username.clone());
+    db_poll_cfg.password = Some(config.password.clone());
+    db_poll_cfg.dbname = Some(config.db_name.clone());
+    db_poll_cfg.host = Some(config.host.clone());
+    db_poll_cfg.port = Some(config.port);
     db_poll_cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Verified,
     });
     db_poll_cfg.pool = Some(deadpool_postgres::PoolConfig {
-        max_size: 10,
-        timeouts: Default::default(),
+        max_size: config.pool_max_size,
+        timeouts: deadpool::managed::Timeouts {
+            wait: Some(Duration::from_millis(config.pool_wait_timeout_ms)),
+            create: Some(Duration::from_millis(config.pool_create_timeout_ms)),
+            recycle: Some(Duration::from_millis(config.pool_recycle_timeout_ms)),
+        },
         queue_mode: deadpool::managed::QueueMode::Lifo,
     });
-    let pool = db_poll_cfg.create_pool(None, tokio_postgres::NoTls)?;
-    info!(target: "server::startup", "正在检查数据库连接");
+    info!(
+        target: "server::startup",
+        event = "DatabasePoolCreateStarted",
+        database_host = %config.host,
+        database_port = config.port,
+        database_name = %config.db_name,
+        pool_max_size = config.pool_max_size,
+        runtime = "tokio1",
+        recycling_method = "verified",
+        "正在创建 PostgreSQL 连接池"
+    );
+    let pool = db_poll_cfg
+        .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
+        .map_err(|error| {
+            error!(
+                target: "server::startup",
+                event = "DatabasePoolCreateFailed",
+                database_host = %config.host,
+                database_port = config.port,
+                database_name = %config.db_name,
+                runtime = "tokio1",
+                message = %error_chain_diagnostics(&error),
+                error = ?error,
+                "PostgreSQL 连接池创建失败"
+            );
+            Box::new(error) as Box<dyn std::error::Error>
+        })?;
+    info!(
+        target: "server::startup",
+        pool_max_size = config.pool_max_size,
+        pool_wait_timeout_ms = config.pool_wait_timeout_ms,
+        pool_create_timeout_ms = config.pool_create_timeout_ms,
+        pool_recycle_timeout_ms = config.pool_recycle_timeout_ms,
+        "正在检查数据库连接"
+    );
     match pool.get().await {
         Ok(_conn) => {
             // _conn 是一个 deadpool::managed::Object，它会在离开作用域时自动返回池中
-            info!(target: "server::startup", "数据库连接成功，连接池可用");
+            info!(
+                target: "server::startup",
+                event = "DatabasePoolConnectionVerified",
+                database_host = %config.host,
+                database_port = config.port,
+                database_name = %config.db_name,
+                pool_max_size = config.pool_max_size,
+                "数据库连接成功，连接池可用"
+            );
         }
         Err(e) => {
-            // 如果连接失败，这里会返回错误
-            panic!(
-                "致命错误：无法从连接池获取连接。请检查数据库配置或服务状态。错误: {}",
-                e
-            )
+            error!(
+                target: "server::startup",
+                event = "DatabasePoolConnectionCheckFailed",
+                database_host = %config.host,
+                database_port = config.port,
+                database_name = %config.db_name,
+                pool_wait_timeout_ms = config.pool_wait_timeout_ms,
+                pool_create_timeout_ms = config.pool_create_timeout_ms,
+                pool_recycle_timeout_ms = config.pool_recycle_timeout_ms,
+                message = %error_chain_diagnostics(&e),
+                error = ?e,
+                "数据库连接池连通性检查失败"
+            );
+            return Err(Box::new(e));
         }
     }
     Ok(pool)
@@ -88,20 +142,12 @@ pub async fn init_database_table(
     cpool: &deadpool_postgres::Pool,
     file_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sql_from_f = fs::read_to_string(file_path).await;
-    match sql_from_f {
-        Ok(o) => {
-            let mut client = cpool.get().await?;
-            let transaction = client.transaction().await?;
-            debug!("开始执行数据库初始化事务");
-            transaction.batch_execute(&o).await?;
-            transaction.commit().await?;
-        }
-        Err(e) => {
-            tracing::error!("{}", e);
-            panic!("读取目标文件失败");
-        }
-    };
+    let sql = fs::read_to_string(file_path).await?;
+    let mut client = cpool.get().await?;
+    let transaction = client.transaction().await?;
+    debug!(init_database_file = file_path, "开始执行数据库初始化事务");
+    transaction.batch_execute(&sql).await?;
+    transaction.commit().await?;
 
     Ok(())
 }

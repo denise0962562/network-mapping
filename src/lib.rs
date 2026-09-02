@@ -9,6 +9,7 @@ pub mod client_ip;
 pub mod config;
 pub mod db;
 pub mod dns;
+pub mod dns_follow_up;
 pub mod elasticsearch;
 pub mod frontend;
 pub mod handlers;
@@ -28,10 +29,12 @@ pub mod rir; // 该模块用于从五大 RIR 获取 ASN 和组织等信息
 pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
+pub mod runtime_config;
 pub mod scanner_latency;
 mod search_content;
 pub mod search_projection;
 pub mod system_maintenance;
+pub mod system_resource_cache;
 
 #[cfg(test)]
 pub mod test; // 测试模块
@@ -50,13 +53,14 @@ use password_hash::{PasswordHash, SaltString};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tera::{Context, Tera};
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
@@ -134,28 +138,28 @@ pub struct TemplatesInit {
 }
 
 //以下存储的数据都为约值，会自动舍弃精度
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbResource {
     pub db_library_size: String,
     pub db_table_size: BTreeMap<String, DbTableSizeInfo>,
     pub db_conn: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbTableSizeInfo {
     pub total: i64,
     pub data: i64,
     pub index: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemCPU {
     pub cpu_usage: f32,            //cpu总体使用率
     pub cpu: HashMap<String, f32>, //单个cpu使用率
 }
 
 //系统缓存大小，包括swap
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemRAM {
     pub total_ram: u64,
     pub used_ram: u64,
@@ -165,25 +169,25 @@ pub struct SystemRAM {
     pub swap_usage: f32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemDisk {
     pub disk_total_space: u64,
     pub disk_total_usage: u64,
     pub disk: HashMap<String, Vec<u64>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemNetInfo {
     pub send: String,
     pub receive: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemNetwork {
     pub net: BTreeMap<String, SystemNetInfo>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemResource {
     pub server_run_time: i64,
     pub cpu: SystemCPU,
@@ -500,11 +504,22 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
     }
 }
 
+/// Returns the two Elasticsearch representations used by scan observations.
+///
+/// Elasticsearch's `ip` type accepts only an address literal, while `ip_range`
+/// accepts CIDR. Keeping both values lets callers submit either form without
+/// discarding the original network prefix.
+fn scan_observation_addresses(value: &str) -> Result<(String, String, IpAddr), AddrParseError> {
+    let network = parse_ip_or_cidr(value)?;
+    let address = network.addr();
+    Ok((address.to_string(), network.to_string(), address))
+}
+
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
     use super::{
         CreateTask, STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan,
-        parse_ip_or_cidr,
+        is_ip_scan_profile, parse_ip_or_cidr, scan_observation_addresses,
     };
 
     #[test]
@@ -540,6 +555,22 @@ mod parse_ip_or_cidr_tests {
     }
 
     #[test]
+    fn builds_compatible_host_and_network_representations() {
+        let (address, network, parsed) = scan_observation_addresses("192.0.2.10").unwrap();
+        assert_eq!(address, "192.0.2.10");
+        assert_eq!(network, "192.0.2.10/32");
+        assert_eq!(parsed.to_string(), address);
+
+        let (address, network, _) = scan_observation_addresses("192.0.2.0/24").unwrap();
+        assert_eq!(address, "192.0.2.0");
+        assert_eq!(network, "192.0.2.0/24");
+
+        let (address, network, _) = scan_observation_addresses("2001:db8::1/128").unwrap();
+        assert_eq!(address, "2001:db8::1");
+        assert_eq!(network, "2001:db8::1/128");
+    }
+
+    #[test]
     fn tasks_must_use_one_address_family() {
         let ipv4 =
             STask::new(TargetIP::S("192.0.2.1,198.51.100.0/24"), "test", None, None).unwrap();
@@ -567,6 +598,16 @@ mod parse_ip_or_cidr_tests {
         let dns_full = build_scan_plan("dns_full").unwrap();
         assert_eq!(dns_full["stages"][0]["type"], "dns_lookup");
         assert!(build_scan_plan("arbitrary_command").is_err());
+    }
+
+    #[test]
+    fn only_ip_profiles_can_be_used_as_the_system_default() {
+        for profile in ["legacy", "port_only", "service_inventory"] {
+            assert!(is_ip_scan_profile(profile));
+        }
+        for profile in ["dns_records", "dns_ports", "dns_full"] {
+            assert!(!is_ip_scan_profile(profile));
+        }
     }
 
     #[test]
@@ -705,6 +746,13 @@ pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
         "profile": profile,
         "stages": stages,
     }))
+}
+
+/// Profiles valid for IP/CIDR tasks and the system-wide default. DNS profiles
+/// require the dedicated domain-task endpoint and must never be inherited by
+/// an IP task.
+pub fn is_ip_scan_profile(profile: &str) -> bool {
+    matches!(profile, "legacy" | "port_only" | "service_inventory")
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
@@ -1144,22 +1192,68 @@ pub async fn insert_system_status(
     db_name: String,
     sys: Systems,
     elasticsearch: &ElasticsearchService,
+    cache: &system_resource_cache::SystemResourceCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (s, elasticsearch_metrics) = tokio::join!(
-        SystemResource::new(sys, pool, &db_name),
-        elasticsearch.storage_metrics()
+    // 数据库指标是系统快照的附加信息，最多等待 3 秒；不能让其拖住 CPU/RAM 等
+    // 实时数据的发布。连接池自身还有更短的 wait timeout 作为第一层保护。
+    let mut s = match tokio::time::timeout(
+        Duration::from_secs(3),
+        SystemResource::new(sys.clone(), pool, &db_name),
+    )
+    .await
+    {
+        Ok(resource) => resource,
+        Err(_) => {
+            warn!(
+                event = "SystemDatabaseMetricsTimeout",
+                timeout_seconds = 3,
+                "PostgreSQL 指标采集超时，本周期使用默认数据库指标"
+            );
+            SystemResource {
+                server_run_time: get_server_uptime() as i64,
+                cpu: SystemCPU::new(sys.sys.clone()),
+                ram: SystemRAM::new(sys.sys.clone()),
+                disk: SystemDisk::new(sys.disk.clone()),
+                db_postgresql: DbResource::default(),
+                network: SystemNetwork::new(sys.network.clone()),
+                create_at: None,
+            }
+        }
+    };
+    s.create_at = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
     );
+    // 发布内存快照早于持久化。即使数据库正忙，仪表盘仍能读取本周期采集结果；
+    // 随后的 INSERT 继续作为重启恢复和长期审计的权威数据源。
+    cache.record(s.clone());
+    // Elasticsearch 容量采集可能触发网络超时，必须发生在内存快照发布之后，且不能
+    // 推迟 PostgreSQL 持久化。失败只使本周期 ES 容量字段标记为 unavailable。
+    let elasticsearch_metrics =
+        match tokio::time::timeout(Duration::from_secs(3), elasticsearch.storage_metrics()).await {
+            Ok(metrics) => metrics,
+            Err(_) => {
+                warn!(
+                    event = "ElasticsearchStorageMetricsTimeout",
+                    timeout_seconds = 3,
+                    "Elasticsearch 容量指标采集超时"
+                );
+                elasticsearch::ElasticsearchStorageMetrics::unavailable(elasticsearch.enabled())
+            }
+        };
     let mut client = pool.get().await?;
     let transaction = client.transaction().await?;
     let sql = get_sql_from_file("source/database/", "insert_system_status.sql").await?;
     let statement = transaction.prepare(&sql).await?;
     let server_run_time = s.server_run_time;
-    let cpu = serde_json::to_value(s.cpu).unwrap();
-    let ram = serde_json::to_value(s.ram).unwrap();
-    let disk = serde_json::to_value(s.disk).unwrap();
-    let db_postgresql = serde_json::to_value(s.db_postgresql).unwrap();
+    let cpu = serde_json::to_value(&s.cpu).unwrap();
+    let ram = serde_json::to_value(&s.ram).unwrap();
+    let disk = serde_json::to_value(&s.disk).unwrap();
+    let db_postgresql = serde_json::to_value(&s.db_postgresql).unwrap();
     let db_elasticsearch = serde_json::to_value(elasticsearch_metrics).unwrap();
-    let network = serde_json::to_value(s.network).unwrap();
+    let network = serde_json::to_value(&s.network).unwrap();
     let raw = transaction
         .execute(
             &statement,
@@ -1452,6 +1546,12 @@ fn sanitize_result_item(item: ScannerResultItem) -> ScannerResultItem {
 fn immutable_scan_observation(value: &Value) -> Value {
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
+        // `ip_network` was split from `ip_address` for Elasticsearch mapping
+        // compatibility. Hash the network under the legacy field name so
+        // pending batches created before this change retain the same checksum.
+        if let Some(network) = object.remove("ip_network") {
+            object.insert("ip_address".to_owned(), network);
+        }
         for field in [
             "asn",
             "isp",
@@ -1619,6 +1719,7 @@ fn normalize_upload_observations(
 async fn save_dns_scanner_results(
     pool: &deadpool_postgres::Pool,
     elasticsearch: &ElasticsearchService,
+    dns_follow_up: &dns_follow_up::DnsFollowUpConfig,
     upload: &ScannerResultUpload,
     token: &str,
     token_pepper: &str,
@@ -1652,6 +1753,10 @@ async fn save_dns_scanner_results(
         .transaction()
         .await
         .map_err(scanner_result_database_error)?;
+    transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '5s';")
+        .await
+        .map_err(scanner_result_database_error)?;
     let token_hash =
         hash_scanner_token(token, token_pepper).map_err(scanner_result_database_error)?;
     let scanner_id = upload.scanner_id.to_string();
@@ -1667,8 +1772,9 @@ async fn save_dns_scanner_results(
     }
     let task = transaction
         .query_opt(
-            "SELECT t.id AS task_id, t.user_id, e.id AS execution_id, e.execution_id AS public_execution_id, \
-             e.execution_status, t.task_source, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name \
+            "SELECT t.id AS task_id, t.user_id, t.task_port, t.task_level, t.remarks, t.generation_metadata, \
+             e.id AS execution_id, e.execution_id AS public_execution_id, e.execution_status, t.task_source, \
+             COALESCE(s.name, e.assigned_scanner_id) AS scanner_name \
              FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id \
              LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id \
              WHERE t.task_id = $1 AND e.assigned_scanner_id = $2 \
@@ -1700,6 +1806,11 @@ async fn save_dns_scanner_results(
         batch_index,
         is_final,
     };
+    let follow_up_enabled = task
+        .get::<_, Value>("generation_metadata")
+        .pointer("/dns_follow_up/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let payload_checksum = openssl::sha::sha256(
         &serde_json::to_vec(&serde_json::json!({
             "execution_id": context.execution_id,
@@ -1720,7 +1831,8 @@ async fn save_dns_scanner_results(
                  MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
                  MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
                  COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
-                 COUNT(*) FILTER (WHERE is_final)::BIGINT AS final_count \
+                 COUNT(*) FILTER (WHERE is_final)::BIGINT AS final_count, \
+                 BOOL_OR(is_final) FILTER (WHERE batch_index = $3) AS current_is_final \
                  FROM scan_result_batch WHERE execution_id = $1 AND upload_id = $2;",
                 &[&execution_db_id, &upload_id, &batch_index],
             )
@@ -1736,9 +1848,16 @@ async fn save_dns_scanner_results(
                 && first_prior == Some(0)
                 && last_prior == Some(batch_index - 1)
         };
+        let final_count: i64 = sequence.get("final_count");
+        let current_is_final: Option<bool> = sequence.get("current_is_final");
+        let existing_final_valid = match current_is_final {
+            Some(true) => final_count == 1,
+            Some(false) => false,
+            None => final_count == 0,
+        };
         if !complete_prior_sequence
             || sequence.get::<_, i64>("later_count") != 0
-            || sequence.get::<_, i64>("final_count") != 0
+            || !existing_final_valid
         {
             return Err(SaveScannerResultsError::InvalidUpload(
                 "final DNS batch requires one contiguous sequence starting at batch_index 0".into(),
@@ -1747,7 +1866,7 @@ async fn save_dns_scanner_results(
     }
     if let Some(existing) = transaction
         .query_opt(
-            "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+            "SELECT is_final, observation_count, payload_checksum, storage_backend FROM scan_result_batch \
              WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
             &[&execution_db_id, &upload_id, &batch_index],
         )
@@ -1765,35 +1884,97 @@ async fn save_dns_scanner_results(
                 "batch identity was already used with different content".into(),
             ));
         }
+        if existing.get::<_, String>("storage_backend") != "pending" {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        }
+    } else {
+        transaction
+            .execute(
+                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
+                 protocol_version, payload_checksum, storage_backend, storage_references) \
+                 VALUES ($1, $2, $3, $4, $5, 2, $6, 'pending', '[]'::JSONB);",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &is_final,
+                    &observation_count,
+                    &payload_checksum,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+    }
+    // `pending` 是持久化的上传占位符。先提交占位符再访问 ES，可以释放任务行锁和
+    // PostgreSQL 连接；进程中断后，同一批次会从 pending 状态幂等重试。
+    transaction
+        .commit()
+        .await
+        .map_err(scanner_result_database_error)?;
+    drop(client);
+    elasticsearch
+        .persist_dns_observations(&context, "default", &observations)
+        .await
+        .map_err(SaveScannerResultsError::Storage)?;
+    let mut client = pool.get().await.map_err(scanner_result_database_error)?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(scanner_result_database_error)?;
+    transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '10s';")
+        .await
+        .map_err(scanner_result_database_error)?;
+    transaction
+        .query_one(
+            "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
+            &[&execution_db_id],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    let receipt_updated = transaction
+        .execute(
+            "UPDATE scan_result_batch SET storage_backend = 'elasticsearch', storage_references = $4 \
+             WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3 \
+             AND storage_backend = 'pending';",
+            &[
+                &execution_db_id,
+                &upload_id,
+                &batch_index,
+                &serde_json::json!(["dns-observations", "dns-records"]),
+            ],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    if receipt_updated == 0 {
         transaction
             .commit()
             .await
             .map_err(scanner_result_database_error)?;
         return Ok(0);
     }
-    // The control-plane receipt is only written after the idempotent ES writes
-    // have succeeded. A retry repeats harmless create/upsert operations.
-    elasticsearch
-        .persist_dns_observations(&context, "default", &observations)
-        .await
-        .map_err(SaveScannerResultsError::Storage)?;
-    transaction
-        .execute(
-            "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
-             protocol_version, payload_checksum, storage_backend, storage_references) \
-             VALUES ($1, $2, $3, $4, $5, 2, $6, 'elasticsearch', $7);",
-            &[
-                &execution_db_id,
-                &upload_id,
-                &batch_index,
-                &is_final,
-                &observation_count,
-                &payload_checksum,
-                &serde_json::json!(["dns-observations", "dns-records"]),
-            ],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
+    if follow_up_enabled {
+        let resolved_ips = resolved_dns_answer_ips(&observations);
+        if !resolved_ips.is_empty() {
+            let values = resolved_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            transaction
+                .execute(
+                    "INSERT INTO dns_resolved_address (execution_id, task_id, ip_address) \
+                     SELECT $1, $2, value::INET FROM UNNEST($3::TEXT[]) AS value \
+                     ON CONFLICT (execution_id, ip_address) DO NOTHING;",
+                    &[&execution_db_id, &task_db_id, &values],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
+        }
+    }
     if is_final {
         transaction
             .execute(
@@ -1808,12 +1989,229 @@ async fn save_dns_scanner_results(
         refresh_task_aggregate(&transaction, task_db_id)
             .await
             .map_err(scanner_result_database_error)?;
+        if follow_up_enabled {
+            create_dns_follow_up_tasks(
+                &transaction,
+                &task,
+                dns_follow_up,
+                task_db_id,
+                execution_db_id,
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        }
     }
     transaction
         .commit()
         .await
         .map_err(scanner_result_database_error)?;
     Ok(usize::try_from(observation_count).expect("non-negative observation count"))
+}
+
+fn resolved_dns_answer_ips(observations: &[dns::DnsObservation]) -> Vec<IpAddr> {
+    observations
+        .iter()
+        .flat_map(|observation| observation.answers.iter())
+        .filter(|answer| matches!(answer.record_type.as_str(), "A" | "AAAA"))
+        .filter_map(|answer| answer.value.parse::<IpAddr>().ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+async fn create_dns_follow_up_tasks(
+    transaction: &deadpool_postgres::Transaction<'_>,
+    parent: &Row,
+    policy: &dns_follow_up::DnsFollowUpConfig,
+    parent_task_id: i32,
+    parent_execution_id: i32,
+) -> Result<(), tokio_postgres::Error> {
+    let metadata: Value = parent.get("generation_metadata");
+    let Some(follow_up) = metadata.get("dns_follow_up") else {
+        return Ok(());
+    };
+    if follow_up.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let scan_profile = follow_up
+        .get("scan_profile")
+        .and_then(Value::as_str)
+        .unwrap_or("port_only");
+    let stored_addresses = transaction
+        .query(
+            "SELECT host(ip_address) AS ip FROM dns_resolved_address WHERE execution_id = $1 ORDER BY ip_address;",
+            &[&parent_execution_id],
+        )
+        .await?;
+    let mut targets = BTreeMap::<&str, Vec<String>>::new();
+    for row in stored_addresses {
+        let ip: String = row.get("ip");
+        let Ok(parsed) = ip.parse::<IpAddr>() else {
+            continue;
+        };
+        if policy.enabled && policy.allows(parsed) {
+            targets
+                .entry(if parsed.is_ipv4() { "ipv4" } else { "ipv6" })
+                .or_default()
+                .push(parsed.to_string());
+        }
+    }
+    let eligible_ip_count = targets.values().map(Vec::len).sum::<usize>();
+    if !policy.enabled {
+        transaction
+            .execute(
+                "INSERT INTO dns_follow_up_generation (execution_id, status, eligible_ip_count, created_task_count) \
+                 VALUES ($1, 'blocked_policy', 0, 0) ON CONFLICT (execution_id) DO NOTHING;",
+                &[&parent_execution_id],
+            )
+            .await?;
+        return Ok(());
+    }
+    if eligible_ip_count == 0 {
+        transaction
+            .execute(
+                "INSERT INTO dns_follow_up_generation (execution_id, status, eligible_ip_count, created_task_count) \
+                 VALUES ($1, 'no_eligible_ip', 0, 0) ON CONFLICT (execution_id) DO NOTHING;",
+                &[&parent_execution_id],
+            )
+            .await?;
+        return Ok(());
+    }
+    let claimed = transaction
+        .execute(
+            "INSERT INTO dns_follow_up_generation (execution_id, status, eligible_ip_count, created_task_count) \
+             VALUES ($1, 'succeeded', $2, 0) ON CONFLICT (execution_id) DO NOTHING;",
+            &[&parent_execution_id, &(eligible_ip_count as i32)],
+        )
+        .await?;
+    if claimed == 0 {
+        return Ok(());
+    }
+
+    let user_id: i32 = parent.get("user_id");
+    let port: String = parent.get("task_port");
+    let level: i32 = parent.get("task_level");
+    let parent_public_execution_id: String = parent.get("public_execution_id");
+    let scan_plan =
+        build_scan_plan(scan_profile).expect("stored DNS follow-up profile was validated");
+    let mut created_task_count = 0_i32;
+    for (family, family_targets) in targets {
+        for (chunk_index, chunk) in family_targets
+            .chunks(usize::from(policy.max_targets_per_task))
+            .enumerate()
+        {
+            let task_id = Uuid::now_v7().to_string();
+            let metadata = serde_json::json!({
+                "dns_follow_up": {
+                    "parent_task_id": parent_task_id,
+                    "parent_execution_id": parent_public_execution_id,
+                    "source": "dns_a_aaaa_answer",
+                }
+            });
+            let task_pk: i32 = transaction
+                .query_one(
+                    "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
+                     dispatch_mode, task_source, generation_strategy, generation_key, generation_metadata, address_family, scan_profile, scan_plan) \
+                     VALUES ($1, $2, 'system', ARRAY(SELECT value::INET FROM UNNEST($3::TEXT[]) AS value), $4, $5, \
+                     'DNS 解析自动生成端口扫描任务', 'automatic', 'dns_follow_up', 'dns_resolution', $6, $7, $8, $9, $10) \
+                     RETURNING id;",
+                    &[
+                        &user_id,
+                        &task_id,
+                        &chunk,
+                        &port,
+                        &level,
+                        &format!("dns:{parent_public_execution_id}:{family}:{chunk_index}"),
+                        &metadata,
+                        &family,
+                        &scan_profile,
+                        &scan_plan,
+                    ],
+                )
+                .await?
+                .get("id");
+            transaction
+                .execute(
+                    "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, NULL);",
+                    &[&Uuid::now_v7().to_string(), &task_pk],
+                )
+                .await?;
+            transaction
+                .execute(
+                    "INSERT INTO scan_task_lineage (parent_task_id, parent_execution_id, child_task_id, source_addresses) \
+                     VALUES ($1, $2, $3, ARRAY(SELECT value::INET FROM UNNEST($4::TEXT[]) AS value));",
+                    &[&parent_task_id, &parent_execution_id, &task_pk, &chunk],
+                )
+                .await?;
+            created_task_count += 1;
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE dns_follow_up_generation SET created_task_count = $2 WHERE execution_id = $1;",
+            &[&parent_execution_id, &created_task_count],
+        )
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod dns_follow_up_tests {
+    use super::resolved_dns_answer_ips;
+    use crate::dns::{DnsAnswer, DnsObservation, DnsQuestion};
+
+    fn observation(answers: Vec<(&str, &str)>) -> DnsObservation {
+        DnsObservation {
+            observed_at: 1,
+            question: DnsQuestion {
+                name: "example.test".into(),
+                record_type: "A".into(),
+                class: "IN".into(),
+            },
+            response_code: "NOERROR".into(),
+            authoritative: false,
+            truncated: false,
+            dnssec_authenticated: false,
+            answers: answers
+                .into_iter()
+                .map(|(record_type, value)| DnsAnswer {
+                    record_type: record_type.into(),
+                    value: value.into(),
+                    ttl: 60,
+                    priority: None,
+                    weight: None,
+                    port: None,
+                })
+                .collect(),
+            authority: Vec::new(),
+            additional: Vec::new(),
+            resolver_ip: None,
+            resolver_id: None,
+            resolver_label: None,
+            resolver_port: None,
+            resolver_transport: None,
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn resolved_dns_addresses_include_only_unique_a_and_aaaa_answers() {
+        let resolved = resolved_dns_answer_ips(&[
+            observation(vec![
+                ("A", "192.0.2.10"),
+                ("AAAA", "2001:db8::10"),
+                ("CNAME", "alias.example.test"),
+            ]),
+            observation(vec![("A", "192.0.2.10"), ("A", "not-an-ip")]),
+        ]);
+        assert_eq!(
+            resolved
+                .into_iter()
+                .map(|address| address.to_string())
+                .collect::<Vec<_>>(),
+            vec!["192.0.2.10", "2001:db8::10"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1914,6 +2312,7 @@ pub async fn save_scanner_results(
     pool: &deadpool_postgres::Pool,
     maxmind: &MaxMindState,
     elasticsearch: &ElasticsearchService,
+    dns_follow_up: &dns_follow_up::DnsFollowUpConfig,
     upload: &ScannerResultUpload,
     token: &str,
     token_pepper: &str,
@@ -1984,6 +2383,7 @@ pub async fn save_scanner_results(
             let dns_count = save_dns_scanner_results(
                 pool,
                 elasticsearch,
+                dns_follow_up,
                 &dns_upload,
                 token,
                 token_pepper,
@@ -2002,6 +2402,7 @@ pub async fn save_scanner_results(
                 pool,
                 maxmind,
                 elasticsearch,
+                dns_follow_up,
                 &regular_upload,
                 token,
                 token_pepper,
@@ -2032,6 +2433,7 @@ pub async fn save_scanner_results(
         return save_dns_scanner_results(
             pool,
             elasticsearch,
+            dns_follow_up,
             upload,
             token,
             token_pepper,
@@ -2046,6 +2448,10 @@ pub async fn save_scanner_results(
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()
+        .await
+        .map_err(scanner_result_database_error)?;
+    transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '10s';")
         .await
         .map_err(scanner_result_database_error)?;
     let token_hash =
@@ -2212,16 +2618,14 @@ pub async fn save_scanner_results(
     let mut ip_intel_cache = HashMap::new();
     let fallback_observed_at = task_start_time.unwrap_or_else(get_unix_epoch_ms);
     for observation in &normalized_observations {
-        let parsed_ip = parse_ip_or_cidr(&observation.ip).map_err(|source_error| {
-            SaveScannerResultsError::InvalidIp {
+        let (ip_address, ip_network, parsed_ip) = scan_observation_addresses(&observation.ip)
+            .map_err(|source_error| SaveScannerResultsError::InvalidIp {
                 ip: observation.ip.clone(),
                 source: source_error,
-            }
-        })?;
-        let canonical_ip = parsed_ip.to_string();
+            })?;
         let observation_key = serde_json::to_string(&serde_json::json!([
             observation.kind,
-            canonical_ip,
+            ip_network,
             observation.port,
             observation.protocol,
             observation.service,
@@ -2231,17 +2635,16 @@ pub async fn save_scanner_results(
         let endpoint_id = openssl::sha::sha256(
             format!(
                 "{}\0{}\0{}",
-                public_execution_id, canonical_ip, observation.port
+                public_execution_id, ip_network, observation.port
             )
             .as_bytes(),
         )
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-        let ip_addr = parsed_ip.addr();
         let intel = ip_intel_cache
-            .entry(ip_addr)
-            .or_insert_with(|| maxmind.lookup(ip_addr))
+            .entry(parsed_ip)
+            .or_insert_with(|| maxmind.lookup(parsed_ip))
             .clone();
         let search_content = search_content::extract_search_content(observation.data.as_ref());
         let observed_at = observation.observed_at.unwrap_or(fallback_observed_at);
@@ -2254,7 +2657,10 @@ pub async fn save_scanner_results(
             "observation_key": observation_key,
             "endpoint_id": endpoint_id,
             "kind": observation.kind,
-            "ip_address": canonical_ip,
+            // `ip` fields reject CIDR strings. Preserve the network separately
+            // as `ip_range`, including /32 and /128 single-host networks.
+            "ip_address": ip_address,
+            "ip_network": ip_network,
             "port": i32::from(observation.port),
             "protocol": observation.protocol,
             "service": observation.service,
@@ -2280,7 +2686,8 @@ pub async fn save_scanner_results(
         let addresses = observation_rows
             .iter()
             .filter_map(|row| {
-                row.get("ip_address")
+                row.get("ip_network")
+                    .or_else(|| row.get("ip_address"))
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
@@ -2318,14 +2725,17 @@ pub async fn save_scanner_results(
                 .insert("tags".to_owned(), tags);
         }
     }
-    let mut storage_references = Vec::new();
-    let mut es_execution_summary = None;
-    let payload_checksum = if storage_mode.writes_elasticsearch() {
+    let storage_backend = match storage_mode {
+        config::ScanStorageMode::Postgres => "postgres",
+        config::ScanStorageMode::Dual => "dual",
+        config::ScanStorageMode::Elasticsearch => "elasticsearch",
+    };
+    let (transaction, batch_db_id, es_execution_summary) = if storage_mode.writes_elasticsearch() {
         let expected_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
             .map_err(SaveScannerResultsError::Storage)?;
         if let Some(existing) = transaction
             .query_opt(
-                "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+                "SELECT is_final, observation_count, payload_checksum, storage_backend FROM scan_result_batch \
                  WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
                 &[&execution_db_id, &upload_id, &batch_index],
             )
@@ -2343,17 +2753,92 @@ pub async fn save_scanner_results(
                     "batch identity was already used with different content".into(),
                 ));
             }
+            if existing.get::<_, String>("storage_backend") != "pending" {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(scanner_result_database_error)?;
+                return Ok(0);
+            }
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
+                     protocol_version, payload_checksum, storage_backend, storage_references) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', '[]'::JSONB);",
+                    &[
+                        &execution_db_id,
+                        &upload_id,
+                        &batch_index,
+                        &is_final,
+                        &observation_count,
+                        &protocol_version,
+                        &expected_checksum,
+                    ],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
         }
+        // 关键边界：任务行锁和连接在任何 Elasticsearch await 之前释放。
+        transaction
+            .commit()
+            .await
+            .map_err(scanner_result_database_error)?;
+        drop(client);
         let result = elasticsearch
             .persist_scan_batch(&batch_context, &observation_rows)
             .await
             .map_err(SaveScannerResultsError::Storage)?;
         debug_assert_eq!(result.payload_checksum, expected_checksum);
-        storage_references = result.indices;
-        es_execution_summary = result.execution_summary;
-        result.payload_checksum
+        let storage_references =
+            Value::Array(result.indices.into_iter().map(Value::String).collect());
+        client = pool.get().await.map_err(scanner_result_database_error)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(scanner_result_database_error)?;
+        transaction
+            .batch_execute(
+                "SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '15s';",
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        transaction
+            .query_one(
+                "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
+                &[&execution_db_id],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let receipt = transaction
+            .query_opt(
+                "UPDATE scan_result_batch SET storage_backend = $4, storage_references = $5 \
+                 WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3 \
+                 AND storage_backend = 'pending' RETURNING id;",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &storage_backend,
+                    &storage_references,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let Some(receipt) = receipt else {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        };
+        (
+            transaction,
+            receipt.get::<_, i64>("id"),
+            result.execution_summary,
+        )
     } else {
-        openssl::sha::sha256(
+        let payload_checksum = openssl::sha::sha256(
             &serde_json::to_vec(&serde_json::json!({
                 "execution_id": public_execution_id,
                 "upload_id": upload_id,
@@ -2365,62 +2850,56 @@ pub async fn save_scanner_results(
         )
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
-    };
-    let storage_backend = match storage_mode {
-        config::ScanStorageMode::Postgres => "postgres",
-        config::ScanStorageMode::Dual => "dual",
-        config::ScanStorageMode::Elasticsearch => "elasticsearch",
-    };
-    let storage_references =
-        Value::Array(storage_references.into_iter().map(Value::String).collect());
-    let row = transaction
-        .query_opt(
-            "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
-                protocol_version, payload_checksum, storage_backend, storage_references) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING RETURNING id;",
-            &[
-                &execution_db_id,
-                &upload_id,
-                &batch_index,
-                &is_final,
-                &observation_count,
-                &protocol_version,
-                &payload_checksum,
-                &storage_backend,
-                &storage_references,
-            ],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
-    let Some(row) = row else {
-        let existing = transaction
-            .query_one(
-                "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
-                 WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
-                &[&execution_db_id, &upload_id, &batch_index],
+        .collect::<String>();
+        let storage_references = Value::Array(Vec::new());
+        let row = transaction
+            .query_opt(
+                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
+                    protocol_version, payload_checksum, storage_backend, storage_references) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING RETURNING id;",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &is_final,
+                    &observation_count,
+                    &protocol_version,
+                    &payload_checksum,
+                    &storage_backend,
+                    &storage_references,
+                ],
             )
             .await
             .map_err(scanner_result_database_error)?;
-        let existing_checksum: Option<String> = existing.get("payload_checksum");
-        if existing.get::<_, bool>("is_final") != is_final
-            || existing.get::<_, i32>("observation_count") != observation_count
-            || existing_checksum
-                .as_deref()
-                .is_some_and(|checksum| checksum != payload_checksum)
-        {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "batch identity was already used with different content".into(),
-            ));
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(scanner_result_database_error)?;
-        return Ok(0);
+        let Some(row) = row else {
+            let existing = transaction
+                .query_one(
+                    "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+                     WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
+                    &[&execution_db_id, &upload_id, &batch_index],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
+            let existing_checksum: Option<String> = existing.get("payload_checksum");
+            if existing.get::<_, bool>("is_final") != is_final
+                || existing.get::<_, i32>("observation_count") != observation_count
+                || existing_checksum
+                    .as_deref()
+                    .is_some_and(|checksum| checksum != payload_checksum)
+            {
+                return Err(SaveScannerResultsError::InvalidUpload(
+                    "batch identity was already used with different content".into(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        };
+        (transaction, row.get::<_, i64>("id"), None)
     };
-    let batch_db_id: i64 = row.get("id");
     let observation_rows = Value::Array(observation_rows);
     // Keep the fact rows and their asset projection in one set-based statement. The
     // projection reads only rows inserted by this batch and deduplicates both IPs and
@@ -2429,8 +2908,9 @@ pub async fn save_scanner_results(
         let saved_row = transaction
             .query_one(
             "WITH input AS MATERIALIZED ( \
-                SELECT * FROM jsonb_to_recordset($4::jsonb) AS item( \
-                    observation_key TEXT, kind TEXT, ip_address INET, port INT, \
+                SELECT item.*, COALESCE(item.ip_network, item.ip_address) AS storage_ip_address \
+                FROM jsonb_to_recordset($4::jsonb) AS item( \
+                    observation_key TEXT, kind TEXT, ip_address INET, ip_network INET, port INT, \
                     protocol TEXT, service TEXT, banner TEXT, title TEXT, http_body TEXT, \
                     http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
                     search_content_extracted BOOLEAN, observed_at BIGINT, \
@@ -2440,7 +2920,7 @@ pub async fn save_scanner_results(
                 INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
                     ip_address, port, protocol, service, banner, title, http_body, \
                     http_body_truncated, tls_subject, search_content_extracted, source, data, observed_at) \
-                SELECT $2, $3, observation_key, kind, ip_address, port, protocol, service, \
+                SELECT $2, $3, observation_key, kind, storage_ip_address, port, protocol, service, \
                     banner, title, http_body, http_body_truncated, tls_subject, \
                     search_content_extracted, source, data, to_timestamp(observed_at / 1000.0) FROM input \
                 ON CONFLICT (execution_id, observation_key) DO NOTHING \
@@ -2452,12 +2932,12 @@ pub async fn save_scanner_results(
              ), upserted_ips AS ( \
                 INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
                     country_code, country_name, region_name, city_name) \
-                SELECT DISTINCT ON (item.ip_address) $1, $2, item.ip_address, item.asn, \
+                SELECT DISTINCT ON (item.storage_ip_address) $1, $2, item.storage_ip_address, item.asn, \
                     item.isp, item.as_org, item.country_code, item.country_name, \
                     item.region_name, item.city_name \
                 FROM input item \
-                JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.ip_address \
-                ORDER BY item.ip_address \
+                JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.storage_ip_address \
+                ORDER BY item.storage_ip_address \
                 ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
                     asn = COALESCE(EXCLUDED.asn, ips.asn), \
                     isp = COALESCE(EXCLUDED.isp, ips.isp), \
@@ -3183,14 +3663,6 @@ pub async fn get_filtered_task_page(
         next_cursor,
         has_more,
     })
-}
-
-/// 用于接收系统信息查询
-#[derive(Deserialize)]
-pub struct ReceiveSystemStatusInfo {
-    pub count: Option<i64>,
-    pub start_at: Option<i64>,
-    pub end_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]

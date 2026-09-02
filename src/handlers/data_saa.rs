@@ -5,15 +5,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use tokio_postgres::types::ToSql;
-use tracing::error;
 use uuid::Uuid;
 
-use crate::ReceiveSystemStatusInfo;
 use crate::admin::UserBaseI;
 use crate::config::AnalyticsSnapshotConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
-use crate::logs::write::error_logs;
-use crate::{SystemDetails, SystemStatusJson, Systems, get_system_status_info};
+use crate::logs::write::{error_logs, error_logs_error};
+use crate::runtime_config::RuntimeConfig;
+use crate::system_resource_cache::SystemResourceCache;
+use crate::{SystemDetails, SystemStatusJson, Systems};
 
 const ANALYSIS_TIMEZONE: &str = "Asia/Shanghai";
 const DEFAULT_RANGE_WEEKS: i64 = 12;
@@ -187,34 +187,14 @@ fn bad_request(message: &'static str) -> HttpResponse {
 #[get("/api/data/system-data")]
 async fn get_system_data_handler(
     _req: HttpRequest,
-    query_info: web::Query<ReceiveSystemStatusInfo>,
-    pool: web::Data<Pool>,
+    cache: web::Data<SystemResourceCache>,
     systems: web::Data<Systems>,
 ) -> impl Responder {
-    let p = pool.get_ref();
-
-    let (t, c) = match get_system_status_info(
-        query_info.start_at,
-        query_info.end_at,
-        query_info.count.unwrap_or(1),
-        p,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            error!(
-                event = "GetSystemStatusError",
-                path = "fn get_system_data_handler",
-                message = %e
-            );
-            return HttpResponse::InternalServerError().body("500 Internal Server Error");
-        }
-    };
+    let status_item: Vec<_> = cache.latest().into_iter().collect();
 
     let t_json = SystemStatusJson {
-        total_c: c,
-        status_item: t,
+        total_c: status_item.len() as i32,
+        status_item,
         system_info: SystemDetails::new(systems.get_ref()),
     };
 
@@ -227,7 +207,7 @@ pub(crate) async fn get_analysis_distribution(
     query: web::Query<DistributionQuery>,
     pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
-    analytics_snapshot: web::Data<AnalyticsSnapshotConfig>,
+    analytics_snapshot: web::Data<RuntimeConfig<AnalyticsSnapshotConfig>>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
@@ -242,7 +222,7 @@ pub(crate) async fn get_analysis_distribution(
     if !matches!(limit, 5 | 7 | 10) {
         return bad_request("limit must be 5, 7 or 10");
     }
-    if analytics_snapshot.mode.reads_snapshot() {
+    if analytics_snapshot.get().await.value.mode.reads_snapshot() {
         return analysis_distribution_from_snapshot(
             &req,
             pool.get_ref(),
@@ -360,14 +340,14 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     query: web::Query<HeatmapQuery>,
     pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
-    analytics_snapshot: web::Data<AnalyticsSnapshotConfig>,
+    analytics_snapshot: web::Data<RuntimeConfig<AnalyticsSnapshotConfig>>,
     user: UserBaseI,
 ) -> impl Responder {
     let filters = match normalize_filters(&query.filters) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    if analytics_snapshot.mode.reads_snapshot() {
+    if analytics_snapshot.get().await.value.mode.reads_snapshot() {
         return analysis_heatmap_from_snapshot(&req, pool.get_ref(), &filters, &user).await;
     }
     if elasticsearch.scan_storage_mode().reads_elasticsearch() {
@@ -377,7 +357,12 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error_value) => {
-            error_logs(&req, "AnalysisHeatmapPoolError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "AnalysisHeatmapPoolError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -409,7 +394,12 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error_value) => {
-            error_logs(&req, "AnalysisHeatmapQueryError", &error_value.to_string());
+            error_logs_error(
+                &req,
+                "AnalysisHeatmapQueryError",
+                "database_operation",
+                &error_value,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -451,7 +441,12 @@ async fn analysis_distribution_from_snapshot(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotPoolError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotPoolError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -462,7 +457,12 @@ async fn analysis_distribution_from_snapshot(
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotWatermarkError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotWatermarkError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::ServiceUnavailable()
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
@@ -500,7 +500,12 @@ async fn analysis_distribution_from_snapshot(
     let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotDistributionError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotDistributionError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -543,7 +548,12 @@ async fn analysis_heatmap_from_snapshot(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotPoolError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotPoolError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -554,7 +564,12 @@ async fn analysis_heatmap_from_snapshot(
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotWatermarkError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotWatermarkError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::ServiceUnavailable()
                 .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
         }
@@ -584,7 +599,12 @@ async fn analysis_heatmap_from_snapshot(
     let rows = match client.query(&sql, &params).await {
         Ok(value) => value,
         Err(error) => {
-            error_logs(req, "AnalysisSnapshotHeatmapError", &error.to_string());
+            error_logs_error(
+                req,
+                "AnalysisSnapshotHeatmapError",
+                "database_operation",
+                &error,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };

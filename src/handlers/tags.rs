@@ -4,7 +4,7 @@ use std::str::FromStr;
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
 use crate::elasticsearch::ElasticsearchService;
-use crate::logs::write::error_logs;
+use crate::logs::write::{error_logs, error_logs_error};
 use crate::search_projection;
 use actix_web::{HttpRequest, HttpResponse, Responder, delete, get, patch, post, web};
 use deadpool_postgres::{Pool, Transaction};
@@ -218,9 +218,9 @@ pub(crate) fn tags_from_json(value: Value) -> Vec<AssetTag> {
 fn database_error(
     req: &HttpRequest,
     event: &str,
-    error_value: &dyn std::fmt::Display,
+    error_value: &(dyn std::error::Error + 'static),
 ) -> HttpResponse {
-    error_logs(req, event, &error_value.to_string());
+    error_logs_error(req, event, "tag_database_operation", error_value);
     HttpResponse::InternalServerError()
         .json(json!({"success": false, "message": "标签服务暂时不可用"}))
 }
