@@ -2043,8 +2043,8 @@ impl ElasticsearchService {
                     &format!("/{}/_search", self.inner.config.dns_record_index),
                     |request| {
                         request.json(&json!({
-                            "size": MAX_DOMAIN_RECORDS + 1,
-                            "track_total_hits": false,
+                            "size": MAX_DOMAIN_RECORDS,
+                            "track_total_hits": MAX_DOMAIN_RECORDS,
                             "_source": ["record_type", "ip", "target_domain"],
                             "query": {"bool": {"filter": [
                                 {"term": {"tenant_id": "default"}},
@@ -2061,7 +2061,11 @@ impl ElasticsearchService {
                 .and_then(Value::as_array)
                 .ok_or_else(|| "DNS 搜索响应缺少 hits.hits".to_owned())?;
             processed_records = processed_records.saturating_add(hits.len());
-            if hits.len() > MAX_DOMAIN_RECORDS || processed_records > MAX_DOMAIN_RECORDS {
+            let exceeded_result_limit = response
+                .pointer("/hits/total/relation")
+                .and_then(Value::as_str)
+                == Some("gte");
+            if exceeded_result_limit || processed_records > MAX_DOMAIN_RECORDS {
                 return Err(
                     "DOMAIN_RESULT_TOO_BROAD: 域名匹配的 DNS 记录超过 10000 条，请增加限定条件"
                         .to_owned(),
