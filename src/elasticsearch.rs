@@ -952,13 +952,21 @@ impl ElasticsearchService {
                 )
                 .await?;
             if response.status().is_success() {
-                self.send_json_request(
-                    ElasticsearchOperation::IndexAdmin,
-                    Method::PUT,
-                    &format!("{observation_pattern}/_mapping"),
-                    |request| request.json(&scan_observation_compatibility_mapping()),
-                )
-                .await?;
+                // 索引通配符在节点状态切换或索引刚被删除时可能在 HEAD 与 PUT
+                // 之间不再匹配任何索引。此时没有旧映射需要升级，不应阻断服务初始化。
+                let response = self
+                    .send_request(
+                        ElasticsearchOperation::IndexAdmin,
+                        Method::PUT,
+                        &format!(
+                            "{observation_pattern}/_mapping?allow_no_indices=true&ignore_unavailable=true"
+                        ),
+                        |request| request.json(&scan_observation_compatibility_mapping()),
+                    )
+                    .await?;
+                if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
+                    return Err(response_error(response).await);
+                }
             } else if response.status() != StatusCode::NOT_FOUND {
                 return Err(response_error(response).await);
             }
@@ -2615,14 +2623,43 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
         return;
     }
     let mut ticker = interval(Duration::from_millis(service.inner.config.poll_interval_ms));
+    let mut initialization_failures = 0_u32;
     loop {
         ticker.tick().await;
-        if !service.runtime().connected
-            && let Err(message) = service.initialize(&pool).await
-        {
-            service.mark_error(&message);
-            warn!(event = "ElasticsearchInitializeError", message = %message);
-            continue;
+        if !service.runtime().connected {
+            match service.initialize(&pool).await {
+                Ok(_) => {
+                    if initialization_failures > 0 {
+                        info!(
+                            event = "ElasticsearchInitializeRecovered",
+                            failed_attempts = initialization_failures,
+                            "Elasticsearch 初始化已恢复"
+                        );
+                    }
+                    initialization_failures = 0;
+                }
+                Err(message) => {
+                    service.mark_error(&message);
+                    initialization_failures = initialization_failures.saturating_add(1);
+                    let retry_after = initialization_retry_delay(
+                        service.inner.config.poll_interval_ms,
+                        initialization_failures,
+                    );
+                    // 首次失败和指数退避的边界都保留完整日志，避免配置错误时每个轮询
+                    // 周期重复同一条错误。
+                    if initialization_failures == 1 || initialization_failures.is_power_of_two() {
+                        warn!(
+                            event = "ElasticsearchInitializeError",
+                            attempt = initialization_failures,
+                            retry_after_ms = retry_after.as_millis(),
+                            message = %message,
+                            "Elasticsearch 初始化失败，稍后重试"
+                        );
+                    }
+                    sleep(retry_after).await;
+                    continue;
+                }
+            }
         }
         match service.process_scan_projection_outbox(&pool).await {
             Ok(true) => continue,
@@ -3142,6 +3179,13 @@ fn bulk_response_is_retryable(result: &Value, create_conflict_is_success: bool) 
 
 fn bulk_retry_delay(initial_ms: u64, attempt: u32) -> Duration {
     let multiplier = 1_u64.checked_shl(attempt.min(16)).unwrap_or(u64::MAX);
+    Duration::from_millis(initial_ms.saturating_mul(multiplier).min(30_000))
+}
+
+fn initialization_retry_delay(poll_interval_ms: u64, failures: u32) -> Duration {
+    let initial_ms = poll_interval_ms.max(500);
+    let exponent = failures.saturating_sub(1).min(6);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
     Duration::from_millis(initial_ms.saturating_mul(multiplier).min(30_000))
 }
 
@@ -3757,9 +3801,10 @@ mod tests {
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
-        bulk_retry_delay, index_definition, new_trace_context, parse_asn, parse_storage_metrics,
-        scan_batch_payload_checksum, scan_endpoint_index_definition,
-        scan_observation_compatibility_mapping, scan_observation_template,
+        bulk_retry_delay, index_definition, initialization_retry_delay, new_trace_context,
+        parse_asn, parse_storage_metrics, scan_batch_payload_checksum,
+        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
+        scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::time::Duration;
@@ -3901,6 +3946,22 @@ mod tests {
         assert_eq!(bulk_retry_delay(200, 0), Duration::from_millis(200));
         assert_eq!(bulk_retry_delay(200, 3), Duration::from_millis(1_600));
         assert_eq!(bulk_retry_delay(60_000, 10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn initialization_retry_delay_is_exponential_and_capped() {
+        assert_eq!(
+            initialization_retry_delay(500, 1),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            initialization_retry_delay(500, 2),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            initialization_retry_delay(500, 20),
+            Duration::from_millis(30_000)
+        );
     }
 
     #[test]

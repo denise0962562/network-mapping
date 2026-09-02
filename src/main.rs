@@ -97,19 +97,21 @@ async fn main() -> io::Result<()> {
 
     let db_pool = db::create_postgresql_pool(&db_config)
         .await
-        .map_err(|error_value| {
+        .unwrap_or_else(|error_value| {
             let diagnostics = error_chain_diagnostics(error_value.as_ref());
             error!(
                 target: "server::startup",
                 event = "DatabaseStartupFailed",
+                startup_stage = "connection_pool",
                 database_host = %db_config.host,
                 database_port = db_config.port,
                 database_name = %db_config.db_name,
                 message = %diagnostics,
-                "数据库初始化失败，服务未启动"
+                error = ?error_value,
+                "数据库初始化失败，服务即将终止"
             );
-            io::Error::other(format!("数据库初始化失败：{diagnostics}"))
-        })?;
+            panic!("数据库初始化失败：{diagnostics}");
+        });
     let pool = db_pool.clone();
     let request_log_pool = db_pool.clone();
     let scanner_latency_pool = db_pool.clone();
@@ -130,7 +132,22 @@ async fn main() -> io::Result<()> {
 
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
-        Err(e) => panic!("初始化数据库错误{}", e),
+        Err(error_value) => {
+            let diagnostics = error_chain_diagnostics(error_value.as_ref());
+            error!(
+                target: "server::startup",
+                event = "DatabaseStartupFailed",
+                startup_stage = "schema_initialization",
+                database_host = %db_config.host,
+                database_port = db_config.port,
+                database_name = %db_config.db_name,
+                init_database_file = %db_config.init_database_file,
+                message = %diagnostics,
+                error = ?error_value,
+                "数据库结构初始化失败，服务即将终止"
+            );
+            panic!("初始化数据库错误：{diagnostics}");
+        }
     };
     if !args.rebuild_elasticsearch
         && !args.refresh_ip_intel
@@ -141,8 +158,20 @@ async fn main() -> io::Result<()> {
         match network_mapping_server::search_projection::ensure_initialized(&db_pool).await {
             Ok(true) => info!(target: "server::startup", "历史数据已生成 PostgreSQL 当前端点投影"),
             Ok(false) => {}
-            Err(error) => {
-                return Err(io::Error::other(format!("初始化当前端点投影失败：{error}")));
+            Err(error_value) => {
+                let diagnostics = error_chain_diagnostics(error_value.as_ref());
+                error!(
+                    target: "server::startup",
+                    event = "DatabaseStartupFailed",
+                    startup_stage = "search_projection_initialization",
+                    database_host = %db_config.host,
+                    database_port = db_config.port,
+                    database_name = %db_config.db_name,
+                    message = %diagnostics,
+                    error = ?error_value,
+                    "PostgreSQL 当前端点投影初始化失败，服务即将终止"
+                );
+                panic!("初始化当前端点投影失败：{diagnostics}");
             }
         }
     }

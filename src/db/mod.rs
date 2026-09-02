@@ -142,20 +142,12 @@ pub async fn init_database_table(
     cpool: &deadpool_postgres::Pool,
     file_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sql_from_f = fs::read_to_string(file_path).await;
-    match sql_from_f {
-        Ok(o) => {
-            let mut client = cpool.get().await?;
-            let transaction = client.transaction().await?;
-            debug!("开始执行数据库初始化事务");
-            transaction.batch_execute(&o).await?;
-            transaction.commit().await?;
-        }
-        Err(e) => {
-            tracing::error!("{}", e);
-            panic!("读取目标文件失败");
-        }
-    };
+    let sql = fs::read_to_string(file_path).await?;
+    let mut client = cpool.get().await?;
+    let transaction = client.transaction().await?;
+    debug!(init_database_file = file_path, "开始执行数据库初始化事务");
+    transaction.batch_execute(&sql).await?;
+    transaction.commit().await?;
 
     Ok(())
 }

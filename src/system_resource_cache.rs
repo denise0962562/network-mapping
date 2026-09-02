@@ -126,7 +126,9 @@ impl SystemResourceCache {
     /// 后台分页恢复最近 30 天的轻量样本。分页之间释放连接，避免启动恢复独占连接池。
     pub async fn hydrate_from_database(&self, pool: &Pool) {
         let cutoff = chrono::Utc::now().timestamp() - HISTORY_RETENTION_SECONDS;
-        let mut last_id = 0_i64;
+        // `system_status.id` 是 PostgreSQL `SERIAL`，其参数类型为 INT4；使用 i64
+        // 会在 tokio-postgres 序列化第二个查询参数时失败。
+        let mut last_id = 0_i32;
         let mut restored = 0_usize;
         loop {
             let client = match pool.get().await {
@@ -146,7 +148,15 @@ impl SystemResourceCache {
             {
                 Ok(rows) => rows,
                 Err(error) => {
-                    warn!(event = "SystemResourceCacheHydrateQueryError", message = %error);
+                    warn!(
+                        event = "SystemResourceCacheHydrateQueryError",
+                        cutoff_seconds = cutoff,
+                        last_id,
+                        page_size = HYDRATE_PAGE_SIZE,
+                        message = %error,
+                        error = ?error,
+                        "系统资源缓存恢复查询失败"
+                    );
                     return;
                 }
             };
