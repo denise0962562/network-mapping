@@ -115,6 +115,13 @@ fn bad_request(message: impl Into<String>) -> HttpResponse {
     HttpResponse::BadRequest().json(serde_json::json!({ "message": message.into() }))
 }
 
+fn domain_result_too_broad(error: &str) -> HttpResponse {
+    HttpResponse::UnprocessableEntity().json(serde_json::json!({
+        "code": "DOMAIN_RESULT_TOO_BROAD",
+        "message": error.strip_prefix("DOMAIN_RESULT_TOO_BROAD: ").unwrap_or(error),
+    }))
+}
+
 #[get("/api/search/elasticsearch/status")]
 pub async fn elasticsearch_status(
     pool: web::Data<Pool>,
@@ -147,7 +154,7 @@ pub async fn search_v2(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    let compiled = match parse_and_compile(query) {
+    let elasticsearch_compilation = match parse_and_compile_elasticsearch(query) {
         Ok(value) => value,
         Err(error_value) => {
             let utf16_offset = |byte_offset: usize| {
@@ -166,12 +173,10 @@ pub async fn search_v2(
             }));
         }
     };
-
-    let elasticsearch_compilation = parse_and_compile_elasticsearch(query)
-        .expect("PostgreSQL and Elasticsearch parsers share the validated syntax tree");
     if elasticsearch.scan_storage_mode().reads_elasticsearch() {
         return match elasticsearch_compilation {
-            ElasticsearchCompilation::Supported(filter) => respond_search_elasticsearch(
+            ElasticsearchCompilation::Supported(filter)
+            | ElasticsearchCompilation::RequiresElasticsearch(filter) => respond_search_elasticsearch(
                 elasticsearch.get_ref(), &user, "advanced", query.to_owned(), filter, (limit, offset),
             ).await,
             ElasticsearchCompilation::RequiresPostgres => HttpResponse::UnprocessableEntity().json(
@@ -180,8 +185,60 @@ pub async fn search_v2(
         };
     }
 
-    if let ElasticsearchCompilation::Supported(filter) = elasticsearch_compilation {
-        if elasticsearch.can_read() {
+    match elasticsearch_compilation {
+        ElasticsearchCompilation::RequiresElasticsearch(filter) => {
+            if !elasticsearch.can_read() {
+                return HttpResponse::ServiceUnavailable()
+                    .json(serde_json::json!({"message": "域名搜索索引暂时不可用"}));
+            }
+            match elasticsearch
+                .search(user.role, user.id, filter, limit, offset)
+                .await
+            {
+                Ok(page) => {
+                    let items = page
+                        .items
+                        .into_iter()
+                        .map(|item| SearchItem {
+                            ip_address: item.ip_address,
+                            port: Some(item.port),
+                            protocol: item.protocol,
+                            service: item.service,
+                            banner: item.banner,
+                            title: item.title,
+                            tls_subject: item.tls_subject,
+                            scanner_name: item.scanner_name,
+                            scan_time: Some(item.scan_time),
+                            asn: item.asn,
+                            isp: item.isp,
+                            as_org: item.as_org,
+                            country_code: item.country_code,
+                            country_name: item.country_name,
+                            region_name: item.region_name,
+                            city_name: item.city_name,
+                            tags: item.tags,
+                        })
+                        .collect();
+                    return HttpResponse::Ok().json(SearchResponse {
+                        query_type: "advanced",
+                        query: query.to_owned(),
+                        items,
+                        total: page.total,
+                        limit,
+                        offset,
+                    });
+                }
+                Err(err) if err.starts_with("DOMAIN_RESULT_TOO_BROAD:") => {
+                    return domain_result_too_broad(&err);
+                }
+                Err(err) => {
+                    error!(event = "ElasticsearchSearchError", message = %err, error = ?err);
+                    return HttpResponse::ServiceUnavailable()
+                        .json(serde_json::json!({"message": "域名搜索索引暂时不可用"}));
+                }
+            }
+        }
+        ElasticsearchCompilation::Supported(filter) if elasticsearch.can_read() => {
             match elasticsearch
                 .search(user.role, user.id, filter, limit, offset)
                 .await
@@ -228,11 +285,22 @@ pub async fn search_v2(
                         .json(serde_json::json!({"message": "搜索索引暂时不可用"}));
                 }
             }
-        } else if !elasticsearch.fallback_to_postgres() {
+        }
+        ElasticsearchCompilation::Supported(_) if !elasticsearch.fallback_to_postgres() => {
             return HttpResponse::ServiceUnavailable()
                 .json(serde_json::json!({"message": "搜索索引暂时不可用"}));
         }
+        ElasticsearchCompilation::Supported(_) | ElasticsearchCompilation::RequiresPostgres => {}
     }
+
+    let compiled = match parse_and_compile(query) {
+        Ok(value) => value,
+        Err(error_value) => {
+            error!(event = "AdvancedSearchPostgresCompilationError", message = %error_value.message);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"message": "搜索索引暂时不可用"}));
+        }
+    };
 
     let limit_parameter = compiled.parameters.len() + 3;
     let offset_parameter = compiled.parameters.len() + 4;
@@ -473,6 +541,9 @@ async fn respond_search_elasticsearch(
             limit,
             offset,
         }),
+        Err(error_value) if error_value.starts_with("DOMAIN_RESULT_TOO_BROAD:") => {
+            domain_result_too_broad(&error_value)
+        }
         Err(error_value) => {
             error!(event = "SearchElasticsearchError", query_type, message = %error_value);
             HttpResponse::ServiceUnavailable()

@@ -180,6 +180,25 @@ tag:生产环境
 - 其他字段：转换为精确匹配 `=`；
 - `ip` 的值为 CIDR 时，按网段包含关系处理。
 
+### 3.5 域名关联搜索
+
+`domain`（别名 `dns.domain`）是资产级字段。搜索会在当前 DNS RR 索引中查找匹配的
+域名，收集其 `A`/`AAAA` 地址，并最多跟随 8 层 `CNAME` 后，以得到的 IP 筛选当前可见的
+服务端点。结果单位仍是 `(IP 地址, 端口)`，不会把 DNS 记录复制进资产搜索索引：
+
+```text
+domain = "www.example.com"
+domain ~ "example.com" AND port = 443
+domain IN ("api.example.com", "www.example.com") AND service = "https"
+```
+
+`domain:` 等同于包含匹配。支持 `=`、`!=`、`~`、`!~`、`IN` 和 `NOT IN`；不支持
+`EXISTS(domain)` 或范围比较。域名不允许写在 `has_endpoint(...)` 内。
+
+域名搜索依赖 Elasticsearch DNS RR 索引。DNS 记录超过 10000 条、CNAME 链的唯一域名超过
+1000 个时，接口返回 HTTP `422` 和 `DOMAIN_RESULT_TOO_BROAD`，请改用精确域名或增加其他
+条件；索引不可用时返回 HTTP `503`，不会回退到 PostgreSQL 并返回不完整结果。
+
 对于复杂查询建议使用完整运算符，语义更明确。
 
 ## 4. 字段参考
@@ -191,6 +210,7 @@ tag:生产环境
 | 字段 | 类型 | 支持操作 | 说明 |
 |---|---|---|---|
 | `ip`、`network` | IP/CIDR | `=`、`!=`、`IN`、`NOT IN` | `network` 是 `ip` 的别名 |
+| `domain`、`dns.domain` | 域名 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 经当前 A/AAAA 与 CNAME 链关联到 IP；仅 Elasticsearch |
 | `asn` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | `AS4134` 与 `4134` 精确匹配等价 |
 | `isp` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | ISP 名称 |
 | `org`、`as_org` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | AS 组织；`as_org` 是别名 |
