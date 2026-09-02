@@ -1034,7 +1034,10 @@ impl ElasticsearchService {
         let response = self
             .send_request(
                 ElasticsearchOperation::IndexAdmin,
-                Method::HEAD,
+                // The data-stream API exposes existence through GET; unlike
+                // index HEAD requests, HEAD /_data_stream/{name} is rejected
+                // by Elasticsearch with 405.
+                Method::GET,
                 &format!("/_data_stream/{name}"),
                 |request| request,
             )
