@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use tokio_postgres::types::ToSql;
-use tracing::error;
 use uuid::Uuid;
 
 use crate::ReceiveSystemStatusInfo;
@@ -14,7 +13,8 @@ use crate::config::AnalyticsSnapshotConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::logs::write::{error_logs, error_logs_error};
 use crate::runtime_config::RuntimeConfig;
-use crate::{SystemDetails, SystemStatusJson, Systems, get_system_status_info};
+use crate::system_resource_cache::SystemResourceCache;
+use crate::{SystemDetails, SystemStatusJson, Systems};
 
 const ANALYSIS_TIMEZONE: &str = "Asia/Shanghai";
 const DEFAULT_RANGE_WEEKS: i64 = 12;
@@ -189,33 +189,18 @@ fn bad_request(message: &'static str) -> HttpResponse {
 async fn get_system_data_handler(
     _req: HttpRequest,
     query_info: web::Query<ReceiveSystemStatusInfo>,
-    pool: web::Data<Pool>,
+    cache: web::Data<SystemResourceCache>,
     systems: web::Data<Systems>,
 ) -> impl Responder {
-    let p = pool.get_ref();
-
-    let (t, c) = match get_system_status_info(
+    let status_item = cache.details(
         query_info.start_at,
         query_info.end_at,
         query_info.count.unwrap_or(1),
-        p,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            error!(
-                event = "GetSystemStatusError",
-                path = "fn get_system_data_handler",
-                message = %e
-            );
-            return HttpResponse::InternalServerError().body("500 Internal Server Error");
-        }
-    };
+    );
 
     let t_json = SystemStatusJson {
-        total_c: c,
-        status_item: t,
+        total_c: status_item.len() as i32,
+        status_item,
         system_info: SystemDetails::new(systems.get_ref()),
     };
 

@@ -1,6 +1,8 @@
+use crate::config::DatabaseConfig;
 use crate::path_secure_join;
 use actix_web::web;
 use deadpool_postgres::{ManagerConfig, RecyclingMethod};
+use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, error, info};
 
@@ -19,29 +21,35 @@ impl SqlFile {
 }
 
 pub async fn create_postgresql_pool(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    dbname: String,
-    max_size: usize,
+    config: &DatabaseConfig,
 ) -> Result<deadpool_postgres::Pool, Box<dyn std::error::Error>> {
     let mut db_poll_cfg = deadpool_postgres::Config::new();
-    db_poll_cfg.user = Some(username);
-    db_poll_cfg.password = Some(password);
-    db_poll_cfg.dbname = Some(dbname);
-    db_poll_cfg.host = Some(host);
-    db_poll_cfg.port = Some(port);
+    db_poll_cfg.user = Some(config.username.clone());
+    db_poll_cfg.password = Some(config.password.clone());
+    db_poll_cfg.dbname = Some(config.db_name.clone());
+    db_poll_cfg.host = Some(config.host.clone());
+    db_poll_cfg.port = Some(config.port);
     db_poll_cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Verified,
     });
     db_poll_cfg.pool = Some(deadpool_postgres::PoolConfig {
-        max_size,
-        timeouts: Default::default(),
+        max_size: config.pool_max_size,
+        timeouts: deadpool::managed::Timeouts {
+            wait: Some(Duration::from_millis(config.pool_wait_timeout_ms)),
+            create: Some(Duration::from_millis(config.pool_create_timeout_ms)),
+            recycle: Some(Duration::from_millis(config.pool_recycle_timeout_ms)),
+        },
         queue_mode: deadpool::managed::QueueMode::Lifo,
     });
     let pool = db_poll_cfg.create_pool(None, tokio_postgres::NoTls)?;
-    info!(target: "server::startup", "正在检查数据库连接");
+    info!(
+        target: "server::startup",
+        pool_max_size = config.pool_max_size,
+        pool_wait_timeout_ms = config.pool_wait_timeout_ms,
+        pool_create_timeout_ms = config.pool_create_timeout_ms,
+        pool_recycle_timeout_ms = config.pool_recycle_timeout_ms,
+        "正在检查数据库连接"
+    );
     match pool.get().await {
         Ok(_conn) => {
             // _conn 是一个 deadpool::managed::Object，它会在离开作用域时自动返回池中

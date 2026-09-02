@@ -285,6 +285,8 @@ pub struct ElasticsearchConfig {
     pub dns_record_index: String,
     pub dns_observation_retention_days: u16,
     pub scan_number_of_replicas: u32,
+    /// Bulk 写入等待的分片副本数；单节点应使用 `1`（仅主分片）。
+    pub write_wait_for_active_shards: String,
     pub expected_version: String,
     pub api_key: Option<String>,
     pub username: Option<String>,
@@ -302,6 +304,10 @@ pub struct ElasticsearchConfig {
     pub bulk_max_retries: u32,
     /// Initial exponential backoff delay for Elasticsearch bulk retries.
     pub bulk_retry_initial_ms: u64,
+    /// 一次 Bulk（包含排队、请求、退避和重试）的总时间预算。
+    pub bulk_total_timeout_seconds: u64,
+    /// 进程内允许并发执行的 Bulk 数量，防止故障时重试风暴。
+    pub bulk_max_concurrency: usize,
     /// Persist migration progress after at least this many newly migrated batches.
     pub scan_migration_checkpoint_batches: u64,
     pub fallback_to_postgres: bool,
@@ -352,6 +358,10 @@ impl fmt::Debug for ElasticsearchConfig {
                 &self.dns_observation_retention_days,
             )
             .field("scan_number_of_replicas", &self.scan_number_of_replicas)
+            .field(
+                "write_wait_for_active_shards",
+                &self.write_wait_for_active_shards,
+            )
             .field("expected_version", &self.expected_version)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("username", &self.username)
@@ -367,6 +377,11 @@ impl fmt::Debug for ElasticsearchConfig {
             .field("scan_migration_page_size", &self.scan_migration_page_size)
             .field("bulk_max_retries", &self.bulk_max_retries)
             .field("bulk_retry_initial_ms", &self.bulk_retry_initial_ms)
+            .field(
+                "bulk_total_timeout_seconds",
+                &self.bulk_total_timeout_seconds,
+            )
+            .field("bulk_max_concurrency", &self.bulk_max_concurrency)
             .field(
                 "scan_migration_checkpoint_batches",
                 &self.scan_migration_checkpoint_batches,
@@ -390,7 +405,8 @@ impl Default for ElasticsearchConfig {
             dns_observation_data_stream: "network-mapping-dns-observations".to_owned(),
             dns_record_index: "network-mapping-dns-records-v1".to_owned(),
             dns_observation_retention_days: 180,
-            scan_number_of_replicas: 1,
+            scan_number_of_replicas: 0,
+            write_wait_for_active_shards: "1".to_owned(),
             expected_version: "9.5.2".to_owned(),
             api_key: None,
             username: None,
@@ -403,6 +419,8 @@ impl Default for ElasticsearchConfig {
             scan_migration_page_size: 100,
             bulk_max_retries: 4,
             bulk_retry_initial_ms: 200,
+            bulk_total_timeout_seconds: 25,
+            bulk_max_concurrency: 2,
             scan_migration_checkpoint_batches: 100,
             fallback_to_postgres: true,
         }
@@ -537,6 +555,22 @@ impl SelfChecking for ElasticsearchConfig {
         if !(10..=60_000).contains(&self.bulk_retry_initial_ms) {
             return Err("elasticsearch.bulk_retry_initial_ms 必须在 10 到 60000 之间".into());
         }
+        if !(1..=300).contains(&self.bulk_total_timeout_seconds) {
+            return Err("elasticsearch.bulk_total_timeout_seconds 必须在 1 到 300 之间".into());
+        }
+        if !(1..=32).contains(&self.bulk_max_concurrency) {
+            return Err("elasticsearch.bulk_max_concurrency 必须在 1 到 32 之间".into());
+        }
+        if self.write_wait_for_active_shards != "1"
+            && self.write_wait_for_active_shards != "all"
+            && self
+                .write_wait_for_active_shards
+                .parse::<u32>()
+                .ok()
+                .is_none_or(|value| value == 0)
+        {
+            return Err("elasticsearch.write_wait_for_active_shards 必须是 1、all 或正整数".into());
+        }
         if self.scan_migration_checkpoint_batches == 0 {
             return Err("elasticsearch.scan_migration_checkpoint_batches 必须大于 0".into());
         }
@@ -546,11 +580,6 @@ impl SelfChecking for ElasticsearchConfig {
         if !(30..=365).contains(&self.dns_observation_retention_days) {
             return Err(
                 "elasticsearch.dns_observation_retention_days 必须在 30 到 365 之间".into(),
-            );
-        }
-        if self.scan_storage.reads_elasticsearch() && self.scan_number_of_replicas == 0 {
-            return Err(
-                "elasticsearch 承担权威扫描存储时 scan_number_of_replicas 必须至少为 1".into(),
             );
         }
         Ok(true)
@@ -1058,12 +1087,19 @@ fn validate_port_list(value: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
-    pub host: String,               //数据库主机地址
-    pub port: u16,                  //数据库端口
-    pub username: String,           //用户名
-    pub password: String,           //密码
-    pub db_name: String,            //数据库名
-    pub pool_max_size: usize,       //连接池最大连接数
+    pub host: String,         //数据库主机地址
+    pub port: u16,            //数据库端口
+    pub username: String,     //用户名
+    pub password: String,     //密码
+    pub db_name: String,      //数据库名
+    pub pool_max_size: usize, //连接池最大连接数
+    /// 请求等待空闲连接的上限。到期后快速失败，避免所有 HTTP worker 一起堆积。
+    #[serde(default = "default_pool_wait_timeout_ms")]
+    pub pool_wait_timeout_ms: u64,
+    #[serde(default = "default_pool_create_timeout_ms")]
+    pub pool_create_timeout_ms: u64,
+    #[serde(default = "default_pool_recycle_timeout_ms")]
+    pub pool_recycle_timeout_ms: u64,
     pub tls: bool,                  //是否使用tls
     pub init_database_file: String, //初始化数据库表的sql文件
     pub sql_file_path: String,      //sql文件存放路径（相对）
@@ -1076,6 +1112,9 @@ impl SelfChecking for DatabaseConfig {
             || self.password.is_empty()
             || self.db_name.is_empty()
             || self.pool_max_size == 0
+            || self.pool_wait_timeout_ms == 0
+            || self.pool_create_timeout_ms == 0
+            || self.pool_recycle_timeout_ms == 0
             || self.init_database_file.is_empty()
         {
             panic!("数据库关键字段为空")
@@ -1090,6 +1129,9 @@ impl SelfChecking for DatabaseConfig {
             || self.password.is_empty()
             || self.db_name.is_empty()
             || self.pool_max_size == 0
+            || self.pool_wait_timeout_ms == 0
+            || self.pool_create_timeout_ms == 0
+            || self.pool_recycle_timeout_ms == 0
             || self.init_database_file.is_empty()
         {
             println!("数据库关键字段为空");
@@ -1097,6 +1139,18 @@ impl SelfChecking for DatabaseConfig {
         }
         Ok(true)
     }
+}
+
+fn default_pool_wait_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_pool_create_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_pool_recycle_timeout_ms() -> u64 {
+    3_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1281,6 +1335,9 @@ mod tests {
             password: "password".to_owned(),
             db_name: "network_mapping".to_owned(),
             pool_max_size: 10,
+            pool_wait_timeout_ms: 2_000,
+            pool_create_timeout_ms: 5_000,
+            pool_recycle_timeout_ms: 3_000,
             tls: false,
             init_database_file: "source/database/init.sql".to_owned(),
             sql_file_path: "source/database".to_owned(),
@@ -1290,6 +1347,14 @@ mod tests {
 
         database.pool_max_size = 0;
         assert!(!database.try_check().expect("zero pool size is invalid"));
+
+        database.pool_max_size = 10;
+        database.pool_wait_timeout_ms = 0;
+        assert!(
+            !database
+                .try_check()
+                .expect("zero pool wait timeout is invalid")
+        );
     }
 
     #[test]
@@ -1451,6 +1516,10 @@ mod tests {
         assert_eq!(config.scan_migration_concurrency, 4);
         assert!(config.scan_migration_page_size >= config.scan_migration_concurrency);
         assert_eq!(config.bulk_max_retries, 4);
+        assert_eq!(config.scan_number_of_replicas, 0);
+        assert_eq!(config.write_wait_for_active_shards, "1");
+        assert_eq!(config.bulk_total_timeout_seconds, 25);
+        assert_eq!(config.bulk_max_concurrency, 2);
         assert!(config.try_check().unwrap());
 
         config.enabled = true;
@@ -1482,6 +1551,16 @@ mod tests {
 
         config.bulk_max_retries = 4;
         config.bulk_retry_initial_ms = 0;
+        assert!(config.try_check().is_err());
+
+        config.bulk_retry_initial_ms = 200;
+        config.bulk_total_timeout_seconds = 0;
+        assert!(config.try_check().is_err());
+        config.bulk_total_timeout_seconds = 25;
+        config.bulk_max_concurrency = 0;
+        assert!(config.try_check().is_err());
+        config.bulk_max_concurrency = 2;
+        config.write_wait_for_active_shards = "0".to_owned();
         assert!(config.try_check().is_err());
     }
 

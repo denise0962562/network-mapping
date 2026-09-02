@@ -286,6 +286,8 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	observation_count INT NOT NULL CHECK (observation_count >= 0),
 	protocol_version SMALLINT NOT NULL DEFAULT 2 CHECK (protocol_version IN (1, 2)),
 	payload_checksum VARCHAR(64),
+	-- `pending` reserves an upload while its idempotent Elasticsearch write runs outside
+	-- the PostgreSQL transaction. A retry resumes the same receipt after a crash/timeout.
 	storage_backend TEXT NOT NULL DEFAULT 'postgres',
 	storage_references JSONB NOT NULL DEFAULT '[]'::JSONB,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

@@ -603,7 +603,7 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let transaction = match connection.transaction().await {
+    let scanner_transaction = match connection.transaction().await {
         Ok(transaction) => transaction,
         Err(error) => {
             error_logs_error(
@@ -615,6 +615,18 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     };
+    if let Err(error) = scanner_transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '5s';")
+        .await
+    {
+        error_logs_error(
+            &req,
+            "ScannerHeartbeatTimeoutSetupError",
+            "set_local_timeouts",
+            &error,
+        );
+        return HttpResponse::ServiceUnavailable().finish();
+    }
     let scanner_id = heartbeat.scanner_id.to_string();
     let system_version = format!(
         "{} {}",
@@ -664,7 +676,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     let latency_server_processing_us = latency.as_ref().map(|value| value.server_processing_us);
     let latency_measured_at = latency.as_ref().map(|value| value.measured_at);
     let latency_probe_id = latency.as_ref().map(|value| value.probe_id);
-    let update = transaction
+    let update = scanner_transaction
         .query_opt(
             "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
              cpus = $4, ram = $5, uptime = $6, runtime_state = $7, last_seen_at = NOW(), \
@@ -731,9 +743,44 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     }
+    // 扫描器状态行与任务执行行使用两个短事务。过去这里会在等待任务租约锁时一直
+    // 持有 scanner_info 行锁，导致同一扫描器后续心跳形成分钟级锁队列。
+    if let Err(error) = scanner_transaction.commit().await {
+        error_logs_error(
+            &req,
+            "ScannerHeartbeatCommitError",
+            "commit_scanner_state",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
     let mut lease = None;
     let mut cancel_task_id = None;
     if let Some(task_id) = heartbeat.active_task_id {
+        let transaction = match connection.transaction().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                error_logs_error(
+                    &req,
+                    "ScannerLeaseTransactionError",
+                    "begin_transaction",
+                    &error,
+                );
+                return HttpResponse::ServiceUnavailable().finish();
+            }
+        };
+        if let Err(error) = transaction
+            .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '5s';")
+            .await
+        {
+            error_logs_error(
+                &req,
+                "ScannerLeaseTimeoutSetupError",
+                "set_local_timeouts",
+                &error,
+            );
+            return HttpResponse::ServiceUnavailable().finish();
+        }
         let lease_expires_at = crate::get_unix_epoch_ms() + crate::TASK_LEASE_MS;
         let renewed = match transaction
             .query_opt(
@@ -747,7 +794,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         {
             Err(error) => {
                 error_logs_error(&req, "ScannerLeaseRenewError", "renew_task_lease", &error);
-                return HttpResponse::InternalServerError().finish();
+                return HttpResponse::ServiceUnavailable().finish();
             }
             Ok(row) => row,
         };
@@ -782,7 +829,7 @@ pub(crate) async fn scanner_heartbeat_handler(
                         "read_cancel_command",
                         &error,
                     );
-                    return HttpResponse::InternalServerError().finish();
+                    return HttpResponse::ServiceUnavailable().finish();
                 }
             }
         } else {
@@ -794,15 +841,10 @@ pub(crate) async fn scanner_heartbeat_handler(
                 maintenance_hold: false,
             });
         }
-    }
-    if let Err(error) = transaction.commit().await {
-        error_logs_error(
-            &req,
-            "ScannerHeartbeatCommitError",
-            "commit_heartbeat",
-            &error,
-        );
-        return HttpResponse::InternalServerError().finish();
+        if let Err(error) = transaction.commit().await {
+            error_logs_error(&req, "ScannerLeaseCommitError", "commit_task_lease", &error);
+            return HttpResponse::ServiceUnavailable().finish();
+        }
     }
     if let Some(latency) = latency {
         latency_history.record(ScannerLatencyHistoryEntry {

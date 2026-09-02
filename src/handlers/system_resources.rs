@@ -7,60 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::admin::UserBaseI;
 use crate::logs::write::{database_error_diagnostics, error_logs};
+use crate::system_resource_cache::SystemResourceCache;
 
 const DEFAULT_RANGE_MINUTES: i64 = 30;
 const MAX_RANGE_DAYS: i64 = 30;
 pub(crate) const MAX_BUCKETS: i64 = 1_500;
 const RESOURCE_TIMEZONE: &str = "Asia/Shanghai";
-const RESOURCE_HISTORY_SQL: &str = r#"
-WITH bucket_range AS (
-    SELECT generate_series(
-        ($1::BIGINT / $3::BIGINT) * $3::BIGINT,
-        (($2::BIGINT - 1) / $3::BIGINT) * $3::BIGINT,
-        $3
-    )::BIGINT AS bucket_start
-), normalized AS (
-    SELECT create_time,
-        CASE WHEN jsonb_typeof(cpu->'cpu_usage') = 'number'
-             THEN (cpu->>'cpu_usage')::DOUBLE PRECISION END AS cpu_usage,
-        CASE WHEN jsonb_typeof(ram->'ram_usage') = 'number'
-             THEN (ram->>'ram_usage')::DOUBLE PRECISION
-             WHEN jsonb_typeof(ram->'used_ram') = 'number'
-              AND jsonb_typeof(ram->'total_ram') = 'number'
-              AND (ram->>'total_ram')::DOUBLE PRECISION > 0
-             THEN (ram->>'used_ram')::DOUBLE PRECISION
-                  / (ram->>'total_ram')::DOUBLE PRECISION * 100 END AS ram_usage,
-        CASE WHEN jsonb_typeof(disk->'disk_total_usage') = 'number'
-              AND jsonb_typeof(disk->'disk_total_space') = 'number'
-              AND (disk->>'disk_total_space')::DOUBLE PRECISION > 0
-             THEN (disk->>'disk_total_usage')::DOUBLE PRECISION
-                  / (disk->>'disk_total_space')::DOUBLE PRECISION * 100 END AS disk_usage
-    FROM system_status
-    WHERE create_time >= $1 AND create_time < $2
-), aggregated AS (
-    SELECT (create_time / $3::BIGINT) * $3::BIGINT AS bucket_start,
-        COUNT(*)::BIGINT AS sample_count,
-        AVG(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_avg,
-        MAX(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_max,
-        AVG(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_avg,
-        MAX(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_max,
-        AVG(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_avg,
-        MAX(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_max
-    FROM normalized
-    GROUP BY bucket_start
-)
-SELECT b.bucket_start,
-       COALESCE(a.sample_count, 0)::BIGINT AS sample_count,
-       a.cpu_avg,
-       a.cpu_max,
-       a.ram_avg,
-       a.ram_max,
-       a.disk_avg,
-       a.disk_max
-FROM bucket_range b
-LEFT JOIN aggregated a USING (bucket_start)
-ORDER BY b.bucket_start;
-"#;
 const DATABASE_HISTORY_SQL: &str = r#"
 WITH bucket_range AS (
     SELECT generate_series(
@@ -410,59 +362,30 @@ fn elasticsearch_sizes_from_json(
 
 #[get("/api/data/system-resource-history")]
 pub(crate) async fn get_system_resource_history(
-    req: HttpRequest,
+    _req: HttpRequest,
     query: web::Query<ResourceHistoryQuery>,
-    pool: web::Data<Pool>,
+    cache: web::Data<SystemResourceCache>,
     _user: UserBaseI,
 ) -> impl Responder {
     let normalized = match normalize_query(&query) {
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    let client = match pool.get().await {
-        Ok(value) => value,
-        Err(error_value) => {
-            error_logs(
-                &req,
-                "SystemResourceHistoryPoolError",
-                &error_value.to_string(),
-            );
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
     let start_seconds = normalized.start_at.timestamp();
     let end_seconds = normalized.end_at.timestamp();
     let bucket_seconds = normalized.granularity.seconds();
-    let rows = match client
-        .query(
-            RESOURCE_HISTORY_SQL,
-            &[&start_seconds, &end_seconds, &bucket_seconds],
-        )
-        .await
-    {
-        Ok(value) => value,
-        Err(error_value) => {
-            error_logs(
-                &req,
-                "SystemResourceHistoryQueryError",
-                &database_error_diagnostics(&error_value),
-            );
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
-    let points: Vec<ResourceHistoryPoint> = rows
+    let points: Vec<ResourceHistoryPoint> = cache
+        .aggregate(start_seconds, end_seconds, bucket_seconds)
         .into_iter()
-        .map(|row| ResourceHistoryPoint {
-            timestamp_ms: row.get::<_, i64>("bucket_start") * 1_000,
-            sample_count: row.get("sample_count"),
-            cpu_avg: rounded(row.get("cpu_avg")),
-            cpu_max: rounded(row.get("cpu_max")),
-            ram_avg: rounded(row.get("ram_avg")),
-            ram_max: rounded(row.get("ram_max")),
-            disk_avg: rounded(row.get("disk_avg")),
-            disk_max: rounded(row.get("disk_max")),
+        .map(|(bucket, aggregate)| ResourceHistoryPoint {
+            timestamp_ms: bucket * 1_000,
+            sample_count: aggregate.sample_count,
+            cpu_avg: rounded(aggregate.cpu_avg),
+            cpu_max: rounded(aggregate.cpu_max),
+            ram_avg: rounded(aggregate.ram_avg),
+            ram_max: rounded(aggregate.ram_max),
+            disk_avg: rounded(aggregate.disk_avg),
+            disk_max: rounded(aggregate.disk_max),
         })
         .collect();
     let point_count = points.len();
@@ -575,9 +498,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        DATABASE_HISTORY_SQL, Granularity, RESOURCE_HISTORY_SQL, ResourceHistoryQuery,
-        elasticsearch_sizes_from_json, normalize_database_query, normalize_query, rounded,
-        table_sizes_from_json,
+        DATABASE_HISTORY_SQL, Granularity, ResourceHistoryQuery, elasticsearch_sizes_from_json,
+        normalize_database_query, normalize_query, rounded, table_sizes_from_json,
     };
 
     fn query(duration: Duration, granularity: &str) -> ResourceHistoryQuery {
@@ -667,11 +589,6 @@ mod tests {
 
     #[test]
     fn history_query_keeps_sql_clause_boundaries() {
-        assert!(RESOURCE_HISTORY_SQL.contains("FROM system_status"));
-        assert!(RESOURCE_HISTORY_SQL.contains("FROM normalized"));
-        assert!(RESOURCE_HISTORY_SQL.contains("FROM bucket_range"));
-        assert!(!RESOURCE_HISTORY_SQL.contains("usageFROM"));
-        assert!(!RESOURCE_HISTORY_SQL.contains("maxFROM"));
         assert!(DATABASE_HISTORY_SQL.contains("FROM system_status"));
     }
 

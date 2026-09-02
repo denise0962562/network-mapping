@@ -38,16 +38,9 @@ async fn login_test() {
     let db_config = config.database;
 
     // let database = format!("postgresql://{}:{}@{}/{}", db_config.username, db_config.password, db_config.host, db_config.db_name);
-    let db_pool = db::create_postgresql_pool(
-        db_config.host,
-        db_config.port,
-        db_config.username,
-        db_config.password,
-        db_config.db_name,
-        db_config.pool_max_size,
-    )
-    .await
-    .expect("创建连接池错误");
+    let db_pool = db::create_postgresql_pool(&db_config)
+        .await
+        .expect("创建连接池错误");
 
     let app = test::init_service(
         App::new()

@@ -8,7 +8,8 @@ use futures_util::{StreamExt, stream};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::{interval, sleep};
+use tokio::sync::Semaphore;
+use tokio::time::{interval, sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -78,6 +79,7 @@ struct ElasticsearchInner {
     client: reqwest::Client,
     runtime: RwLock<ElasticsearchRuntime>,
     monitor: RwLock<Option<MonitorHandle>>,
+    bulk_semaphore: Semaphore,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -127,7 +129,7 @@ pub(crate) struct ElasticsearchStorageMetrics {
 }
 
 impl ElasticsearchStorageMetrics {
-    fn unavailable(enabled: bool) -> Self {
+    pub(crate) fn unavailable(enabled: bool) -> Self {
         Self {
             enabled,
             available: false,
@@ -296,12 +298,14 @@ impl ElasticsearchService {
             let certificate = reqwest::Certificate::from_pem(&pem)?;
             builder = builder.add_root_certificate(certificate);
         }
+        let bulk_max_concurrency = config.bulk_max_concurrency;
         Ok(Self {
             inner: Arc::new(ElasticsearchInner {
                 config,
                 client: builder.build()?,
                 runtime: RwLock::new(ElasticsearchRuntime::default()),
                 monitor: RwLock::new(None),
+                bulk_semaphore: Semaphore::new(bulk_max_concurrency),
             }),
         })
     }
@@ -688,9 +692,25 @@ impl ElasticsearchService {
     ) -> Result<Value, String> {
         let (trace_id, traceparent) = new_trace_context();
         let started = Instant::now();
-        let result = self
-            .send_bulk_with_retry_inner(path, body, create_conflict_is_success, &traceparent)
-            .await;
+        let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
+        let result = match timeout(budget, async {
+            let _permit = self
+                .inner
+                .bulk_semaphore
+                .acquire()
+                .await
+                .map_err(|_| "Elasticsearch Bulk 并发控制器已关闭".to_owned())?;
+            self.send_bulk_with_retry_inner(path, body, create_conflict_is_success, &traceparent)
+                .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Elasticsearch Bulk 超过总时间预算 {} 秒",
+                self.inner.config.bulk_total_timeout_seconds
+            )),
+        };
         let failure_kind = match result.as_ref() {
             Ok(value) if value.get("errors").and_then(Value::as_bool) == Some(true) => {
                 Some("bulk_items")
@@ -1136,13 +1156,27 @@ impl ElasticsearchService {
         }
         if !observation_bulk.is_empty() {
             let response = self
-                .send_bulk_with_retry("/_bulk?wait_for_active_shards=all", &observation_bulk, true)
+                .send_bulk_with_retry(
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
+                    &observation_bulk,
+                    true,
+                )
                 .await?;
             validate_dns_bulk_result(&response)?;
         }
         if !record_bulk.is_empty() {
             let response = self
-                .send_bulk_with_retry("/_bulk?wait_for_active_shards=all", &record_bulk, false)
+                .send_bulk_with_retry(
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
+                    &record_bulk,
+                    false,
+                )
                 .await?;
             validate_dns_bulk_result(&response)?;
         }
@@ -1221,7 +1255,10 @@ impl ElasticsearchService {
             };
             let result = self
                 .send_bulk_with_retry(
-                    &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}{refresh}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
                     &body,
                     true,
                 )
@@ -1419,7 +1456,10 @@ impl ElasticsearchService {
         };
         let result = self
             .send_bulk_with_retry(
-                &format!("/_bulk?wait_for_active_shards=all{refresh}"),
+                &format!(
+                    "/_bulk?wait_for_active_shards={}{refresh}",
+                    self.inner.config.write_wait_for_active_shards
+                ),
                 &body,
                 false,
             )
@@ -1539,7 +1579,10 @@ impl ElasticsearchService {
             }
             let bulk = self
                 .send_bulk_with_retry(
-                    "/_bulk?wait_for_active_shards=all&refresh=wait_for",
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}&refresh=wait_for",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
                     &body,
                     false,
                 )
@@ -2076,7 +2119,7 @@ impl ElasticsearchService {
                     "SELECT e.id FROM scan_task_execution e \
                      WHERE e.id > $1 AND EXISTS (SELECT 1 FROM scan_result_batch b \
                         WHERE b.execution_id = e.id AND b.id <= $2 \
-                          AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres')) \
+                          AND (b.payload_checksum IS NULL OR b.storage_backend IN ('postgres', 'pending'))) \
                      ORDER BY e.id LIMIT $3;",
                     &[
                         &execution_cursor,
@@ -2166,7 +2209,7 @@ impl ElasticsearchService {
             .map_err(|error| error.to_string())?
             .query_one(
                 "SELECT COUNT(*)::BIGINT AS remaining FROM scan_result_batch \
-                 WHERE id <= $1 AND (payload_checksum IS NULL OR storage_backend = 'postgres');",
+                 WHERE id <= $1 AND (payload_checksum IS NULL OR storage_backend IN ('postgres', 'pending'));",
                 &[&high_watermark],
             )
             .await
@@ -2230,10 +2273,10 @@ impl ElasticsearchService {
                 "SELECT batch_counts.batches, batch_counts.completed_batches, \
                         observation_counts.observations, observation_counts.completed_observations \
                  FROM (SELECT COUNT(*)::BIGINT AS batches, \
-                              COUNT(*) FILTER (WHERE payload_checksum IS NOT NULL AND storage_backend <> 'postgres')::BIGINT AS completed_batches \
+                              COUNT(*) FILTER (WHERE payload_checksum IS NOT NULL AND storage_backend IN ('dual', 'elasticsearch'))::BIGINT AS completed_batches \
                        FROM scan_result_batch WHERE id <= $1) batch_counts \
                  CROSS JOIN (SELECT COUNT(*)::BIGINT AS observations, \
-                                    COUNT(*) FILTER (WHERE b.payload_checksum IS NOT NULL AND b.storage_backend <> 'postgres')::BIGINT AS completed_observations \
+                                    COUNT(*) FILTER (WHERE b.payload_checksum IS NOT NULL AND b.storage_backend IN ('dual', 'elasticsearch'))::BIGINT AS completed_observations \
                              FROM scan_observation o JOIN scan_result_batch b ON b.id = o.batch_id \
                              WHERE b.id <= $1) observation_counts;",
                 &[&high_watermark],
@@ -2328,7 +2371,7 @@ impl ElasticsearchService {
                  LEFT JOIN scanner_info scanner ON scanner.scanner_id = \
                     COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
                  WHERE b.execution_id = $1 AND b.id <= $2 \
-                   AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres') \
+                   AND (b.payload_checksum IS NULL OR b.storage_backend IN ('postgres', 'pending')) \
                  ORDER BY b.batch_index, b.id;",
                 &[&execution_db_id, &high_watermark],
             )
@@ -2481,7 +2524,7 @@ impl ElasticsearchService {
                   AND state_value->>'execution_endpoint_index' = $2 \
                   AND state_value->>'current_endpoint_index' = $3) AS migration_ready, \
                 (SELECT COUNT(*)::BIGINT FROM scan_result_batch \
-                    WHERE payload_checksum IS NULL OR storage_backend = 'postgres') AS incomplete_batches, \
+                    WHERE payload_checksum IS NULL OR storage_backend IN ('postgres', 'pending')) AS incomplete_batches, \
                 (SELECT COUNT(*)::BIGINT FROM scan_task_execution \
                     WHERE execution_status = 'succeeded' AND (result_ip_count IS NULL \
                         OR result_port_count IS NULL OR result_observation_count IS NULL)) AS incomplete_executions, \

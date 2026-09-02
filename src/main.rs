@@ -2,7 +2,7 @@ use actix_web::{App, HttpMessage, HttpServer, dev::Service, http::header, web};
 use clap::Parser;
 use core::panic;
 use std::io;
-use tokio::time::{Duration, Instant, interval_at};
+use tokio::time::{Duration, Instant, MissedTickBehavior, interval_at};
 use tracing::{Instrument, error, info};
 
 use network_mapping_server::admin::{
@@ -32,6 +32,7 @@ use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
 use network_mapping_server::system_maintenance::{
     SystemMaintenanceState, run_reconciler as run_system_maintenance_reconciler,
 };
+use network_mapping_server::system_resource_cache::SystemResourceCache;
 use network_mapping_server::target_generated::run_generator;
 use network_mapping_server::tls::build_acceptor;
 use network_mapping_server::trusted_proxy::TrustedProxyState;
@@ -94,16 +95,9 @@ async fn main() -> io::Result<()> {
     let database_c = db_config.clone();
     let database_c2 = db_config.clone();
 
-    let db_pool = db::create_postgresql_pool(
-        db_config.host,
-        db_config.port,
-        db_config.username,
-        db_config.password,
-        db_config.db_name,
-        db_config.pool_max_size,
-    )
-    .await
-    .expect("创建连接池错误");
+    let db_pool = db::create_postgresql_pool(&db_config)
+        .await
+        .expect("创建连接池错误");
     let pool = db_pool.clone();
     let request_log_pool = db_pool.clone();
     let scanner_latency_pool = db_pool.clone();
@@ -335,6 +329,13 @@ async fn main() -> io::Result<()> {
 
     let sys = Systems::new();
     let sys_2 = sys.clone();
+    let system_resource_cache = SystemResourceCache::new();
+    let system_resource_cache_data = web::Data::new(system_resource_cache.clone());
+    tokio::spawn({
+        let cache = system_resource_cache.clone();
+        let pool = db_pool.clone();
+        async move { cache.hydrate_from_database(&pool).await }
+    });
     let maxmind_state = web::Data::new(maxmind_state);
     let runtime_settings = web::Data::new(runtime_settings);
     let automatic_target_service = web::Data::new(runtime_settings.automatic_target.clone());
@@ -384,6 +385,8 @@ async fn main() -> io::Result<()> {
             Instant::now() + Duration::from_millis(0),
             Duration::from_secs(log.status_duration),
         );
+        // 依赖偶发变慢时跳过已错过的周期，避免恢复后立即突发执行多次采集。
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             ticker.tick().await;
@@ -392,6 +395,7 @@ async fn main() -> io::Result<()> {
                 database_c.db_name.clone(),
                 sys.clone(),
                 &elasticsearch_service,
+                &system_resource_cache,
             )
             .await
             {
@@ -440,6 +444,7 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(template_info.clone()))
             .app_data(web::Data::new(sys_2.clone()))
+            .app_data(system_resource_cache_data.clone())
             .app_data(web::Data::new(database_c2.clone()))
             .app_data(web::Data::new(pwd_h.clone()))
             .app_data(web::Data::new(mail_c.clone()))

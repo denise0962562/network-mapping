@@ -34,6 +34,7 @@ pub mod scanner_latency;
 mod search_content;
 pub mod search_projection;
 pub mod system_maintenance;
+pub mod system_resource_cache;
 
 #[cfg(test)]
 pub mod test; // 测试模块
@@ -59,7 +60,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tera::{Context, Tera};
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
@@ -137,28 +138,28 @@ pub struct TemplatesInit {
 }
 
 //以下存储的数据都为约值，会自动舍弃精度
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbResource {
     pub db_library_size: String,
     pub db_table_size: BTreeMap<String, DbTableSizeInfo>,
     pub db_conn: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbTableSizeInfo {
     pub total: i64,
     pub data: i64,
     pub index: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemCPU {
     pub cpu_usage: f32,            //cpu总体使用率
     pub cpu: HashMap<String, f32>, //单个cpu使用率
 }
 
 //系统缓存大小，包括swap
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemRAM {
     pub total_ram: u64,
     pub used_ram: u64,
@@ -168,25 +169,25 @@ pub struct SystemRAM {
     pub swap_usage: f32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemDisk {
     pub disk_total_space: u64,
     pub disk_total_usage: u64,
     pub disk: HashMap<String, Vec<u64>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemNetInfo {
     pub send: String,
     pub receive: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemNetwork {
     pub net: BTreeMap<String, SystemNetInfo>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemResource {
     pub server_run_time: i64,
     pub cpu: SystemCPU,
@@ -1164,22 +1165,68 @@ pub async fn insert_system_status(
     db_name: String,
     sys: Systems,
     elasticsearch: &ElasticsearchService,
+    cache: &system_resource_cache::SystemResourceCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (s, elasticsearch_metrics) = tokio::join!(
-        SystemResource::new(sys, pool, &db_name),
-        elasticsearch.storage_metrics()
+    // 数据库指标是系统快照的附加信息，最多等待 3 秒；不能让其拖住 CPU/RAM 等
+    // 实时数据的发布。连接池自身还有更短的 wait timeout 作为第一层保护。
+    let mut s = match tokio::time::timeout(
+        Duration::from_secs(3),
+        SystemResource::new(sys.clone(), pool, &db_name),
+    )
+    .await
+    {
+        Ok(resource) => resource,
+        Err(_) => {
+            warn!(
+                event = "SystemDatabaseMetricsTimeout",
+                timeout_seconds = 3,
+                "PostgreSQL 指标采集超时，本周期使用默认数据库指标"
+            );
+            SystemResource {
+                server_run_time: get_server_uptime() as i64,
+                cpu: SystemCPU::new(sys.sys.clone()),
+                ram: SystemRAM::new(sys.sys.clone()),
+                disk: SystemDisk::new(sys.disk.clone()),
+                db_postgresql: DbResource::default(),
+                network: SystemNetwork::new(sys.network.clone()),
+                create_at: None,
+            }
+        }
+    };
+    s.create_at = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
     );
+    // 发布内存快照早于持久化。即使数据库正忙，仪表盘仍能读取本周期采集结果；
+    // 随后的 INSERT 继续作为重启恢复和长期审计的权威数据源。
+    cache.record(s.clone());
+    // Elasticsearch 容量采集可能触发网络超时，必须发生在内存快照发布之后，且不能
+    // 推迟 PostgreSQL 持久化。失败只使本周期 ES 容量字段标记为 unavailable。
+    let elasticsearch_metrics =
+        match tokio::time::timeout(Duration::from_secs(3), elasticsearch.storage_metrics()).await {
+            Ok(metrics) => metrics,
+            Err(_) => {
+                warn!(
+                    event = "ElasticsearchStorageMetricsTimeout",
+                    timeout_seconds = 3,
+                    "Elasticsearch 容量指标采集超时"
+                );
+                elasticsearch::ElasticsearchStorageMetrics::unavailable(elasticsearch.enabled())
+            }
+        };
     let mut client = pool.get().await?;
     let transaction = client.transaction().await?;
     let sql = get_sql_from_file("source/database/", "insert_system_status.sql").await?;
     let statement = transaction.prepare(&sql).await?;
     let server_run_time = s.server_run_time;
-    let cpu = serde_json::to_value(s.cpu).unwrap();
-    let ram = serde_json::to_value(s.ram).unwrap();
-    let disk = serde_json::to_value(s.disk).unwrap();
-    let db_postgresql = serde_json::to_value(s.db_postgresql).unwrap();
+    let cpu = serde_json::to_value(&s.cpu).unwrap();
+    let ram = serde_json::to_value(&s.ram).unwrap();
+    let disk = serde_json::to_value(&s.disk).unwrap();
+    let db_postgresql = serde_json::to_value(&s.db_postgresql).unwrap();
     let db_elasticsearch = serde_json::to_value(elasticsearch_metrics).unwrap();
-    let network = serde_json::to_value(s.network).unwrap();
+    let network = serde_json::to_value(&s.network).unwrap();
     let raw = transaction
         .execute(
             &statement,
@@ -1673,6 +1720,10 @@ async fn save_dns_scanner_results(
         .transaction()
         .await
         .map_err(scanner_result_database_error)?;
+    transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '5s';")
+        .await
+        .map_err(scanner_result_database_error)?;
     let token_hash =
         hash_scanner_token(token, token_pepper).map_err(scanner_result_database_error)?;
     let scanner_id = upload.scanner_id.to_string();
@@ -1747,7 +1798,8 @@ async fn save_dns_scanner_results(
                  MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
                  MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
                  COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
-                 COUNT(*) FILTER (WHERE is_final)::BIGINT AS final_count \
+                 COUNT(*) FILTER (WHERE is_final)::BIGINT AS final_count, \
+                 BOOL_OR(is_final) FILTER (WHERE batch_index = $3) AS current_is_final \
                  FROM scan_result_batch WHERE execution_id = $1 AND upload_id = $2;",
                 &[&execution_db_id, &upload_id, &batch_index],
             )
@@ -1763,9 +1815,16 @@ async fn save_dns_scanner_results(
                 && first_prior == Some(0)
                 && last_prior == Some(batch_index - 1)
         };
+        let final_count: i64 = sequence.get("final_count");
+        let current_is_final: Option<bool> = sequence.get("current_is_final");
+        let existing_final_valid = match current_is_final {
+            Some(true) => final_count == 1,
+            Some(false) => false,
+            None => final_count == 0,
+        };
         if !complete_prior_sequence
             || sequence.get::<_, i64>("later_count") != 0
-            || sequence.get::<_, i64>("final_count") != 0
+            || !existing_final_valid
         {
             return Err(SaveScannerResultsError::InvalidUpload(
                 "final DNS batch requires one contiguous sequence starting at batch_index 0".into(),
@@ -1774,7 +1833,7 @@ async fn save_dns_scanner_results(
     }
     if let Some(existing) = transaction
         .query_opt(
-            "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+            "SELECT is_final, observation_count, payload_checksum, storage_backend FROM scan_result_batch \
              WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
             &[&execution_db_id, &upload_id, &batch_index],
         )
@@ -1792,35 +1851,79 @@ async fn save_dns_scanner_results(
                 "batch identity was already used with different content".into(),
             ));
         }
+        if existing.get::<_, String>("storage_backend") != "pending" {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        }
+    } else {
+        transaction
+            .execute(
+                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
+                 protocol_version, payload_checksum, storage_backend, storage_references) \
+                 VALUES ($1, $2, $3, $4, $5, 2, $6, 'pending', '[]'::JSONB);",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &is_final,
+                    &observation_count,
+                    &payload_checksum,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+    }
+    // `pending` 是持久化的上传占位符。先提交占位符再访问 ES，可以释放任务行锁和
+    // PostgreSQL 连接；进程中断后，同一批次会从 pending 状态幂等重试。
+    transaction
+        .commit()
+        .await
+        .map_err(scanner_result_database_error)?;
+    drop(client);
+    elasticsearch
+        .persist_dns_observations(&context, "default", &observations)
+        .await
+        .map_err(SaveScannerResultsError::Storage)?;
+    let mut client = pool.get().await.map_err(scanner_result_database_error)?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(scanner_result_database_error)?;
+    transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '10s';")
+        .await
+        .map_err(scanner_result_database_error)?;
+    transaction
+        .query_one(
+            "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
+            &[&execution_db_id],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    let receipt_updated = transaction
+        .execute(
+            "UPDATE scan_result_batch SET storage_backend = 'elasticsearch', storage_references = $4 \
+             WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3 \
+             AND storage_backend = 'pending';",
+            &[
+                &execution_db_id,
+                &upload_id,
+                &batch_index,
+                &serde_json::json!(["dns-observations", "dns-records"]),
+            ],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    if receipt_updated == 0 {
         transaction
             .commit()
             .await
             .map_err(scanner_result_database_error)?;
         return Ok(0);
     }
-    // The control-plane receipt is only written after the idempotent ES writes
-    // have succeeded. A retry repeats harmless create/upsert operations.
-    elasticsearch
-        .persist_dns_observations(&context, "default", &observations)
-        .await
-        .map_err(SaveScannerResultsError::Storage)?;
-    transaction
-        .execute(
-            "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
-             protocol_version, payload_checksum, storage_backend, storage_references) \
-             VALUES ($1, $2, $3, $4, $5, 2, $6, 'elasticsearch', $7);",
-            &[
-                &execution_db_id,
-                &upload_id,
-                &batch_index,
-                &is_final,
-                &observation_count,
-                &payload_checksum,
-                &serde_json::json!(["dns-observations", "dns-records"]),
-            ],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
     if follow_up_enabled {
         let resolved_ips = resolved_dns_answer_ips(&observations);
         if !resolved_ips.is_empty() {
@@ -2314,6 +2417,10 @@ pub async fn save_scanner_results(
         .transaction()
         .await
         .map_err(scanner_result_database_error)?;
+    transaction
+        .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '10s';")
+        .await
+        .map_err(scanner_result_database_error)?;
     let token_hash =
         hash_scanner_token(token, token_pepper).map_err(scanner_result_database_error)?;
     let scanner_id = upload.scanner_id.to_string();
@@ -2584,14 +2691,17 @@ pub async fn save_scanner_results(
                 .insert("tags".to_owned(), tags);
         }
     }
-    let mut storage_references = Vec::new();
-    let mut es_execution_summary = None;
-    let payload_checksum = if storage_mode.writes_elasticsearch() {
+    let storage_backend = match storage_mode {
+        config::ScanStorageMode::Postgres => "postgres",
+        config::ScanStorageMode::Dual => "dual",
+        config::ScanStorageMode::Elasticsearch => "elasticsearch",
+    };
+    let (transaction, batch_db_id, es_execution_summary) = if storage_mode.writes_elasticsearch() {
         let expected_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
             .map_err(SaveScannerResultsError::Storage)?;
         if let Some(existing) = transaction
             .query_opt(
-                "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+                "SELECT is_final, observation_count, payload_checksum, storage_backend FROM scan_result_batch \
                  WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
                 &[&execution_db_id, &upload_id, &batch_index],
             )
@@ -2609,17 +2719,92 @@ pub async fn save_scanner_results(
                     "batch identity was already used with different content".into(),
                 ));
             }
+            if existing.get::<_, String>("storage_backend") != "pending" {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(scanner_result_database_error)?;
+                return Ok(0);
+            }
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
+                     protocol_version, payload_checksum, storage_backend, storage_references) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', '[]'::JSONB);",
+                    &[
+                        &execution_db_id,
+                        &upload_id,
+                        &batch_index,
+                        &is_final,
+                        &observation_count,
+                        &protocol_version,
+                        &expected_checksum,
+                    ],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
         }
+        // 关键边界：任务行锁和连接在任何 Elasticsearch await 之前释放。
+        transaction
+            .commit()
+            .await
+            .map_err(scanner_result_database_error)?;
+        drop(client);
         let result = elasticsearch
             .persist_scan_batch(&batch_context, &observation_rows)
             .await
             .map_err(SaveScannerResultsError::Storage)?;
         debug_assert_eq!(result.payload_checksum, expected_checksum);
-        storage_references = result.indices;
-        es_execution_summary = result.execution_summary;
-        result.payload_checksum
+        let storage_references =
+            Value::Array(result.indices.into_iter().map(Value::String).collect());
+        client = pool.get().await.map_err(scanner_result_database_error)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(scanner_result_database_error)?;
+        transaction
+            .batch_execute(
+                "SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '15s';",
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        transaction
+            .query_one(
+                "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
+                &[&execution_db_id],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let receipt = transaction
+            .query_opt(
+                "UPDATE scan_result_batch SET storage_backend = $4, storage_references = $5 \
+                 WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3 \
+                 AND storage_backend = 'pending' RETURNING id;",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &storage_backend,
+                    &storage_references,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let Some(receipt) = receipt else {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        };
+        (
+            transaction,
+            receipt.get::<_, i64>("id"),
+            result.execution_summary,
+        )
     } else {
-        openssl::sha::sha256(
+        let payload_checksum = openssl::sha::sha256(
             &serde_json::to_vec(&serde_json::json!({
                 "execution_id": public_execution_id,
                 "upload_id": upload_id,
@@ -2631,62 +2816,56 @@ pub async fn save_scanner_results(
         )
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect()
-    };
-    let storage_backend = match storage_mode {
-        config::ScanStorageMode::Postgres => "postgres",
-        config::ScanStorageMode::Dual => "dual",
-        config::ScanStorageMode::Elasticsearch => "elasticsearch",
-    };
-    let storage_references =
-        Value::Array(storage_references.into_iter().map(Value::String).collect());
-    let row = transaction
-        .query_opt(
-            "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
-                protocol_version, payload_checksum, storage_backend, storage_references) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING RETURNING id;",
-            &[
-                &execution_db_id,
-                &upload_id,
-                &batch_index,
-                &is_final,
-                &observation_count,
-                &protocol_version,
-                &payload_checksum,
-                &storage_backend,
-                &storage_references,
-            ],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
-    let Some(row) = row else {
-        let existing = transaction
-            .query_one(
-                "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
-                 WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
-                &[&execution_db_id, &upload_id, &batch_index],
+        .collect::<String>();
+        let storage_references = Value::Array(Vec::new());
+        let row = transaction
+            .query_opt(
+                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
+                    protocol_version, payload_checksum, storage_backend, storage_references) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING RETURNING id;",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &is_final,
+                    &observation_count,
+                    &protocol_version,
+                    &payload_checksum,
+                    &storage_backend,
+                    &storage_references,
+                ],
             )
             .await
             .map_err(scanner_result_database_error)?;
-        let existing_checksum: Option<String> = existing.get("payload_checksum");
-        if existing.get::<_, bool>("is_final") != is_final
-            || existing.get::<_, i32>("observation_count") != observation_count
-            || existing_checksum
-                .as_deref()
-                .is_some_and(|checksum| checksum != payload_checksum)
-        {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "batch identity was already used with different content".into(),
-            ));
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(scanner_result_database_error)?;
-        return Ok(0);
+        let Some(row) = row else {
+            let existing = transaction
+                .query_one(
+                    "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+                     WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
+                    &[&execution_db_id, &upload_id, &batch_index],
+                )
+                .await
+                .map_err(scanner_result_database_error)?;
+            let existing_checksum: Option<String> = existing.get("payload_checksum");
+            if existing.get::<_, bool>("is_final") != is_final
+                || existing.get::<_, i32>("observation_count") != observation_count
+                || existing_checksum
+                    .as_deref()
+                    .is_some_and(|checksum| checksum != payload_checksum)
+            {
+                return Err(SaveScannerResultsError::InvalidUpload(
+                    "batch identity was already used with different content".into(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        };
+        (transaction, row.get::<_, i64>("id"), None)
     };
-    let batch_db_id: i64 = row.get("id");
     let observation_rows = Value::Array(observation_rows);
     // Keep the fact rows and their asset projection in one set-based statement. The
     // projection reads only rows inserted by this batch and deduplicates both IPs and
