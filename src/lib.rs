@@ -504,11 +504,22 @@ fn parse_ip_or_cidr(value: &str) -> Result<IpNet, AddrParseError> {
     }
 }
 
+/// Returns the two Elasticsearch representations used by scan observations.
+///
+/// Elasticsearch's `ip` type accepts only an address literal, while `ip_range`
+/// accepts CIDR. Keeping both values lets callers submit either form without
+/// discarding the original network prefix.
+fn scan_observation_addresses(value: &str) -> Result<(String, String, IpAddr), AddrParseError> {
+    let network = parse_ip_or_cidr(value)?;
+    let address = network.addr();
+    Ok((address.to_string(), network.to_string(), address))
+}
+
 #[cfg(test)]
 mod parse_ip_or_cidr_tests {
     use super::{
         CreateTask, STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan,
-        is_ip_scan_profile, parse_ip_or_cidr,
+        is_ip_scan_profile, parse_ip_or_cidr, scan_observation_addresses,
     };
 
     #[test]
@@ -541,6 +552,22 @@ mod parse_ip_or_cidr_tests {
     fn rejects_invalid_ip() {
         assert!(parse_ip_or_cidr("not-an-ip").is_err());
         assert!(parse_ip_or_cidr("192.0.2.1/99").is_err());
+    }
+
+    #[test]
+    fn builds_compatible_host_and_network_representations() {
+        let (address, network, parsed) = scan_observation_addresses("192.0.2.10").unwrap();
+        assert_eq!(address, "192.0.2.10");
+        assert_eq!(network, "192.0.2.10/32");
+        assert_eq!(parsed.to_string(), address);
+
+        let (address, network, _) = scan_observation_addresses("192.0.2.0/24").unwrap();
+        assert_eq!(address, "192.0.2.0");
+        assert_eq!(network, "192.0.2.0/24");
+
+        let (address, network, _) = scan_observation_addresses("2001:db8::1/128").unwrap();
+        assert_eq!(address, "2001:db8::1");
+        assert_eq!(network, "2001:db8::1/128");
     }
 
     #[test]
@@ -1519,6 +1546,12 @@ fn sanitize_result_item(item: ScannerResultItem) -> ScannerResultItem {
 fn immutable_scan_observation(value: &Value) -> Value {
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
+        // `ip_network` was split from `ip_address` for Elasticsearch mapping
+        // compatibility. Hash the network under the legacy field name so
+        // pending batches created before this change retain the same checksum.
+        if let Some(network) = object.remove("ip_network") {
+            object.insert("ip_address".to_owned(), network);
+        }
         for field in [
             "asn",
             "isp",
@@ -2585,16 +2618,14 @@ pub async fn save_scanner_results(
     let mut ip_intel_cache = HashMap::new();
     let fallback_observed_at = task_start_time.unwrap_or_else(get_unix_epoch_ms);
     for observation in &normalized_observations {
-        let parsed_ip = parse_ip_or_cidr(&observation.ip).map_err(|source_error| {
-            SaveScannerResultsError::InvalidIp {
+        let (ip_address, ip_network, parsed_ip) = scan_observation_addresses(&observation.ip)
+            .map_err(|source_error| SaveScannerResultsError::InvalidIp {
                 ip: observation.ip.clone(),
                 source: source_error,
-            }
-        })?;
-        let canonical_ip = parsed_ip.to_string();
+            })?;
         let observation_key = serde_json::to_string(&serde_json::json!([
             observation.kind,
-            canonical_ip,
+            ip_network,
             observation.port,
             observation.protocol,
             observation.service,
@@ -2604,17 +2635,16 @@ pub async fn save_scanner_results(
         let endpoint_id = openssl::sha::sha256(
             format!(
                 "{}\0{}\0{}",
-                public_execution_id, canonical_ip, observation.port
+                public_execution_id, ip_network, observation.port
             )
             .as_bytes(),
         )
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-        let ip_addr = parsed_ip.addr();
         let intel = ip_intel_cache
-            .entry(ip_addr)
-            .or_insert_with(|| maxmind.lookup(ip_addr))
+            .entry(parsed_ip)
+            .or_insert_with(|| maxmind.lookup(parsed_ip))
             .clone();
         let search_content = search_content::extract_search_content(observation.data.as_ref());
         let observed_at = observation.observed_at.unwrap_or(fallback_observed_at);
@@ -2627,7 +2657,10 @@ pub async fn save_scanner_results(
             "observation_key": observation_key,
             "endpoint_id": endpoint_id,
             "kind": observation.kind,
-            "ip_address": canonical_ip,
+            // `ip` fields reject CIDR strings. Preserve the network separately
+            // as `ip_range`, including /32 and /128 single-host networks.
+            "ip_address": ip_address,
+            "ip_network": ip_network,
             "port": i32::from(observation.port),
             "protocol": observation.protocol,
             "service": observation.service,
@@ -2653,7 +2686,8 @@ pub async fn save_scanner_results(
         let addresses = observation_rows
             .iter()
             .filter_map(|row| {
-                row.get("ip_address")
+                row.get("ip_network")
+                    .or_else(|| row.get("ip_address"))
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
@@ -2874,8 +2908,9 @@ pub async fn save_scanner_results(
         let saved_row = transaction
             .query_one(
             "WITH input AS MATERIALIZED ( \
-                SELECT * FROM jsonb_to_recordset($4::jsonb) AS item( \
-                    observation_key TEXT, kind TEXT, ip_address INET, port INT, \
+                SELECT item.*, COALESCE(item.ip_network, item.ip_address) AS storage_ip_address \
+                FROM jsonb_to_recordset($4::jsonb) AS item( \
+                    observation_key TEXT, kind TEXT, ip_address INET, ip_network INET, port INT, \
                     protocol TEXT, service TEXT, banner TEXT, title TEXT, http_body TEXT, \
                     http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
                     search_content_extracted BOOLEAN, observed_at BIGINT, \
@@ -2885,7 +2920,7 @@ pub async fn save_scanner_results(
                 INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
                     ip_address, port, protocol, service, banner, title, http_body, \
                     http_body_truncated, tls_subject, search_content_extracted, source, data, observed_at) \
-                SELECT $2, $3, observation_key, kind, ip_address, port, protocol, service, \
+                SELECT $2, $3, observation_key, kind, storage_ip_address, port, protocol, service, \
                     banner, title, http_body, http_body_truncated, tls_subject, \
                     search_content_extracted, source, data, to_timestamp(observed_at / 1000.0) FROM input \
                 ON CONFLICT (execution_id, observation_key) DO NOTHING \
@@ -2897,12 +2932,12 @@ pub async fn save_scanner_results(
              ), upserted_ips AS ( \
                 INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
                     country_code, country_name, region_name, city_name) \
-                SELECT DISTINCT ON (item.ip_address) $1, $2, item.ip_address, item.asn, \
+                SELECT DISTINCT ON (item.storage_ip_address) $1, $2, item.storage_ip_address, item.asn, \
                     item.isp, item.as_org, item.country_code, item.country_name, \
                     item.region_name, item.city_name \
                 FROM input item \
-                JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.ip_address \
-                ORDER BY item.ip_address \
+                JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.storage_ip_address \
+                ORDER BY item.storage_ip_address \
                 ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
                     asn = COALESCE(EXCLUDED.asn, ips.asn), \
                     isp = COALESCE(EXCLUDED.isp, ips.isp), \

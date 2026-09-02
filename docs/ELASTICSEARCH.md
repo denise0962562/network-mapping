@@ -29,6 +29,15 @@ Elasticsearch 可以从可选搜索副本升级为扫描事实的权威存储。
 逐项检查：非 2xx 立即失败；409 通过 `_mget` 回读并比较文档校验和，只有内容完全相同才
 视为幂等重试。原始 evidence 的 `data` 保留在 `_source`，mapping 使用 `enabled:false`。
 
+扫描结果地址兼容单 IP 与 CIDR。观察文档同时写入两个字段：`ip_address` 使用 ES `ip`
+类型，仅保存具体地址；`ip_network` 使用 `ip_range`，保存 CIDR。单 IPv4/IPv6 会规范化为
+`/32`/`/128` 网络，因此 `192.0.2.1` 与 `192.0.2.1/32` 具有相同观察身份。PostgreSQL 的
+`INET` 事实字段继续保存 `ip_network`，不会丢失非主机前缀。模板 schema version 3 会为
+新月度索引创建该 mapping；服务也会对已有匹配索引执行可加字段的 mapping 更新。
+
+为兼容修复前已进入 `pending` 的上传回执，批次和文档校验和仍按旧的 CIDR 语义计算；部署
+修复后扫描器可以使用原 `upload_id` 重试，不需要清理或重建待上传批次。
+
 扫描器先将稳定 `upload_id`、观察和下一批序号原子写入本地 `scanner-state.json`。服务端
 验证扫描器和任务后先写 ES，再写 PostgreSQL 回执、payload SHA-256 和实际索引引用。最终批
 使用 `refresh=wait_for`，所有 Bulk 请求使用 `wait_for_active_shards=all`；批次必须从 0 连续、

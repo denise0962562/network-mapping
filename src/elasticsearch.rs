@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, Monit
 
 const INDEX_SCHEMA_VERSION: &str = "2";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
-const SCAN_INDEX_SCHEMA_VERSION: &str = "2";
+const SCAN_INDEX_SCHEMA_VERSION: &str = "3";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
 const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
@@ -80,6 +81,7 @@ struct ElasticsearchInner {
     runtime: RwLock<ElasticsearchRuntime>,
     monitor: RwLock<Option<MonitorHandle>>,
     bulk_semaphore: Semaphore,
+    observation_compatibility_ready: AtomicBool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -306,6 +308,7 @@ impl ElasticsearchService {
                 runtime: RwLock::new(ElasticsearchRuntime::default()),
                 monitor: RwLock::new(None),
                 bulk_semaphore: Semaphore::new(bulk_max_concurrency),
+                observation_compatibility_ready: AtomicBool::new(false),
             }),
         })
     }
@@ -932,6 +935,37 @@ impl ElasticsearchService {
             },
         )
         .await?;
+        // Templates only affect newly-created monthly indices. Existing strict
+        // indices need this additive field before a dual IP/CIDR document lands.
+        if !self
+            .inner
+            .observation_compatibility_ready
+            .load(Ordering::Acquire)
+        {
+            let observation_pattern = format!("{}-*", self.inner.config.observation_index_prefix);
+            let response = self
+                .send_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::HEAD,
+                    &observation_pattern,
+                    |request| request,
+                )
+                .await?;
+            if response.status().is_success() {
+                self.send_json_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::PUT,
+                    &format!("{observation_pattern}/_mapping"),
+                    |request| request.json(&scan_observation_compatibility_mapping()),
+                )
+                .await?;
+            } else if response.status() != StatusCode::NOT_FOUND {
+                return Err(response_error(response).await);
+            }
+            self.inner
+                .observation_compatibility_ready
+                .store(true, Ordering::Release);
+        }
         self.ensure_named_index(
             &self.inner.config.execution_endpoint_index,
             &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
@@ -2383,7 +2417,8 @@ impl ElasticsearchService {
             let execution_id: String = batch.get("execution_id");
             let rows = connection
                 .query(
-                    "SELECT o.observation_key, o.kind, host(o.ip_address) AS ip_address, o.port, \
+                    "SELECT o.observation_key, o.kind, host(o.ip_address) AS ip_address, \
+                        o.ip_address::TEXT AS ip_network, o.port, \
                         o.protocol, o.service, o.banner, o.title, o.http_body, o.http_body_truncated, \
                         o.tls_subject, o.search_content_extracted, o.source, o.data, \
                         FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS observed_at, \
@@ -2407,13 +2442,15 @@ impl ElasticsearchService {
                 .into_iter()
                 .map(|row| {
                     let ip: String = row.get("ip_address");
+                    let network: String = row.get("ip_network");
                     let port: i32 = row.get("port");
                     let endpoint_id =
-                        sha256_hex(format!("{execution_id}\0{ip}\0{port}").as_bytes());
+                        sha256_hex(format!("{execution_id}\0{network}\0{port}").as_bytes());
                     json!({
                         "observation_key": row.get::<_, String>("observation_key"),
                         "endpoint_id": endpoint_id,
-                        "kind": row.get::<_, String>("kind"), "ip_address": ip, "port": port,
+                        "kind": row.get::<_, String>("kind"), "ip_address": ip,
+                        "ip_network": network, "port": port,
                         "protocol": row.get::<_, Option<String>>("protocol"),
                         "service": row.get::<_, Option<String>>("service"),
                         "banner": row.get::<_, Option<String>>("banner"),
@@ -3167,6 +3204,11 @@ fn replace_has_endpoint_filters(
 fn immutable_scan_observation(value: &Value) -> Value {
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
+        // Preserve checksums written by the legacy representation, which kept
+        // CIDR (including /32 and /128) directly in `ip_address`.
+        if let Some(network) = object.remove("ip_network") {
+            object.insert("ip_address".to_owned(), network);
+        }
         for field in [
             "asn",
             "isp",
@@ -3231,6 +3273,7 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "endpoint_id": {"type": "keyword"},
                     "kind": {"type": "keyword"},
                     "ip_address": {"type": "ip"},
+                    "ip_network": {"type": "ip_range"},
                     "port": {"type": "integer"},
                     "protocol": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                     "service": {"type": "keyword", "normalizer": "lowercase_normalizer"},
@@ -3259,6 +3302,10 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
             }
         }
     })
+}
+
+fn scan_observation_compatibility_mapping() -> Value {
+    json!({"properties": {"ip_network": {"type": "ip_range"}}})
 }
 
 fn dns_observation_template(data_stream: &str, replicas: u32, retention_days: u16) -> Value {
@@ -3712,6 +3759,7 @@ mod tests {
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
         bulk_retry_delay, index_definition, new_trace_context, parse_asn, parse_storage_metrics,
         scan_batch_payload_checksum, scan_endpoint_index_definition,
+        scan_observation_compatibility_mapping, scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::time::Duration;
@@ -3734,6 +3782,23 @@ mod tests {
         assert_eq!(
             mapping.pointer("/mappings/properties/http_body/type"),
             Some(&serde_json::json!("match_only_text"))
+        );
+    }
+
+    #[test]
+    fn scan_observation_mapping_keeps_ip_and_cidr_as_distinct_types() {
+        let template = scan_observation_template("observations", 0);
+        assert_eq!(
+            template.pointer("/template/mappings/properties/ip_address/type"),
+            Some(&serde_json::json!("ip"))
+        );
+        assert_eq!(
+            template.pointer("/template/mappings/properties/ip_network/type"),
+            Some(&serde_json::json!("ip_range"))
+        );
+        assert_eq!(
+            scan_observation_compatibility_mapping().pointer("/properties/ip_network/type"),
+            Some(&serde_json::json!("ip_range"))
         );
     }
 
@@ -3861,6 +3926,20 @@ mod tests {
         assert_eq!(
             scan_batch_payload_checksum(&context, std::slice::from_ref(&original)).unwrap(),
             scan_batch_payload_checksum(&context, &[enriched]).unwrap()
+        );
+        let legacy_cidr = serde_json::json!({
+            "observation_key": "key", "ip_address": "192.0.2.1/32", "port": 443,
+            "banner": "first", "observed_at": 1, "asn": "4134", "tags": []
+        });
+        let compatible_dual_fields = serde_json::json!({
+            "observation_key": "key", "ip_address": "192.0.2.1",
+            "ip_network": "192.0.2.1/32", "port": 443,
+            "banner": "first", "observed_at": 1, "asn": "AS4134",
+            "tags": [{"id": 1, "name": "prod"}]
+        });
+        assert_eq!(
+            scan_batch_payload_checksum(&context, &[legacy_cidr]).unwrap(),
+            scan_batch_payload_checksum(&context, &[compatible_dual_fields]).unwrap()
         );
         let mut changed = original.clone();
         changed["banner"] = serde_json::json!("different");
