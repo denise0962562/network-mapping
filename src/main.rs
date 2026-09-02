@@ -97,7 +97,19 @@ async fn main() -> io::Result<()> {
 
     let db_pool = db::create_postgresql_pool(&db_config)
         .await
-        .expect("创建连接池错误");
+        .map_err(|error_value| {
+            let diagnostics = error_chain_diagnostics(error_value.as_ref());
+            error!(
+                target: "server::startup",
+                event = "DatabaseStartupFailed",
+                database_host = %db_config.host,
+                database_port = db_config.port,
+                database_name = %db_config.db_name,
+                message = %diagnostics,
+                "数据库初始化失败，服务未启动"
+            );
+            io::Error::other(format!("数据库初始化失败：{diagnostics}"))
+        })?;
     let pool = db_pool.clone();
     let request_log_pool = db_pool.clone();
     let scanner_latency_pool = db_pool.clone();
