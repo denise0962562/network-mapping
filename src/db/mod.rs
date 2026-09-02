@@ -24,6 +24,7 @@ pub async fn create_postgresql_pool(
     username: String,
     password: String,
     dbname: String,
+    max_size: usize,
 ) -> Result<deadpool_postgres::Pool, Box<dyn std::error::Error>> {
     let mut db_poll_cfg = deadpool_postgres::Config::new();
     db_poll_cfg.user = Some(username);
@@ -35,7 +36,7 @@ pub async fn create_postgresql_pool(
         recycling_method: RecyclingMethod::Verified,
     });
     db_poll_cfg.pool = Some(deadpool_postgres::PoolConfig {
-        max_size: 10,
+        max_size,
         timeouts: Default::default(),
         queue_mode: deadpool::managed::QueueMode::Lifo,
     });

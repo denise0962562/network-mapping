@@ -44,6 +44,7 @@ async fn login_test() {
         db_config.username,
         db_config.password,
         db_config.db_name,
+        db_config.pool_max_size,
     )
     .await
     .expect("创建连接池错误");

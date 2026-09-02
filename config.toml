@@ -164,6 +164,7 @@ port = 5432
 username = ""
 password = ""
 db_name = ""
+pool_max_size = 10                                  # PostgreSQL 连接池最大连接数
 tls = false # true or false
 
 init_database_file = "source/database/init.sql"          #用于初始化数据库表的sql文件位置

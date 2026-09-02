@@ -1063,6 +1063,7 @@ pub struct DatabaseConfig {
     pub username: String,           //用户名
     pub password: String,           //密码
     pub db_name: String,            //数据库名
+    pub pool_max_size: usize,       //连接池最大连接数
     pub tls: bool,                  //是否使用tls
     pub init_database_file: String, //初始化数据库表的sql文件
     pub sql_file_path: String,      //sql文件存放路径（相对）
@@ -1074,6 +1075,7 @@ impl SelfChecking for DatabaseConfig {
             || self.username.is_empty()
             || self.password.is_empty()
             || self.db_name.is_empty()
+            || self.pool_max_size == 0
             || self.init_database_file.is_empty()
         {
             panic!("数据库关键字段为空")
@@ -1087,6 +1089,7 @@ impl SelfChecking for DatabaseConfig {
             || self.username.is_empty()
             || self.password.is_empty()
             || self.db_name.is_empty()
+            || self.pool_max_size == 0
             || self.init_database_file.is_empty()
         {
             println!("数据库关键字段为空");
@@ -1248,9 +1251,9 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutomaticTargetConfig, BackupConfig, Clis, ElasticsearchConfig, FrontendConfig,
-        MaxMindConfig, MonitorConfig, NotificationPreferences, SecurityConfig, SelfChecking,
-        TlsConfig, session_ttl_seconds_from_minutes,
+        AutomaticTargetConfig, BackupConfig, Clis, DatabaseConfig, ElasticsearchConfig,
+        FrontendConfig, MaxMindConfig, MonitorConfig, NotificationPreferences, SecurityConfig,
+        SelfChecking, TlsConfig, session_ttl_seconds_from_minutes,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -1267,6 +1270,26 @@ mod tests {
         }))
         .expect("旧前端缺少 healthAlertEnabled 时应能正常反序列化");
         assert!(prefs.health_alert_enabled);
+    }
+
+    #[test]
+    fn database_connection_pool_size_must_be_positive() {
+        let mut database = DatabaseConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 5432,
+            username: "network_mapping".to_owned(),
+            password: "password".to_owned(),
+            db_name: "network_mapping".to_owned(),
+            pool_max_size: 10,
+            tls: false,
+            init_database_file: "source/database/init.sql".to_owned(),
+            sql_file_path: "source/database".to_owned(),
+        };
+
+        assert!(database.try_check().expect("valid database config"));
+
+        database.pool_max_size = 0;
+        assert!(!database.try_check().expect("zero pool size is invalid"));
     }
 
     #[test]
