@@ -1506,6 +1506,9 @@ impl ElasticsearchService {
         }
         let mut body = String::new();
         for observation in observations {
+            if observation.get("kind").and_then(Value::as_str) == Some("vulnerability") {
+                continue;
+            }
             let ip = observation
                 .get("ip_address")
                 .and_then(Value::as_str)

@@ -96,6 +96,7 @@ ALTER TABLE scan_task ADD CONSTRAINT scan_task_profile_check
         'legacy',
         'port_only',
         'service_inventory',
+        'vulnerability_scan',
         'dns_records',
         'dns_ports',
         'dns_full'
@@ -288,7 +289,7 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	batch_index INT NOT NULL CHECK (batch_index >= 0),
 	is_final BOOLEAN NOT NULL,
 	observation_count INT NOT NULL CHECK (observation_count >= 0),
-	protocol_version SMALLINT NOT NULL DEFAULT 2 CHECK (protocol_version IN (1, 2)),
+	protocol_version SMALLINT NOT NULL DEFAULT 2 CHECK (protocol_version IN (1, 2, 3)),
 	payload_checksum VARCHAR(64),
 	-- `pending` reserves an upload while its idempotent Elasticsearch write runs outside
 	-- the PostgreSQL transaction. A retry resumes the same receipt after a crash/timeout.
@@ -320,25 +321,16 @@ ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS payload_checksum VARCHAR(64);
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_references JSONB NOT NULL DEFAULT '[]'::JSONB;
-DO $$
-BEGIN
-	IF NOT EXISTS (
-		SELECT 1 FROM pg_constraint
-		WHERE conrelid = 'scan_result_batch'::regclass
-			AND conname = 'scan_result_batch_protocol_version_check'
-	) THEN
-		ALTER TABLE scan_result_batch
-			ADD CONSTRAINT scan_result_batch_protocol_version_check
-			CHECK (protocol_version IN (1, 2));
-	END IF;
-END $$;
+ALTER TABLE scan_result_batch DROP CONSTRAINT IF EXISTS scan_result_batch_protocol_version_check;
+ALTER TABLE scan_result_batch ADD CONSTRAINT scan_result_batch_protocol_version_check
+	CHECK (protocol_version IN (1, 2, 3));
 
 CREATE TABLE IF NOT EXISTS scan_observation (
 	id BIGSERIAL PRIMARY KEY,
 	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
 	batch_id BIGINT NOT NULL REFERENCES scan_result_batch(id) ON DELETE CASCADE,
 	observation_key TEXT NOT NULL,
-	kind TEXT NOT NULL CHECK (kind IN ('port', 'service')),
+	kind TEXT NOT NULL CHECK (kind IN ('port', 'service', 'vulnerability')),
 	ip_address INET NOT NULL,
 	port INT NOT NULL CHECK (port >= 0 AND port <= 65535),
 	protocol TEXT NOT NULL,
@@ -355,7 +347,11 @@ CREATE TABLE IF NOT EXISTS scan_observation (
 	UNIQUE(execution_id, observation_key)
 );
 
--- 旧版结果允许协议为空；v2 上传仍由应用层要求协议非空。
+ALTER TABLE scan_observation DROP CONSTRAINT IF EXISTS scan_observation_kind_check;
+ALTER TABLE scan_observation ADD CONSTRAINT scan_observation_kind_check
+	CHECK (kind IN ('port', 'service', 'vulnerability'));
+
+-- 旧版结果允许协议为空；类型化上传仍由应用层要求协议非空。
 ALTER TABLE scan_observation ALTER COLUMN protocol DROP NOT NULL;
 ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS title TEXT;
 ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS http_body TEXT;
@@ -547,6 +543,7 @@ FROM (
 				o.id DESC
 		) AS row_number
 	FROM scan_observation o
+	WHERE o.kind IN ('port', 'service')
 ) ranked
 WHERE ranked.row_number = 1;
 
@@ -1263,7 +1260,9 @@ WITH eligible AS MATERIALIZED (
 	CROSS JOIN LATERAL (
 		VALUES ('global'::TEXT, 0), ('user'::TEXT, task.user_id)
 	) AS scope(scope_type, scope_id)
-	WHERE execution.execution_status = 'succeeded' AND observation.port > 0
+	WHERE execution.execution_status = 'succeeded'
+		AND observation.port > 0
+		AND observation.kind IN ('port', 'service')
 ), endpoint_stats AS (
 	SELECT scope_type, scope_id, ip_address, port,
 		MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at

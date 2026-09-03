@@ -323,6 +323,7 @@ pub(crate) async fn export_task(
                 FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
             FROM scan_observation o \
             WHERE o.execution_id = e.id AND o.ip_address = i.ip_address AND o.port = p.port \
+                AND o.kind IN ('port', 'service') \
             ORDER BY (o.kind = 'service') DESC, \
                 (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
                 o.observed_at DESC, o.id DESC LIMIT 1 \

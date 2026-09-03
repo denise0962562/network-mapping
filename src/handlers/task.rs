@@ -245,6 +245,7 @@ impl ScannerScanCapabilities {
                 "legacy"
                     | "port_only"
                     | "service_inventory"
+                    | "vulnerability_scan"
                     | "dns_records"
                     | "dns_ports"
                     | "dns_full"
@@ -252,7 +253,7 @@ impl ScannerScanCapabilities {
         }) || self.stages.iter().any(|value| {
             !matches!(
                 value.as_str(),
-                "port_discovery" | "service_detection" | "dns_lookup"
+                "port_discovery" | "service_detection" | "dns_lookup" | "vulnerability_detection"
             )
         }) {
             return Err("unsupported scan capability");
@@ -562,6 +563,61 @@ async fn load_execution_results_from_elasticsearch(
         }
     }
     Ok(results)
+}
+
+async fn load_vulnerabilities_from_elasticsearch(
+    elasticsearch: &ElasticsearchService,
+    execution_id: &str,
+) -> Result<(Vec<Value>, i64), String> {
+    let response = elasticsearch
+        .scan_query(
+            ScanQueryIndex::Observations,
+            &json!({
+                "size": 500,
+                "track_total_hits": true,
+                "query": {"bool": {"filter": [
+                    {"term": {"execution_id": execution_id}},
+                    {"term": {"kind": "vulnerability"}}
+                ]}},
+                "sort": [{"observed_at": "desc"}, {"_id": "asc"}]
+            }),
+        )
+        .await?;
+    let total = response
+        .pointer("/hits/total/value")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let findings = response
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| hit.get("_source"))
+        .map(vulnerability_response)
+        .collect();
+    Ok((findings, total))
+}
+
+fn vulnerability_response(source: &Value) -> Value {
+    let data = source.get("data").cloned().unwrap_or_else(|| json!({}));
+    let mut finding = data.as_object().cloned().unwrap_or_default();
+    finding.insert(
+        "ip".into(),
+        source.get("ip_address").cloned().unwrap_or(Value::Null),
+    );
+    finding.insert(
+        "port".into(),
+        source.get("port").cloned().unwrap_or(Value::Null),
+    );
+    finding.insert(
+        "protocol".into(),
+        source.get("protocol").cloned().unwrap_or(Value::Null),
+    );
+    finding.insert(
+        "observed_at".into(),
+        source.get("observed_at").cloned().unwrap_or(Value::Null),
+    );
+    Value::Object(finding)
 }
 
 #[post("/api/scanner/heartbeat")]
@@ -1324,6 +1380,7 @@ async fn get_task(
                         FROM scan_observation o \
                         WHERE o.execution_id = i.execution_id \
                             AND o.ip_address = i.ip_address AND o.port = p.port \
+                            AND o.kind IN ('port', 'service') \
                         ORDER BY (o.kind = 'service') DESC, \
                             (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
                             o.observed_at DESC, o.id DESC LIMIT 1 \
@@ -1371,6 +1428,62 @@ async fn get_task(
             })
             .collect()
     };
+    let (vulnerabilities, vulnerability_count) = if elasticsearch
+        .scan_storage_mode()
+        .reads_elasticsearch()
+    {
+        match load_vulnerabilities_from_elasticsearch(
+            elasticsearch.get_ref(),
+            selected_execution.get::<_, String>("execution_id").as_str(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                error_logs(&req, "GetTaskVulnerabilitiesElasticsearchError", &error);
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"message": "漏洞结果索引暂时不可用"}));
+            }
+        }
+    } else {
+        let rows = match connection
+                .query(
+                    "SELECT jsonb_build_object( \
+                        'ip', host(ip_address), 'port', port, 'protocol', protocol, \
+                        'observed_at', FLOOR(EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT, \
+                        'template_id', data->>'template_id', 'name', data->>'name', \
+                        'severity', data->>'severity', 'matcher_name', data->>'matcher_name', \
+                        'matched_at', data->>'matched_at', 'description', data->>'description', \
+                        'remediation', data->>'remediation', 'tags', COALESCE(data->'tags', '[]'::jsonb), \
+                        'references', COALESCE(data->'references', '[]'::jsonb), \
+                        'classification', data->'classification', \
+                        'extracted_results', COALESCE(data->'extracted_results', '[]'::jsonb)) AS finding, \
+                        COUNT(*) OVER()::BIGINT AS total \
+                     FROM scan_observation WHERE execution_id = $1 AND kind = 'vulnerability' \
+                     ORDER BY observed_at DESC, id DESC LIMIT 500;",
+                    &[&selected_execution_pk],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    error_logs_error(
+                        &req,
+                        "GetTaskVulnerabilitiesError",
+                        "load_task_vulnerabilities",
+                        &error,
+                    );
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+        let total = rows.first().map(|row| row.get("total")).unwrap_or(0_i64);
+        (
+            rows.into_iter()
+                .map(|row| row.get::<_, Value>("finding"))
+                .collect(),
+            total,
+        )
+    };
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "data": {
@@ -1406,8 +1519,10 @@ async fn get_task(
                 "ip_count": ip_count,
                 "port_count": port_count,
                 "result_count": result_count,
+                "vulnerability_count": vulnerability_count,
             },
             "results": results,
+            "vulnerabilities": vulnerabilities,
             "pagination": {
                 "page": page,
                 "page_size": page_size,
@@ -2342,8 +2457,12 @@ mod tests {
     fn scan_capabilities_are_allowlisted() {
         let valid = ScannerScanCapabilities {
             plan_versions: vec![1],
-            profiles: vec!["legacy".into(), "port_only".into()],
-            stages: vec!["port_discovery".into()],
+            profiles: vec![
+                "legacy".into(),
+                "port_only".into(),
+                "vulnerability_scan".into(),
+            ],
+            stages: vec!["port_discovery".into(), "vulnerability_detection".into()],
             explicit_dns_resolvers: false,
         };
         assert!(valid.validate().is_ok());
@@ -2358,10 +2477,18 @@ mod tests {
     }
 
     #[test]
-    fn database_schema_allows_all_dns_scan_profiles() {
+    fn database_schema_allows_all_scan_profiles() {
         let initialization_sql = include_str!("../../source/database/init.sql");
 
-        for profile in ["dns_records", "dns_ports", "dns_full"] {
+        for profile in [
+            "legacy",
+            "port_only",
+            "service_inventory",
+            "vulnerability_scan",
+            "dns_records",
+            "dns_ports",
+            "dns_full",
+        ] {
             assert!(
                 initialization_sql.contains(&format!("'{profile}'")),
                 "database schema must allow {profile}"
