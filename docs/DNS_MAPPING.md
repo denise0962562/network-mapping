@@ -62,7 +62,12 @@ max_targets_per_task = 100
 前端“创建扫描”页使用单一目标输入框，完整校验后把整批目标识别为 IPv4/CIDR、IPv6/CIDR
 或域名，并自动选择对应创建接口。多个目标可用逗号或换行分隔，但同一次输入只能使用一种
 分隔符，且不能混合目标类型。“仅 DNS”只有在整批目标均识别为域名时才可选；提交前仍会
-再次校验。DNS 父任务固定自动分配；生成的 IP 子任务按系统任务保存，可通过任务列表的系统
+再次校验。扫描域名必须至少包含两个由 `.` 分隔的标签，仅允许 ASCII 字母、数字及非首尾
+连字符；单标签最多 63 octets，完整 wire name 最多 255 octets（不含末尾根点的点分形式最多
+253 octets）。长度限制依据 [RFC 1035 §2.3.4](https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.4)，
+字符规则采用其 [§2.3.1 preferred name syntax](https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.1)。
+首字符允许数字遵循 [RFC 1123 §2.1](https://www.rfc-editor.org/rfc/rfc1123.html#section-2.1) 的放宽。
+DNS 父任务固定自动分配；生成的 IP 子任务按系统任务保存，可通过任务列表的系统
 任务开关查看。
 
 ## Elasticsearch 配置与保留

@@ -73,20 +73,36 @@ fn default_dns_class() -> String {
 }
 
 pub fn canonical_domain(value: &str) -> Result<String, String> {
-    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    let value = value.trim();
+    let value = value
+        .strip_suffix('.')
+        .unwrap_or(value)
+        .to_ascii_lowercase();
     if value.is_empty() || value.len() > 253 {
-        return Err("DNS domain must contain 1 to 253 characters".to_owned());
+        return Err("DNS domain must contain 1 to 253 octets without the root dot".to_owned());
     }
-    if value.split('.').any(|label| {
-        label.is_empty()
-            || label.len() > 63
-            || !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || label.starts_with('-')
-            || label.ends_with('-')
-    }) {
+    let labels = value.split('.').collect::<Vec<_>>();
+    let wire_length = 1 + labels.iter().map(|label| 1 + label.len()).sum::<usize>();
+    if wire_length > 255
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || label.starts_with('-')
+                || label.ends_with('-')
+        })
+    {
         return Err(format!("invalid DNS domain '{value}'"));
+    }
+    Ok(value)
+}
+
+pub fn canonical_scan_domain(value: &str) -> Result<String, String> {
+    let value = canonical_domain(value)?;
+    if !value.contains('.') {
+        return Err("DNS scan domain must contain at least two labels separated by '.'".to_owned());
     }
     Ok(value)
 }
@@ -370,6 +386,31 @@ mod tests {
             "priority=10;target=mail.example.com"
         );
         assert_eq!(record.target_domain.as_deref(), Some("mail.example.com"));
+    }
+
+    #[test]
+    fn scan_domains_require_dot_separation_and_obey_wire_limits() {
+        let label_63 = "a".repeat(63);
+        let maximum = format!(
+            "{label_63}.{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        let oversized_name = format!(
+            "{label_63}.{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+
+        assert!(canonical_scan_domain("a").is_err());
+        assert_eq!(canonical_scan_domain("A.Example.").unwrap(), "a.example");
+        assert_eq!(maximum.len(), 253);
+        assert!(canonical_scan_domain(&maximum).is_ok());
+        assert!(canonical_scan_domain(&oversized_name).is_err());
+        assert!(canonical_scan_domain(&format!("{}.example", "a".repeat(64))).is_err());
+        assert!(canonical_scan_domain("a.example..").is_err());
     }
 
     #[test]

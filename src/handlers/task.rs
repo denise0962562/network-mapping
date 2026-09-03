@@ -1995,7 +1995,7 @@ async fn create_dns_task(
     let mut domains = match input
         .domains
         .iter()
-        .map(|domain| crate::dns::canonical_domain(domain))
+        .map(|domain| crate::dns::canonical_scan_domain(domain))
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(domains) => domains,
