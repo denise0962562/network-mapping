@@ -109,6 +109,9 @@ fn resolve_dns_task_port(
     port: Option<&str>,
 ) -> Result<String, &'static str> {
     if scan_profile == "dns_records" && !follow_up_port_scan {
+        if port.is_some_and(|value| !value.trim().is_empty()) {
+            return Err("port must be omitted for DNS-only tasks");
+        }
         return Ok("53".to_owned());
     }
 
@@ -120,6 +123,55 @@ fn resolve_dns_task_port(
         return Err("invalid port range");
     }
     Ok(port.to_owned())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedDnsScanRequest {
+    task_profile: String,
+    follow_up_profile: Option<String>,
+}
+
+fn resolve_dns_scan_request(
+    scan_profile: &str,
+    legacy_follow_up_enabled: bool,
+    legacy_follow_up_profile: &str,
+) -> Result<ResolvedDnsScanRequest, &'static str> {
+    match scan_profile {
+        "dns_records" if legacy_follow_up_enabled => {
+            if !crate::is_ip_scan_profile(legacy_follow_up_profile) {
+                return Err("invalid DNS follow-up scan profile");
+            }
+            Ok(ResolvedDnsScanRequest {
+                task_profile: "dns_records".into(),
+                follow_up_profile: Some(legacy_follow_up_profile.into()),
+            })
+        }
+        "dns_records" => Ok(ResolvedDnsScanRequest {
+            task_profile: "dns_records".into(),
+            follow_up_profile: None,
+        }),
+        // Unified domain modes always run DNS first. The server then creates
+        // address-family-specific child tasks from authorized A/AAAA answers.
+        "legacy" | "port_only" | "service_inventory" | "vulnerability_scan" => {
+            if legacy_follow_up_enabled {
+                return Err("follow_up_port_scan must not be combined with a unified scan profile");
+            }
+            Ok(ResolvedDnsScanRequest {
+                task_profile: "dns_records".into(),
+                follow_up_profile: Some(scan_profile.into()),
+            })
+        }
+        // Retain the original in-scanner DNS profiles for rolling upgrades and
+        // existing API clients. The web UI no longer creates these profiles.
+        "dns_ports" | "dns_full" if !legacy_follow_up_enabled => Ok(ResolvedDnsScanRequest {
+            task_profile: scan_profile.into(),
+            follow_up_profile: None,
+        }),
+        "dns_ports" | "dns_full" => {
+            Err("follow_up_port_scan is not valid for legacy DNS scan profiles")
+        }
+        _ => Err("invalid DNS scan profile"),
+    }
 }
 
 #[derive(Serialize)]
@@ -1484,6 +1536,10 @@ async fn get_task(
             total,
         )
     };
+    let generation_metadata = task.get::<_, Option<Value>>("generation_metadata");
+    let stored_scan_profile = task.get::<_, String>("scan_profile");
+    let display_scan_profile =
+        crate::display_scan_profile(&stored_scan_profile, generation_metadata.as_ref());
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "data": {
@@ -1500,9 +1556,10 @@ async fn get_task(
             "dispatch_mode": task.get::<_, String>("dispatch_mode"),
             "task_source": task.get::<_, String>("task_source"),
             "generation_strategy": task.get::<_, Option<String>>("generation_strategy"),
-            "generation_metadata": task.get::<_, Option<Value>>("generation_metadata"),
+            "generation_metadata": generation_metadata,
             "address_family": task.get::<_, String>("address_family"),
-            "scan_profile": task.get::<_, String>("scan_profile"),
+            "scan_profile": display_scan_profile,
+            "task_scan_profile": stored_scan_profile,
             "scan_plan": task.get::<_, Value>("scan_plan"),
             "dns_resolvers": task.get::<_, Value>("dns_resolvers"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
@@ -1908,39 +1965,26 @@ async fn create_dns_task(
         return HttpResponse::BadRequest()
             .json(json!({"success": false, "message": "dns_resolvers contains duplicate IDs"}));
     }
-    if !matches!(
-        input.scan_profile.as_str(),
-        "dns_records" | "dns_ports" | "dns_full"
+    let requested_scan_profile = input.scan_profile.trim().to_ascii_lowercase();
+    let resolved_scan = match resolve_dns_scan_request(
+        &requested_scan_profile,
+        input.follow_up_port_scan,
+        input.follow_up_scan_profile.trim(),
     ) {
-        return HttpResponse::BadRequest()
-            .json(json!({"success": false, "message": "invalid DNS scan profile"}));
-    }
-    if input.follow_up_port_scan {
-        if !dns_follow_up.get().await.value.enabled {
-            return HttpResponse::Conflict().json(json!({
-                "success": false,
-                "message": "DNS 解析后自动创建端口任务未启用"
-            }));
+        Ok(resolved) => resolved,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
         }
-        if input.scan_profile != "dns_records" {
-            return HttpResponse::BadRequest().json(json!({
-                "success": false,
-                "message": "启用自动端口任务时 DNS 扫描模式必须为仅 DNS 记录"
-            }));
-        }
-        if !matches!(
-            input.follow_up_scan_profile.as_str(),
-            "legacy" | "port_only" | "service_inventory"
-        ) {
-            return HttpResponse::BadRequest().json(json!({
-                "success": false,
-                "message": "invalid DNS follow-up scan profile"
-            }));
-        }
+    };
+    if resolved_scan.follow_up_profile.is_some() && !dns_follow_up.get().await.value.enabled {
+        return HttpResponse::Conflict().json(json!({
+            "success": false,
+            "message": "DNS 解析后自动扫描未启用，请配置授权网段并启用 dns_follow_up"
+        }));
     }
     let task_port = match resolve_dns_task_port(
-        &input.scan_profile,
-        input.follow_up_port_scan,
+        &resolved_scan.task_profile,
+        resolved_scan.follow_up_profile.is_some(),
         input.port.as_deref(),
     ) {
         Ok(port) => port,
@@ -1971,7 +2015,7 @@ async fn create_dns_task(
              AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
              AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
              LIMIT 1;",
-            &[&input.scan_profile, &!dns_resolvers.is_empty()],
+            &[&resolved_scan.task_profile, &!dns_resolvers.is_empty()],
         )
         .await
     {
@@ -1991,10 +2035,10 @@ async fn create_dns_task(
         }
     };
     let task_id = Uuid::now_v7().to_string();
-    let generation_metadata = if input.follow_up_port_scan {
+    let generation_metadata = if let Some(follow_up_profile) = &resolved_scan.follow_up_profile {
         json!({"dns_follow_up": {
             "enabled": true,
-            "scan_profile": input.follow_up_scan_profile,
+            "scan_profile": follow_up_profile,
         }})
     } else {
         json!({})
@@ -2024,8 +2068,9 @@ async fn create_dns_task(
                 &task_port,
                 &(i32::from(input.level)),
                 &input.remark,
-                &input.scan_profile,
-                &build_scan_plan(&input.scan_profile).expect("DNS scan profile was validated"),
+                &resolved_scan.task_profile,
+                &build_scan_plan(&resolved_scan.task_profile)
+                    .expect("resolved DNS scan profile was validated"),
                 &domains,
                 &serde_json::to_value(&dns_resolvers).expect("DNS resolver input is serializable"),
                 &generation_metadata,
@@ -2053,7 +2098,13 @@ async fn create_dns_task(
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
         .resource("task", task_id.clone());
     audit_event.response_status = Some(200);
-    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": input.scan_profile, "dns_resolver_count": dns_resolvers.len(), "follow_up_port_scan": input.follow_up_port_scan, "follow_up_scan_profile": input.follow_up_scan_profile});
+    audit_event.metadata = json!({
+        "target_count": domains.len(),
+        "requested_scan_profile": requested_scan_profile,
+        "task_scan_profile": resolved_scan.task_profile,
+        "dns_resolver_count": dns_resolvers.len(),
+        "follow_up_scan_profile": resolved_scan.follow_up_profile,
+    });
     if let Err(error) = audit::write(
         &transaction,
         &AuditContext::from_request(&req),
@@ -2073,7 +2124,15 @@ async fn create_dns_task(
         );
         return HttpResponse::InternalServerError().finish();
     }
-    HttpResponse::Ok().json(json!({"success": true, "task_id": task_id, "domains": domains, "dns_resolvers": dns_resolvers}))
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "task_id": task_id,
+        "domains": domains,
+        "dns_resolvers": dns_resolvers,
+        "scan_profile": requested_scan_profile,
+        "task_scan_profile": resolved_scan.task_profile,
+        "follow_up_scan_profile": resolved_scan.follow_up_profile,
+    }))
 }
 
 /// 用于扫描器申请一个扫描目标
@@ -2362,7 +2421,8 @@ mod tests {
     use super::{
         ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
         ScannerScanCapabilities, build_dns_comparison, normalize_task_list_query,
-        resolve_dns_task_port, task_result_pagination, validate_latency_report, validate_public_ip,
+        resolve_dns_scan_request, resolve_dns_task_port, task_result_pagination,
+        validate_latency_report, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
@@ -2511,6 +2571,42 @@ mod tests {
         assert_eq!(
             resolve_dns_task_port("dns_ports", false, Some("80,abc")).unwrap_err(),
             "invalid port range"
+        );
+    }
+
+    #[test]
+    fn dns_only_mode_rejects_ports() {
+        assert_eq!(
+            resolve_dns_task_port("dns_records", false, Some("53")).unwrap_err(),
+            "port must be omitted for DNS-only tasks"
+        );
+        assert_eq!(
+            resolve_dns_task_port("dns_records", false, Some("  ")).unwrap(),
+            "53"
+        );
+    }
+
+    #[test]
+    fn unified_domain_modes_resolve_to_dns_parent_and_ip_follow_up() {
+        for profile in ["port_only", "service_inventory", "vulnerability_scan"] {
+            let resolved = resolve_dns_scan_request(profile, false, "port_only").unwrap();
+            assert_eq!(resolved.task_profile, "dns_records");
+            assert_eq!(resolved.follow_up_profile.as_deref(), Some(profile));
+        }
+
+        let dns_only = resolve_dns_scan_request("dns_records", false, "port_only").unwrap();
+        assert_eq!(dns_only.task_profile, "dns_records");
+        assert_eq!(dns_only.follow_up_profile, None);
+        assert!(resolve_dns_scan_request("unsupported", false, "port_only").is_err());
+    }
+
+    #[test]
+    fn legacy_dns_follow_up_accepts_vulnerability_profile() {
+        let resolved = resolve_dns_scan_request("dns_records", true, "vulnerability_scan").unwrap();
+        assert_eq!(resolved.task_profile, "dns_records");
+        assert_eq!(
+            resolved.follow_up_profile.as_deref(),
+            Some("vulnerability_scan")
         );
     }
 

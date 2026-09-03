@@ -2,13 +2,21 @@
 
 ## 任务计划
 
-任务创建 API 可选传入 `scan_profile`：
+创建扫描页与域名任务 API 使用以下四种用户模式：
+
+- “全部”/`vulnerability_scan`：端口发现、可选服务识别和必需漏洞检测；
+- “仅端口”/`port_only`：只执行端口发现；
+- “服务识别”/`service_inventory`：端口发现后执行必需的服务识别；
+- “仅 DNS”/`dns_records`：只查询并归档 DNS 记录，只允许域名目标。
+
+IP/CIDR 使用 `POST /api/task/create`；域名使用 `POST /api/task/create-dns`。域名选择前三种
+模式时，服务端先保存一个 `dns_records` 父任务，再从其 A/AAAA 结果中筛选授权地址，按
+IPv4/IPv6 和任务上限拆分为对应 profile 的子任务。“仅 DNS”不会创建子任务，也不接受
+`port`。两条创建接口都会执行最终目标/profile 校验，不能依靠绕过前端提交非法组合。
+
+协议层还保留以下兼容 profile：
 
 - `legacy`：兼容旧扫描器，由节点本地配置决定是否识别服务；
-- `port_only`：只执行 `port_discovery`；
-- `service_inventory`：依次执行 `port_discovery` 和 `service_detection`；
-- `vulnerability_scan`：依次执行端口发现、可选服务识别和必需的 `vulnerability_detection`；
-- `dns_records`：只执行 `dns_lookup`，目标为显式 domain 列表；
 - `dns_ports`：对显式 domain 查询 A/AAAA 后扫描解析地址的端口；
 - `dns_full`：归档 DNS 记录，并扫描解析地址的端口。
 
@@ -43,6 +51,31 @@ Nuclei 启动失败、非零退出、输出无效、超时或超过本地安全�
   "dispatch_mode": "automatic"
 }
 ```
+
+创建域名“全部”任务的请求示例：
+
+```json
+{
+  "domains": ["api.example.com", "www.example.com"],
+  "port": "80,443,8080,8443",
+  "level": 1,
+  "scan_profile": "vulnerability_scan"
+}
+```
+
+创建“仅 DNS”任务时必须使用域名接口，且省略 `port`：
+
+```json
+{
+  "domains": ["example.com"],
+  "level": 1,
+  "scan_profile": "dns_records"
+}
+```
+
+域名解析后扫描受运行时 `dns_follow_up` 策略控制。只有 `enabled=true` 且解析地址落入
+`authorized_cidrs`、同时未命中 `excluded_cidrs` 时才会生成子任务。策略未启用时创建请求
+返回冲突响应，不会退化为不受限扫描。
 
 任务目标必须属于调用方已获授权的范围。服务端只负责调度和结果校验，不会代替组织完成扫描
 授权审批。

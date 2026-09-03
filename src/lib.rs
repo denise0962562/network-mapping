@@ -519,7 +519,7 @@ fn scan_observation_addresses(value: &str) -> Result<(String, String, IpAddr), A
 mod parse_ip_or_cidr_tests {
     use super::{
         CreateTask, STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan,
-        is_ip_scan_profile, normalize_upload_observations, parse_ip_or_cidr,
+        display_scan_profile, is_ip_scan_profile, normalize_upload_observations, parse_ip_or_cidr,
         scan_observation_addresses,
     };
 
@@ -620,6 +620,18 @@ mod parse_ip_or_cidr_tests {
         for profile in ["dns_records", "dns_ports", "dns_full"] {
             assert!(!is_ip_scan_profile(profile));
         }
+    }
+
+    #[test]
+    fn domain_parent_displays_the_requested_follow_up_profile() {
+        let metadata = serde_json::json!({
+            "dns_follow_up": {"enabled": true, "scan_profile": "vulnerability_scan"}
+        });
+        assert_eq!(
+            display_scan_profile("dns_records", Some(&metadata)),
+            "vulnerability_scan"
+        );
+        assert_eq!(display_scan_profile("dns_records", None), "dns_records");
     }
 
     #[test]
@@ -806,6 +818,18 @@ pub fn is_ip_scan_profile(profile: &str) -> bool {
         profile,
         "legacy" | "port_only" | "service_inventory" | "vulnerability_scan"
     )
+}
+
+/// Returns the profile selected by the user for display purposes. A domain
+/// follow-up request keeps `dns_records` as its executable parent profile and
+/// stores the requested IP profile in generation metadata.
+pub fn display_scan_profile(stored_profile: &str, generation_metadata: Option<&Value>) -> String {
+    generation_metadata
+        .and_then(|metadata| metadata.pointer("/dns_follow_up/scan_profile"))
+        .and_then(Value::as_str)
+        .filter(|profile| is_ip_scan_profile(profile))
+        .unwrap_or(stored_profile)
+        .to_owned()
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
@@ -3834,26 +3858,30 @@ pub async fn get_filtered_task_page(
     };
     let items = rows
         .into_iter()
-        .map(|row| TaskItem {
-            task_id: row.get("task_id"),
-            task_target: row.get("display_targets"),
-            task_kind: row.get("task_kind"),
-            task_initiator: row.get("task_initiator"),
-            task_port: row.get("task_port"),
-            task_create_time: row.get("task_create_time"),
-            task_level: row.get("task_level"),
-            scanner_id: row.get("assigned_scanner_id"),
-            task_status: row.get("task_status"),
-            lease_expires_at: row.get("lease_expires_at"),
-            attempt_count: row.get("attempt_count"),
-            failure_reason: row.get("failure_reason"),
-            start_at: row.get("task_start_time"),
-            end_at: row.get("task_end_time"),
-            remarks: row.get("remarks"),
-            task_source: row.get("task_source"),
-            address_family: row.get("address_family"),
-            scan_profile: row.get("scan_profile"),
-            scan_plan: row.get("scan_plan"),
+        .map(|row| {
+            let stored_profile: String = row.get("scan_profile");
+            let generation_metadata: Option<Value> = row.get("generation_metadata");
+            TaskItem {
+                task_id: row.get("task_id"),
+                task_target: row.get("display_targets"),
+                task_kind: row.get("task_kind"),
+                task_initiator: row.get("task_initiator"),
+                task_port: row.get("task_port"),
+                task_create_time: row.get("task_create_time"),
+                task_level: row.get("task_level"),
+                scanner_id: row.get("assigned_scanner_id"),
+                task_status: row.get("task_status"),
+                lease_expires_at: row.get("lease_expires_at"),
+                attempt_count: row.get("attempt_count"),
+                failure_reason: row.get("failure_reason"),
+                start_at: row.get("task_start_time"),
+                end_at: row.get("task_end_time"),
+                remarks: row.get("remarks"),
+                task_source: row.get("task_source"),
+                address_family: row.get("address_family"),
+                scan_profile: display_scan_profile(&stored_profile, generation_metadata.as_ref()),
+                scan_plan: row.get("scan_plan"),
+            }
         })
         .collect();
     Ok(TaskListPage {

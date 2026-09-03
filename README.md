@@ -117,9 +117,11 @@ API 请求响应和限制参见[资产搜索语法与 API](docs/SEARCH_SYNTAX.md
 
 创建任务接口 `POST /api/task/create` 支持 `dispatch_mode`：`automatic` 由下一台可用扫描器领取一次，`selected` 配合 `scanner_ids` 指定一台或多台扫描器，`all` 会为创建时所有已启用扫描器分别创建执行实例。离线的指定扫描器会在重新上线后领取任务。
 
-接口还支持 `scan_profile`：`legacy` 保持旧节点行为，`port_only` 只发现开放端口，
-`service_inventory` 继续执行服务识别，`vulnerability_scan` 在端口发现和可选服务识别后执行
-节点本地配置的 Nuclei 安全模板。非 legacy 任务会根据心跳中的扫描能力选择节点。
+创建页统一提供四种扫描模式：“全部”对应 `vulnerability_scan`，“仅端口”对应
+`port_only`，“服务识别”对应 `service_inventory`，“仅 DNS”对应 `dns_records`。
+前三种可用于 IP/CIDR 或域名；域名会先解析 A/AAAA，再按地址族创建授权范围内的扫描任务。
+“仅 DNS”只能用于域名，前端与服务端都会拒绝 IP/CIDR 目标或附带端口的请求。`legacy`
+继续作为旧节点和系统默认值的兼容 profile。非 legacy 任务会根据心跳中的扫描能力选择节点。
 任务计划、能力字段、类型化观察结果和幂等分批上传参见
 [扫描计划与结果协议](docs/SCAN_PIPELINE.md)。
 

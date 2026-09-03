@@ -28,7 +28,11 @@ query_timeout_seconds = 5
 
 初始 DNS engine 使用系统递归解析器，只主动查询 A/AAAA；服务端 ingestion 模型已能接收 CNAME、NS、MX、PTR、SRV、TXT、CAA、SOA、SVCB、HTTPS 的规范化 payload，扩展扫描器支持时不需改变索引身份规则。
 
-DNS 域名任务支持三种扫描 profile：`dns_records` 仅归档 DNS 记录；`dns_ports` 先解析 A/AAAA、再只扫描解析出的 IP 端口；`dns_full` 同时归档 DNS 记录并扫描解析 IP 的端口。`dns_full` 为后续漏洞扫描阶段预留扩展位置，但当前不会执行漏洞扫描。
+创建扫描页对 IP/CIDR 和域名使用同一组模式：`vulnerability_scan`（全部）、`port_only`
+（仅端口）、`service_inventory`（服务识别）和 `dns_records`（仅 DNS）。前三种域名任务先执行
+DNS 查询，再由服务端把授权的 A/AAAA 地址按地址族拆为对应 IP 子任务；`dns_records` 只归档
+记录，不创建子任务。旧协议的 `dns_ports`、`dns_full` 仍可被已有客户端和扫描器接受，但
+新前端不再创建这两种任务。
 
 DNS 任务由管理员 API 创建，仅自动分配给 heartbeat 中声明对应 DNS profile 与 `dns_lookup` 能力的 scanner：
 
@@ -36,12 +40,29 @@ DNS 任务由管理员 API 创建，仅自动分配给 heartbeat 中声明对应
 POST /api/task/create-dns
 Content-Type: application/json
 
-{"domains":["api.example.com","www.example.com"],"level":2,"remark":"authorized inventory"}
+{"domains":["api.example.com","www.example.com"],"port":"80,443","level":2,"scan_profile":"service_inventory","remark":"authorized inventory"}
 ```
 
-该 API 只接受显式域名列表（1–500）；不会从 DNS answer 自动创建端口扫描任务。自动 IP 扫描必须先增加资产范围 allowlist、私网/保留地址策略、CDN 高扇出抑制、去重与队列上限。
+该 API 只接受显式域名列表（1–500）。使用前三种模式前必须配置并启用
+`dns_follow_up`：`authorized_cidrs` 是可扫描地址 allowlist，`excluded_cidrs` 优先排除地址，
+`max_targets_per_task` 控制每个地址族子任务的目标上限。解析结果会去重；不在授权范围内的
+地址不会进入扫描队列。策略关闭时服务端拒绝创建域名后续扫描。`dns_records` 不依赖该策略，
+不允许携带非空 `port`。
 
-前端“创建扫描”页可在“IP / 网段”和“DNS 域名”之间切换。DNS 模式支持每行一个域名（或用英文逗号分隔），并固定自动分配；任务列表与详情页会以域名和 `A / AAAA` 查询类型展示这类任务。
+```toml
+[dns_follow_up]
+enabled = true
+authorized_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
+excluded_cidrs = ["192.0.2.128/25"]
+max_targets_per_task = 100
+```
+
+示例网段仅用于说明，部署时必须替换为组织已书面授权的实际范围。
+
+前端“创建扫描”页可在“IP / CIDR”和“域名”之间切换，两类目标共用相同扫描模式。
+“仅 DNS”在 IP/CIDR 目标下显示为禁用，切回 IP/CIDR 时也会自动移除该选择；提交前仍会
+再次校验。域名支持每行一个（或用英文逗号分隔），DNS 父任务固定自动分配；生成的 IP 子任务
+按系统任务保存，可通过任务列表的系统任务开关查看。
 
 ## Elasticsearch 配置与保留
 
