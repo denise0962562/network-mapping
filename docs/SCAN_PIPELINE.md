@@ -14,6 +14,10 @@ IP/CIDR 使用 `POST /api/task/create`；域名使用 `POST /api/task/create-dns
 IPv4/IPv6 和任务上限拆分为对应 profile 的子任务。“仅 DNS”不会创建子任务，也不接受
 `port`。两条创建接口都会执行最终目标/profile 校验，不能依靠绕过前端提交非法组合。
 
+两个创建接口都接受 `dispatch_mode=automatic|selected|all`。`selected` 必须同时提供非空
+`scanner_ids`，另外两种模式不能附带 `scanner_ids`。域名接口按 DNS 父任务能力及显式解析器
+能力校验所选节点，并为每台指定或符合“全部扫描器”的节点创建独立执行记录。
+
 协议层还保留以下兼容 profile：
 
 - `legacy`：兼容旧扫描器，由节点本地配置决定是否识别服务；
@@ -59,7 +63,9 @@ Nuclei 启动失败、非零退出、输出无效、超时或超过本地安全�
   "domains": ["api.example.com", "www.example.com"],
   "port": "80,443,8080,8443",
   "level": 1,
-  "scan_profile": "vulnerability_scan"
+  "scan_profile": "vulnerability_scan",
+  "dispatch_mode": "selected",
+  "scanner_ids": ["019c0000-0000-7000-8000-000000000001"]
 }
 ```
 
@@ -69,7 +75,8 @@ Nuclei 启动失败、非零退出、输出无效、超时或超过本地安全�
 {
   "domains": ["example.com"],
   "level": 1,
-  "scan_profile": "dns_records"
+  "scan_profile": "dns_records",
+  "dispatch_mode": "automatic"
 }
 ```
 

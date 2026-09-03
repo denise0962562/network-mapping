@@ -34,13 +34,14 @@ DNS 查询，再由服务端把授权的 A/AAAA 地址按地址族拆为对应 I
 记录，不创建子任务。旧协议的 `dns_ports`、`dns_full` 仍可被已有客户端和扫描器接受，但
 新前端不再创建这两种任务。
 
-DNS 任务由管理员 API 创建，仅自动分配给 heartbeat 中声明对应 DNS profile 与 `dns_lookup` 能力的 scanner：
+DNS 任务由管理员 API 创建，可自动分配、指定扫描器或分配给全部扫描器。候选节点必须在
+heartbeat 中声明对应 DNS profile 与 `dns_lookup` 能力：
 
 ```http
 POST /api/task/create-dns
 Content-Type: application/json
 
-{"domains":["api.example.com","www.example.com"],"port":"80,443","level":2,"scan_profile":"service_inventory","remark":"authorized inventory"}
+{"domains":["api.example.com","www.example.com"],"port":"80,443","level":2,"scan_profile":"service_inventory","dispatch_mode":"automatic","remark":"authorized inventory"}
 ```
 
 该 API 只接受显式域名列表（1–500）。使用前三种模式前必须配置并启用
@@ -67,7 +68,7 @@ max_targets_per_task = 100
 253 octets）。长度限制依据 [RFC 1035 §2.3.4](https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.4)，
 字符规则采用其 [§2.3.1 preferred name syntax](https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.1)。
 首字符允许数字遵循 [RFC 1123 §2.1](https://www.rfc-editor.org/rfc/rfc1123.html#section-2.1) 的放宽。
-DNS 父任务固定自动分配；生成的 IP 子任务按系统任务保存，可通过任务列表的系统
+DNS 父任务支持自动分配、指定扫描器和全部扫描器；生成的 IP 子任务按系统任务保存，可通过任务列表的系统
 任务开关查看。
 
 ## Elasticsearch 配置与保留
