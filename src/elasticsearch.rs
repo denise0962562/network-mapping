@@ -1013,9 +1013,19 @@ impl ElasticsearchService {
             &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
         )
         .await?;
+        self.ensure_named_index_mapping(
+            &self.inner.config.execution_endpoint_index,
+            &index_mapping_update(),
+        )
+        .await?;
         self.ensure_named_index(
             &self.inner.config.current_endpoint_index,
             &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
+        )
+        .await?;
+        self.ensure_named_index_mapping(
+            &self.inner.config.current_endpoint_index,
+            &index_mapping_update(),
         )
         .await
     }
@@ -1102,6 +1112,17 @@ impl ElasticsearchService {
             Method::PUT,
             index,
             |request| request.json(definition),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn ensure_named_index_mapping(&self, index: &str, mapping: &Value) -> Result<(), String> {
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            &format!("/{index}/_mapping"),
+            |request| request.json(mapping),
         )
         .await
         .map(|_| ())
@@ -3589,11 +3610,7 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "country_name": {"type": "keyword"},
                     "region_name": {"type": "keyword"},
                     "city_name": {"type": "keyword"},
-                    "tags": {"type": "object", "properties": {
-                        "id": {"type": "long"}, "name": {"type": "keyword"},
-                        "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
-                        "category_id": {"type": "long"}, "category_name": {"type": "keyword"}
-                    }}
+                    "tags": {"type": "object", "properties": scan_observation_tag_mapping_properties()}
                 }
             }
         }
@@ -3601,7 +3618,21 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
 }
 
 fn scan_observation_compatibility_mapping() -> Value {
-    json!({"properties": {"ip_network": {"type": "ip_range"}}})
+    json!({"properties": {
+        "ip_network": {"type": "ip_range"},
+        "tags": {"properties": scan_observation_tag_mapping_properties()}
+    }})
+}
+
+fn scan_observation_tag_mapping_properties() -> Value {
+    json!({
+        "id": {"type": "long"},
+        "name": {"type": "keyword"},
+        "kind": {"type": "keyword"},
+        "description": {"type": "text", "index": false},
+        "category_id": {"type": "long"},
+        "category_name": {"type": "keyword"}
+    })
 }
 
 fn dns_observation_template(data_stream: &str, replicas: u32, retention_days: u16) -> Value {
@@ -3820,11 +3851,7 @@ fn scan_endpoint_index_definition(replicas: u32) -> Value {
                 "country_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "region_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "city_name": {"type": "wildcard"},
-                "tags": {"type": "object", "properties": {
-                    "id": {"type": "long"}, "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
-                    "category_id": {"type": "long"}, "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
-                }},
+                "tags": {"type": "object", "properties": tag_mapping_properties()},
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tag_ids": {"type": "long"},
                 "tag_kinds": {"type": "keyword"},
@@ -4104,7 +4131,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_index_mapping_update_adds_tag_category_fields() {
+    fn existing_projection_mapping_update_adds_tag_category_fields() {
         let mapping = index_mapping_update();
         assert_eq!(
             mapping.pointer("/properties/tags/properties/category_id/type"),
@@ -4113,6 +4140,10 @@ mod tests {
         assert_eq!(
             mapping.pointer("/properties/tags/properties/category_name/type"),
             Some(&serde_json::json!("keyword"))
+        );
+        assert_eq!(
+            mapping.pointer("/properties/tags/properties/category_name/normalizer"),
+            Some(&serde_json::json!("lowercase_normalizer"))
         );
     }
 
@@ -4130,6 +4161,16 @@ mod tests {
         assert_eq!(
             scan_observation_compatibility_mapping().pointer("/properties/ip_network/type"),
             Some(&serde_json::json!("ip_range"))
+        );
+        assert_eq!(
+            scan_observation_compatibility_mapping()
+                .pointer("/properties/tags/properties/category_id/type"),
+            Some(&serde_json::json!("long"))
+        );
+        assert_eq!(
+            scan_observation_compatibility_mapping()
+                .pointer("/properties/tags/properties/category_name/type"),
+            Some(&serde_json::json!("keyword"))
         );
     }
 
