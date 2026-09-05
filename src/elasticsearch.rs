@@ -442,12 +442,7 @@ impl ElasticsearchService {
         if !self.inner.config.scan_storage.reads_elasticsearch() || !self.can_read() {
             return Err("Elasticsearch DNS 查询读路径尚未就绪".to_owned());
         }
-        let body = json!({
-            "size": 10_000,
-            "track_total_hits": false,
-            "query": {"term": {"scan.task_id": task_id}},
-            "sort": [{"@timestamp": {"order": "desc"}}]
-        });
+        let body = dns_task_observations_search_body(task_id);
         let result = self
             .send_json_request(
                 ElasticsearchOperation::ScanQuery,
@@ -1013,9 +1008,19 @@ impl ElasticsearchService {
             &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
         )
         .await?;
+        self.ensure_named_index_mapping(
+            &self.inner.config.execution_endpoint_index,
+            &index_mapping_update(),
+        )
+        .await?;
         self.ensure_named_index(
             &self.inner.config.current_endpoint_index,
             &scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas),
+        )
+        .await?;
+        self.ensure_named_index_mapping(
+            &self.inner.config.current_endpoint_index,
+            &index_mapping_update(),
         )
         .await
     }
@@ -1102,6 +1107,17 @@ impl ElasticsearchService {
             Method::PUT,
             index,
             |request| request.json(definition),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn ensure_named_index_mapping(&self, index: &str, mapping: &Value) -> Result<(), String> {
+        self.send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::PUT,
+            &format!("/{index}/_mapping"),
+            |request| request.json(mapping),
         )
         .await
         .map(|_| ())
@@ -2768,6 +2784,18 @@ impl ElasticsearchService {
     }
 }
 
+fn dns_task_observations_search_body(task_id: &str) -> Value {
+    json!({
+        "size": 10_000,
+        "track_total_hits": false,
+        "query": {"term": {"scan.task_id": task_id}},
+        "sort": [
+            {"@timestamp": {"order": "desc"}},
+            {"event_id": "asc"}
+        ]
+    })
+}
+
 pub(crate) fn scan_batch_payload_checksum(
     context: &ScanBatchContext,
     observations: &[Value],
@@ -3589,11 +3617,7 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "country_name": {"type": "keyword"},
                     "region_name": {"type": "keyword"},
                     "city_name": {"type": "keyword"},
-                    "tags": {"type": "object", "properties": {
-                        "id": {"type": "long"}, "name": {"type": "keyword"},
-                        "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
-                        "category_id": {"type": "long"}, "category_name": {"type": "keyword"}
-                    }}
+                    "tags": {"type": "object", "properties": scan_observation_tag_mapping_properties()}
                 }
             }
         }
@@ -3601,7 +3625,21 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
 }
 
 fn scan_observation_compatibility_mapping() -> Value {
-    json!({"properties": {"ip_network": {"type": "ip_range"}}})
+    json!({"properties": {
+        "ip_network": {"type": "ip_range"},
+        "tags": {"properties": scan_observation_tag_mapping_properties()}
+    }})
+}
+
+fn scan_observation_tag_mapping_properties() -> Value {
+    json!({
+        "id": {"type": "long"},
+        "name": {"type": "keyword"},
+        "kind": {"type": "keyword"},
+        "description": {"type": "text", "index": false},
+        "category_id": {"type": "long"},
+        "category_name": {"type": "keyword"}
+    })
 }
 
 fn dns_observation_template(data_stream: &str, replicas: u32, retention_days: u16) -> Value {
@@ -3820,11 +3858,7 @@ fn scan_endpoint_index_definition(replicas: u32) -> Value {
                 "country_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "region_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "city_name": {"type": "wildcard"},
-                "tags": {"type": "object", "properties": {
-                    "id": {"type": "long"}, "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                    "kind": {"type": "keyword"}, "description": {"type": "text", "index": false},
-                    "category_id": {"type": "long"}, "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
-                }},
+                "tags": {"type": "object", "properties": tag_mapping_properties()},
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tag_ids": {"type": "long"},
                 "tag_kinds": {"type": "keyword"},
@@ -4065,14 +4099,28 @@ mod tests {
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
-        bulk_retry_delay, collect_domain_addresses, index_definition, index_mapping_update,
-        initialization_retry_delay, new_trace_context, parse_asn, parse_storage_metrics,
-        replace_domain_filters, scan_batch_payload_checksum, scan_endpoint_index_definition,
-        scan_observation_compatibility_mapping, scan_observation_template,
+        bulk_retry_delay, collect_domain_addresses, dns_task_observations_search_body,
+        index_definition, index_mapping_update, initialization_retry_delay, new_trace_context,
+        parse_asn, parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
+        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
+        scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::collections::BTreeSet;
     use std::time::Duration;
+
+    #[test]
+    fn dns_task_observation_search_has_stable_tie_breaker() {
+        let body = dns_task_observations_search_body("019c0000-0000-7000-8000-000000000001");
+
+        assert_eq!(
+            body["sort"],
+            serde_json::json!([
+                {"@timestamp": {"order": "desc"}},
+                {"event_id": "asc"}
+            ])
+        );
+    }
 
     #[test]
     fn index_mapping_targets_elasticsearch_9_5_2_and_expected_field_types() {
@@ -4104,7 +4152,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_index_mapping_update_adds_tag_category_fields() {
+    fn existing_projection_mapping_update_adds_tag_category_fields() {
         let mapping = index_mapping_update();
         assert_eq!(
             mapping.pointer("/properties/tags/properties/category_id/type"),
@@ -4113,6 +4161,10 @@ mod tests {
         assert_eq!(
             mapping.pointer("/properties/tags/properties/category_name/type"),
             Some(&serde_json::json!("keyword"))
+        );
+        assert_eq!(
+            mapping.pointer("/properties/tags/properties/category_name/normalizer"),
+            Some(&serde_json::json!("lowercase_normalizer"))
         );
     }
 
@@ -4130,6 +4182,16 @@ mod tests {
         assert_eq!(
             scan_observation_compatibility_mapping().pointer("/properties/ip_network/type"),
             Some(&serde_json::json!("ip_range"))
+        );
+        assert_eq!(
+            scan_observation_compatibility_mapping()
+                .pointer("/properties/tags/properties/category_id/type"),
+            Some(&serde_json::json!("long"))
+        );
+        assert_eq!(
+            scan_observation_compatibility_mapping()
+                .pointer("/properties/tags/properties/category_name/type"),
+            Some(&serde_json::json!("keyword"))
         );
     }
 
