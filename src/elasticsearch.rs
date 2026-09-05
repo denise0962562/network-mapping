@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -24,6 +24,9 @@ const INDEX_SCHEMA_VERSION: &str = "2";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
 const SCAN_INDEX_SCHEMA_VERSION: &str = "3";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
+const MAX_DOMAIN_RECORDS: usize = 10_000;
+const MAX_DOMAIN_NAMES: usize = 1_000;
+const MAX_DOMAIN_CNAME_DEPTH: usize = 8;
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
 const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
      ON asset_endpoint_current(projection_version);";
@@ -254,6 +257,7 @@ enum ElasticsearchOperation {
     ProjectionSearch,
     AssetSearch,
     EndpointFilter,
+    DomainFilter,
 }
 
 impl ElasticsearchOperation {
@@ -270,6 +274,7 @@ impl ElasticsearchOperation {
             Self::ProjectionSearch => "projection-search",
             Self::AssetSearch => "asset-search",
             Self::EndpointFilter => "endpoint-filter",
+            Self::DomainFilter => "domain-filter",
         }
     }
 
@@ -280,7 +285,8 @@ impl ElasticsearchOperation {
             | Self::ConflictCheck
             | Self::ProjectionSearch
             | Self::AssetSearch
-            | Self::EndpointFilter => ElasticsearchOperationKind::Query,
+            | Self::EndpointFilter
+            | Self::DomainFilter => ElasticsearchOperationKind::Query,
             Self::RefreshTags | Self::BulkWrite => ElasticsearchOperationKind::Write,
             Self::StorageMetrics | Self::ClusterInfo | Self::IndexAdmin => {
                 ElasticsearchOperationKind::Maintenance
@@ -829,11 +835,18 @@ impl ElasticsearchService {
             self.ensure_legacy_search_projection_index(pool).await?;
         }
         self.ensure_scan_indices().await?;
+        // Domain search reads the current DNS RR index even before the first DNS
+        // upload. Create its template, data stream, and empty current-record
+        // index during startup so a valid no-result search is not a 404.
+        self.ensure_dns_indices().await?;
         let state = if self.inner.config.scan_storage.reads_elasticsearch() {
             IndexState::Existing
         } else {
             self.ensure_index().await?
         };
+        if !self.inner.config.scan_storage.reads_elasticsearch() {
+            self.ensure_index_mapping().await?;
+        }
         if state == IndexState::Created {
             let mut connection = pool.get().await.map_err(|error| error.to_string())?;
             let transaction = connection
@@ -916,6 +929,27 @@ impl ElasticsearchService {
         }
         self.create_index().await?;
         Ok(IndexState::Created)
+    }
+
+    /// Adds compatible fields to an existing legacy search index.
+    ///
+    /// `dynamic: strict` rejects documents as soon as a newly introduced tag
+    /// property is written, but index creation only happens when the index is
+    /// absent. Keep this migration idempotent so deployments that add tag
+    /// attributes also work with an already-created index.
+    async fn ensure_index_mapping(&self) -> Result<(), String> {
+        let response = self
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::PUT,
+                &format!("/{}/_mapping", self.inner.config.index),
+                |request| request.json(&index_mapping_update()),
+            )
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(response_error(response).await)
     }
 
     async fn ensure_scan_indices(&self) -> Result<(), String> {
@@ -1024,7 +1058,10 @@ impl ElasticsearchService {
         let response = self
             .send_request(
                 ElasticsearchOperation::IndexAdmin,
-                Method::HEAD,
+                // The data-stream API exposes existence through GET; unlike
+                // index HEAD requests, HEAD /_data_stream/{name} is rejected
+                // by Elasticsearch with 405.
+                Method::GET,
                 &format!("/_data_stream/{name}"),
                 |request| request,
             )
@@ -1469,6 +1506,9 @@ impl ElasticsearchService {
         }
         let mut body = String::new();
         for observation in observations {
+            if observation.get("kind").and_then(Value::as_str) == Some("vulnerability") {
+                continue;
+            }
             let ip = observation
                 .get("ip_address")
                 .and_then(Value::as_str)
@@ -1805,6 +1845,7 @@ impl ElasticsearchService {
         let filter = self
             .resolve_has_endpoint_filters(scope_type, scope_id, filter)
             .await?;
+        let filter = self.resolve_domain_filters(filter).await?;
         let body = json!({
             "from": offset,
             "size": limit,
@@ -1954,6 +1995,132 @@ impl ElasticsearchService {
         }
         let mut iterator = address_sets.into_iter();
         Ok(replace_has_endpoint_filters(filter, &mut iterator))
+    }
+
+    async fn resolve_domain_filters(&self, filter: Value) -> Result<Value, String> {
+        let mut domain_filters = Vec::new();
+        collect_domain_filters(&filter, &mut domain_filters);
+        if domain_filters.is_empty() {
+            return Ok(filter);
+        }
+
+        let mut replacements = Vec::with_capacity(domain_filters.len());
+        for domain_filter in domain_filters {
+            replacements.push(self.resolve_domain_filter(&domain_filter).await?);
+        }
+        let mut iterator = replacements.into_iter();
+        Ok(replace_domain_filters(filter, &mut iterator))
+    }
+
+    async fn resolve_domain_filter(&self, filter: &Value) -> Result<Value, String> {
+        let operator = filter
+            .get("operator")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "domain 搜索条件无效".to_owned())?;
+        let values = filter
+            .get("values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "domain 搜索条件无效".to_owned())?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "domain 搜索条件无效".to_owned())?;
+        let contains = matches!(operator, "contains" | "not_contains");
+        let mut seen_names = BTreeSet::new();
+        let mut pending_names = BTreeSet::new();
+        for value in values {
+            let normalized = value.trim_end_matches('.').to_ascii_lowercase();
+            seen_names.insert(normalized.clone());
+            pending_names.insert(normalized);
+        }
+
+        let mut addresses = BTreeSet::new();
+        let mut processed_records = 0usize;
+        for depth in 0..=MAX_DOMAIN_CNAME_DEPTH {
+            if pending_names.is_empty() {
+                break;
+            }
+            let names = pending_names.iter().cloned().collect::<Vec<_>>();
+            pending_names.clear();
+            let name_query = if depth == 0 && contains {
+                let clauses = names
+                    .iter()
+                    .map(|name| {
+                        json!({"wildcard": {"domain": {
+                            "value": format!("*{}*", escape_es_wildcard(name)),
+                            "case_insensitive": true
+                        }}})
+                    })
+                    .collect::<Vec<_>>();
+                if clauses.len() == 1 {
+                    clauses
+                        .into_iter()
+                        .next()
+                        .expect("one domain wildcard clause")
+                } else {
+                    json!({"bool": {"should": clauses, "minimum_should_match": 1}})
+                }
+            } else {
+                json!({"terms": {"domain": names}})
+            };
+            let response = self
+                .send_json_request(
+                    ElasticsearchOperation::DomainFilter,
+                    Method::POST,
+                    &format!("/{}/_search", self.inner.config.dns_record_index),
+                    |request| {
+                        request.json(&json!({
+                            "size": MAX_DOMAIN_RECORDS,
+                            "track_total_hits": MAX_DOMAIN_RECORDS,
+                            "_source": ["record_type", "ip", "target_domain"],
+                            "query": {"bool": {"filter": [
+                                {"term": {"tenant_id": "default"}},
+                                {"term": {"state": "active"}},
+                                {"terms": {"record_type": ["A", "AAAA", "CNAME"]}},
+                                name_query
+                            ]}}
+                        }))
+                    },
+                )
+                .await?;
+            let hits = response
+                .pointer("/hits/hits")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "DNS 搜索响应缺少 hits.hits".to_owned())?;
+            processed_records = processed_records.saturating_add(hits.len());
+            let exceeded_result_limit = response
+                .pointer("/hits/total/relation")
+                .and_then(Value::as_str)
+                == Some("gte");
+            if exceeded_result_limit || processed_records > MAX_DOMAIN_RECORDS {
+                return Err(
+                    "DOMAIN_RESULT_TOO_BROAD: 域名匹配的 DNS 记录超过 10000 条，请增加限定条件"
+                        .to_owned(),
+                );
+            }
+            collect_domain_addresses(
+                hits,
+                depth < MAX_DOMAIN_CNAME_DEPTH,
+                &mut addresses,
+                &mut seen_names,
+                &mut pending_names,
+            )?;
+        }
+
+        let positive = if addresses.is_empty() {
+            json!({"match_none": {}})
+        } else {
+            json!({"terms": {"ip": addresses.into_iter().collect::<Vec<_>>()}})
+        };
+        if matches!(operator, "not_eq" | "not_contains" | "not_in") {
+            if positive.get("match_none").is_some() {
+                Ok(json!({"match_all": {}}))
+            } else {
+                Ok(json!({"bool": {"must_not": [positive]}}))
+            }
+        } else {
+            Ok(positive)
+        }
     }
 
     fn update_runtime(&self, update: impl FnOnce(&mut ElasticsearchRuntime)) {
@@ -3221,6 +3388,26 @@ fn collect_has_endpoint_filters(value: &Value, filters: &mut Vec<Value>) {
     }
 }
 
+fn collect_domain_filters(value: &Value, filters: &mut Vec<Value>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(filter) = object.get("network_mapping_domain") {
+                filters.push(filter.clone());
+                return;
+            }
+            for child in object.values() {
+                collect_domain_filters(child, filters);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_domain_filters(child, filters);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn replace_has_endpoint_filters(
     value: Value,
     addresses: &mut impl Iterator<Item = Vec<String>>,
@@ -3245,6 +3432,69 @@ fn replace_has_endpoint_filters(
     }
 }
 
+fn replace_domain_filters(value: Value, filters: &mut impl Iterator<Item = Value>) -> Value {
+    match value {
+        Value::Object(mut object) => {
+            if object.contains_key("network_mapping_domain") {
+                return filters.next().unwrap_or_else(|| json!({"match_none": {}}));
+            }
+            for child in object.values_mut() {
+                *child = replace_domain_filters(child.take(), filters);
+            }
+            Value::Object(object)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|child| replace_domain_filters(child, filters))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn escape_es_wildcard(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('*', "\\*")
+        .replace('?', "\\?")
+}
+
+fn collect_domain_addresses(
+    hits: &[Value],
+    follow_cname: bool,
+    addresses: &mut BTreeSet<String>,
+    seen_names: &mut BTreeSet<String>,
+    pending_names: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for hit in hits {
+        let source = hit.get("_source").unwrap_or(hit);
+        match source.get("record_type").and_then(Value::as_str) {
+            Some("A") | Some("AAAA") => {
+                if let Some(ip) = source.get("ip").and_then(Value::as_str) {
+                    addresses.insert(ip.to_owned());
+                }
+            }
+            Some("CNAME") if follow_cname => {
+                if let Some(target) = source.get("target_domain").and_then(Value::as_str) {
+                    let target = target.trim_end_matches('.').to_ascii_lowercase();
+                    if seen_names.insert(target.clone()) {
+                        if seen_names.len() > MAX_DOMAIN_NAMES {
+                            return Err(
+                                "DOMAIN_RESULT_TOO_BROAD: 域名 CNAME 链过宽，请使用更精确的域名"
+                                    .to_owned(),
+                            );
+                        }
+                        pending_names.insert(target);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn immutable_scan_observation(value: &Value) -> Value {
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
@@ -3261,6 +3511,8 @@ fn immutable_scan_observation(value: &Value) -> Value {
             "country_name",
             "region_name",
             "city_name",
+            "latitude",
+            "longitude",
             "tags",
         ] {
             object.remove(field);
@@ -3724,6 +3976,25 @@ fn append_projection_update(
     Ok(())
 }
 
+fn tag_mapping_properties() -> Value {
+    json!({
+        "id": {"type": "long"},
+        "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "kind": {"type": "keyword"},
+        "description": {"type": "text", "index": false},
+        "category_id": {"type": "long"},
+        "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
+    })
+}
+
+fn index_mapping_update() -> Value {
+    json!({
+        "properties": {
+            "tags": {"properties": tag_mapping_properties()}
+        }
+    })
+}
+
 fn index_definition() -> Value {
     json!({
         "settings": {
@@ -3776,14 +4047,7 @@ fn index_definition() -> Value {
                 "city_name": {"type": "wildcard"},
                 "tags": {
                     "type": "object",
-                    "properties": {
-                        "id": {"type": "long"},
-                        "name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                        "kind": {"type": "keyword"},
-                        "description": {"type": "text", "index": false},
-                        "category_id": {"type": "long"},
-                        "category_name": {"type": "keyword", "normalizer": "lowercase_normalizer"}
-                    }
+                    "properties": tag_mapping_properties()
                 },
                 "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tag_ids": {"type": "long"},
@@ -3801,12 +4065,13 @@ mod tests {
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
-        bulk_retry_delay, index_definition, initialization_retry_delay, new_trace_context,
-        parse_asn, parse_storage_metrics, scan_batch_payload_checksum,
-        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
-        scan_observation_template,
+        bulk_retry_delay, collect_domain_addresses, index_definition, index_mapping_update,
+        initialization_retry_delay, new_trace_context, parse_asn, parse_storage_metrics,
+        replace_domain_filters, scan_batch_payload_checksum, scan_endpoint_index_definition,
+        scan_observation_compatibility_mapping, scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     #[test]
@@ -3827,6 +4092,27 @@ mod tests {
         assert_eq!(
             mapping.pointer("/mappings/properties/http_body/type"),
             Some(&serde_json::json!("match_only_text"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/tags/properties/category_id/type"),
+            Some(&serde_json::json!("long"))
+        );
+        assert_eq!(
+            mapping.pointer("/mappings/properties/tags/properties/category_name/type"),
+            Some(&serde_json::json!("keyword"))
+        );
+    }
+
+    #[test]
+    fn existing_index_mapping_update_adds_tag_category_fields() {
+        let mapping = index_mapping_update();
+        assert_eq!(
+            mapping.pointer("/properties/tags/properties/category_id/type"),
+            Some(&serde_json::json!("long"))
+        );
+        assert_eq!(
+            mapping.pointer("/properties/tags/properties/category_name/type"),
+            Some(&serde_json::json!("keyword"))
         );
     }
 
@@ -3875,6 +4161,55 @@ mod tests {
         assert_eq!(parse_asn("AS4134"), Some(4134));
         assert_eq!(parse_asn("4134"), Some(4134));
         assert_eq!(parse_asn("unknown"), None);
+    }
+
+    #[test]
+    fn replaces_domain_filter_markers_without_leaking_internal_dsl() {
+        let filter = serde_json::json!({
+            "bool": {"filter": [
+                {"network_mapping_domain": {"operator": "eq", "values": ["www.example.com"]}},
+                {"term": {"port": 443}}
+            ]}
+        });
+        let mut replacements =
+            vec![serde_json::json!({"terms": {"ip": ["192.0.2.10"]}})].into_iter();
+        let replaced = replace_domain_filters(filter, &mut replacements);
+        assert_eq!(
+            replaced.pointer("/bool/filter/0/terms/ip/0"),
+            Some(&serde_json::json!("192.0.2.10"))
+        );
+        assert!(!replaced.to_string().contains("network_mapping_domain"));
+    }
+
+    #[test]
+    fn collects_a_aaaa_and_cname_targets_without_revisiting_a_cname_loop() {
+        let hits = vec![
+            serde_json::json!({"_source": {"record_type": "A", "ip": "192.0.2.10"}}),
+            serde_json::json!({"_source": {"record_type": "AAAA", "ip": "2001:db8::10"}}),
+            serde_json::json!({"_source": {"record_type": "CNAME", "target_domain": "edge.example.com."}}),
+            serde_json::json!({"_source": {"record_type": "CNAME", "target_domain": "www.example.com"}}),
+        ];
+        let mut addresses = BTreeSet::new();
+        let mut seen_names = BTreeSet::from(["www.example.com".to_owned()]);
+        let mut pending_names = BTreeSet::new();
+
+        collect_domain_addresses(
+            &hits,
+            true,
+            &mut addresses,
+            &mut seen_names,
+            &mut pending_names,
+        )
+        .expect("DNS records should be collected");
+
+        assert_eq!(
+            addresses,
+            BTreeSet::from(["192.0.2.10".to_owned(), "2001:db8::10".to_owned()])
+        );
+        assert_eq!(
+            pending_names,
+            BTreeSet::from(["edge.example.com".to_owned()])
+        );
     }
 
     #[test]

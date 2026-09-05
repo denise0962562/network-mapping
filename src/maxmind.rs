@@ -172,6 +172,8 @@ impl MaxMindState {
                          country_name = COALESCE($6, country_name), \
                          region_name = COALESCE($7, region_name), \
                          city_name = COALESCE($8, city_name), \
+                         latitude = COALESCE($9, latitude), \
+                         longitude = COALESCE($10, longitude), \
                          update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
                          WHERE ip_id = $1;",
                         &[
@@ -183,6 +185,8 @@ impl MaxMindState {
                             &intel.country_name,
                             &intel.region_name,
                             &intel.city_name,
+                            &intel.latitude,
+                            &intel.longitude,
                         ],
                     )
                     .await?;
@@ -210,6 +214,8 @@ impl IpIntel {
             || self.country_name.is_some()
             || self.region_name.is_some()
             || self.city_name.is_some()
+            || self.latitude.is_some()
+            || self.longitude.is_some()
     }
 }
 
@@ -279,9 +285,15 @@ mod tests {
             region_name: Some("Hubei".to_owned()),
             ..IpIntel::default()
         };
+        let with_coordinates = IpIntel {
+            latitude: Some(30.5928),
+            longitude: Some(114.3055),
+            ..IpIntel::default()
+        };
 
         assert!(!only_time_zone.has_persisted_data());
         assert!(with_country.has_persisted_data());
         assert!(with_region.has_persisted_data());
+        assert!(with_coordinates.has_persisted_data());
     }
 }

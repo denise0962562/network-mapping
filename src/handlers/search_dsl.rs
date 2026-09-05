@@ -29,6 +29,7 @@ pub(crate) struct Predicate {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Field {
     Ip,
+    Domain,
     Asn,
     Isp,
     Org,
@@ -117,6 +118,7 @@ pub(crate) struct CompiledFilter {
 #[derive(Debug)]
 pub(crate) enum ElasticsearchCompilation {
     Supported(Value),
+    RequiresElasticsearch(Value),
     RequiresPostgres,
 }
 
@@ -125,7 +127,7 @@ pub(crate) fn parse_and_compile_elasticsearch(
 ) -> Result<ElasticsearchCompilation, SearchSyntaxError> {
     let (expression, normalized_query) = parse_expression(query)?;
     let mut compiler = ElasticsearchCompiler::default();
-    let Some(filter) = compiler.compile_expr(&expression)? else {
+    let Some(filter) = compiler.compile_expr(&expression, false)? else {
         return Ok(ElasticsearchCompilation::RequiresPostgres);
     };
     if compiler.predicate_count > MAX_PREDICATES {
@@ -135,42 +137,66 @@ pub(crate) fn parse_and_compile_elasticsearch(
             normalized_query.len(),
         ));
     }
-    Ok(ElasticsearchCompilation::Supported(filter))
+    if compiler.requires_elasticsearch {
+        Ok(ElasticsearchCompilation::RequiresElasticsearch(filter))
+    } else {
+        Ok(ElasticsearchCompilation::Supported(filter))
+    }
 }
 
 #[derive(Default)]
 struct ElasticsearchCompiler {
     predicate_count: usize,
+    requires_elasticsearch: bool,
 }
 
 impl ElasticsearchCompiler {
-    fn compile_expr(&mut self, expression: &Expr) -> Result<Option<Value>, SearchSyntaxError> {
+    fn compile_expr(
+        &mut self,
+        expression: &Expr,
+        endpoint_scope: bool,
+    ) -> Result<Option<Value>, SearchSyntaxError> {
         match expression {
             Expr::Predicate(predicate) => {
+                if endpoint_scope && !predicate.field.is_endpoint() {
+                    return Err(SearchSyntaxError::new(
+                        format!(
+                            "has_endpoint 中不能使用资产字段 {}",
+                            predicate.field.display_name()
+                        ),
+                        0,
+                        0,
+                    ));
+                }
                 self.predicate_count += 1;
                 self.compile_predicate(predicate).map(Some)
             }
             Expr::And(left, right) => {
-                let (Some(left), Some(right)) =
-                    (self.compile_expr(left)?, self.compile_expr(right)?)
-                else {
+                let (Some(left), Some(right)) = (
+                    self.compile_expr(left, endpoint_scope)?,
+                    self.compile_expr(right, endpoint_scope)?,
+                ) else {
                     return Ok(None);
                 };
                 Ok(Some(json!({"bool": {"filter": [left, right]}})))
             }
             Expr::Or(left, right) => {
-                let (Some(left), Some(right)) =
-                    (self.compile_expr(left)?, self.compile_expr(right)?)
-                else {
+                let (Some(left), Some(right)) = (
+                    self.compile_expr(left, endpoint_scope)?,
+                    self.compile_expr(right, endpoint_scope)?,
+                ) else {
                     return Ok(None);
                 };
                 Ok(Some(json!({
                     "bool": {"should": [left, right], "minimum_should_match": 1}
                 })))
             }
-            Expr::Not(inner) => self.compile_negated_expr(inner),
+            Expr::Not(inner) => self.compile_negated_expr(inner, endpoint_scope),
             Expr::HasEndpoint(inner) => {
-                let Some(compiled) = self.compile_expr(inner)? else {
+                if endpoint_scope {
+                    return Err(SearchSyntaxError::new("has_endpoint 不能嵌套", 0, 0));
+                }
+                let Some(compiled) = self.compile_expr(inner, true)? else {
                     return Ok(None);
                 };
                 Ok(Some(json!({"network_mapping_has_endpoint": compiled})))
@@ -181,12 +207,23 @@ impl ElasticsearchCompiler {
     fn compile_negated_expr(
         &mut self,
         expression: &Expr,
+        endpoint_scope: bool,
     ) -> Result<Option<Value>, SearchSyntaxError> {
         match expression {
             Expr::Predicate(predicate) => {
+                if endpoint_scope && !predicate.field.is_endpoint() {
+                    return Err(SearchSyntaxError::new(
+                        format!(
+                            "has_endpoint 中不能使用资产字段 {}",
+                            predicate.field.display_name()
+                        ),
+                        0,
+                        0,
+                    ));
+                }
                 self.predicate_count += 1;
                 let compiled = self.compile_predicate(predicate)?;
-                if predicate.operator == Operator::Exists {
+                if predicate.field == Field::Domain || predicate.operator == Operator::Exists {
                     Ok(Some(json!({"bool": {"must_not": [compiled]}})))
                 } else {
                     Ok(Some(json!({"bool": {
@@ -197,8 +234,8 @@ impl ElasticsearchCompiler {
             }
             Expr::And(left, right) => {
                 let (Some(left), Some(right)) = (
-                    self.compile_negated_expr(left)?,
-                    self.compile_negated_expr(right)?,
+                    self.compile_negated_expr(left, endpoint_scope)?,
+                    self.compile_negated_expr(right, endpoint_scope)?,
                 ) else {
                     return Ok(None);
                 };
@@ -208,16 +245,19 @@ impl ElasticsearchCompiler {
             }
             Expr::Or(left, right) => {
                 let (Some(left), Some(right)) = (
-                    self.compile_negated_expr(left)?,
-                    self.compile_negated_expr(right)?,
+                    self.compile_negated_expr(left, endpoint_scope)?,
+                    self.compile_negated_expr(right, endpoint_scope)?,
                 ) else {
                     return Ok(None);
                 };
                 Ok(Some(json!({"bool": {"filter": [left, right]}})))
             }
-            Expr::Not(inner) => self.compile_expr(inner),
+            Expr::Not(inner) => self.compile_expr(inner, endpoint_scope),
             Expr::HasEndpoint(inner) => {
-                let Some(compiled) = self.compile_expr(inner)? else {
+                if endpoint_scope {
+                    return Err(SearchSyntaxError::new("has_endpoint 不能嵌套", 0, 0));
+                }
+                let Some(compiled) = self.compile_expr(inner, true)? else {
                     return Ok(None);
                 };
                 Ok(Some(json!({"bool": {
@@ -227,12 +267,15 @@ impl ElasticsearchCompiler {
         }
     }
 
-    fn compile_predicate(&self, predicate: &Predicate) -> Result<Value, SearchSyntaxError> {
+    fn compile_predicate(&mut self, predicate: &Predicate) -> Result<Value, SearchSyntaxError> {
         let operator = if predicate.operator == Operator::Colon {
             predicate.field.default_colon_operator()
         } else {
             predicate.operator
         };
+        if predicate.field == Field::Domain && operator == Operator::Exists {
+            return Err(SearchSyntaxError::new("字段 domain 不支持 EXISTS", 0, 0));
+        }
         if operator == Operator::Exists {
             return Ok(json!({"exists": {"field": es_field(predicate.field)}}));
         }
@@ -241,6 +284,7 @@ impl ElasticsearchCompiler {
         }
         match predicate.field {
             Field::Ip => self.compile_ip(operator, &predicate.values),
+            Field::Domain => self.compile_domain(operator, &predicate.values),
             Field::Port | Field::TagId => {
                 self.compile_integer(predicate.field, operator, &predicate.values)
             }
@@ -249,6 +293,39 @@ impl ElasticsearchCompiler {
             }
             field => self.compile_text(field, operator, &predicate.values),
         }
+    }
+
+    fn compile_domain(
+        &mut self,
+        operator: Operator,
+        values: &[String],
+    ) -> Result<Value, SearchSyntaxError> {
+        if !matches!(
+            operator,
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Contains
+                | Operator::NotContains
+                | Operator::In
+                | Operator::NotIn
+        ) {
+            return Err(unsupported_operator(Field::Domain));
+        }
+        let values = values
+            .iter()
+            .map(|value| normalize_domain(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.requires_elasticsearch = true;
+        let operator = match operator {
+            Operator::Eq => "eq",
+            Operator::NotEq => "not_eq",
+            Operator::Contains => "contains",
+            Operator::NotContains => "not_contains",
+            Operator::In => "in",
+            Operator::NotIn => "not_in",
+            _ => unreachable!(),
+        };
+        Ok(json!({"network_mapping_domain": {"operator": operator, "values": values}}))
     }
 
     fn compile_ip(
@@ -471,6 +548,7 @@ fn negative_filter(
 fn es_field(field: Field) -> &'static str {
     match field {
         Field::Ip => "ip",
+        Field::Domain => "domain",
         Field::Asn => "asn",
         Field::Isp => "isp",
         Field::Org => "as_org",
@@ -513,6 +591,7 @@ impl Field {
     fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "ip" | "network" => Some(Self::Ip),
+            "domain" | "dns.domain" => Some(Self::Domain),
             "asn" => Some(Self::Asn),
             "isp" => Some(Self::Isp),
             "org" | "as_org" => Some(Self::Org),
@@ -540,6 +619,7 @@ impl Field {
     fn display_name(self) -> &'static str {
         match self {
             Self::Ip => "ip",
+            Self::Domain => "domain",
             Self::Asn => "asn",
             Self::Isp => "isp",
             Self::Org => "org",
@@ -588,6 +668,7 @@ impl Field {
             | Self::Org
             | Self::City
             | Self::Scanner => Operator::Contains,
+            Self::Domain => Operator::Contains,
             Self::Ip
             | Self::Asn
             | Self::Country
@@ -1119,6 +1200,11 @@ impl Compiler {
         }
         match predicate.field {
             Field::Ip => self.compile_ip(operator, &predicate.values, alias),
+            Field::Domain => Err(SearchSyntaxError::new(
+                "domain 搜索需要 Elasticsearch",
+                0,
+                0,
+            )),
             Field::Port | Field::TagId => {
                 self.compile_integer(predicate.field, operator, &predicate.values, alias)
             }
@@ -1149,6 +1235,7 @@ impl Compiler {
     fn compile_exists(&self, field: Field, alias: &str) -> Result<String, SearchSyntaxError> {
         let sql = match field {
             Field::Ip => "TRUE".to_owned(),
+            Field::Domain => return Err(SearchSyntaxError::new("字段 domain 不支持 EXISTS", 0, 0)),
             Field::Port => format!("{alias}.port > 0"),
             Field::Tag | Field::TagId | Field::TagKind | Field::TagCategory => format!(
                 "EXISTS (SELECT 1 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id JOIN asset_tag_category category ON category.id = tag.category_id WHERE assignment.ip_address = {alias}.ip_address AND tag.is_active AND category.is_active)"
@@ -1547,6 +1634,11 @@ fn validate_text_value(field: Field, value: &str) -> Result<(), SearchSyntaxErro
     Ok(())
 }
 
+fn normalize_domain(value: &str) -> Result<String, SearchSyntaxError> {
+    crate::dns::canonical_domain(value)
+        .map_err(|_| SearchSyntaxError::new("domain 必须是有效域名", 0, 0))
+}
+
 fn escape_like(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -1688,6 +1780,47 @@ mod tests {
         let complex_not = complex_not.to_string();
         assert!(complex_not.contains("minimum_should_match"));
         assert!(complex_not.matches("must_not").count() >= 2);
+    }
+
+    #[test]
+    fn compiles_domain_queries_as_elasticsearch_only_filters() {
+        let ElasticsearchCompilation::RequiresElasticsearch(filter) =
+            parse_and_compile_elasticsearch("domain = www.example.com AND port = 443")
+                .expect("domain query should compile")
+        else {
+            panic!("domain query must require Elasticsearch");
+        };
+        assert_eq!(
+            filter.pointer("/bool/filter/0/network_mapping_domain/operator"),
+            Some(&serde_json::json!("eq"))
+        );
+        assert_eq!(
+            filter.pointer("/bool/filter/0/network_mapping_domain/values/0"),
+            Some(&serde_json::json!("www.example.com"))
+        );
+
+        let ElasticsearchCompilation::RequiresElasticsearch(negated) =
+            parse_and_compile_elasticsearch("NOT domain ~ example.com").unwrap()
+        else {
+            panic!("negated domain query must require Elasticsearch");
+        };
+        assert!(negated.to_string().contains("network_mapping_domain"));
+        assert!(!negated.to_string().contains("exists"));
+    }
+
+    #[test]
+    fn rejects_invalid_or_unsupported_domain_queries() {
+        let invalid = parse_and_compile_elasticsearch("domain = invalid_domain")
+            .expect_err("invalid domain must be rejected");
+        assert_eq!(invalid.message, "domain 必须是有效域名");
+
+        let exists = parse_and_compile_elasticsearch("EXISTS(domain)")
+            .expect_err("domain existence cannot be expanded safely");
+        assert_eq!(exists.message, "字段 domain 不支持 EXISTS");
+
+        let nested = parse_and_compile_elasticsearch("has_endpoint(domain = example.com)")
+            .expect_err("domain is not an endpoint field");
+        assert!(nested.message.contains("不能使用资产字段"));
     }
 
     #[test]

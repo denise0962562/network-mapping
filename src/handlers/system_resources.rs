@@ -31,6 +31,15 @@ WITH bucket_range AS (
               AND (ram->>'total_ram')::DOUBLE PRECISION > 0
              THEN (ram->>'used_ram')::DOUBLE PRECISION
                   / (ram->>'total_ram')::DOUBLE PRECISION * 100 END AS ram_usage,
+        CASE WHEN ram->>'total_swap' ~ '^[0-9]+([.][0-9]+)?$'
+              AND (ram->>'total_swap')::DOUBLE PRECISION > 0
+              AND ram->>'swap_usage' ~ '^[0-9]+([.][0-9]+)?$'
+             THEN (ram->>'swap_usage')::DOUBLE PRECISION
+             WHEN ram->>'total_swap' ~ '^[0-9]+([.][0-9]+)?$'
+              AND (ram->>'total_swap')::DOUBLE PRECISION > 0
+              AND ram->>'use_swap' ~ '^[0-9]+([.][0-9]+)?$'
+             THEN (ram->>'use_swap')::DOUBLE PRECISION
+                  / (ram->>'total_swap')::DOUBLE PRECISION * 100 END AS swap_usage,
         CASE WHEN disk->>'disk_total_usage' ~ '^[0-9]+([.][0-9]+)?$'
               AND disk->>'disk_total_space' ~ '^[0-9]+([.][0-9]+)?$'
               AND (disk->>'disk_total_space')::DOUBLE PRECISION > 0
@@ -45,6 +54,8 @@ WITH bucket_range AS (
            MAX(cpu_usage) FILTER (WHERE cpu_usage BETWEEN 0 AND 100) AS cpu_max,
            AVG(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_avg,
            MAX(ram_usage) FILTER (WHERE ram_usage BETWEEN 0 AND 100) AS ram_max,
+           AVG(swap_usage) FILTER (WHERE swap_usage BETWEEN 0 AND 100) AS swap_avg,
+           MAX(swap_usage) FILTER (WHERE swap_usage BETWEEN 0 AND 100) AS swap_max,
            AVG(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_avg,
            MAX(disk_usage) FILTER (WHERE disk_usage BETWEEN 0 AND 100) AS disk_max
     FROM metrics
@@ -52,7 +63,8 @@ WITH bucket_range AS (
 )
 SELECT b.bucket_start,
        COALESCE(a.sample_count, 0)::BIGINT AS sample_count,
-       a.cpu_avg, a.cpu_max, a.ram_avg, a.ram_max, a.disk_avg, a.disk_max
+       a.cpu_avg, a.cpu_max, a.ram_avg, a.ram_max, a.swap_avg, a.swap_max,
+       a.disk_avg, a.disk_max
 FROM bucket_range b
 LEFT JOIN aggregates a ON a.bucket_start = b.bucket_start
 ORDER BY b.bucket_start;
@@ -235,6 +247,8 @@ struct ResourceHistoryPoint {
     cpu_max: Option<f64>,
     ram_avg: Option<f64>,
     ram_max: Option<f64>,
+    swap_avg: Option<f64>,
+    swap_max: Option<f64>,
     disk_avg: Option<f64>,
     disk_max: Option<f64>,
 }
@@ -455,6 +469,8 @@ pub(crate) async fn get_system_resource_history(
             cpu_max: rounded(row.get("cpu_max")),
             ram_avg: rounded(row.get("ram_avg")),
             ram_max: rounded(row.get("ram_max")),
+            swap_avg: rounded(row.get("swap_avg")),
+            swap_max: rounded(row.get("swap_max")),
             disk_avg: rounded(row.get("disk_avg")),
             disk_max: rounded(row.get("disk_max")),
         })
@@ -662,6 +678,7 @@ mod tests {
     #[test]
     fn history_query_keeps_sql_clause_boundaries() {
         assert!(RESOURCE_HISTORY_SQL.contains("FROM system_status"));
+        assert!(RESOURCE_HISTORY_SQL.contains("AS swap_usage"));
         assert!(DATABASE_HISTORY_SQL.contains("FROM system_status"));
     }
 

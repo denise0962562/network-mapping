@@ -6,6 +6,7 @@
 //! installed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
 use deadpool_postgres::Pool;
@@ -32,7 +33,7 @@ struct ExecutionContext {
 #[derive(Default)]
 struct ExecutionFacts {
     distribution: BTreeMap<(DateTime<Utc>, String, String), i64>,
-    discovery: BTreeSet<(NaiveDate, String)>,
+    discovery: BTreeSet<(NaiveDate, IpAddr)>,
 }
 
 /// Starts the worker only in `shadow` or `snapshot` mode. Realtime is deliberately the default
@@ -250,7 +251,7 @@ async fn facts_from_postgres(
     let rows = connection
         .query(
             "SELECT ((MIN(observed_at) AT TIME ZONE 'Asia/Shanghai')::DATE) AS day_start, \
-                host(ip_address) AS ip_address FROM scan_observation \
+                ip_address FROM scan_observation \
          WHERE execution_id = $1 GROUP BY ip_address ORDER BY day_start, ip_address;",
             &[&context.database_id],
         )
@@ -270,7 +271,7 @@ async fn facts_from_elasticsearch(
 ) -> Result<ExecutionFacts, String> {
     let mut facts = ExecutionFacts::default();
     let mut endpoint_first = BTreeMap::<(String, String, String), DateTime<Utc>>::new();
-    let mut ip_first = BTreeMap::<String, DateTime<Utc>>::new();
+    let mut ip_first = BTreeMap::<IpAddr, DateTime<Utc>>::new();
     let mut after: Option<Value> = None;
     loop {
         let mut body = json!({
@@ -305,6 +306,9 @@ async fn facts_from_elasticsearch(
                 .get("ip_address")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "Elasticsearch 统计文档缺少 ip_address".to_owned())?;
+            let ip_address = ip.parse::<IpAddr>().map_err(|error| {
+                format!("Elasticsearch 统计文档 ip_address 无效（{ip}）：{error}")
+            })?;
             let port = source
                 .get("port")
                 .and_then(Value::as_i64)
@@ -331,7 +335,7 @@ async fn facts_from_elasticsearch(
                     );
                 }
             }
-            update_first(&mut ip_first, ip.to_owned(), timestamp);
+            update_first(&mut ip_first, ip_address, timestamp);
         }
         after = hits.last().and_then(|hit| hit.get("sort")).cloned();
         if hits.len() < 1000 || after.is_none() {

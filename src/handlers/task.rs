@@ -46,6 +46,10 @@ struct CreateDnsTask {
     remark: Option<String>,
     #[serde(default = "default_dns_scan_profile")]
     scan_profile: String,
+    #[serde(default = "crate::default_dispatch_mode")]
+    dispatch_mode: String,
+    #[serde(default)]
+    scanner_ids: Vec<Uuid>,
     port: Option<String>,
     #[serde(default)]
     follow_up_port_scan: bool,
@@ -101,6 +105,77 @@ fn default_dns_scan_profile() -> String {
 
 fn default_follow_up_scan_profile() -> String {
     "port_only".into()
+}
+
+fn resolve_dns_task_port(
+    scan_profile: &str,
+    follow_up_port_scan: bool,
+    port: Option<&str>,
+) -> Result<String, &'static str> {
+    if scan_profile == "dns_records" && !follow_up_port_scan {
+        if port.is_some_and(|value| !value.trim().is_empty()) {
+            return Err("port must be omitted for DNS-only tasks");
+        }
+        return Ok("53".to_owned());
+    }
+
+    let port = port
+        .map(str::trim)
+        .filter(|port| !port.is_empty())
+        .unwrap_or("1-65535");
+    if !crate::check_port(port) {
+        return Err("invalid port range");
+    }
+    Ok(port.to_owned())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedDnsScanRequest {
+    task_profile: String,
+    follow_up_profile: Option<String>,
+}
+
+fn resolve_dns_scan_request(
+    scan_profile: &str,
+    legacy_follow_up_enabled: bool,
+    legacy_follow_up_profile: &str,
+) -> Result<ResolvedDnsScanRequest, &'static str> {
+    match scan_profile {
+        "dns_records" if legacy_follow_up_enabled => {
+            if !crate::is_ip_scan_profile(legacy_follow_up_profile) {
+                return Err("invalid DNS follow-up scan profile");
+            }
+            Ok(ResolvedDnsScanRequest {
+                task_profile: "dns_records".into(),
+                follow_up_profile: Some(legacy_follow_up_profile.into()),
+            })
+        }
+        "dns_records" => Ok(ResolvedDnsScanRequest {
+            task_profile: "dns_records".into(),
+            follow_up_profile: None,
+        }),
+        // Unified domain modes always run DNS first. The server then creates
+        // address-family-specific child tasks from authorized A/AAAA answers.
+        "legacy" | "port_only" | "service_inventory" | "vulnerability_scan" => {
+            if legacy_follow_up_enabled {
+                return Err("follow_up_port_scan must not be combined with a unified scan profile");
+            }
+            Ok(ResolvedDnsScanRequest {
+                task_profile: "dns_records".into(),
+                follow_up_profile: Some(scan_profile.into()),
+            })
+        }
+        // Retain the original in-scanner DNS profiles for rolling upgrades and
+        // existing API clients. The web UI no longer creates these profiles.
+        "dns_ports" | "dns_full" if !legacy_follow_up_enabled => Ok(ResolvedDnsScanRequest {
+            task_profile: scan_profile.into(),
+            follow_up_profile: None,
+        }),
+        "dns_ports" | "dns_full" => {
+            Err("follow_up_port_scan is not valid for legacy DNS scan profiles")
+        }
+        _ => Err("invalid DNS scan profile"),
+    }
 }
 
 #[derive(Serialize)]
@@ -226,6 +301,7 @@ impl ScannerScanCapabilities {
                 "legacy"
                     | "port_only"
                     | "service_inventory"
+                    | "vulnerability_scan"
                     | "dns_records"
                     | "dns_ports"
                     | "dns_full"
@@ -233,7 +309,7 @@ impl ScannerScanCapabilities {
         }) || self.stages.iter().any(|value| {
             !matches!(
                 value.as_str(),
-                "port_discovery" | "service_detection" | "dns_lookup"
+                "port_discovery" | "service_detection" | "dns_lookup" | "vulnerability_detection"
             )
         }) {
             return Err("unsupported scan capability");
@@ -543,6 +619,61 @@ async fn load_execution_results_from_elasticsearch(
         }
     }
     Ok(results)
+}
+
+async fn load_vulnerabilities_from_elasticsearch(
+    elasticsearch: &ElasticsearchService,
+    execution_id: &str,
+) -> Result<(Vec<Value>, i64), String> {
+    let response = elasticsearch
+        .scan_query(
+            ScanQueryIndex::Observations,
+            &json!({
+                "size": 500,
+                "track_total_hits": true,
+                "query": {"bool": {"filter": [
+                    {"term": {"execution_id": execution_id}},
+                    {"term": {"kind": "vulnerability"}}
+                ]}},
+                "sort": [{"observed_at": "desc"}, {"_id": "asc"}]
+            }),
+        )
+        .await?;
+    let total = response
+        .pointer("/hits/total/value")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let findings = response
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| hit.get("_source"))
+        .map(vulnerability_response)
+        .collect();
+    Ok((findings, total))
+}
+
+fn vulnerability_response(source: &Value) -> Value {
+    let data = source.get("data").cloned().unwrap_or_else(|| json!({}));
+    let mut finding = data.as_object().cloned().unwrap_or_default();
+    finding.insert(
+        "ip".into(),
+        source.get("ip_address").cloned().unwrap_or(Value::Null),
+    );
+    finding.insert(
+        "port".into(),
+        source.get("port").cloned().unwrap_or(Value::Null),
+    );
+    finding.insert(
+        "protocol".into(),
+        source.get("protocol").cloned().unwrap_or(Value::Null),
+    );
+    finding.insert(
+        "observed_at".into(),
+        source.get("observed_at").cloned().unwrap_or(Value::Null),
+    );
+    Value::Object(finding)
 }
 
 #[post("/api/scanner/heartbeat")]
@@ -1305,6 +1436,7 @@ async fn get_task(
                         FROM scan_observation o \
                         WHERE o.execution_id = i.execution_id \
                             AND o.ip_address = i.ip_address AND o.port = p.port \
+                            AND o.kind IN ('port', 'service') \
                         ORDER BY (o.kind = 'service') DESC, \
                             (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
                             o.observed_at DESC, o.id DESC LIMIT 1 \
@@ -1352,6 +1484,66 @@ async fn get_task(
             })
             .collect()
     };
+    let (vulnerabilities, vulnerability_count) = if elasticsearch
+        .scan_storage_mode()
+        .reads_elasticsearch()
+    {
+        match load_vulnerabilities_from_elasticsearch(
+            elasticsearch.get_ref(),
+            selected_execution.get::<_, String>("execution_id").as_str(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                error_logs(&req, "GetTaskVulnerabilitiesElasticsearchError", &error);
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"message": "漏洞结果索引暂时不可用"}));
+            }
+        }
+    } else {
+        let rows = match connection
+                .query(
+                    "SELECT jsonb_build_object( \
+                        'ip', host(ip_address), 'port', port, 'protocol', protocol, \
+                        'observed_at', FLOOR(EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT, \
+                        'template_id', data->>'template_id', 'name', data->>'name', \
+                        'severity', data->>'severity', 'matcher_name', data->>'matcher_name', \
+                        'matched_at', data->>'matched_at', 'description', data->>'description', \
+                        'remediation', data->>'remediation', 'tags', COALESCE(data->'tags', '[]'::jsonb), \
+                        'references', COALESCE(data->'references', '[]'::jsonb), \
+                        'classification', data->'classification', \
+                        'extracted_results', COALESCE(data->'extracted_results', '[]'::jsonb)) AS finding, \
+                        COUNT(*) OVER()::BIGINT AS total \
+                     FROM scan_observation WHERE execution_id = $1 AND kind = 'vulnerability' \
+                     ORDER BY observed_at DESC, id DESC LIMIT 500;",
+                    &[&selected_execution_pk],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    error_logs_error(
+                        &req,
+                        "GetTaskVulnerabilitiesError",
+                        "load_task_vulnerabilities",
+                        &error,
+                    );
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+        let total = rows.first().map(|row| row.get("total")).unwrap_or(0_i64);
+        (
+            rows.into_iter()
+                .map(|row| row.get::<_, Value>("finding"))
+                .collect(),
+            total,
+        )
+    };
+    let generation_metadata = task.get::<_, Option<Value>>("generation_metadata");
+    let stored_scan_profile = task.get::<_, String>("scan_profile");
+    let display_scan_profile =
+        crate::display_scan_profile(&stored_scan_profile, generation_metadata.as_ref());
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
         "data": {
@@ -1368,9 +1560,10 @@ async fn get_task(
             "dispatch_mode": task.get::<_, String>("dispatch_mode"),
             "task_source": task.get::<_, String>("task_source"),
             "generation_strategy": task.get::<_, Option<String>>("generation_strategy"),
-            "generation_metadata": task.get::<_, Option<Value>>("generation_metadata"),
+            "generation_metadata": generation_metadata,
             "address_family": task.get::<_, String>("address_family"),
-            "scan_profile": task.get::<_, String>("scan_profile"),
+            "scan_profile": display_scan_profile,
+            "task_scan_profile": stored_scan_profile,
             "scan_plan": task.get::<_, Value>("scan_plan"),
             "dns_resolvers": task.get::<_, Value>("dns_resolvers"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
@@ -1387,8 +1580,10 @@ async fn get_task(
                 "ip_count": ip_count,
                 "port_count": port_count,
                 "result_count": result_count,
+                "vulnerability_count": vulnerability_count,
             },
             "results": results,
+            "vulnerabilities": vulnerabilities,
             "pagination": {
                 "page": page,
                 "page_size": page_size,
@@ -1730,9 +1925,9 @@ async fn create_task(
     }
 }
 
-/// Creates the initial DNS-only task type. DNS tasks intentionally use an
-/// explicit domain list and automatic dispatch only; they do not inherit the
-/// IP/CIDR target generator or automatically expand into port scans.
+/// Creates the initial DNS task from an explicit domain list. DNS executions
+/// use the same automatic, selected, or all-scanners dispatch contract as IP
+/// tasks without inheriting the IP/CIDR target generator.
 #[post("/api/task/create-dns")]
 async fn create_dns_task(
     req: HttpRequest,
@@ -1774,50 +1969,37 @@ async fn create_dns_task(
         return HttpResponse::BadRequest()
             .json(json!({"success": false, "message": "dns_resolvers contains duplicate IDs"}));
     }
-    if !matches!(
-        input.scan_profile.as_str(),
-        "dns_records" | "dns_ports" | "dns_full"
+    let requested_scan_profile = input.scan_profile.trim().to_ascii_lowercase();
+    let resolved_scan = match resolve_dns_scan_request(
+        &requested_scan_profile,
+        input.follow_up_port_scan,
+        input.follow_up_scan_profile.trim(),
     ) {
-        return HttpResponse::BadRequest()
-            .json(json!({"success": false, "message": "invalid DNS scan profile"}));
+        Ok(resolved) => resolved,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
+        }
+    };
+    if resolved_scan.follow_up_profile.is_some() && !dns_follow_up.get().await.value.enabled {
+        return HttpResponse::Conflict().json(json!({
+            "success": false,
+            "message": "DNS 解析后自动扫描未启用，请配置授权网段并启用 dns_follow_up"
+        }));
     }
-    if input.follow_up_port_scan {
-        if !dns_follow_up.get().await.value.enabled {
-            return HttpResponse::Conflict().json(json!({
-                "success": false,
-                "message": "DNS 解析后自动创建端口任务未启用"
-            }));
+    let task_port = match resolve_dns_task_port(
+        &resolved_scan.task_profile,
+        resolved_scan.follow_up_profile.is_some(),
+        input.port.as_deref(),
+    ) {
+        Ok(port) => port,
+        Err(message) => {
+            return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
         }
-        if input.scan_profile != "dns_records" {
-            return HttpResponse::BadRequest().json(json!({
-                "success": false,
-                "message": "启用自动端口任务时 DNS 扫描模式必须为仅 DNS 记录"
-            }));
-        }
-        if !matches!(
-            input.follow_up_scan_profile.as_str(),
-            "legacy" | "port_only" | "service_inventory"
-        ) {
-            return HttpResponse::BadRequest().json(json!({
-                "success": false,
-                "message": "invalid DNS follow-up scan profile"
-            }));
-        }
-    }
-    let task_port = if input.scan_profile == "dns_records" && !input.follow_up_port_scan {
-        "53".to_owned()
-    } else {
-        let port = input.port.as_deref().unwrap_or("1-65535");
-        if !crate::check_port(port) {
-            return HttpResponse::BadRequest()
-                .json(json!({"success": false, "message": "invalid port range"}));
-        }
-        port.to_owned()
     };
     let mut domains = match input
         .domains
         .iter()
-        .map(|domain| crate::dns::canonical_domain(domain))
+        .map(|domain| crate::dns::canonical_scan_domain(domain))
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(domains) => domains,
@@ -1831,36 +2013,105 @@ async fn create_dns_task(
         Ok(connection) => connection,
         Err(_) => return HttpResponse::InternalServerError().finish(),
     };
-    match connection
-        .query(
-            "SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
-             AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
-             AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
-             LIMIT 1;",
-            &[&input.scan_profile, &!dns_resolvers.is_empty()],
-        )
-        .await
-    {
-        Ok(rows) if !rows.is_empty() => (),
-        // A DNS task cannot be queued until a scanner can actually accept it.
-        // This is a transient service-capacity/configuration condition, rather
-        // than a conflict with a resource the caller submitted.
-        Ok(_) => return HttpResponse::ServiceUnavailable().json(
-            json!({
+    let dispatch_mode = input.dispatch_mode.trim().to_ascii_lowercase();
+    let requires_explicit_resolvers = !dns_resolvers.is_empty();
+    let requested_scanners: Vec<Option<String>> = match dispatch_mode.as_str() {
+        "automatic" if input.scanner_ids.is_empty() => {
+            match connection
+                .query(
+                    "SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
+                     AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
+                     AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     LIMIT 1;",
+                    &[&resolved_scan.task_profile, &requires_explicit_resolvers],
+                )
+                .await
+            {
+                Ok(rows) if !rows.is_empty() => {}
+                Ok(_) => return HttpResponse::ServiceUnavailable().json(json!({
+                    "success": false,
+                    "message": "no DNS-capable scanner is currently available; enable DNS on a scanner and wait for its next heartbeat"
+                })),
+                Err(error) => {
+                    error_logs_error(&req, "ResolveDnsTaskScannersError", "resolve_automatic_dns_scanner", &error);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            }
+            vec![None]
+        }
+        "selected" if !input.scanner_ids.is_empty() => {
+            let ids = input
+                .scanner_ids
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<HashSet<_>>();
+            let values = ids.into_iter().collect::<Vec<_>>();
+            let rows = match connection
+                .query(
+                    "SELECT scanner_id FROM scanner_info WHERE scanner_id = ANY($1::text[]) \
+                     AND is_enable = true AND deleted_at IS NULL AND supports_ipv4 AND ipv4_ready \
+                     AND scan_capabilities->'profiles' ? $2 \
+                     AND ($3 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     ORDER BY scanner_id;",
+                    &[&values, &resolved_scan.task_profile, &requires_explicit_resolvers],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    error_logs_error(&req, "ResolveDnsTaskScannersError", "resolve_selected_dns_scanners", &error);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+            if rows.len() != values.len() {
+                return HttpResponse::BadRequest().json(json!({
+                    "success": false,
+                    "message": "selected scanner is unavailable or does not support the DNS task configuration"
+                }));
+            }
+            rows.into_iter()
+                .map(|row| Some(row.get("scanner_id")))
+                .collect()
+        }
+        "all" if input.scanner_ids.is_empty() => {
+            let rows = match connection
+                .query(
+                    "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
+                     AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
+                     AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     ORDER BY scanner_id;",
+                    &[&resolved_scan.task_profile, &requires_explicit_resolvers],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    error_logs_error(&req, "ResolveDnsTaskScannersError", "resolve_all_dns_scanners", &error);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+            if rows.is_empty() {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "success": false,
+                    "message": "no DNS-capable scanner is currently available"
+                }));
+            }
+            rows.into_iter()
+                .map(|row| Some(row.get("scanner_id")))
+                .collect()
+        }
+        _ => {
+            return HttpResponse::BadRequest().json(json!({
                 "success": false,
-                "message": "no DNS-capable scanner is currently available; enable DNS on a scanner and wait for its next heartbeat"
-            }),
-        ),
-        Err(error) => {
-            error_logs_error(&req, "ResolveDnsTaskScannersError", "resolve_dns_scanners", &error);
-            return HttpResponse::InternalServerError().finish();
+                "message": "invalid dispatch mode or scanner selection"
+            }));
         }
     };
     let task_id = Uuid::now_v7().to_string();
-    let generation_metadata = if input.follow_up_port_scan {
+    let generation_metadata = if let Some(follow_up_profile) = &resolved_scan.follow_up_profile {
         json!({"dns_follow_up": {
             "enabled": true,
-            "scan_profile": input.follow_up_scan_profile,
+            "scan_profile": follow_up_profile,
         }})
     } else {
         json!({})
@@ -1881,8 +2132,8 @@ async fn create_dns_task(
         .query_one(
             "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
              dispatch_mode, address_family, scan_profile, scan_plan, task_kind, dns_targets, dns_resolvers, generation_metadata) \
-             VALUES ($1, $2, $3, ARRAY[]::INET[], $4, $5, $6, 'automatic', 'ipv4', $7, \
-             $8, 'dns', $9, $10, $11) RETURNING id;",
+             VALUES ($1, $2, $3, ARRAY[]::INET[], $4, $5, $6, $7, 'ipv4', $8, \
+             $9, 'dns', $10, $11, $12) RETURNING id;",
             &[
                 &user.id,
                 &task_id,
@@ -1890,8 +2141,10 @@ async fn create_dns_task(
                 &task_port,
                 &(i32::from(input.level)),
                 &input.remark,
-                &input.scan_profile,
-                &build_scan_plan(&input.scan_profile).expect("DNS scan profile was validated"),
+                &dispatch_mode,
+                &resolved_scan.task_profile,
+                &build_scan_plan(&resolved_scan.task_profile)
+                    .expect("resolved DNS scan profile was validated"),
                 &domains,
                 &serde_json::to_value(&dns_resolvers).expect("DNS resolver input is serializable"),
                 &generation_metadata,
@@ -1906,20 +2159,30 @@ async fn create_dns_task(
         }
     };
     let task_db_id: i32 = task.get("id");
-    if let Err(error) = transaction
-        .execute(
-            "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, NULL);",
-            &[&Uuid::now_v7().to_string(), &task_db_id],
-        )
-        .await
-    {
-        error_logs_error(&req, "CreateDnsTaskExecutionError", "insert_task_execution", &error);
-        return HttpResponse::InternalServerError().finish();
+    for requested_scanner in &requested_scanners {
+        if let Err(error) = transaction
+            .execute(
+                "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, $3);",
+                &[&Uuid::now_v7().to_string(), &task_db_id, requested_scanner],
+            )
+            .await
+        {
+            error_logs_error(&req, "CreateDnsTaskExecutionError", "insert_task_execution", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     }
     let mut audit_event = audit::AuditEvent::user("task", "task.create_dns", "success", &user)
         .resource("task", task_id.clone());
     audit_event.response_status = Some(200);
-    audit_event.metadata = json!({"target_count": domains.len(), "scan_profile": input.scan_profile, "dns_resolver_count": dns_resolvers.len(), "follow_up_port_scan": input.follow_up_port_scan, "follow_up_scan_profile": input.follow_up_scan_profile});
+    audit_event.metadata = json!({
+        "target_count": domains.len(),
+        "requested_scan_profile": requested_scan_profile,
+        "task_scan_profile": resolved_scan.task_profile,
+        "dispatch_mode": dispatch_mode,
+        "scanner_count": requested_scanners.len(),
+        "dns_resolver_count": dns_resolvers.len(),
+        "follow_up_scan_profile": resolved_scan.follow_up_profile,
+    });
     if let Err(error) = audit::write(
         &transaction,
         &AuditContext::from_request(&req),
@@ -1939,7 +2202,17 @@ async fn create_dns_task(
         );
         return HttpResponse::InternalServerError().finish();
     }
-    HttpResponse::Ok().json(json!({"success": true, "task_id": task_id, "domains": domains, "dns_resolvers": dns_resolvers}))
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "task_id": task_id,
+        "domains": domains,
+        "dns_resolvers": dns_resolvers,
+        "scan_profile": requested_scan_profile,
+        "task_scan_profile": resolved_scan.task_profile,
+        "dispatch_mode": dispatch_mode,
+        "scanner_count": requested_scanners.len(),
+        "follow_up_scan_profile": resolved_scan.follow_up_profile,
+    }))
 }
 
 /// 用于扫描器申请一个扫描目标
@@ -2226,15 +2499,38 @@ async fn get_all_task_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
+        CreateDnsTask, ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
         ScannerScanCapabilities, build_dns_comparison, normalize_task_list_query,
-        task_result_pagination, validate_latency_report, validate_public_ip,
+        resolve_dns_scan_request, resolve_dns_task_port, task_result_pagination,
+        validate_latency_report, validate_public_ip,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
     use chrono::Utc;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn dns_task_dispatch_defaults_to_automatic_and_accepts_selected_scanners() {
+        let automatic: CreateDnsTask = serde_json::from_value(json!({
+            "domains": ["example.com"],
+            "level": 1
+        }))
+        .unwrap();
+        assert_eq!(automatic.dispatch_mode, "automatic");
+        assert!(automatic.scanner_ids.is_empty());
+
+        let scanner_id = Uuid::now_v7();
+        let selected: CreateDnsTask = serde_json::from_value(json!({
+            "domains": ["example.com"],
+            "level": 1,
+            "dispatch_mode": "selected",
+            "scanner_ids": [scanner_id]
+        }))
+        .unwrap();
+        assert_eq!(selected.dispatch_mode, "selected");
+        assert_eq!(selected.scanner_ids, vec![scanner_id]);
+    }
 
     #[test]
     fn latency_reports_are_bounded_and_recomputed() {
@@ -2323,8 +2619,12 @@ mod tests {
     fn scan_capabilities_are_allowlisted() {
         let valid = ScannerScanCapabilities {
             plan_versions: vec![1],
-            profiles: vec!["legacy".into(), "port_only".into()],
-            stages: vec!["port_discovery".into()],
+            profiles: vec![
+                "legacy".into(),
+                "port_only".into(),
+                "vulnerability_scan".into(),
+            ],
+            stages: vec!["port_discovery".into(), "vulnerability_detection".into()],
             explicit_dns_resolvers: false,
         };
         assert!(valid.validate().is_ok());
@@ -2339,15 +2639,77 @@ mod tests {
     }
 
     #[test]
-    fn database_schema_allows_all_dns_scan_profiles() {
+    fn database_schema_allows_all_scan_profiles() {
         let initialization_sql = include_str!("../../source/database/init.sql");
 
-        for profile in ["dns_records", "dns_ports", "dns_full"] {
+        for profile in [
+            "legacy",
+            "port_only",
+            "service_inventory",
+            "vulnerability_scan",
+            "dns_records",
+            "dns_ports",
+            "dns_full",
+        ] {
             assert!(
                 initialization_sql.contains(&format!("'{profile}'")),
                 "database schema must allow {profile}"
             );
         }
+    }
+
+    #[test]
+    fn dns_port_scan_uses_all_ports_when_port_is_blank() {
+        for port in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                resolve_dns_task_port("dns_full", false, port).unwrap(),
+                "1-65535"
+            );
+        }
+        assert_eq!(
+            resolve_dns_task_port("dns_ports", false, Some("80,443")).unwrap(),
+            "80,443"
+        );
+        assert_eq!(
+            resolve_dns_task_port("dns_ports", false, Some("80,abc")).unwrap_err(),
+            "invalid port range"
+        );
+    }
+
+    #[test]
+    fn dns_only_mode_rejects_ports() {
+        assert_eq!(
+            resolve_dns_task_port("dns_records", false, Some("53")).unwrap_err(),
+            "port must be omitted for DNS-only tasks"
+        );
+        assert_eq!(
+            resolve_dns_task_port("dns_records", false, Some("  ")).unwrap(),
+            "53"
+        );
+    }
+
+    #[test]
+    fn unified_domain_modes_resolve_to_dns_parent_and_ip_follow_up() {
+        for profile in ["port_only", "service_inventory", "vulnerability_scan"] {
+            let resolved = resolve_dns_scan_request(profile, false, "port_only").unwrap();
+            assert_eq!(resolved.task_profile, "dns_records");
+            assert_eq!(resolved.follow_up_profile.as_deref(), Some(profile));
+        }
+
+        let dns_only = resolve_dns_scan_request("dns_records", false, "port_only").unwrap();
+        assert_eq!(dns_only.task_profile, "dns_records");
+        assert_eq!(dns_only.follow_up_profile, None);
+        assert!(resolve_dns_scan_request("unsupported", false, "port_only").is_err());
+    }
+
+    #[test]
+    fn legacy_dns_follow_up_accepts_vulnerability_profile() {
+        let resolved = resolve_dns_scan_request("dns_records", true, "vulnerability_scan").unwrap();
+        assert_eq!(resolved.task_profile, "dns_records");
+        assert_eq!(
+            resolved.follow_up_profile.as_deref(),
+            Some("vulnerability_scan")
+        );
     }
 
     #[test]

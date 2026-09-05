@@ -519,7 +519,8 @@ fn scan_observation_addresses(value: &str) -> Result<(String, String, IpAddr), A
 mod parse_ip_or_cidr_tests {
     use super::{
         CreateTask, STask, ScannerObservation, ScannerResultUpload, TargetIP, build_scan_plan,
-        is_ip_scan_profile, parse_ip_or_cidr, scan_observation_addresses,
+        display_scan_profile, is_ip_scan_profile, normalize_upload_observations, parse_ip_or_cidr,
+        scan_observation_addresses,
     };
 
     #[test]
@@ -591,6 +592,12 @@ mod parse_ip_or_cidr_tests {
 
         let inventory = build_scan_plan("service_inventory").unwrap();
         assert_eq!(inventory["stages"].as_array().unwrap().len(), 2);
+        let vulnerabilities = build_scan_plan("vulnerability_scan").unwrap();
+        assert_eq!(vulnerabilities["stages"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            vulnerabilities["stages"][2]["type"],
+            "vulnerability_detection"
+        );
         let dns = build_scan_plan("dns_records").unwrap();
         assert_eq!(dns["stages"][0]["type"], "dns_lookup");
         let dns_ports = build_scan_plan("dns_ports").unwrap();
@@ -602,12 +609,29 @@ mod parse_ip_or_cidr_tests {
 
     #[test]
     fn only_ip_profiles_can_be_used_as_the_system_default() {
-        for profile in ["legacy", "port_only", "service_inventory"] {
+        for profile in [
+            "legacy",
+            "port_only",
+            "service_inventory",
+            "vulnerability_scan",
+        ] {
             assert!(is_ip_scan_profile(profile));
         }
         for profile in ["dns_records", "dns_ports", "dns_full"] {
             assert!(!is_ip_scan_profile(profile));
         }
+    }
+
+    #[test]
+    fn domain_parent_displays_the_requested_follow_up_profile() {
+        let metadata = serde_json::json!({
+            "dns_follow_up": {"enabled": true, "scan_profile": "vulnerability_scan"}
+        });
+        assert_eq!(
+            display_scan_profile("dns_records", Some(&metadata)),
+            "vulnerability_scan"
+        );
+        assert_eq!(display_scan_profile("dns_records", None), "dns_records");
     }
 
     #[test]
@@ -655,6 +679,39 @@ mod parse_ip_or_cidr_tests {
             typed.observations[0],
             ScannerObservation::Port { .. }
         ));
+
+        let vulnerability: ScannerResultUpload = serde_json::from_value(serde_json::json!({
+            "protocol_version": 3,
+            "scanner_id": "019c0000-0000-7000-8000-000000000001",
+            "task_id": "019c0000-0000-7000-8000-000000000002",
+            "upload_id": "019c0000-0000-7000-8000-000000000003",
+            "batch_index": 0,
+            "is_final": true,
+            "observations": [{
+                "kind": "vulnerability",
+                "ip": "192.0.2.1",
+                "port": 443,
+                "protocol": "https",
+                "template_id": "cve-test",
+                "name": "Example vulnerability",
+                "severity": "high",
+                "matcher_name": "body",
+                "matched_at": "https://192.0.2.1/",
+                "tags": ["cve"],
+                "references": ["https://example.test/advisory"],
+                "extracted_results": [],
+                "source": "nuclei",
+                "observed_at": 1788393600000_i64
+            }]
+        }))
+        .unwrap();
+        assert_eq!(vulnerability.protocol_version, 3);
+        let normalized = normalize_upload_observations(&vulnerability).unwrap();
+        assert_eq!(normalized[0].kind, "vulnerability");
+        assert_eq!(
+            normalized[0].data.as_ref().unwrap()["template_id"],
+            "cve-test"
+        );
     }
 }
 
@@ -728,6 +785,11 @@ pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
             {"type": "port_discovery", "required": true},
             {"type": "service_detection", "required": true}
         ]),
+        "vulnerability_scan" => serde_json::json!([
+            {"type": "port_discovery", "required": true},
+            {"type": "service_detection", "required": false},
+            {"type": "vulnerability_detection", "required": true}
+        ]),
         "dns_records" => serde_json::json!([
             {"type": "dns_lookup", "required": true}
         ]),
@@ -752,7 +814,22 @@ pub fn build_scan_plan(profile: &str) -> Result<Value, &'static str> {
 /// require the dedicated domain-task endpoint and must never be inherited by
 /// an IP task.
 pub fn is_ip_scan_profile(profile: &str) -> bool {
-    matches!(profile, "legacy" | "port_only" | "service_inventory")
+    matches!(
+        profile,
+        "legacy" | "port_only" | "service_inventory" | "vulnerability_scan"
+    )
+}
+
+/// Returns the profile selected by the user for display purposes. A domain
+/// follow-up request keeps `dns_records` as its executable parent profile and
+/// stores the requested IP profile in generation metadata.
+pub fn display_scan_profile(stored_profile: &str, generation_metadata: Option<&Value>) -> String {
+    generation_metadata
+        .and_then(|metadata| metadata.pointer("/dns_follow_up/scan_profile"))
+        .and_then(Value::as_str)
+        .filter(|profile| is_ip_scan_profile(profile))
+        .unwrap_or(stored_profile)
+        .to_owned()
 }
 
 /// 该结构体用于表示一个任务，该结构体不适合直接接收用户创建任务时的数据
@@ -1374,6 +1451,28 @@ pub enum ScannerObservation {
         #[serde(flatten)]
         observation: dns::DnsObservation,
     },
+    Vulnerability {
+        ip: String,
+        port: u16,
+        protocol: String,
+        template_id: String,
+        name: String,
+        severity: String,
+        matcher_name: Option<String>,
+        matched_at: String,
+        description: Option<String>,
+        remediation: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        references: Vec<String>,
+        classification: Option<Value>,
+        #[serde(default)]
+        extracted_results: Vec<String>,
+        source: String,
+        #[serde(default)]
+        observed_at: Option<i64>,
+    },
 }
 
 #[derive(Clone, Deserialize)]
@@ -1560,6 +1659,8 @@ fn immutable_scan_observation(value: &Value) -> Value {
             "country_name",
             "region_name",
             "city_name",
+            "latitude",
+            "longitude",
             "tags",
         ] {
             object.remove(field);
@@ -1571,8 +1672,8 @@ fn immutable_scan_observation(value: &Value) -> Value {
 fn normalize_upload_observations(
     upload: &ScannerResultUpload,
 ) -> Result<Vec<NormalizedObservation>, SaveScannerResultsError> {
-    let is_v2 = upload.protocol_version == 2;
-    let observations: Vec<NormalizedObservation> = if is_v2 {
+    let is_typed = matches!(upload.protocol_version, 2 | 3);
+    let observations: Vec<NormalizedObservation> = if is_typed {
         upload
             .observations
             .iter()
@@ -1626,6 +1727,46 @@ fn normalize_upload_observations(
                 ScannerObservation::Dns { .. } => {
                     unreachable!("DNS observations are handled before endpoint normalization")
                 }
+                ScannerObservation::Vulnerability {
+                    ip,
+                    port,
+                    protocol,
+                    template_id,
+                    name,
+                    severity,
+                    matcher_name,
+                    matched_at,
+                    description,
+                    remediation,
+                    tags,
+                    references,
+                    classification,
+                    extracted_results,
+                    source,
+                    observed_at,
+                } => NormalizedObservation {
+                    kind: "vulnerability",
+                    ip: ip.clone(),
+                    port: *port,
+                    protocol: Some(sanitize_text(protocol)),
+                    service: None,
+                    banner: None,
+                    source: sanitize_text(source),
+                    data: Some(sanitize_json_value(serde_json::json!({
+                        "template_id": template_id,
+                        "name": name,
+                        "severity": severity.to_ascii_lowercase(),
+                        "matcher_name": matcher_name,
+                        "matched_at": matched_at,
+                        "description": description,
+                        "remediation": remediation,
+                        "tags": tags,
+                        "references": references,
+                        "classification": classification,
+                        "extracted_results": extracted_results,
+                    }))),
+                    observed_at: *observed_at,
+                },
             })
             .collect()
     } else {
@@ -1681,7 +1822,7 @@ fn normalize_upload_observations(
                 .protocol
                 .as_ref()
                 .is_some_and(|value| value.len() > 16)
-            || (is_v2
+            || (is_typed
                 && observation
                     .protocol
                     .as_ref()
@@ -1706,6 +1847,8 @@ fn normalize_upload_observations(
                 .data
                 .as_ref()
                 .is_some_and(|value| value.to_string().len() > 1_048_576)
+            || (observation.kind == "vulnerability"
+                && !valid_vulnerability_data(observation.data.as_ref()))
         {
             return Err(SaveScannerResultsError::InvalidUpload(
                 "observation fields exceed allowed values or sizes".into(),
@@ -1714,6 +1857,60 @@ fn normalize_upload_observations(
     }
 
     Ok(observations)
+}
+
+fn valid_vulnerability_data(data: Option<&Value>) -> bool {
+    let Some(data) = data else { return false };
+    let text = |field: &str, max: usize| {
+        data.get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                !value.trim().is_empty() && !value.contains('\0') && value.len() <= max
+            })
+    };
+    let optional_text = |field: &str, max: usize| {
+        data.get(field).is_none_or(|value| {
+            value.is_null()
+                || value
+                    .as_str()
+                    .is_some_and(|value| !value.contains('\0') && value.len() <= max)
+        })
+    };
+    let string_array = |field: &str, max_items: usize, max_len: usize| {
+        data.get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values.len() <= max_items
+                    && values.iter().all(|value| {
+                        value
+                            .as_str()
+                            .is_some_and(|value| !value.contains('\0') && value.len() <= max_len)
+                    })
+            })
+    };
+    text("template_id", 256)
+        && text("name", 512)
+        && text("matched_at", 4_096)
+        && optional_text("matcher_name", 256)
+        && optional_text("description", 8_192)
+        && optional_text("remediation", 8_192)
+        && data
+            .get("severity")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "info" | "low" | "medium" | "high" | "critical"))
+        && string_array("tags", 128, 128)
+        && string_array("references", 64, 2_048)
+        && data
+            .get("references")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values.iter().all(|value| {
+                    value.as_str().is_some_and(|value| {
+                        value.starts_with("https://") || value.starts_with("http://")
+                    })
+                })
+            })
+        && string_array("extracted_results", 64, 2_048)
 }
 
 async fn save_dns_scanner_results(
@@ -2317,14 +2514,14 @@ pub async fn save_scanner_results(
     token: &str,
     token_pepper: &str,
 ) -> Result<usize, SaveScannerResultsError> {
-    let is_v2 = upload.protocol_version == 2;
-    if upload.protocol_version != 1 && !is_v2 {
+    let is_typed = matches!(upload.protocol_version, 2 | 3);
+    if upload.protocol_version != 1 && !is_typed {
         return Err(SaveScannerResultsError::InvalidUpload(format!(
             "unsupported protocol_version {}",
             upload.protocol_version
         )));
     }
-    if is_v2
+    if is_typed
         && (upload.upload_id.is_none()
             || upload.batch_index.is_none()
             || upload.is_final.is_none()
@@ -2332,16 +2529,26 @@ pub async fn save_scanner_results(
             || upload.observations.len() > 500)
     {
         return Err(SaveScannerResultsError::InvalidUpload(
-            "version 2 requires upload_id, batch_index and is_final, accepts only observations, and limits each batch to 500 observations".into(),
+            "typed result protocols require upload_id, batch_index and is_final, accept only observations, and limit each batch to 500 observations".into(),
         ));
     }
-    if !is_v2 && !upload.observations.is_empty() {
+    if !is_typed && !upload.observations.is_empty() {
         return Err(SaveScannerResultsError::InvalidUpload(
-            "typed observations require protocol_version 2".into(),
+            "typed observations require protocol_version 2 or 3".into(),
+        ));
+    }
+    if upload.protocol_version == 2
+        && upload
+            .observations
+            .iter()
+            .any(|item| matches!(item, ScannerObservation::Vulnerability { .. }))
+    {
+        return Err(SaveScannerResultsError::InvalidUpload(
+            "vulnerability observations require protocol_version 3".into(),
         ));
     }
 
-    if is_v2
+    if is_typed
         && upload
             .observations
             .iter()
@@ -2536,7 +2743,7 @@ pub async fn save_scanner_results(
         None => return Err(SaveScannerResultsError::TaskNotFound),
     };
 
-    let (upload_id, batch_index, is_final) = if is_v2 {
+    let (upload_id, batch_index, is_final) = if is_typed {
         (
             upload.upload_id.expect("validated above").to_string(),
             i32::try_from(upload.batch_index.expect("validated above")).map_err(|_| {
@@ -2629,7 +2836,19 @@ pub async fn save_scanner_results(
             observation.port,
             observation.protocol,
             observation.service,
-            observation.source
+            observation.source,
+            observation
+                .data
+                .as_ref()
+                .and_then(|value| value.get("template_id")),
+            observation
+                .data
+                .as_ref()
+                .and_then(|value| value.get("matcher_name")),
+            observation
+                .data
+                .as_ref()
+                .and_then(|value| value.get("matched_at"))
         ]))
         .map_err(scanner_result_database_error)?;
         let endpoint_id = openssl::sha::sha256(
@@ -2680,6 +2899,8 @@ pub async fn save_scanner_results(
             "country_name": intel.country_name,
             "region_name": intel.region_name,
             "city_name": intel.city_name,
+            "latitude": intel.latitude,
+            "longitude": intel.longitude,
         }));
     }
     if storage_mode.writes_elasticsearch() && !observation_rows.is_empty() {
@@ -2915,7 +3136,8 @@ pub async fn save_scanner_results(
                     http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
                     search_content_extracted BOOLEAN, observed_at BIGINT, \
                     asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
-                    country_name TEXT, region_name TEXT, city_name TEXT) \
+                    country_name TEXT, region_name TEXT, city_name TEXT, \
+                    latitude DOUBLE PRECISION, longitude DOUBLE PRECISION) \
              ), inserted_observations AS ( \
                 INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
                     ip_address, port, protocol, service, banner, title, http_body, \
@@ -2931,10 +3153,10 @@ pub async fn save_scanner_results(
                 SELECT DISTINCT ip_address FROM inserted_endpoints \
              ), upserted_ips AS ( \
                 INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
-                    country_code, country_name, region_name, city_name) \
+                    country_code, country_name, region_name, city_name, latitude, longitude) \
                 SELECT DISTINCT ON (item.storage_ip_address) $1, $2, item.storage_ip_address, item.asn, \
                     item.isp, item.as_org, item.country_code, item.country_name, \
-                    item.region_name, item.city_name \
+                    item.region_name, item.city_name, item.latitude, item.longitude \
                 FROM input item \
                 JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.storage_ip_address \
                 ORDER BY item.storage_ip_address \
@@ -2946,6 +3168,8 @@ pub async fn save_scanner_results(
                     country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
                     region_name = COALESCE(EXCLUDED.region_name, ips.region_name), \
                     city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
+                    latitude = COALESCE(EXCLUDED.latitude, ips.latitude), \
+                    longitude = COALESCE(EXCLUDED.longitude, ips.longitude), \
                     update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
                 RETURNING ip_id, ip_address \
              ), upserted_ports AS ( \
@@ -2971,7 +3195,7 @@ pub async fn save_scanner_results(
         normalized_observations.len()
     };
 
-    if !is_v2 || upload.is_final == Some(true) {
+    if !is_typed || upload.is_final == Some(true) {
         let batch_sequence = transaction
             .query_one(
                 "SELECT COUNT(*)::BIGINT AS count, MIN(batch_index) AS first_batch, \
@@ -3634,26 +3858,30 @@ pub async fn get_filtered_task_page(
     };
     let items = rows
         .into_iter()
-        .map(|row| TaskItem {
-            task_id: row.get("task_id"),
-            task_target: row.get("display_targets"),
-            task_kind: row.get("task_kind"),
-            task_initiator: row.get("task_initiator"),
-            task_port: row.get("task_port"),
-            task_create_time: row.get("task_create_time"),
-            task_level: row.get("task_level"),
-            scanner_id: row.get("assigned_scanner_id"),
-            task_status: row.get("task_status"),
-            lease_expires_at: row.get("lease_expires_at"),
-            attempt_count: row.get("attempt_count"),
-            failure_reason: row.get("failure_reason"),
-            start_at: row.get("task_start_time"),
-            end_at: row.get("task_end_time"),
-            remarks: row.get("remarks"),
-            task_source: row.get("task_source"),
-            address_family: row.get("address_family"),
-            scan_profile: row.get("scan_profile"),
-            scan_plan: row.get("scan_plan"),
+        .map(|row| {
+            let stored_profile: String = row.get("scan_profile");
+            let generation_metadata: Option<Value> = row.get("generation_metadata");
+            TaskItem {
+                task_id: row.get("task_id"),
+                task_target: row.get("display_targets"),
+                task_kind: row.get("task_kind"),
+                task_initiator: row.get("task_initiator"),
+                task_port: row.get("task_port"),
+                task_create_time: row.get("task_create_time"),
+                task_level: row.get("task_level"),
+                scanner_id: row.get("assigned_scanner_id"),
+                task_status: row.get("task_status"),
+                lease_expires_at: row.get("lease_expires_at"),
+                attempt_count: row.get("attempt_count"),
+                failure_reason: row.get("failure_reason"),
+                start_at: row.get("task_start_time"),
+                end_at: row.get("task_end_time"),
+                remarks: row.get("remarks"),
+                task_source: row.get("task_source"),
+                address_family: row.get("address_family"),
+                scan_profile: display_scan_profile(&stored_profile, generation_metadata.as_ref()),
+                scan_plan: row.get("scan_plan"),
+            }
         })
         .collect();
     Ok(TaskListPage {
