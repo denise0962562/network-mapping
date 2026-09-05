@@ -32,6 +32,7 @@ const SPA_ROUTES: &[&str] = &[
 ];
 
 const REQUIRED_FRONTEND_FILES: &[&str] = &["index.html", "login.html", "search.html", "asset.html"];
+const FRONTEND_STATIC_DIRECTORIES: &[(&str, &str)] = &[("/assets", "assets"), ("/maps", "maps")];
 
 #[derive(Clone, Debug)]
 pub struct FrontendAssets {
@@ -52,13 +53,15 @@ impl FrontendAssets {
             }
         }
 
-        let asset_directory = directory.join("assets");
-        if !asset_directory.is_dir() {
-            warn!(
-                target: "server::startup",
-                path = %asset_directory.display(),
-                "缺少前端资源目录，静态资源请求将返回 404"
-            );
+        for (_, directory_name) in FRONTEND_STATIC_DIRECTORIES {
+            let static_directory = directory.join(directory_name);
+            if !static_directory.is_dir() {
+                warn!(
+                    target: "server::startup",
+                    path = %static_directory.display(),
+                    "缺少前端资源目录，静态资源请求将返回 404"
+                );
+            }
         }
 
         Self { directory }
@@ -84,17 +87,27 @@ impl FrontendAssets {
 }
 
 pub fn configure_assets(cfg: &mut web::ServiceConfig, directory: impl AsRef<Path>) {
-    let asset_directory = directory.as_ref().join("assets");
-    if asset_directory.is_dir() {
+    for (route, directory_name) in FRONTEND_STATIC_DIRECTORIES {
+        configure_static_directory(cfg, route, directory.as_ref().join(directory_name));
+    }
+}
+
+fn configure_static_directory(
+    cfg: &mut web::ServiceConfig,
+    route: &'static str,
+    directory: PathBuf,
+) {
+    if directory.is_dir() {
         cfg.service(
-            Files::new("/assets", asset_directory)
+            Files::new(route, directory)
                 .use_etag(true)
                 .use_last_modified(true)
                 .prefer_utf8(true),
         );
     } else {
+        let resource_pattern = format!("{route}/{{path:.*}}");
         cfg.service(
-            web::resource("/assets/{path:.*}")
+            web::resource(resource_pattern)
                 .route(web::get().to(HttpResponse::NotFound))
                 .route(web::head().to(HttpResponse::NotFound)),
         );
@@ -182,7 +195,10 @@ pub fn is_protected_frontend_path(path: &str) -> bool {
 pub fn is_frontend_resource_path(path: &str) -> bool {
     is_protected_frontend_path(path)
         || matches!(path, "/login" | "/login.html" | "/favicon.ico")
-        || path.starts_with("/assets/")
+        || FRONTEND_STATIC_DIRECTORIES.iter().any(|(route, _)| {
+            path.strip_prefix(route)
+                .is_some_and(|path| path.starts_with('/'))
+        })
 }
 
 fn single_path_parameter<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
@@ -303,6 +319,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(directory.join("assets")).expect("create frontend fixture");
+        fs::create_dir_all(directory.join("maps")).expect("create map fixture");
         fs::write(directory.join("index.html"), "<main>spa entry</main>")
             .expect("write SPA fixture");
         fs::write(directory.join("login.html"), "<main>login entry</main>")
@@ -313,6 +330,11 @@ mod tests {
             .expect("write asset fixture");
         fs::write(directory.join("assets/app.js"), "export default true")
             .expect("write asset fixture");
+        fs::write(
+            directory.join("maps/world.geojson"),
+            r#"{"type":"FeatureCollection","features":[]}"#,
+        )
+        .expect("write map fixture");
         directory
     }
 
@@ -348,6 +370,8 @@ mod tests {
         assert!(is_frontend_resource_path("/asset"));
         assert!(is_frontend_resource_path("/asset.html"));
         assert!(is_frontend_resource_path("/assets/app.js"));
+        assert!(is_frontend_resource_path("/maps/world.geojson"));
+        assert!(!is_frontend_resource_path("/maps-private/world.geojson"));
         assert!(!is_frontend_resource_path("/api/unknown"));
         assert!(!is_frontend_resource_path("/missing.js"));
     }
@@ -449,6 +473,16 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
+        let map_request = actix_test::TestRequest::get()
+            .uri("/maps/world.geojson")
+            .to_request();
+        let map_response = actix_test::call_service(&app, map_request).await;
+        assert_eq!(map_response.status(), StatusCode::OK);
+        assert_eq!(
+            actix_test::read_body(map_response).await,
+            web::Bytes::from_static(br#"{"type":"FeatureCollection","features":[]}"#)
+        );
+
         fs::remove_dir_all(directory).expect("remove frontend fixture");
     }
 
@@ -503,6 +537,14 @@ mod tests {
             .to_request();
         assert_eq!(
             actix_test::call_service(&app, asset_request).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let map_request = actix_test::TestRequest::get()
+            .uri("/maps/world.geojson")
+            .to_request();
+        assert_eq!(
+            actix_test::call_service(&app, map_request).await.status(),
             StatusCode::NOT_FOUND
         );
     }
