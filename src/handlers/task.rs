@@ -628,15 +628,7 @@ async fn load_vulnerabilities_from_elasticsearch(
     let response = elasticsearch
         .scan_query(
             ScanQueryIndex::Observations,
-            &json!({
-                "size": 500,
-                "track_total_hits": true,
-                "query": {"bool": {"filter": [
-                    {"term": {"execution_id": execution_id}},
-                    {"term": {"kind": "vulnerability"}}
-                ]}},
-                "sort": [{"observed_at": "desc"}, {"_id": "asc"}]
-            }),
+            &vulnerability_search_body(execution_id),
         )
         .await?;
     let total = response
@@ -652,6 +644,21 @@ async fn load_vulnerabilities_from_elasticsearch(
         .map(vulnerability_response)
         .collect();
     Ok((findings, total))
+}
+
+fn vulnerability_search_body(execution_id: &str) -> Value {
+    json!({
+        "size": 500,
+        "track_total_hits": true,
+        "query": {"bool": {"filter": [
+            {"term": {"execution_id": execution_id}},
+            {"term": {"kind": "vulnerability"}}
+        ]}},
+        "sort": [
+            {"observed_at": {"order": "desc", "format": "epoch_millis"}},
+            {"observation_key": "asc"}
+        ]
+    })
 }
 
 fn vulnerability_response(source: &Value) -> Value {
@@ -2502,13 +2509,27 @@ mod tests {
         CreateDnsTask, ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
         ScannerScanCapabilities, build_dns_comparison, normalize_task_list_query,
         resolve_dns_scan_request, resolve_dns_task_port, task_result_pagination,
-        validate_latency_report, validate_public_ip,
+        validate_latency_report, validate_public_ip, vulnerability_search_body,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
     use chrono::Utc;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn vulnerability_search_uses_sortable_stable_tie_breaker() {
+        let body = vulnerability_search_body("019c0000-0000-7000-8000-000000000001");
+
+        assert_eq!(
+            body["sort"],
+            json!([
+                {"observed_at": {"order": "desc", "format": "epoch_millis"}},
+                {"observation_key": "asc"}
+            ])
+        );
+        assert!(!body.to_string().contains("\"_id\""));
+    }
 
     #[test]
     fn dns_task_dispatch_defaults_to_automatic_and_accepts_selected_scanners() {

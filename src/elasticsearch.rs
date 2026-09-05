@@ -442,12 +442,7 @@ impl ElasticsearchService {
         if !self.inner.config.scan_storage.reads_elasticsearch() || !self.can_read() {
             return Err("Elasticsearch DNS 查询读路径尚未就绪".to_owned());
         }
-        let body = json!({
-            "size": 10_000,
-            "track_total_hits": false,
-            "query": {"term": {"scan.task_id": task_id}},
-            "sort": [{"@timestamp": {"order": "desc"}}]
-        });
+        let body = dns_task_observations_search_body(task_id);
         let result = self
             .send_json_request(
                 ElasticsearchOperation::ScanQuery,
@@ -2789,6 +2784,18 @@ impl ElasticsearchService {
     }
 }
 
+fn dns_task_observations_search_body(task_id: &str) -> Value {
+    json!({
+        "size": 10_000,
+        "track_total_hits": false,
+        "query": {"term": {"scan.task_id": task_id}},
+        "sort": [
+            {"@timestamp": {"order": "desc"}},
+            {"event_id": "asc"}
+        ]
+    })
+}
+
 pub(crate) fn scan_batch_payload_checksum(
     context: &ScanBatchContext,
     observations: &[Value],
@@ -4092,14 +4099,28 @@ mod tests {
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
-        bulk_retry_delay, collect_domain_addresses, index_definition, index_mapping_update,
-        initialization_retry_delay, new_trace_context, parse_asn, parse_storage_metrics,
-        replace_domain_filters, scan_batch_payload_checksum, scan_endpoint_index_definition,
-        scan_observation_compatibility_mapping, scan_observation_template,
+        bulk_retry_delay, collect_domain_addresses, dns_task_observations_search_body,
+        index_definition, index_mapping_update, initialization_retry_delay, new_trace_context,
+        parse_asn, parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
+        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
+        scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::collections::BTreeSet;
     use std::time::Duration;
+
+    #[test]
+    fn dns_task_observation_search_has_stable_tie_breaker() {
+        let body = dns_task_observations_search_body("019c0000-0000-7000-8000-000000000001");
+
+        assert_eq!(
+            body["sort"],
+            serde_json::json!([
+                {"@timestamp": {"order": "desc"}},
+                {"event_id": "asc"}
+            ])
+        );
+    }
 
     #[test]
     fn index_mapping_targets_elasticsearch_9_5_2_and_expected_field_types() {

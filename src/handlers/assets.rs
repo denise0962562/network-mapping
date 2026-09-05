@@ -539,6 +539,22 @@ fn asset_history_search_body(filters: Vec<Value>, limit: i64, offset: i64) -> Va
     })
 }
 
+fn asset_summary_current_search_body(filters: Vec<Value>) -> Value {
+    json!({
+        "size": 0,
+        "track_total_hits": true,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {
+            "services": {"cardinality": {"field": "service", "precision_threshold": 40000}},
+            "scanners": {"cardinality": {"field": "scanner_id", "precision_threshold": 40000}},
+            "latest": {"top_hits": {"size": 1, "sort": [
+                {"observed_at_ms": "desc"},
+                {"port": "asc"}
+            ], "_source": ["asn", "isp", "as_org", "country_code", "country_name", "region_name", "city_name", "latitude", "longitude"]}}
+        }
+    })
+}
+
 async fn get_asset_summary_from_elasticsearch(
     req: &HttpRequest,
     pool: &Pool,
@@ -551,16 +567,7 @@ async fn get_asset_summary_from_elasticsearch(
     let current = elasticsearch
         .scan_query(
             ScanQueryIndex::CurrentEndpoints,
-            &json!({
-                "size": 0, "track_total_hits": true,
-                "query": {"bool": {"filter": current_filters}},
-                "aggs": {
-                    "services": {"cardinality": {"field": "service", "precision_threshold": 40000}},
-                    "scanners": {"cardinality": {"field": "scanner_id", "precision_threshold": 40000}},
-                    "latest": {"top_hits": {"size": 1, "sort": [{"observed_at_ms": "desc"}],
-                        "_source": ["asn", "isp", "as_org", "country_code", "country_name", "region_name", "city_name", "latitude", "longitude"]}}
-                }
-            }),
+            &asset_summary_current_search_body(current_filters),
         )
         .await;
     let mut observation_filters = observation_access_filters(user);
@@ -842,8 +849,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        asset_history_search_body, normalize_history_pagination, normalize_ip,
-        normalize_port_pagination,
+        asset_history_search_body, asset_summary_current_search_body, normalize_history_pagination,
+        normalize_ip, normalize_port_pagination,
     };
 
     #[test]
@@ -883,5 +890,18 @@ mod tests {
         assert_eq!(body["from"], 100);
         assert_eq!(body["size"], 50);
         assert!(!body.to_string().contains("\"_id\""));
+    }
+
+    #[test]
+    fn asset_summary_latest_hit_has_stable_tie_breaker() {
+        let body = asset_summary_current_search_body(vec![json!({"term": {"ip": "192.0.2.1"}})]);
+
+        assert_eq!(
+            body["aggs"]["latest"]["top_hits"]["sort"],
+            json!([
+                {"observed_at_ms": "desc"},
+                {"port": "asc"}
+            ])
+        );
     }
 }
