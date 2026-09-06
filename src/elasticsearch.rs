@@ -21,7 +21,7 @@ use crate::handlers::tags::AssetTag;
 use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
 
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
-const SCAN_INDEX_SCHEMA_VERSION: &str = "3";
+const SCAN_INDEX_SCHEMA_VERSION: &str = "4";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const MAX_DOMAIN_RECORDS: usize = 10_000;
 const MAX_DOMAIN_NAMES: usize = 1_000;
@@ -3316,6 +3316,8 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "country_name": {"type": "keyword"},
                     "region_name": {"type": "keyword"},
                     "city_name": {"type": "keyword"},
+                    "latitude": {"type": "double"},
+                    "longitude": {"type": "double"},
                     "tags": {"type": "object", "properties": scan_observation_tag_mapping_properties()}
                 }
             }
@@ -3326,6 +3328,8 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
 fn scan_observation_compatibility_mapping() -> Value {
     json!({"properties": {
         "ip_network": {"type": "ip_range"},
+        "latitude": {"type": "double"},
+        "longitude": {"type": "double"},
         "tags": {"properties": scan_observation_tag_mapping_properties()}
     }})
 }
@@ -3810,8 +3814,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_observation_mapping_keeps_ip_and_cidr_as_distinct_types() {
+    fn scan_observation_mapping_declares_compatible_fields() {
         let template = scan_observation_template("observations", 0);
+        assert_eq!(
+            template.pointer("/_meta/schema_version"),
+            Some(&serde_json::json!("4"))
+        );
         assert_eq!(
             template.pointer("/template/mappings/properties/ip_address/type"),
             Some(&serde_json::json!("ip"))
@@ -3824,6 +3832,17 @@ mod tests {
             scan_observation_compatibility_mapping().pointer("/properties/ip_network/type"),
             Some(&serde_json::json!("ip_range"))
         );
+        for field in ["latitude", "longitude"] {
+            assert_eq!(
+                template.pointer(&format!("/template/mappings/properties/{field}/type")),
+                Some(&serde_json::json!("double"))
+            );
+            assert_eq!(
+                scan_observation_compatibility_mapping()
+                    .pointer(&format!("/properties/{field}/type")),
+                Some(&serde_json::json!("double"))
+            );
+        }
         assert_eq!(
             scan_observation_compatibility_mapping()
                 .pointer("/properties/tags/properties/category_id/type"),
