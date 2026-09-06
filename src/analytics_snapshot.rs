@@ -303,11 +303,7 @@ async fn process_one(pool: &Pool, elasticsearch: &ElasticsearchService) -> Resul
     info!(event = "AnalyticsSnapshotExecutionStarted", execution_id = %context.execution_id,
         "开始构建执行统计");
     let result = tokio::time::timeout(EXECUTION_TIMEOUT, async {
-        let facts = if elasticsearch.scan_storage_mode().reads_elasticsearch() {
-            facts_from_elasticsearch(elasticsearch, &context).await?
-        } else {
-            facts_from_postgres(pool, &context).await?
-        };
+        let facts = { facts_from_elasticsearch(elasticsearch, &context).await? };
         info!(event = "AnalyticsSnapshotFactsComputed", execution_id = %context.execution_id,
             elapsed_ms = started.elapsed().as_millis() as u64,
             distribution_rows = facts.distribution.len(), discovery_rows = facts.discovery.len(),
@@ -396,74 +392,6 @@ async fn claim_execution(pool: &Pool) -> Result<Option<ExecutionContext>, String
         locked_at: row.get("locked_at"),
         expected_observations: row.get("expected_observations"),
     }))
-}
-
-async fn facts_from_postgres(
-    pool: &Pool,
-    context: &ExecutionContext,
-) -> Result<ExecutionFacts, String> {
-    let connection = pool
-        .get()
-        .await
-        .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
-    let mut facts = ExecutionFacts::default();
-    for (dimension, sql) in [
-        (
-            "service",
-            "SELECT bucket_start, label, endpoint_count FROM ( \
-            SELECT date_trunc('hour', first_observed_at) + \
-                (FLOOR(EXTRACT(MINUTE FROM first_observed_at) / 30) * INTERVAL '30 minutes') AS bucket_start, \
-                label, COUNT(*)::BIGINT AS endpoint_count FROM ( \
-                    SELECT ip_address, port, LOWER(BTRIM(service)) AS label, MIN(observed_at) AS first_observed_at \
-                    FROM scan_observation WHERE execution_id = $1 AND kind = 'service' \
-                        AND service IS NOT NULL AND BTRIM(service) <> '' \
-                    GROUP BY ip_address, port, LOWER(BTRIM(service)) \
-                ) representative GROUP BY bucket_start, label \
-            ) grouped ORDER BY bucket_start, label",
-        ),
-        (
-            "port",
-            "SELECT bucket_start, label, endpoint_count FROM ( \
-            SELECT date_trunc('hour', first_observed_at) + \
-                (FLOOR(EXTRACT(MINUTE FROM first_observed_at) / 30) * INTERVAL '30 minutes') AS bucket_start, \
-                port::TEXT AS label, COUNT(*)::BIGINT AS endpoint_count FROM ( \
-                    SELECT ip_address, port, MIN(observed_at) AS first_observed_at \
-                    FROM scan_observation WHERE execution_id = $1 \
-                    GROUP BY ip_address, port \
-                ) representative GROUP BY bucket_start, port \
-            ) grouped ORDER BY bucket_start, label",
-        ),
-    ] {
-        for row in connection
-            .query(sql, &[&context.database_id])
-            .await
-            .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?
-        {
-            facts.distribution.insert(
-                (
-                    row.get("bucket_start"),
-                    dimension.to_owned(),
-                    row.get("label"),
-                ),
-                row.get("endpoint_count"),
-            );
-        }
-    }
-    let rows = connection
-        .query(
-            "SELECT ((MIN(observed_at) AT TIME ZONE 'Asia/Shanghai')::DATE) AS day_start, \
-                ip_address FROM scan_observation \
-         WHERE execution_id = $1 GROUP BY ip_address ORDER BY day_start, ip_address;",
-            &[&context.database_id],
-        )
-        .await
-        .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
-    for row in rows {
-        facts
-            .discovery
-            .insert((row.get("day_start"), row.get("ip_address")));
-    }
-    Ok(facts)
 }
 
 async fn facts_from_elasticsearch(
@@ -778,10 +706,7 @@ mod tests {
         let start = schema
             .find("CREATE TABLE IF NOT EXISTS analytics_outbox")
             .unwrap();
-        let end = schema[start..]
-            .find("-- 将尚未进入 typed observation")
-            .unwrap()
-            + start;
+        let end = schema[start..].find("-- 表 session").unwrap() + start;
         client
             .batch_execute(&schema[start..end].replace(
                 "CREATE TABLE IF NOT EXISTS",
@@ -915,19 +840,31 @@ mod tests {
                 .data_as_of
                 .is_some()
         );
-        // Exercise the actual worker's write-error path, preserving old facts.
+        // Failed writes preserve old aggregates; the only fact reader is ES.
         client.batch_execute(
-            "CREATE TEMP TABLE scan_observation(execution_id INT, ip_address INET, port INT, kind TEXT, service TEXT, observed_at TIMESTAMPTZ); \
-             INSERT INTO scan_task_execution VALUES (4, 'four', 1, 'succeeded', 'scanner', NULL, 1); \
-             INSERT INTO scan_observation VALUES (4, '192.0.2.1', 80, 'service', 'fail-write', '2026-09-01T10:30:00Z'); \
+            "INSERT INTO scan_task_execution VALUES (4, 'four', 1, 'succeeded', 'scanner', NULL, 1); \
              INSERT INTO analytics_distribution_30m VALUES (4, '2026-09-01T10:30:00Z', 1, 'scanner', 'manual', 'service', 'old', 1); \
              ALTER TABLE analytics_distribution_30m ADD CONSTRAINT reject_test_write CHECK (label <> 'fail-write');"
         ).await.unwrap();
         drop(client);
         reconcile(&pool).await.unwrap();
-        let service =
-            ElasticsearchService::new(crate::config::ElasticsearchConfig::default()).unwrap();
-        assert!(process_one(&pool, &service).await.is_err());
+        let context = claim_execution(&pool).await.unwrap().unwrap();
+        let make_facts = || {
+            let mut facts = ExecutionFacts::default();
+            facts.distribution.insert(
+                (
+                    "2026-09-01T10:30:00Z".parse().unwrap(),
+                    "service".into(),
+                    "fail-write".into(),
+                ),
+                1,
+            );
+            facts
+        };
+        let error = replace_execution_facts(&pool, &context, make_facts())
+            .await
+            .unwrap_err();
+        fail_execution(&pool, &context, &error).await.unwrap();
         let client = pool.get().await.unwrap();
         let progress = snapshot_progress(&client).await.unwrap();
         assert_eq!(progress.running, 0);
@@ -947,7 +884,10 @@ mod tests {
         );
         client.batch_execute("ALTER TABLE analytics_distribution_30m DROP CONSTRAINT reject_test_write; UPDATE analytics_outbox SET available_at = NOW() WHERE execution_id = 4;").await.unwrap();
         drop(client);
-        assert!(process_one(&pool, &service).await.unwrap());
+        let context = claim_execution(&pool).await.unwrap().unwrap();
+        replace_execution_facts(&pool, &context, make_facts())
+            .await
+            .unwrap();
         let client = pool.get().await.unwrap();
         assert_eq!(snapshot_progress(&client).await.unwrap().remaining, 0);
     }

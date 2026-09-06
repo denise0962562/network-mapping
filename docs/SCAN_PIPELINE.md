@@ -160,12 +160,9 @@ Elasticsearch observation 中。
 未完成上传。服务端通过 `(execution_id, upload_id, batch_index)` 回执和 payload SHA-256
 实现批次幂等，并要求最终批形成从 0 开始的连续序列。
 
-`elasticsearch.scan_storage=postgres` 时，观察写入 `scan_observation` 并投影到 `ips`、
-`ports`；`dual` 同时写入 ES；`elasticsearch` 时 PostgreSQL 只保存控制面和上传回执，原始
-观察及执行/当前端点投影均由 ES 保存。迁移和恢复流程参见
-[`ELASTICSEARCH.md`](ELASTICSEARCH.md)。
-只有最终批提交后任务执行才进入 `succeeded`。协议版本 1 的 `results` 和版本 2 的端口/服务
-请求继续支持，便于滚动升级旧扫描器；版本 2 不接受漏洞 observation。
+扫描结果仅支持 `elasticsearch.scan_storage=elasticsearch`，PostgreSQL 保存控制面、上传回执
+和派生分析快照；原始扫描结果及端点投影存储在 ES。PG 历史结果只通过独立 PG → ES 迁移命令
+导入，不支持正常运行时的 PG 写入、查询或双写。参见 [ES 存储说明](ELASTICSEARCH.md)。
 
 漏洞 observation 使用端点、模板 ID、matcher 和匹配位置生成稳定键。同一执行内的上传重试
 不会重复入库；不同执行仍分别保留，用于追踪扫描历史。
@@ -236,7 +233,7 @@ PostgreSQL 模式下 `scan_observation` 是事实来源，`ips`、`ports` 是资
 - 漏洞任务一直 pending：检查是否存在在线、地址族就绪并声明 `vulnerability_scan` 的节点；
 - 任务在漏洞阶段失败：检查扫描器的 Nuclei stderr 摘要、模板签名、超时和结果上限；
 - 前端漏洞数为 0：确认查询的是正确 `execution_id`，并检查协议 3 批次是否已提交最终批；
-- PostgreSQL 有记录但页面不可用：确认当前 `scan_storage` 模式及对应 Elasticsearch 可用性；
+- PostgreSQL 有记录但页面不可用：确认 PG 旧结果已完成迁移，并检查 Elasticsearch 可用性；
 - 端点服务突然变成 Nuclei：这是异常，检查数据库视图和 ES projection 是否仍排除
   vulnerability kind。
 

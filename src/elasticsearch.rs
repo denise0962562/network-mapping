@@ -17,10 +17,9 @@ use uuid::Uuid;
 use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
 use crate::config::{ElasticsearchConfig, ScanStorageMode};
 use crate::dns::DnsObservation;
-use crate::handlers::tags::{AssetTag, tags_from_json};
+use crate::handlers::tags::AssetTag;
 use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
 
-const INDEX_SCHEMA_VERSION: &str = "2";
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
 const SCAN_INDEX_SCHEMA_VERSION: &str = "3";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
@@ -28,8 +27,6 @@ const MAX_DOMAIN_RECORDS: usize = 10_000;
 const MAX_DOMAIN_NAMES: usize = 1_000;
 const MAX_DOMAIN_CNAME_DEPTH: usize = 8;
 const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
-const ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_endpoint_current_projection_version \
-     ON asset_endpoint_current(projection_version);";
 const ENSURE_SCAN_MIGRATION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_scan_observation_batch_id_id \
      ON scan_observation(batch_id, id);";
 
@@ -146,41 +143,6 @@ impl ElasticsearchStorageMetrics {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct SearchDocument {
-    scope_type: String,
-    scope_id: i32,
-    endpoint_key: String,
-    ip: String,
-    port: i32,
-    protocol: Option<String>,
-    service: Option<String>,
-    banner: Option<String>,
-    title: Option<String>,
-    http_body: Option<String>,
-    http_body_truncated: bool,
-    tls_subject: Option<String>,
-    source: String,
-    scanner_name: Option<String>,
-    first_seen: DateTime<Utc>,
-    last_seen: DateTime<Utc>,
-    asn: Option<String>,
-    asn_number: Option<i64>,
-    isp: Option<String>,
-    as_org: Option<String>,
-    country_code: Option<String>,
-    country_name: Option<String>,
-    region_name: Option<String>,
-    city_name: Option<String>,
-    tags: Vec<AssetTag>,
-    tag_names: Vec<String>,
-    tag_ids: Vec<i64>,
-    tag_kinds: Vec<String>,
-    latest_endpoint_observation_id: i64,
-    latest_service_observation_id: Option<i64>,
-    projection_version: i64,
-}
-
 #[derive(Debug, Deserialize)]
 struct SearchSource {
     ip: String,
@@ -233,15 +195,8 @@ pub(crate) struct ElasticsearchSearchPage {
 #[derive(Debug)]
 struct OutboxEvent {
     id: i64,
-    event_kind: String,
     aggregate_key: String,
     attempts: i32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum IndexState {
-    Existing,
-    Created,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -342,21 +297,12 @@ impl ElasticsearchService {
                 .read_ready
     }
 
-    pub fn fallback_to_postgres(&self) -> bool {
-        self.inner.config.fallback_to_postgres
-    }
-
-    pub fn scan_storage_mode(&self) -> ScanStorageMode {
-        self.inner.config.scan_storage
-    }
-
     pub(crate) async fn storage_metrics(&self) -> ElasticsearchStorageMetrics {
         if !self.enabled() {
             return ElasticsearchStorageMetrics::unavailable(false);
         }
 
         let mut targets = vec![
-            self.inner.config.index.clone(),
             format!("{}-*", self.inner.config.observation_index_prefix),
             self.inner.config.execution_endpoint_index.clone(),
             self.inner.config.current_endpoint_index.clone(),
@@ -406,7 +352,7 @@ impl ElasticsearchService {
         index: ScanQueryIndex,
         body: &Value,
     ) -> Result<Value, String> {
-        if !self.inner.config.scan_storage.reads_elasticsearch() || !self.can_read() {
+        if !self.can_read() {
             return Err("Elasticsearch 扫描事实读路径尚未就绪".to_owned());
         }
         let index = match index {
@@ -440,7 +386,7 @@ impl ElasticsearchService {
     /// intentionally derived from these source observations, never from the
     /// mutable current-record projection.
     pub(crate) async fn dns_task_observations(&self, task_id: &str) -> Result<Value, String> {
-        if !self.inner.config.scan_storage.reads_elasticsearch() || !self.can_read() {
+        if !self.can_read() {
             return Err("Elasticsearch DNS 查询读路径尚未就绪".to_owned());
         }
         let body = dns_task_observations_search_body(task_id);
@@ -482,9 +428,6 @@ impl ElasticsearchService {
         ip: &str,
         tags: &[AssetTag],
     ) -> Result<(), String> {
-        if !self.inner.config.scan_storage.writes_elasticsearch() {
-            return Ok(());
-        }
         let tag_names = tags.iter().map(|tag| tag.name.clone()).collect::<Vec<_>>();
         let tag_ids = tags.iter().map(|tag| tag.id).collect::<Vec<_>>();
         let tag_kinds = tags.iter().map(|tag| tag.kind.clone()).collect::<Vec<_>>();
@@ -805,9 +748,9 @@ impl ElasticsearchService {
         unreachable!("bulk retry loop always returns")
     }
 
-    async fn initialize(&self, pool: &Pool) -> Result<IndexState, String> {
+    async fn initialize(&self, _pool: &Pool) -> Result<(), String> {
         if !self.enabled() {
-            return Ok(IndexState::Existing);
+            return Err("Elasticsearch 是必需的扫描结果存储".to_owned());
         }
         let root = self
             .send_json_request(
@@ -827,131 +770,23 @@ impl ElasticsearchService {
                 self.inner.config.expected_version
             ));
         }
-        if !self.inner.config.scan_storage.reads_elasticsearch() {
-            self.ensure_legacy_search_projection_index(pool).await?;
-        }
+
         self.ensure_scan_indices().await?;
         // Domain search reads the current DNS RR index even before the first DNS
         // upload. Create its template, data stream, and empty current-record
         // index during startup so a valid no-result search is not a 404.
         self.ensure_dns_indices().await?;
-        let state = if self.inner.config.scan_storage.reads_elasticsearch() {
-            IndexState::Existing
-        } else {
-            self.ensure_index().await?
-        };
-        if !self.inner.config.scan_storage.reads_elasticsearch() {
-            self.ensure_index_mapping().await?;
-        }
-        if state == IndexState::Created {
-            let mut connection = pool.get().await.map_err(|error| error.to_string())?;
-            let transaction = connection
-                .transaction()
-                .await
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute(
-                    "DELETE FROM search_projection_state WHERE state_key = 'elasticsearch_full_sync_index';",
-                    &[],
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute(
-                    "DELETE FROM search_index_outbox WHERE event_kind = 'full' AND processed_at IS NULL;",
-                    &[],
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute(
-                    "INSERT INTO search_index_outbox (event_kind, aggregate_key, payload) \
-                     VALUES ('full', 'all', '{}');",
-                    &[],
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            transaction
-                .commit()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        let synced = if self.inner.config.scan_storage.reads_elasticsearch() {
-            true
-        } else {
-            let connection = pool.get().await.map_err(|error| error.to_string())?;
-            connection
-                .query_one(
-                    "SELECT EXISTS (SELECT 1 FROM search_projection_state \
-                     WHERE state_key = 'elasticsearch_full_sync_index' AND state_value = $1) AS synced;",
-                    &[&self.inner.config.index],
-                )
-                .await
-                .map_err(|error| error.to_string())?
-                .get("synced")
-        };
         self.update_runtime(|runtime| {
             runtime.connected = true;
-            runtime.read_ready = synced;
+            runtime.read_ready = true;
             runtime.server_version = Some(version.to_owned());
             runtime.last_success_at = Some(Utc::now());
             runtime.last_error = None;
         });
-        Ok(state)
-    }
-
-    async fn ensure_legacy_search_projection_index(&self, pool: &Pool) -> Result<(), String> {
-        let connection = pool.get().await.map_err(|error| error.to_string())?;
-        connection
-            .batch_execute(ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn ensure_index(&self) -> Result<IndexState, String> {
-        let response = self
-            .send_request(
-                ElasticsearchOperation::IndexAdmin,
-                Method::HEAD,
-                &self.inner.config.index,
-                |request| request,
-            )
-            .await?;
-        if response.status().is_success() {
-            return Ok(IndexState::Existing);
-        }
-        if response.status() != StatusCode::NOT_FOUND {
-            return Err(response_error(response).await);
-        }
-        self.create_index().await?;
-        Ok(IndexState::Created)
-    }
-
-    /// Adds compatible fields to an existing legacy search index.
-    ///
-    /// `dynamic: strict` rejects documents as soon as a newly introduced tag
-    /// property is written, but index creation only happens when the index is
-    /// absent. Keep this migration idempotent so deployments that add tag
-    /// attributes also work with an already-created index.
-    async fn ensure_index_mapping(&self) -> Result<(), String> {
-        let response = self
-            .send_request(
-                ElasticsearchOperation::IndexAdmin,
-                Method::PUT,
-                &format!("/{}/_mapping", self.inner.config.index),
-                |request| request.json(&index_mapping_update()),
-            )
-            .await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Err(response_error(response).await)
+        Ok(())
     }
 
     async fn ensure_scan_indices(&self) -> Result<(), String> {
-        if !self.inner.config.scan_storage.writes_elasticsearch() {
-            return Ok(());
-        }
         let template_name = format!("{}-template", self.inner.config.observation_index_prefix);
         self.send_json_request(
             ElasticsearchOperation::IndexAdmin,
@@ -1129,13 +964,96 @@ impl ElasticsearchService {
         context: &ScanBatchContext,
         observations: &[Value],
     ) -> Result<ScanBatchWriteResult, String> {
-        if !self.inner.config.scan_storage.writes_elasticsearch() {
-            return Err("当前配置未启用 Elasticsearch 扫描事实写入".to_owned());
-        }
         self.ensure_scan_indices().await?;
 
         self.persist_scan_batch_prepared(context, observations)
             .await
+    }
+
+    /// Pin a DNS batch to one backing index so data-stream rollover cannot duplicate a retry.
+    pub(crate) async fn pin_dns_batch_storage(
+        &self,
+        pool: &Pool,
+        execution_id: i32,
+        context: &ScanBatchContext,
+    ) -> Result<Vec<String>, String> {
+        let read = |value: Value| -> Result<Vec<String>, String> {
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        };
+        let client = pool.get().await.map_err(|error| error.to_string())?;
+        let refs = read(client.query_one("SELECT storage_references FROM scan_result_batch WHERE execution_id=$1 AND upload_id=$2 AND batch_index=$3",
+            &[&execution_id, &context.upload_id, &context.batch_index]).await.map_err(|error| error.to_string())?.get(0))?;
+        if !refs.is_empty() {
+            return Ok(refs);
+        }
+        drop(client);
+        self.ensure_dns_indices().await?;
+        let stream = &self.inner.config.dns_observation_data_stream;
+        let refreshed = self
+            .send_json_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::POST,
+                &format!("/{stream}/_refresh"),
+                |request| request,
+            )
+            .await?;
+        validate_scan_search_response(&refreshed)?;
+        // Recover pre-upgrade pending batches that may already contain DNS evidence.
+        let existing = self
+            .send_json_request(
+                ElasticsearchOperation::ScanQuery,
+                Method::POST,
+                &format!("/{stream}/_search"),
+                |request| {
+                    request.json(&json!({
+                        "size": 0, "query": {"bool": {"filter": [
+                            {"term": {"scan.execution_id": context.execution_id}},
+                            {"term": {"scan.upload_id": context.upload_id}},
+                            {"term": {"scan.batch_index": context.batch_index}}
+                        ]}}, "aggs": {"indices": {"terms": {"field": "_index", "size": 2}}}
+                    }))
+                },
+            )
+            .await?;
+        validate_scan_search_response(&existing)?;
+        let buckets = existing
+            .pointer("/aggregations/indices/buckets")
+            .and_then(Value::as_array)
+            .ok_or("DNS 索引定位响应不完整")?;
+        if buckets.len() > 1 {
+            return Err("旧 DNS 批次跨多个 backing index，须先对账去重".into());
+        }
+        let index = if let Some(bucket) = buckets.first() {
+            bucket
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or("DNS 索引定位缺少 key")?
+                .to_owned()
+        } else {
+            let metadata = self
+                .send_json_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::GET,
+                    &format!("/_data_stream/{stream}"),
+                    |request| request,
+                )
+                .await?;
+            metadata
+                .pointer("/data_streams/0/indices")
+                .and_then(Value::as_array)
+                .and_then(|indices| indices.last())
+                .and_then(|index| index.get("index_name"))
+                .and_then(Value::as_str)
+                .ok_or("DNS 数据流缺少 write index")?
+                .to_owned()
+        };
+        let candidate = json!([index, self.inner.config.dns_record_index]);
+        let client = pool.get().await.map_err(|error| error.to_string())?;
+        // Concurrent retries all use the first committed target.
+        let row = client.query_one("UPDATE scan_result_batch SET storage_references = CASE WHEN storage_references = '[]'::jsonb THEN $4 ELSE storage_references END \
+            WHERE execution_id=$1 AND upload_id=$2 AND batch_index=$3 RETURNING storage_references",
+            &[&execution_id, &context.upload_id, &context.batch_index, &candidate]).await.map_err(|error| error.to_string())?;
+        read(row.get(0))
     }
 
     /// Persists immutable DNS query observations and projects successful answer
@@ -1147,6 +1065,7 @@ impl ElasticsearchService {
         context: &ScanBatchContext,
         tenant_id: &str,
         observations: &[DnsObservation],
+        observation_index: &str,
     ) -> Result<(), String> {
         if !self.enabled() {
             return Err("Elasticsearch 未启用，无法保存 DNS 观察".to_owned());
@@ -1156,6 +1075,7 @@ impl ElasticsearchService {
         }
         self.ensure_dns_indices().await?;
 
+        self.require_existing_index(observation_index).await?;
         let mut observation_bulk = String::new();
         let mut record_bulk = String::new();
         for (position, input) in observations.iter().cloned().enumerate() {
@@ -1203,7 +1123,7 @@ impl ElasticsearchService {
             });
             observation_bulk.push_str(
                 &serde_json::to_string(&json!({"create": {
-                    "_index": self.inner.config.dns_observation_data_stream, "_id": document_id
+                    "_index": observation_index, "_id": document_id
                 }}))
                 .map_err(|error| error.to_string())?,
             );
@@ -1365,6 +1285,21 @@ impl ElasticsearchService {
         self.update_scan_endpoint_projections(context, observations)
             .await?;
         self.mark_success();
+        if context.is_final {
+            let refreshed = self
+                .send_json_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::POST,
+                    &format!(
+                        "/{}-*,{}/_refresh?allow_no_indices=true&ignore_unavailable=true",
+                        self.inner.config.observation_index_prefix,
+                        self.inner.config.execution_endpoint_index
+                    ),
+                    |request| request,
+                )
+                .await?;
+            validate_scan_search_response(&refreshed)?;
+        }
         let execution_summary = if context.is_final {
             Some(self.execution_summary(&context.execution_id).await?)
         } else {
@@ -1406,6 +1341,7 @@ impl ElasticsearchService {
                     },
                 )
                 .await?;
+            validate_scan_search_response(&endpoints)?;
             port_count = endpoints
                 .pointer("/hits/total/value")
                 .and_then(Value::as_i64)
@@ -1431,6 +1367,7 @@ impl ElasticsearchService {
                 |request| request.json(&json!({"query": {"term": {"execution_id": execution_id}}})),
             )
             .await?;
+        validate_scan_search_response(&observations)?;
         Ok(ScanExecutionSummary {
             ip_count,
             port_count,
@@ -1446,9 +1383,6 @@ impl ElasticsearchService {
         result: &Value,
         expected: &[(String, String, String, String)],
     ) -> Result<(), String> {
-        if result.get("errors").and_then(Value::as_bool) != Some(true) {
-            return Ok(());
-        }
         let items = result
             .get("items")
             .and_then(Value::as_array)
@@ -1640,6 +1574,7 @@ impl ElasticsearchService {
                     |request| request.json(&query),
                 )
                 .await?;
+            validate_scan_search_response(&response)?;
             let hits = response
                 .pointer("/hits/hits")
                 .and_then(Value::as_array)
@@ -1711,9 +1646,6 @@ impl ElasticsearchService {
     }
 
     async fn process_scan_projection_outbox(&self, pool: &Pool) -> Result<bool, String> {
-        if !self.inner.config.scan_storage.writes_elasticsearch() {
-            return Ok(false);
-        }
         let connection = pool.get().await.map_err(|error| error.to_string())?;
         let row = connection
             .query_opt(
@@ -1759,90 +1691,6 @@ impl ElasticsearchService {
         }
     }
 
-    async fn create_index(&self) -> Result<(), String> {
-        let response = self
-            .send_request(
-                ElasticsearchOperation::IndexAdmin,
-                Method::PUT,
-                &self.inner.config.index,
-                |request| request.json(&index_definition()),
-            )
-            .await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Err(response_error(response).await)
-    }
-
-    async fn reset_index(&self) -> Result<(), String> {
-        self.update_runtime(|runtime| runtime.read_ready = false);
-        let response = self
-            .send_request(
-                ElasticsearchOperation::IndexAdmin,
-                Method::DELETE,
-                &self.inner.config.index,
-                |request| request,
-            )
-            .await?;
-        if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
-            return Err(response_error(response).await);
-        }
-        self.create_index().await
-    }
-
-    async fn bulk_index(&self, documents: &[SearchDocument]) -> Result<(), String> {
-        if documents.is_empty() {
-            return Ok(());
-        }
-        let mut body = String::new();
-        for document in documents {
-            let document_id = format!(
-                "{}:{}|{}|{}",
-                document.scope_type, document.scope_id, document.ip, document.port
-            );
-            let action = json!({
-                "index": {
-                    "_index": self.inner.config.index,
-                    "_id": document_id,
-                    "version": document.projection_version,
-                    "version_type": "external_gte"
-                }
-            });
-            body.push_str(&serde_json::to_string(&action).map_err(|error| error.to_string())?);
-            body.push('\n');
-            body.push_str(&serde_json::to_string(document).map_err(|error| error.to_string())?);
-            body.push('\n');
-        }
-        let result = self.send_bulk_with_retry("/_bulk", &body, false).await?;
-        if result.get("errors").and_then(Value::as_bool) != Some(true) {
-            self.mark_success();
-            return Ok(());
-        }
-        let failures = result
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item.get("index"))
-            .filter(|item| {
-                item.get("status")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|status| status >= 300 && status != 409)
-            })
-            .take(3)
-            .map(Value::to_string)
-            .collect::<Vec<_>>();
-        if failures.is_empty() {
-            self.mark_success();
-            Ok(())
-        } else {
-            Err(format!(
-                "Elasticsearch Bulk 部分失败：{}",
-                failures.join("; ")
-            ))
-        }
-    }
-
     pub(crate) async fn search(
         &self,
         role: i32,
@@ -1883,11 +1731,7 @@ impl ElasticsearchService {
                 {"port": {"order": "asc"}}
             ]
         });
-        let search_index = if self.inner.config.scan_storage.reads_elasticsearch() {
-            &self.inner.config.current_endpoint_index
-        } else {
-            &self.inner.config.index
-        };
+        let search_index = { &self.inner.config.current_endpoint_index };
         let result = match self
             .send_json_request(
                 ElasticsearchOperation::AssetSearch,
@@ -2169,8 +2013,9 @@ impl ElasticsearchService {
         let connection = pool.get().await.map_err(|error| error.to_string())?;
         let row = connection
             .query_one(
-                "SELECT COUNT(*)::BIGINT AS pending, MIN(created_at) AS oldest \
-                 FROM search_index_outbox WHERE processed_at IS NULL;",
+                "SELECT COUNT(*)::BIGINT AS pending, MIN(created_at) AS oldest FROM ( \
+                 SELECT created_at FROM search_index_outbox WHERE processed_at IS NULL AND event_kind = 'ip' \
+                 UNION ALL SELECT created_at FROM scan_projection_outbox WHERE processed_at IS NULL) pending;",
                 &[],
             )
             .await
@@ -2180,7 +2025,7 @@ impl ElasticsearchService {
             read_enabled: self.inner.config.read_enabled,
             fallback_to_postgres: self.inner.config.fallback_to_postgres,
             url: self.inner.config.url.clone(),
-            index: self.inner.config.index.clone(),
+            index: self.inner.config.current_endpoint_index.clone(),
             scan_storage: self.inner.config.scan_storage,
             observation_index_prefix: self.inner.config.observation_index_prefix.clone(),
             execution_endpoint_index: self.inner.config.execution_endpoint_index.clone(),
@@ -2194,108 +2039,6 @@ impl ElasticsearchService {
         })
     }
 
-    pub async fn full_sync(&self, pool: &Pool) -> Result<u64, String> {
-        self.full_sync_with_progress(pool, &NoopProgressReporter)
-            .await
-    }
-
-    pub async fn full_sync_with_progress(
-        &self,
-        pool: &Pool,
-        reporter: &dyn ProgressReporter,
-    ) -> Result<u64, String> {
-        if !self.enabled() {
-            return Err("Elasticsearch 未启用".to_owned());
-        }
-        reporter.report(ProgressUpdate::phase("正在检查 Elasticsearch 并初始化索引"));
-        self.initialize(pool).await?;
-        reporter.report(ProgressUpdate::phase("正在重置 Elasticsearch 搜索索引"));
-        clear_full_sync_marker(pool).await?;
-        self.reset_index().await?;
-        let expected_total = if reporter.is_enabled() {
-            reporter.report(ProgressUpdate::phase("正在统计待同步搜索文档"));
-            let total: i64 = pool
-                .get()
-                .await
-                .map_err(|error| error.to_string())?
-                .query_one(
-                    "SELECT COUNT(*)::BIGINT AS total FROM asset_endpoint_current;",
-                    &[],
-                )
-                .await
-                .map_err(|error| error.to_string())?
-                .get("total");
-            Some(u64::try_from(total).map_err(|error| error.to_string())?)
-        } else {
-            None
-        };
-        let mut cursor = 0_i64;
-        let mut indexed = 0_u64;
-        reporter.report(ProgressUpdate::count(
-            "同步 Elasticsearch 搜索文档",
-            0,
-            expected_total,
-            "条",
-            "",
-        ));
-        loop {
-            let documents = load_documents(
-                pool,
-                "full",
-                "all",
-                cursor,
-                i64::try_from(self.inner.config.bulk_batch_size)
-                    .map_err(|error| error.to_string())?,
-            )
-            .await?;
-            if documents.is_empty() {
-                break;
-            }
-            cursor = documents
-                .last()
-                .map(|document| document.projection_version)
-                .unwrap_or(cursor);
-            reporter.report(ProgressUpdate::count(
-                "同步 Elasticsearch 搜索文档",
-                indexed,
-                expected_total,
-                "条",
-                format!("正在写入下一批，末尾 projection_version={cursor}"),
-            ));
-            let document_count = documents.len() as u64;
-            self.bulk_index(&documents).await?;
-            indexed = indexed.saturating_add(document_count);
-            reporter.report(ProgressUpdate::count(
-                "同步 Elasticsearch 搜索文档",
-                indexed,
-                expected_total,
-                "条",
-                format!("最后成功 projection_version={cursor}"),
-            ));
-        }
-        reporter.report(ProgressUpdate::phase("正在写入 Elasticsearch 同步完成标记"));
-        let connection = pool.get().await.map_err(|error| error.to_string())?;
-        connection
-            .execute(
-                "INSERT INTO search_projection_state (state_key, state_value, updated_at) \
-                 VALUES ('elasticsearch_full_sync_index', $1, NOW()) \
-                 ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = NOW();",
-                &[&self.inner.config.index],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        connection
-            .execute(
-                "UPDATE search_index_outbox SET processed_at = NOW(), locked_at = NULL, last_error = NULL \
-                 WHERE event_kind = 'full' AND processed_at IS NULL;",
-                &[],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        self.update_runtime(|runtime| runtime.read_ready = true);
-        Ok(indexed)
-    }
-
     pub async fn migrate_scan_data(&self, pool: &Pool) -> Result<ScanMigrationReport, String> {
         self.migrate_scan_data_with_progress(pool, &NoopProgressReporter)
             .await
@@ -2306,11 +2049,22 @@ impl ElasticsearchService {
         pool: &Pool,
         reporter: &dyn ProgressReporter,
     ) -> Result<ScanMigrationReport, String> {
-        if !self.inner.config.scan_storage.writes_elasticsearch() {
-            return Err(
-                "扫描数据迁移要求 elasticsearch.scan_storage=dual 或 elasticsearch".to_owned(),
-            );
+        let client = pool.get().await.map_err(|error| error.to_string())?;
+        let pending: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM scan_result_batch WHERE storage_backend = 'pending'",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if pending > 0 {
+            return Err(format!(
+                "存在 {pending} 个 ES pending 上传，请先由原 ES 服务和扫描器完成重试；迁移不能把它们当作 PG 空批次"
+            ));
         }
+        drop(client);
+        crate::scan_migration::prepare(pool, reporter).await?;
         reporter.report(ProgressUpdate::phase(
             "正在检查 Elasticsearch 并初始化扫描索引",
         ));
@@ -2323,6 +2077,22 @@ impl ElasticsearchService {
             .map_err(|error| error.to_string())?;
         drop(connection);
 
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let orphaned: i64 = connection
+            .query_one(
+                "SELECT COUNT(*) FROM ips i WHERE NOT EXISTS \
+             (SELECT 1 FROM scan_result_batch b WHERE b.execution_id = i.execution_id)",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if orphaned > 0 {
+            return Err(format!(
+                "存在 {orphaned} 条未关联迁移批次的 PG IP 结果，需先修复历史数据，不能标记迁移完成"
+            ));
+        }
+        drop(connection);
         reporter.report(ProgressUpdate::phase("正在确定迁移高水位和恢复断点"));
         let (high_watermark, resume_execution_cursor, expected, mut report) =
             self.prepare_scan_migration(pool).await?;
@@ -2345,7 +2115,7 @@ impl ElasticsearchService {
                     "SELECT e.id FROM scan_task_execution e \
                      WHERE e.id > $1 AND EXISTS (SELECT 1 FROM scan_result_batch b \
                         WHERE b.execution_id = e.id AND b.id <= $2 \
-                          AND (b.payload_checksum IS NULL OR b.storage_backend IN ('postgres', 'pending'))) \
+                          AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres')) \
                      ORDER BY e.id LIMIT $3;",
                     &[
                         &execution_cursor,
@@ -2435,7 +2205,7 @@ impl ElasticsearchService {
             .map_err(|error| error.to_string())?
             .query_one(
                 "SELECT COUNT(*)::BIGINT AS remaining FROM scan_result_batch \
-                 WHERE id <= $1 AND (payload_checksum IS NULL OR storage_backend IN ('postgres', 'pending'));",
+                 WHERE id <= $1 AND (payload_checksum IS NULL OR storage_backend = 'postgres');",
                 &[&high_watermark],
             )
             .await
@@ -2588,8 +2358,8 @@ impl ElasticsearchService {
         let mut connection = pool.get().await.map_err(|error| error.to_string())?;
         let batches = connection
             .query(
-                "SELECT b.id, b.upload_id, b.batch_index, b.is_final, t.task_id, t.user_id, \
-                    t.task_source, e.execution_id, \
+                "SELECT b.id, b.upload_id, b.batch_index, b.is_final, b.observation_count, t.task_id, t.user_id, \
+                    t.task_source, e.execution_id, e.execution_status, \
                     COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
                     COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name \
                  FROM scan_result_batch b JOIN scan_task_execution e ON e.id = b.execution_id \
@@ -2597,7 +2367,7 @@ impl ElasticsearchService {
                  LEFT JOIN scanner_info scanner ON scanner.scanner_id = \
                     COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
                  WHERE b.execution_id = $1 AND b.id <= $2 \
-                   AND (b.payload_checksum IS NULL OR b.storage_backend IN ('postgres', 'pending')) \
+                   AND (b.payload_checksum IS NULL OR b.storage_backend = 'postgres') \
                  ORDER BY b.batch_index, b.id;",
                 &[&execution_db_id, &high_watermark],
             )
@@ -2630,6 +2400,14 @@ impl ElasticsearchService {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            if rows.len()
+                != usize::try_from(batch.get::<_, i32>("observation_count"))
+                    .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "PG 批次 {batch_id} 的观察数量与回执不符，拒绝迁移不完整结果"
+                ));
+            }
             let observations = rows
                 .into_iter()
                 .map(|row| {
@@ -2684,18 +2462,20 @@ impl ElasticsearchService {
                 })?;
             let storage_references = json!(result.indices);
             if context.is_final {
-                self.promote_execution(&context).await.map_err(|error| {
+                if batch.get::<_, String>("execution_status") == "succeeded" {
+                    self.promote_execution(&context).await.map_err(|error| {
                     format!(
                         "发布 execution_db_id={execution_db_id} batch_id={batch_id} 失败：{error}"
                     )
                 })?;
+                }
                 let transaction = connection
                     .transaction()
                     .await
                     .map_err(|error| error.to_string())?;
                 transaction
                     .execute(
-                        "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'dual', \
+                        "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'elasticsearch', \
                          storage_references = $3 WHERE id = $1;",
                         &[&batch_id, &result.payload_checksum, &storage_references],
                     )
@@ -2724,7 +2504,7 @@ impl ElasticsearchService {
             } else {
                 connection
                     .execute(
-                    "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'dual', \
+                    "UPDATE scan_result_batch SET payload_checksum = $2, storage_backend = 'elasticsearch', \
                      storage_references = $3 WHERE id = $1;",
                     &[&batch_id, &result.payload_checksum, &storage_references],
                 )
@@ -2739,46 +2519,156 @@ impl ElasticsearchService {
         Ok(report)
     }
 
+    /// Fresh installs bootstrap directly into ES. Legacy data requires explicit migration;
+    /// ordinary restarts must allow pending ES receipts and outbox retries to recover.
     pub async fn validate_scan_cutover(&self, pool: &Pool) -> Result<(), String> {
-        if !self.inner.config.scan_storage.reads_elasticsearch() {
-            return Ok(());
-        }
-        self.initialize(pool).await?;
         let connection = pool.get().await.map_err(|error| error.to_string())?;
-        let row = connection.query_one(
-            "SELECT EXISTS (SELECT 1 FROM scan_storage_state \
-                WHERE state_key = 'elasticsearch_scan_migration' \
-                  AND COALESCE(state_value->>'status', 'complete') = 'complete' \
-                  AND state_value->>'observation_index_prefix' = $1 \
-                  AND state_value->>'execution_endpoint_index' = $2 \
-                  AND state_value->>'current_endpoint_index' = $3) AS migration_ready, \
-                (SELECT COUNT(*)::BIGINT FROM scan_result_batch \
-                    WHERE payload_checksum IS NULL OR storage_backend IN ('postgres', 'pending')) AS incomplete_batches, \
-                (SELECT COUNT(*)::BIGINT FROM scan_task_execution \
-                    WHERE execution_status = 'succeeded' AND (result_ip_count IS NULL \
-                        OR result_port_count IS NULL OR result_observation_count IS NULL)) AS incomplete_executions, \
-                (SELECT COUNT(*)::BIGINT FROM scan_projection_outbox \
-                    WHERE processed_at IS NULL) AS pending_projections;",
-            &[
-                &self.inner.config.observation_index_prefix,
+        let runtime = connection.query_opt(
+            "SELECT state_value FROM scan_storage_state WHERE state_key = 'elasticsearch_runtime'", &[]
+        ).await.map_err(|error| error.to_string())?.map(|row| row.get::<_, Value>(0));
+        let migration = connection
+            .query_opt(
+                "SELECT state_value FROM scan_storage_state WHERE state_key = $1",
+                &[&SCAN_MIGRATION_STATE_KEY],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, Value>(0));
+        let target = json!({
+            "observation_index_prefix": self.inner.config.observation_index_prefix,
+            "execution_endpoint_index": self.inner.config.execution_endpoint_index,
+            "current_endpoint_index": self.inner.config.current_endpoint_index,
+            "dns_observation_data_stream": self.inner.config.dns_observation_data_stream,
+            "dns_record_index": self.inner.config.dns_record_index,
+        });
+        if runtime.as_ref().is_some_and(|state| state != &target) {
+            return Err(
+                "ES 存储目标与已初始化的运行标记不符，禁止切换到空索引；请先完成受控迁移".into(),
+            );
+        }
+        let legacy_batches: i64 = connection.query_one(
+            "SELECT COUNT(*) FROM scan_result_batch WHERE storage_backend NOT IN ('elasticsearch', 'dual', 'pending') \
+             OR (storage_backend <> 'pending' AND payload_checksum IS NULL)", &[]
+        ).await.map_err(|error| error.to_string())?.get(0);
+        if legacy_batches > 0 {
+            return Err(format!(
+                "存在 {legacy_batches} 个未迁移 PG 扫描批次；请停服运行 --migrate-scan-data-to-elasticsearch"
+            ));
+        }
+        let incomplete: i64 = connection.query_one(
+            "SELECT COUNT(*) FROM scan_task_execution WHERE execution_status = 'succeeded' \
+             AND (result_ip_count IS NULL OR result_port_count IS NULL OR result_observation_count IS NULL)", &[]
+        ).await.map_err(|error| error.to_string())?.get(0);
+        if incomplete > 0 {
+            return Err(format!(
+                "存在 {incomplete} 个缺少结果计数的成功执行；请完成迁移/恢复对账"
+            ));
+        }
+        if runtime.is_none() {
+            let mut legacy_data = false;
+            // Fixed identifiers only; never create or alter legacy result tables on startup.
+            for table in [
+                "scan_observation",
+                "ips",
+                "ports",
+                "scaninfo",
+                "asset_endpoint_current",
+            ] {
+                let exists: bool = connection
+                    .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .get(0);
+                if exists {
+                    let nonempty: bool = connection
+                        .query_one(&format!("SELECT EXISTS (SELECT 1 FROM {table})"), &[])
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .get(0);
+                    legacy_data |= nonempty;
+                }
+            }
+            let migration_ready = migration.as_ref().is_some_and(|state| {
+                state
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("complete")
+                    == "complete"
+                    && [
+                        "observation_index_prefix",
+                        "execution_endpoint_index",
+                        "current_endpoint_index",
+                    ]
+                    .iter()
+                    .all(|key| state.get(*key) == target.get(*key))
+            });
+            if legacy_data && !migration_ready {
+                return Err(
+                    "检测到 PG 历史扫描结果，请先停服运行 --migrate-scan-data-to-elasticsearch"
+                        .into(),
+                );
+            }
+            if migration.as_ref().is_some_and(|state| {
+                state.get("status").and_then(Value::as_str) == Some("in_progress")
+            }) {
+                return Err("PG -> ES 迁移尚未完成，请继续运行迁移命令".into());
+            }
+        }
+        // Check recorded facts before initialize can create missing projection containers.
+        let references = connection
+            .query(
+                "SELECT DISTINCT ref #>> '{}' AS name FROM scan_result_batch b \
+             CROSS JOIN LATERAL jsonb_array_elements(b.storage_references) ref \
+             WHERE b.storage_backend IN ('elasticsearch', 'dual')",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        for row in references {
+            let index: String = row.get("name");
+            let index = match index.as_str() {
+                "dns-observations" => self.inner.config.dns_observation_data_stream.as_str(),
+                "dns-records" => self.inner.config.dns_record_index.as_str(),
+                _ => index.as_str(),
+            };
+            self.require_existing_index(index).await?;
+        }
+        if runtime.is_some() {
+            for index in [
                 &self.inner.config.execution_endpoint_index,
                 &self.inner.config.current_endpoint_index,
-            ],
+                &self.inner.config.dns_observation_data_stream,
+                &self.inner.config.dns_record_index,
+            ] {
+                self.require_existing_index(index).await?;
+            }
+        }
+        drop(connection);
+        self.initialize(pool).await?;
+        let connection = pool.get().await.map_err(|error| error.to_string())?;
+        connection.execute(
+            "INSERT INTO scan_storage_state (state_key, state_value) VALUES ('elasticsearch_runtime', $1) \
+             ON CONFLICT (state_key) DO NOTHING", &[&target]
         ).await.map_err(|error| error.to_string())?;
-        let migration_ready: bool = row.get("migration_ready");
-        let incomplete_batches: i64 = row.get("incomplete_batches");
-        let incomplete_executions: i64 = row.get("incomplete_executions");
-        let pending_projections: i64 = row.get("pending_projections");
-        if !migration_ready
-            || incomplete_batches > 0
-            || incomplete_executions > 0
-            || pending_projections > 0
-        {
+        Ok(())
+    }
+
+    async fn require_existing_index(&self, index: &str) -> Result<(), String> {
+        if index.is_empty() || index.contains(['/', '?', '#', '*', ',']) {
+            return Err("扫描回执包含无效索引引用".into());
+        }
+        let response = self
+            .send_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::HEAD,
+                &format!("/{index}"),
+                |request| request,
+            )
+            .await?;
+        if !response.status().is_success() {
             return Err(format!(
-                "Elasticsearch 扫描存储切换前置检查失败：migration_ready={migration_ready}, \
-                 incomplete_batches={incomplete_batches}, incomplete_executions={incomplete_executions}, \
-                 pending_projections={pending_projections}；\
-                 请先使用 scan_storage=dual 运行 --migrate-scan-data-to-elasticsearch"
+                "扫描索引 {index} 不可用（{}）；请恢复数据，不能按空库启动",
+                response.status()
             ));
         }
         Ok(())
@@ -2837,8 +2727,8 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
     let mut initialization_failures = 0_u32;
     loop {
         ticker.tick().await;
-        if !service.runtime().connected {
-            match service.initialize(&pool).await {
+        if !service.can_read() {
+            match service.validate_scan_cutover(&pool).await {
                 Ok(_) => {
                     if initialization_failures > 0 {
                         info!(
@@ -2881,68 +2771,33 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
                 continue;
             }
         }
-        if service.inner.config.scan_storage.reads_elasticsearch() {
-            let event = match claim_ip_event(&pool).await {
-                Ok(value) => value,
-                Err(message) => {
-                    service.mark_error(&message);
-                    error!(event = "ElasticsearchTagOutboxClaimError", message = %message);
-                    continue;
-                }
-            };
-            let Some(event) = event else {
-                continue;
-            };
-            match process_scan_tag_event(&service, &pool, &event).await {
-                Ok(()) => {
-                    if let Err(message) = complete_event(&pool, event.id).await {
-                        error!(event = "ElasticsearchTagOutboxCompleteError", outbox_id = event.id, message = %message);
-                    }
-                }
-                Err(message) => {
-                    service.mark_error(&message);
-                    warn!(event = "ElasticsearchTagOutboxProcessError", outbox_id = event.id, message = %message);
-                    if let Err(mark_error) = retry_event(&pool, &event, &message).await {
-                        error!(event = "ElasticsearchTagOutboxRetryError", outbox_id = event.id, message = %mark_error);
-                    }
-                }
-            }
-            continue;
-        }
-        let event = match claim_event(&pool).await {
+
+        let event = match claim_ip_event(&pool).await {
             Ok(value) => value,
             Err(message) => {
                 service.mark_error(&message);
-                error!(event = "ElasticsearchOutboxClaimError", message = %message);
+                error!(event = "ElasticsearchTagOutboxClaimError", message = %message);
                 continue;
             }
         };
         let Some(event) = event else {
             continue;
         };
-        let result = match process_event(&service, &pool, &event).await {
-            Ok(())
-                if event.event_kind == "ip"
-                    && service.inner.config.scan_storage.writes_elasticsearch() =>
-            {
-                process_scan_tag_event(&service, &pool, &event).await
-            }
-            result => result,
-        };
-        match result {
+        match process_scan_tag_event(&service, &pool, &event).await {
             Ok(()) => {
                 if let Err(message) = complete_event(&pool, event.id).await {
-                    error!(event = "ElasticsearchOutboxCompleteError", outbox_id = event.id, message = %message);
+                    error!(event = "ElasticsearchTagOutboxCompleteError", outbox_id = event.id, message = %message);
                 }
             }
             Err(message) => {
                 service.mark_error(&message);
-                warn!(event = "ElasticsearchOutboxProcessError", outbox_id = event.id, event_kind = %event.event_kind, message = %message);
+                warn!(event = "ElasticsearchTagOutboxProcessError", outbox_id = event.id, message = %message);
                 if let Err(mark_error) = retry_event(&pool, &event, &message).await {
-                    error!(event = "ElasticsearchOutboxRetryError", outbox_id = event.id, message = %mark_error);
+                    error!(event = "ElasticsearchTagOutboxRetryError", outbox_id = event.id, message = %mark_error);
                 }
             }
         }
+        continue;
     }
 }
 
@@ -2962,7 +2817,6 @@ async fn claim_ip_event(pool: &Pool) -> Result<Option<OutboxEvent>, String> {
         .map_err(|error| error.to_string())?;
     Ok(row.map(|row| OutboxEvent {
         id: row.get("id"),
-        event_kind: row.get("event_kind"),
         aggregate_key: row.get("aggregate_key"),
         attempts: row.get("attempts"),
     }))
@@ -3002,177 +2856,6 @@ async fn process_scan_tag_event(
         .await
 }
 
-async fn claim_event(pool: &Pool) -> Result<Option<OutboxEvent>, String> {
-    let connection = pool.get().await.map_err(|error| error.to_string())?;
-    let row = connection
-        .query_opt(
-            "UPDATE search_index_outbox SET locked_at = NOW(), attempts = attempts + 1 \
-             WHERE id = (SELECT id FROM search_index_outbox \
-                 WHERE processed_at IS NULL AND available_at <= NOW() \
-                   AND (locked_at IS NULL OR locked_at < NOW() - ($1::BIGINT * INTERVAL '1 minute')) \
-                 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) \
-             RETURNING id, event_kind, aggregate_key, attempts;",
-            &[&OUTBOX_LOCK_TIMEOUT_MINUTES],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(row.map(|row| OutboxEvent {
-        id: row.get("id"),
-        event_kind: row.get("event_kind"),
-        aggregate_key: row.get("aggregate_key"),
-        attempts: row.get("attempts"),
-    }))
-}
-
-async fn process_event(
-    service: &ElasticsearchService,
-    pool: &Pool,
-    event: &OutboxEvent,
-) -> Result<(), String> {
-    if event.event_kind == "full" {
-        clear_full_sync_marker(pool).await?;
-        service.reset_index().await?;
-    }
-    let mut cursor = 0_i64;
-    loop {
-        let documents = load_documents(
-            pool,
-            &event.event_kind,
-            &event.aggregate_key,
-            cursor,
-            i64::try_from(service.inner.config.bulk_batch_size)
-                .map_err(|error| error.to_string())?,
-        )
-        .await?;
-        if documents.is_empty() {
-            break;
-        }
-        cursor = documents
-            .last()
-            .map(|document| document.projection_version)
-            .unwrap_or(cursor);
-        service.bulk_index(&documents).await?;
-    }
-    if event.event_kind == "full" {
-        let connection = pool.get().await.map_err(|error| error.to_string())?;
-        connection
-            .execute(
-                "INSERT INTO search_projection_state (state_key, state_value, updated_at) \
-                 VALUES ('elasticsearch_full_sync_index', $1, NOW()) \
-                 ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = NOW();",
-                &[&service.inner.config.index],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        service.update_runtime(|runtime| runtime.read_ready = true);
-        info!(event = "ElasticsearchFullSyncCompleted", index = %service.inner.config.index);
-    }
-    Ok(())
-}
-
-async fn clear_full_sync_marker(pool: &Pool) -> Result<(), String> {
-    let connection = pool.get().await.map_err(|error| error.to_string())?;
-    connection
-        .execute(
-            "DELETE FROM search_projection_state WHERE state_key = 'elasticsearch_full_sync_index';",
-            &[],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-async fn load_documents(
-    pool: &Pool,
-    event_kind: &str,
-    aggregate_key: &str,
-    cursor: i64,
-    limit: i64,
-) -> Result<Vec<SearchDocument>, String> {
-    let connection = pool.get().await.map_err(|error| error.to_string())?;
-    let (filter, value): (&str, Option<&str>) = match event_kind {
-        "full" => ("TRUE", None),
-        "ip" => ("current.ip_address = $3::TEXT::INET", Some(aggregate_key)),
-        "execution" => (
-            "EXISTS (SELECT 1 FROM scan_observation affected \
-             WHERE affected.execution_id = $3::TEXT::INT \
-               AND affected.ip_address = current.ip_address \
-               AND affected.port = current.port)",
-            Some(aggregate_key),
-        ),
-        _ => return Err(format!("不支持的搜索 Outbox 事件：{event_kind}")),
-    };
-    let sql = format!(
-        "SELECT current.scope_type, current.scope_id, host(current.ip_address) AS ip_address, \
-                current.port, current.protocol, current.service, current.banner, current.title, \
-                current.http_body, current.http_body_truncated, current.tls_subject, current.source, \
-                current.scanner_name, current.first_seen_at, current.last_seen_at, current.asn, \
-                current.isp, current.as_org, current.country_code, current.country_name, \
-                current.region_name, current.city_name, current.latest_endpoint_observation_id, \
-                current.latest_service_observation_id, current.projection_version, \
-                COALESCE(tag_data.tags, '[]'::JSONB) AS tags \
-         FROM asset_endpoint_current current \
-         LEFT JOIN LATERAL (SELECT JSONB_AGG(JSONB_BUILD_OBJECT(\
-             'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
-             'category_id', category.id, 'category_name', category.name\
-             ) ORDER BY category.sort_order, LOWER(category.name), CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id) AS tags \
-             FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-             JOIN asset_tag_category category ON category.id = tag.category_id \
-             WHERE assignment.ip_address = current.ip_address AND tag.is_active AND category.is_active) tag_data ON true \
-         WHERE current.projection_version > $1 AND {filter} \
-         ORDER BY current.projection_version LIMIT $2"
-    );
-    let rows = if let Some(value) = value {
-        connection.query(&sql, &[&cursor, &limit, &value]).await
-    } else {
-        connection.query(&sql, &[&cursor, &limit]).await
-    }
-    .map_err(|error| error.to_string())?;
-    Ok(rows.into_iter().map(document_from_row).collect())
-}
-
-fn document_from_row(row: tokio_postgres::Row) -> SearchDocument {
-    let ip: String = row.get("ip_address");
-    let port: i32 = row.get("port");
-    let asn: Option<String> = row
-        .get::<_, Option<String>>("asn")
-        .map(|value| canonical_asn(&value).to_owned());
-    let tags = tags_from_json(row.get("tags"));
-    SearchDocument {
-        scope_type: row.get("scope_type"),
-        scope_id: row.get("scope_id"),
-        endpoint_key: format!("{ip}:{port}"),
-        ip,
-        port,
-        protocol: row.get("protocol"),
-        service: row.get("service"),
-        banner: row.get("banner"),
-        title: row.get("title"),
-        http_body: row.get("http_body"),
-        http_body_truncated: row.get("http_body_truncated"),
-        tls_subject: row.get("tls_subject"),
-        source: row.get("source"),
-        scanner_name: row.get("scanner_name"),
-        first_seen: row.get("first_seen_at"),
-        last_seen: row.get("last_seen_at"),
-        asn_number: asn.as_deref().and_then(parse_asn),
-        asn,
-        isp: row.get("isp"),
-        as_org: row.get("as_org"),
-        country_code: row.get("country_code"),
-        country_name: row.get("country_name"),
-        region_name: row.get("region_name"),
-        city_name: row.get("city_name"),
-        tag_names: tags.iter().map(|tag| tag.name.clone()).collect(),
-        tag_ids: tags.iter().map(|tag| tag.id).collect(),
-        tag_kinds: tags.iter().map(|tag| tag.kind.clone()).collect(),
-        tags,
-        latest_endpoint_observation_id: row.get("latest_endpoint_observation_id"),
-        latest_service_observation_id: row.get("latest_service_observation_id"),
-        projection_version: row.get("projection_version"),
-    }
-}
-
 fn parse_asn(value: &str) -> Option<i64> {
     canonical_asn(value).parse().ok()
 }
@@ -3192,7 +2875,7 @@ where
     C: GenericClient + Sync,
 {
     let row = connection.query_one(
-        "SELECT t.task_id, t.user_id, t.task_source, e.execution_id, \
+        "SELECT t.task_id, t.user_id, t.task_source, e.execution_id, e.execution_status, \
             COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
             COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, \
             batch.upload_id, batch.batch_index \
@@ -4045,71 +3728,6 @@ fn index_mapping_update() -> Value {
     })
 }
 
-fn index_definition() -> Value {
-    json!({
-        "settings": {
-            "index": {"auto_expand_replicas": "0-1"},
-            "analysis": {
-                "normalizer": {
-                    "lowercase_normalizer": {"type": "custom", "filter": ["lowercase"]}
-                }
-            }
-        },
-        "mappings": {
-            "dynamic": "strict",
-            "_meta": {
-                "application": "network-mapping",
-                "schema_version": INDEX_SCHEMA_VERSION,
-                "elasticsearch_version": "9.5.2"
-            },
-            "properties": {
-                "scope_type": {"type": "keyword"},
-                "scope_id": {"type": "integer"},
-                "endpoint_key": {"type": "keyword"},
-                "ip": {"type": "ip"},
-                "port": {"type": "integer"},
-                "protocol": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "service": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "banner": {"type": "wildcard", "copy_to": "banner_text"},
-                "banner_text": {"type": "text"},
-                "title": {
-                    "type": "text",
-                    "copy_to": "title_contains",
-                    "fields": {"raw": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512}}
-                },
-                "title_contains": {"type": "wildcard"},
-                "http_body": {"type": "match_only_text", "copy_to": "http_body_contains"},
-                "http_body_contains": {"type": "wildcard"},
-                "http_body_truncated": {"type": "boolean"},
-                "tls_subject": {"type": "wildcard", "copy_to": "tls_subject_text"},
-                "tls_subject_text": {"type": "text"},
-                "source": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "scanner_name": {"type": "wildcard"},
-                "first_seen": {"type": "date"},
-                "last_seen": {"type": "date"},
-                "asn": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "asn_number": {"type": "long"},
-                "isp": {"type": "wildcard"},
-                "as_org": {"type": "wildcard"},
-                "country_code": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "country_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "region_name": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "city_name": {"type": "wildcard"},
-                "tags": {
-                    "type": "object",
-                    "properties": tag_mapping_properties()
-                },
-                "tag_names": {"type": "keyword", "normalizer": "lowercase_normalizer"},
-                "tag_ids": {"type": "long"},
-                "tag_kinds": {"type": "keyword"},
-                "latest_endpoint_observation_id": {"type": "long", "index": false},
-                "latest_service_observation_id": {"type": "long", "index": false},
-                "projection_version": {"type": "long"}
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4134,10 +3752,9 @@ mod tests {
         );
     }
     use super::{
-        ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
-        ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,
-        bulk_retry_delay, collect_domain_addresses, dns_task_observations_search_body,
-        index_definition, index_mapping_update, initialization_retry_delay, new_trace_context,
+        ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchOperation, ElasticsearchService,
+        ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay, collect_domain_addresses,
+        dns_task_observations_search_body, initialization_retry_delay, new_trace_context,
         parse_asn, parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
         scan_endpoint_index_definition, scan_observation_compatibility_mapping,
         scan_observation_template,
@@ -4145,6 +3762,39 @@ mod tests {
     use crate::config::ElasticsearchConfig;
     use std::collections::BTreeSet;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn bulk_requires_complete_items_even_when_errors_flag_is_false() {
+        let service = ElasticsearchService::new(ElasticsearchConfig::default()).unwrap();
+        let expected = vec![(
+            "index".into(),
+            "id".into(),
+            "checksum".into(),
+            "batch".into(),
+        )];
+        for response in [
+            serde_json::json!({"errors": false}),
+            serde_json::json!({"errors": false, "items": []}),
+            serde_json::json!({"errors": false, "items": [{"create": {"status": 429}}]}),
+        ] {
+            assert!(
+                service
+                    .validate_scan_bulk_result(&response, &expected)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            service
+                .validate_scan_bulk_result(
+                    &serde_json::json!({"errors": false,
+            "items": [{"create": {"status": 201}}]}),
+                    &expected
+                )
+                .await
+                .is_ok()
+        );
+    }
 
     #[test]
     fn dns_task_observation_search_has_stable_tie_breaker() {
@@ -4156,52 +3806,6 @@ mod tests {
                 {"@timestamp": {"order": "desc"}},
                 {"event_id": "asc"}
             ])
-        );
-    }
-
-    #[test]
-    fn index_mapping_targets_elasticsearch_9_5_2_and_expected_field_types() {
-        let mapping = index_definition();
-        assert_eq!(
-            mapping.pointer("/mappings/_meta/elasticsearch_version"),
-            Some(&serde_json::json!("9.5.2"))
-        );
-        assert_eq!(
-            mapping.pointer("/mappings/properties/ip/type"),
-            Some(&serde_json::json!("ip"))
-        );
-        assert_eq!(
-            mapping.pointer("/mappings/properties/banner/type"),
-            Some(&serde_json::json!("wildcard"))
-        );
-        assert_eq!(
-            mapping.pointer("/mappings/properties/http_body/type"),
-            Some(&serde_json::json!("match_only_text"))
-        );
-        assert_eq!(
-            mapping.pointer("/mappings/properties/tags/properties/category_id/type"),
-            Some(&serde_json::json!("long"))
-        );
-        assert_eq!(
-            mapping.pointer("/mappings/properties/tags/properties/category_name/type"),
-            Some(&serde_json::json!("keyword"))
-        );
-    }
-
-    #[test]
-    fn existing_projection_mapping_update_adds_tag_category_fields() {
-        let mapping = index_mapping_update();
-        assert_eq!(
-            mapping.pointer("/properties/tags/properties/category_id/type"),
-            Some(&serde_json::json!("long"))
-        );
-        assert_eq!(
-            mapping.pointer("/properties/tags/properties/category_name/type"),
-            Some(&serde_json::json!("keyword"))
-        );
-        assert_eq!(
-            mapping.pointer("/properties/tags/properties/category_name/normalizer"),
-            Some(&serde_json::json!("lowercase_normalizer"))
         );
     }
 
@@ -4315,15 +3919,6 @@ mod tests {
     fn scan_migration_index_supports_ordered_batch_reads_online() {
         assert!(ENSURE_SCAN_MIGRATION_INDEX_SQL.contains("CREATE INDEX CONCURRENTLY"));
         assert!(ENSURE_SCAN_MIGRATION_INDEX_SQL.contains("scan_observation(batch_id, id)"));
-    }
-
-    #[test]
-    fn legacy_search_full_sync_indexes_projection_cursor_online() {
-        assert!(ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL.contains("CREATE INDEX CONCURRENTLY"));
-        assert!(
-            ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL
-                .contains("asset_endpoint_current(projection_version)")
-        );
     }
 
     #[test]
@@ -4491,3 +4086,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "elasticsearch_storage_tests.rs"]
+mod storage_tests;

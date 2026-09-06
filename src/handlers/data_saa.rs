@@ -50,27 +50,6 @@ struct AnalysisFilters {
     task_source: Option<String>,
 }
 
-fn push_analysis_scope<'a>(
-    conditions: &mut Vec<String>,
-    params: &mut Vec<&'a (dyn ToSql + Sync)>,
-    owner_id: Option<&'a i32>,
-    scanner_id: &'a Option<String>,
-    task_source: &'a Option<String>,
-) {
-    if let Some(owner_id) = owner_id {
-        params.push(owner_id);
-        conditions.push(format!("t.user_id = ${}", params.len()));
-    }
-    if let Some(scanner_id) = scanner_id.as_ref() {
-        params.push(scanner_id);
-        conditions.push(format!("e.assigned_scanner_id = ${}", params.len()));
-    }
-    if let Some(task_source) = task_source.as_ref() {
-        params.push(task_source);
-        conditions.push(format!("t.task_source = ${}", params.len()));
-    }
-}
-
 #[derive(Clone, Copy)]
 enum DistributionDimension {
     Service,
@@ -233,105 +212,16 @@ pub(crate) async fn get_analysis_distribution(
         )
         .await;
     }
-    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
-        return analysis_distribution_from_elasticsearch(
-            &req,
-            elasticsearch.get_ref(),
-            &filters,
-            dimension,
-            limit,
-            &user,
-        )
-        .await;
-    }
 
-    let client = match pool.get().await {
-        Ok(value) => value,
-        Err(error_value) => {
-            error_logs(
-                &req,
-                "AnalysisDistributionPoolError",
-                &error_value.to_string(),
-            );
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
-    let (label_expression, additional_filter) = match dimension {
-        DistributionDimension::Service => (
-            "LOWER(BTRIM(s.service))",
-            "AND s.kind = 'service' AND s.service IS NOT NULL AND BTRIM(s.service) <> ''",
-        ),
-        DistributionDimension::Port => ("s.port::TEXT", ""),
-    };
-    let mut conditions = vec![
-        "s.observed_at >= $1".to_owned(),
-        "s.observed_at < $2".to_owned(),
-    ];
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&filters.start_at, &filters.end_at];
-    push_analysis_scope(
-        &mut conditions,
-        &mut params,
-        (user.role != 1).then_some(&user.id),
-        &filters.scanner_id,
-        &filters.task_source,
-    );
-    params.push(&limit);
-    let sql = format!(
-        "WITH grouped AS (\
-            SELECT {label_expression} AS label, \
-                   COUNT(DISTINCT (s.execution_id, s.ip_address, s.port))::BIGINT AS endpoint_count \
-            FROM scan_observation s \
-            JOIN scan_task_execution e ON e.id = s.execution_id \
-            JOIN scan_task t ON t.id = e.task_id \
-            WHERE {} \
-              {additional_filter} \
-            GROUP BY label\
-        ) \
-        SELECT label, endpoint_count, (SUM(endpoint_count) OVER ())::BIGINT AS total \
-        FROM grouped ORDER BY endpoint_count DESC, label LIMIT ${};",
-        conditions.join(" AND "),
-        params.len()
-    );
-    let rows = match client.query(&sql, &params).await {
-        Ok(value) => value,
-        Err(error_value) => {
-            error_logs(
-                &req,
-                "AnalysisDistributionQueryError",
-                &error_value.to_string(),
-            );
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
-    let total = rows
-        .first()
-        .map(|row| row.get::<_, i64>("total"))
-        .unwrap_or(0);
-    let items: Vec<DistributionItem> = rows
-        .into_iter()
-        .map(|row| {
-            let count = row.get::<_, i64>("endpoint_count");
-            DistributionItem {
-                name: row.get("label"),
-                count,
-                percentage: percentage(count, total),
-            }
-        })
-        .collect();
-    let visible_count: i64 = items.iter().map(|item| item.count).sum();
-
-    HttpResponse::Ok().json(AnalysisResponse {
-        success: true,
-        data: DistributionData {
-            dimension: dimension.as_str(),
-            items,
-            other_count: total.saturating_sub(visible_count),
-            total,
-        },
-        meta: analysis_meta(&filters),
-    })
+    return analysis_distribution_from_elasticsearch(
+        &req,
+        elasticsearch.get_ref(),
+        &filters,
+        dimension,
+        limit,
+        &user,
+    )
+    .await;
 }
 
 #[get("/api/analysis/discovery-heatmap")]
@@ -350,72 +240,9 @@ pub(crate) async fn get_analysis_discovery_heatmap(
     if analytics_snapshot.get().await.value.mode.reads_snapshot() {
         return analysis_heatmap_from_snapshot(&req, pool.get_ref(), &filters, &user).await;
     }
-    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
-        return analysis_heatmap_from_elasticsearch(&req, elasticsearch.get_ref(), &filters, &user)
-            .await;
-    }
-    let client = match pool.get().await {
-        Ok(value) => value,
-        Err(error_value) => {
-            error_logs_error(
-                &req,
-                "AnalysisHeatmapPoolError",
-                "database_operation",
-                &error_value,
-            );
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
 
-    let mut conditions = vec![
-        "i.create_time >= $1".to_owned(),
-        "i.create_time < $2".to_owned(),
-    ];
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&filters.start_ms, &filters.end_ms];
-    push_analysis_scope(
-        &mut conditions,
-        &mut params,
-        (user.role != 1).then_some(&user.id),
-        &filters.scanner_id,
-        &filters.task_source,
-    );
-    let sql = format!(
-        "SELECT to_char(\
-                 (to_timestamp(i.create_time / 1000.0) AT TIME ZONE 'Asia/Shanghai')::DATE,\
-                 'YYYY-MM-DD'\
-             ) AS day, COUNT(DISTINCT i.ip_address)::BIGINT AS discovered_count \
-             FROM ips i \
-             JOIN scan_task t ON t.id = i.task_id \
-             JOIN scan_task_execution e ON e.id = i.execution_id \
-             WHERE {} \
-             GROUP BY day ORDER BY day;",
-        conditions.join(" AND ")
-    );
-    let rows = match client.query(&sql, &params).await {
-        Ok(value) => value,
-        Err(error_value) => {
-            error_logs_error(
-                &req,
-                "AnalysisHeatmapQueryError",
-                "database_operation",
-                &error_value,
-            );
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-    let items = rows
-        .into_iter()
-        .map(|row| HeatmapItem {
-            date: row.get("day"),
-            count: row.get("discovered_count"),
-        })
-        .collect();
-
-    HttpResponse::Ok().json(AnalysisResponse {
-        success: true,
-        data: HeatmapData { items },
-        meta: analysis_meta(&filters),
-    })
+    return analysis_heatmap_from_elasticsearch(&req, elasticsearch.get_ref(), &filters, &user)
+        .await;
 }
 
 async fn snapshot_data_as_of(
@@ -831,12 +658,10 @@ async fn analysis_heatmap_from_elasticsearch(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
-    use tokio_postgres::types::ToSql;
     use uuid::Uuid;
 
     use super::{
         AnalysisFilterQuery, DistributionDimension, MAX_RANGE_DAYS, normalize_filters, percentage,
-        push_analysis_scope,
     };
 
     fn query(start_offset_days: i64, task_source: Option<&str>) -> AnalysisFilterQuery {
@@ -884,41 +709,5 @@ mod tests {
     fn calculates_percentages_to_one_decimal_place() {
         assert_eq!(percentage(1, 3), 33.3);
         assert_eq!(percentage(0, 0), 0.0);
-    }
-
-    #[test]
-    fn postgres_scope_omits_absent_optional_conditions() {
-        let start = 1_i64;
-        let mut conditions = vec!["observed_at >= $1".to_owned()];
-        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&start];
-
-        push_analysis_scope(&mut conditions, &mut params, None, &None, &None);
-
-        assert_eq!(conditions, ["observed_at >= $1"]);
-        assert_eq!(params.len(), 1);
-    }
-
-    #[test]
-    fn postgres_scope_numbers_present_conditions_only() {
-        let start = 1_i64;
-        let owner_id = 7;
-        let scanner_id = Some("scanner-a".to_owned());
-        let task_source = Some("manual".to_owned());
-        let mut conditions = vec!["observed_at >= $1".to_owned()];
-        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&start];
-
-        push_analysis_scope(
-            &mut conditions,
-            &mut params,
-            Some(&owner_id),
-            &scanner_id,
-            &task_source,
-        );
-
-        assert_eq!(params.len(), 4);
-        assert_eq!(conditions[1], "t.user_id = $2");
-        assert_eq!(conditions[2], "e.assigned_scanner_id = $3");
-        assert_eq!(conditions[3], "t.task_source = $4");
-        assert!(conditions.iter().all(|condition| !condition.contains("OR")));
     }
 }

@@ -1,62 +1,18 @@
-# Elasticsearch 9.5.2 扫描存储与搜索
+# Elasticsearch 9.5.2 扫描结果存储
 
-Elasticsearch 可以从可选搜索副本升级为扫描事实的权威存储。PostgreSQL 始终保留用户、
-权限、标签、任务、执行状态、扫描器和上传回执等控制面数据；切换完成后不再向
-`scan_observation`、`ips`、`ports` 写入新的扫描事实。
+服务端正常运行仅支持 Elasticsearch 扫描结果存储。PostgreSQL 保留用户、权限、标签、
+任务、执行状态、扫描器、上传回执、补偿队列和紧凑分析快照，不再读写完整扫描事实。
+`postgres`、`dual` 配置已不支持；PG 历史结果仅通过离线 PG → ES 迁移读取。
 
-## 存储模式
-
-| 模式 | 扫描事实写入 | 扫描事实读取 | 用途 |
-|---|---|---|---|
-| `postgres` | PostgreSQL | PostgreSQL；旧 ES 搜索副本可选 | 默认与回滚 |
-| `dual` | ES 与 PostgreSQL | PostgreSQL/旧搜索副本 | 历史迁移、对比和观察期 |
-| `elasticsearch` | ES | ES | 完成切换后的正式模式 |
-
-禁止从 `postgres` 直接切换到 `elasticsearch`。服务启动会检查迁移标记、所有批次的内容
-校验和、执行计数和待发布投影；前置条件不完整时拒绝启动，避免页面静默返回空数据。
-
-## 索引与提交协议
-
-- `network-mapping-scan-observations-v1-YYYY.MM`：追加式原始观察事实。月份取扫描器产生的
-  `observed_at`，重试始终落到同一具体索引。
-- `network-mapping-execution-endpoints-v1`：每次执行的 `(execution, IP, port)` 当前投影。
-- `network-mapping-endpoints-current-v2`：`global/user` 权限范围内的当前端点投影。
-- `network-mapping-assets-v1`：旧 PostgreSQL 搜索副本，仅兼容模式使用。
-- `network-mapping-dns-observations`：DNS 查询证据 Data Stream；由 data-stream lifecycle 自动保留。
-- `network-mapping-dns-records-v1`：按完整 RR RDATA 去重的当前 DNS 记录。
-
-原始观察使用 `create` 和确定性 `_id = SHA-256(execution_id + observation_key)`。Bulk 响应
-逐项检查：非 2xx 立即失败；409 通过 `_mget` 回读并比较文档校验和，只有内容完全相同才
-视为幂等重试。原始 evidence 的 `data` 保留在 `_source`，mapping 使用 `enabled:false`。
-
-扫描结果地址兼容单 IP 与 CIDR。观察文档同时写入两个字段：`ip_address` 使用 ES `ip`
-类型，仅保存具体地址；`ip_network` 使用 `ip_range`，保存 CIDR。单 IPv4/IPv6 会规范化为
-`/32`/`/128` 网络，因此 `192.0.2.1` 与 `192.0.2.1/32` 具有相同观察身份。PostgreSQL 的
-`INET` 事实字段继续保存 `ip_network`，不会丢失非主机前缀。模板 schema version 3 会为
-新月度索引创建该 mapping；服务也会对已有匹配索引执行可加字段的 mapping 更新。
-
-为兼容修复前已进入 `pending` 的上传回执，批次和文档校验和仍按旧的 CIDR 语义计算；部署
-修复后扫描器可以使用原 `upload_id` 重试，不需要清理或重建待上传批次。
-
-扫描器先将稳定 `upload_id`、观察和下一批序号原子写入本地 `scanner-state.json`。服务端
-验证扫描器和任务后先写 ES，再写 PostgreSQL 回执、payload SHA-256 和实际索引引用。最终批
-使用 `refresh=wait_for`，所有 Bulk 请求使用 `wait_for_active_shards=all`；批次必须从 0 连续、
-只有一个 final，随后才写执行计数并将任务置为 `succeeded`。current 端点不会在中间批次对
-外可见；最终状态与投影 outbox 同一事务提交后才发布，发布失败由扫描器重试和后台 outbox
-共同补偿。
-
-ES 写失败不会提交回执或成功状态。若 ES 已成功但 PostgreSQL 提交前进程退出，相同批次
-重试会通过确定性 ID 和校验和安全收敛。
-
-## 配置
+## 配置与新安装
 
 ```toml
 [elasticsearch]
 enabled = true
-read_enabled = false
-scan_storage = "dual"
+read_enabled = true
+scan_storage = "elasticsearch"
+fallback_to_postgres = false
 url = "https://127.0.0.1:9200"
-index = "network-mapping-assets-v1"
 observation_index_prefix = "network-mapping-scan-observations-v1"
 execution_endpoint_index = "network-mapping-execution-endpoints-v1"
 current_endpoint_index = "network-mapping-endpoints-current-v2"
@@ -64,84 +20,98 @@ dns_observation_data_stream = "network-mapping-dns-observations"
 dns_record_index = "network-mapping-dns-records-v1"
 dns_observation_retention_days = 180
 scan_number_of_replicas = 1
+write_wait_for_active_shards = "all"
 expected_version = "9.5.2"
-api_key = "base64-encoded-api-key"
-ca_certificate_file = "elasticsearch/http_ca.crt"
-request_timeout_seconds = 30
-poll_interval_ms = 500
-bulk_batch_size = 500
-fallback_to_postgres = true
+# api_key 和 CA 路径由部署环境提供。
 ```
 
-生产权威存储要求 `scan_number_of_replicas >= 1`，并应有足够数据节点使主副本均活动。单节点
-开发环境只能在 `dual` 模式设为 0。索引固定使用 `translog.durability=request`。
+ES 是必需依赖；禁用 ES、禁用读取或启用 PG 回退会被配置检查拒绝。旧 `index` 配置已无用途，
+应删除。开发默认允许零副本并等待主分片；生产应配置至少一份副本和相应故障域，并实测
+`write_wait_for_active_shards` 对故障期间可写性的影响。持久化保持 `translog.durability=request`。
 
-API Key 至少需要读取集群版本、管理目标 index template/index、Bulk/Create/Update、MGet、
-Search/Count 和 Update By Query 权限。认证信息和 CA 私钥不得提交仓库或写入日志。
+新安装的 `init.sql` 只创建 PG 业务结构，不创建 `ips`、`ports`、`scan_observation`、
+`asset_endpoint_current` 或旧搜索视图。空库直接初始化 ES，并记录目标索引；无需执行空迁移。
+已经初始化的运行实例重启时校验目标与回执引用的索引。索引丢失或目标改变会拒绝启动，
+不能静默按空库恢复。正常 ES pending 上传和投影积压允许后台/扫描器恢复，不再阻断重启。
 
-## 迁移与切换
+## 历史 PG → ES 迁移
 
-1. 备份 PostgreSQL，并为 ES 配置快照仓库和定期快照。
-2. 部署新服务端和扫描器，但保持 `scan_storage="postgres"`。
-3. 改为 `dual`；生产保持至少一份副本。
-4. 停止常规服务，在维护窗口幂等迁移历史事实：
+1. 备份 PG，并准备 ES 快照仓库。停止旧服务和结果上传，迁移期间不得运行其他写入实例。新版进程使用 PG 共享/独占咨询锁互斥正常服务与迁移；旧版不持有该锁，仍需人工确认已停服。
+2. 将配置改为上面的 ES 配置；不要尝试用新版服务运行 `postgres` 或 `dual`。
+3. 在停止常规服务的维护窗口运行：
+
+   ```sh
+   cargo run --release -- --config /etc/network-mapping/config.toml \
+     --migrate-scan-data-to-elasticsearch
+   ```
+
+4. 迁移命令独立执行内嵌 `prepare_pg_scan_migration.sql`，补齐旧结构、将遗留 `scaninfo`
+   幂等转换为迁移批次，并提取旧 evidence 搜索内容。正常启动不会执行这些步骤。
+5. 按 execution 有界并行、执行内按批次顺序迁移。逐批核对 PG 观察数与回执，写 ES 并记录
+   校验和、真实索引引用及执行计数；失败保留断点，修复后可重跑。新迁移回执标记为
+   `elasticsearch`，既有 `dual` 标记仅作为历史迁移回执识别，不恢复双写。
+6. 存在 ES `pending` 回执时，先让原 ES 服务与扫描器完成重试；迁移拒绝将其当作 PG 空批次。
+7. 迁移完成后核对批次内容、执行计数、普通用户/管理员权限、资产、任务详情、导出和分析；
+   完成配对备份恢复演练后启动新版服务。历史 PG 事实表暂时保留，后续归档/删除独立安排。
+
+若要在导入前补充旧 PG IP 情报，使用
+`--refresh-ip-intel --migrate-scan-data-to-elasticsearch`。该选项仅用于迁移前准备，不能单独
+维护 PG 结果，也不修改已经迁入 ES 的历史情报。旧 `--rebuild-elasticsearch` 命令已移除，
+避免重建已退役搜索副本或误以为它能恢复原始扫描结果。
+
+迁移是单向能力；没有 ES → PG 回填工具。上线后优先回滚到支持 ES 的应用版本；不能只修改
+配置回 PG。恢复到迁移前备份会丢失之后的数据，必须明确共同恢复边界。
+
+## 索引与提交协议
+
+- `network-mapping-scan-observations-v1-YYYY.MM`：不可变原始观察，月份由扫描器 `observed_at` 确定。
+- `network-mapping-execution-endpoints-v1`：每次执行的端点投影。
+- `network-mapping-endpoints-current-v2`：`global/user` 权限范围内的当前端点投影。
+- `network-mapping-dns-observations`：DNS 查询证据 Data Stream。
+- `network-mapping-dns-records-v1`：当前 DNS RR 投影。
+
+旧 `network-mapping-assets-v1` 不再创建、同步或查询。原始 observation 的确定性 `_id` 和内容
+校验和保持兼容；Bulk 响应逐项校验，409 通过 `_mget` 核对原始内容和批次校验和。
+原始 evidence 保留在 `_source`，不任意展开 mapping。IP/CIDR 继续分别使用 `ip` / `ip_range`。
+
+上传先提交 PG pending 回执，再释放事务和连接后写 ES，成功后重新检查执行归属并确认回执。
+ES 成功而 PG 确认失败时，相同身份重试收敛；完成后的重复批次也要核对内容。final 要求此前
+批次已完成、从 0 连续且唯一 final；空 final 同样刷新原始观察和执行投影后再读取计数，避免
+最后一批没有触及早先月份/分片造成漏计。执行成功、任务聚合和 outbox 在同一 PG 事务提交。
+
+当前端点发布在该事务之后，失败由 outbox 补偿；执行成功不代表所有投影/分析同时可见。
+状态接口统计扫描投影和标签两个队列，不再将旧副本事件计为运行积压。
+
+DNS 新 pending 批次在写入前将实际 backing index 固定到 PG 回执；重试沿用该目标，避免
+Data Stream rollover 后重复写到新索引。旧 pending 批次通过已有证据定位索引；发现跨多个
+backing index 的旧重复批次会要求先对账。回执同时保存实际 RR 索引，不再写占位名称。
+已删除/过期的固定索引不能自动重建后重放，须按保留/恢复流程处理。
+
+## 查询、备份与验收
+
+搜索、资产、历史、任务结果/漏洞、导出统一读取 ES；用户、任务元数据和标签仍读取 PG。
+分析快照继续使用 PG 紧凑统计，后台从 ES 获取事实，参见[分析快照](ANALYTICS_SNAPSHOTS.md)。
+索引不可用返回 503，不回退旧 PG 事实，也不将失败分片作为完整统计。
+
+ES 快照和 PG 备份必须配对恢复，并对回执、事实与投影对账。定期快照、磁盘监控和恢复演练
+仍是部署要求；本次代码调整没有为实际集群执行这些运维动作。索引过期前需定义可恢复归档，
+否则完整历史查询及全量重建不再有保证。详细步骤见[实施方案](ES_SCAN_STORAGE_PLAN.md)。
+
+自动验证：
 
 ```sh
-cargo run --release -- \
-  --config /etc/network-mapping/config.toml \
-  --migrate-scan-data-to-elasticsearch
+cargo fmt --check
+cargo clippy --all-targets
+cargo test
+# 下面的连接只能指向可创建/删除测试 schema 的隔离 PG。
+STORAGE_TEST_DATABASE_URL='host=127.0.0.1 port=5432 dbname=storage_test user=test' \
+  cargo test elasticsearch::storage_tests -- --ignored
+ANALYTICS_TEST_DATABASE_URL='host=127.0.0.1 port=5432 dbname=storage_test user=test' \
+  cargo test postgres_backfill_publication_retry_and_batch_writes -- --ignored
 ```
 
-命令按 PostgreSQL 批次顺序回填原始事实和端点投影，更新回执引用和执行计数，全部成功后
-写迁移标记；失败修复后可原样重跑。迁移和 `--rebuild-elasticsearch` 会立即显示当前阶段，
-并每 5 秒输出已完成数量、总量、耗时和当前批次等进度；进度写入标准错误，最终摘要仍写入
-标准输出，便于终端观察和脚本分别收集。
-
-5. 正常运行 `dual`，核对新任务、任务详情、资产、导出、分析和搜索。
-6. 检查 `GET /api/search/elasticsearch/status` 的版本、连接、读就绪状态和索引名。
-7. 比较代表性普通用户与管理员的总数、分页和权限边界。
-8. 确认快照成功后设置并重启：
-
-```toml
-read_enabled = true
-scan_storage = "elasticsearch"
-fallback_to_postgres = false
-```
-
-启动切换检查通过后，扫描事实查询和新写入均使用 ES。不要立即删除 PostgreSQL 历史事实
-表。回滚时先停止写入，切回 `dual/postgres` 并补齐切换后产生的 ES-only 数据，不能直接
-假设 PostgreSQL 已包含它们。
-
-`dual` 只表示扫描事实双写，读取仍来自 PostgreSQL，或在 `read_enabled=true` 时来自旧的
-`index` 兼容搜索副本；它不会读取迁移生成的 `current_endpoint_index`。首次启用旧搜索副本
-会从 `asset_endpoint_current` 单独执行一次全量同步。同步完成前若同时设置
-`fallback_to_postgres=false`，搜索会失败关闭并返回 503“搜索索引暂时不可用”。不要把扫描
-事实迁移完成误认为旧搜索副本也已完成同步；计划切换到 ES 权威读取时，应完成前置校验后
-使用 `scan_storage="elasticsearch"`，并满足至少一份活动副本的生产要求。
-
-## 查询覆盖与权限
-
-ES 权威模式覆盖简单搜索、高级布尔搜索、`NOT`、`has_endpoint(...)`、资产概览/端口/历史、
-任务详情/导出以及分析分布/热力图。`has_endpoint` 通过 composite aggregation 解析同资产
-端点集合；匹配资产超过 65,536 时要求增加限定条件。
-
-用户、权限、任务元数据、标签定义和审计继续读 PostgreSQL。普通用户查询自己的 `user`
-scope，管理员查询 `global` scope。权威模式绝不回退到停止更新的 PostgreSQL 扫描事实表，
-索引不可用时返回 503。
-
-## 运维与验收
-
-- ES 成为权威存储前必须部署主副本、磁盘水位监控、TLS/API Key 轮换和自动快照。
-- 文件系统复制不是可靠备份；使用 Snapshot/Restore 并定期恢复演练。
-- Bulk 部分失败、mapping 冲突或活动分片不足都会阻止任务成功，扫描器持久缓存会重试。
-- 标签事务写入搜索 outbox；即时 ES 刷新失败后，后台任务会按 IP 重新加载 PostgreSQL 标签
-  并修复 current 投影。
-- 月度事实索引按保留策略快照后才能删除；mapping 变更创建新版本索引并重跑迁移。
-- `--rebuild-elasticsearch` 只重建旧搜索副本；扫描事实使用独立迁移命令。
-
-验收至少包括：历史迁移可重复、批次/观察数一致；重复批次幂等而不同内容被拒绝；缺批或
-多个 final 不能成功；扫描器重启保持上传身份和观察时间；用户权限不串数据；标签操作刷新
-ES；ES 中断时任务不成功且恢复后能续传；快照已校验并完成独立恢复。
+存储集成测试使用真实 PG 隔离 schema 与本地 ES HTTP fixture，验证协议和恢复边界；它不替代
+实际 ES 9.5.2 的 mapping、Painless、rollover、副本故障、性能和 Snapshot/Restore 验收。
 
 ## 慢查询诊断
 

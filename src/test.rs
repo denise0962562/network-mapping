@@ -9,8 +9,9 @@ use crate::logs::LogRollingMode;
 use crate::middlewares::smiddleware::AuthMiddleware;
 
 #[actix_web::test]
+#[ignore = "requires a configured PostgreSQL database and seeded admin account"]
 async fn login_test() {
-    let args = Clis::parse();
+    let args = Clis::parse_from(["networkm"]);
 
     let config = config::Config::from_file(&args.config);
 

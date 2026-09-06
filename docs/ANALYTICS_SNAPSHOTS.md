@@ -1,8 +1,8 @@
 # 扫描分析快照
 
 扫描分析页面原先在每次请求时聚合全部 observation。该行为在 Elasticsearch 成为扫描事实源后，
-会因高基数 composite aggregation 而明显变慢。现在可以将统计改为后台快照：扫描事实仍保留在
-PostgreSQL 或 Elasticsearch，分析接口只读取 PostgreSQL 中的紧凑统计事实。
+会因高基数 composite aggregation 而明显变慢。现在可以将统计改为后台快照：扫描事实仅保留在
+Elasticsearch，分析接口只读取 PostgreSQL 中的紧凑统计事实。
 
 ## 升级步骤
 

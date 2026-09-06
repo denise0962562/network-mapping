@@ -83,14 +83,13 @@ directory = "source/maxmind"
 ```
 
 相对路径以配置文件所在目录为基准。数据库文件缺失时服务仍会启动，相关字段保持为空。
-更新 MMDB 文件后需要重启服务；刷新历史记录可执行：
+更新 MMDB 文件后需要重启服务；仅在 PG → ES 迁移前补充旧记录情报时执行：
 
 ```sh
-cargo run -- --refresh-ip-intel
+cargo run -- --refresh-ip-intel --migrate-scan-data-to-elasticsearch
 ```
 
-刷新期间会立即显示当前阶段，并每 5 秒输出已扫描、已更新、无匹配数量和耗时；随后重建
-搜索投影时也会持续输出心跳，便于在 SSH 或日志重定向环境确认任务仍在运行。
+刷新和迁移期间持续输出进度。该选项不再支持单独刷新 PG 结果；已经迁入 ES 的历史情报不会由此重写。
 
 ## 资产高级搜索
 
@@ -109,10 +108,10 @@ AND tag = "生产环境"
 `banner:nginx` 等旧输入仍然兼容。完整字段表、标签否定语义、逻辑优先级、跨端点查询、
 API 请求响应和限制参见[资产搜索语法与 API](docs/SEARCH_SYNTAX.md)。
 
-服务端可分阶段将 Elasticsearch 9.5.2 从搜索读模型升级为扫描事实的权威存储，PostgreSQL
-仅保留用户、权限、任务、标签和上传回执等控制面数据。双写迁移、幂等回填、切换检查、
+服务端仅支持 Elasticsearch 9.5.2 存储扫描结果，PostgreSQL 保留用户、权限、任务、标签、
+上传回执和派生分析快照。PG 旧结果仅支持通过独立命令迁移到 ES。幂等回填、启动检查、
 查询覆盖、快照和回滚流程参见[Elasticsearch 9.5.2 扫描存储与搜索](docs/ELASTICSEARCH.md)。
-扫描事实统一使用 ES、逐步退役 PG 事实兼容路径的实施顺序和验收门槛参见
+存储职责、迁移验收和旧数据归档边界参见
 [扫描结果 ES 存储实施方案](docs/ES_SCAN_STORAGE_PLAN.md)。
 
 ## 扫描器调度

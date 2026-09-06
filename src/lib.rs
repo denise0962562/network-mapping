@@ -30,6 +30,7 @@ pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
 pub mod runtime_config;
+pub mod scan_migration;
 pub mod scanner_latency;
 mod search_content;
 pub mod search_projection;
@@ -1642,33 +1643,6 @@ fn sanitize_result_item(item: ScannerResultItem) -> ScannerResultItem {
     }
 }
 
-fn immutable_scan_observation(value: &Value) -> Value {
-    let mut value = value.clone();
-    if let Some(object) = value.as_object_mut() {
-        // `ip_network` was split from `ip_address` for Elasticsearch mapping
-        // compatibility. Hash the network under the legacy field name so
-        // pending batches created before this change retain the same checksum.
-        if let Some(network) = object.remove("ip_network") {
-            object.insert("ip_address".to_owned(), network);
-        }
-        for field in [
-            "asn",
-            "isp",
-            "as_org",
-            "country_code",
-            "country_name",
-            "region_name",
-            "city_name",
-            "latitude",
-            "longitude",
-            "tags",
-        ] {
-            object.remove(field);
-        }
-    }
-    value
-}
-
 fn normalize_upload_observations(
     upload: &ScannerResultUpload,
 ) -> Result<Vec<NormalizedObservation>, SaveScannerResultsError> {
@@ -1983,13 +1957,8 @@ async fn save_dns_scanner_results(
     let Some(task) = task else {
         return Err(SaveScannerResultsError::TaskNotFound);
     };
-    if task.get::<_, String>("execution_status") == "succeeded" {
-        transaction
-            .commit()
-            .await
-            .map_err(scanner_result_database_error)?;
-        return Ok(0);
-    }
+    let already_succeeded = task.get::<_, String>("execution_status") == "succeeded";
+
     let task_db_id: i32 = task.get("task_id");
     let execution_db_id: i32 = task.get("execution_id");
     let context = ScanBatchContext {
@@ -2024,7 +1993,7 @@ async fn save_dns_scanner_results(
     if is_final {
         let sequence = transaction
             .query_one(
-                "SELECT COUNT(*) FILTER (WHERE batch_index < $3)::BIGINT AS prior_count, \
+                "SELECT COUNT(*) FILTER (WHERE batch_index < $3 AND storage_backend <> 'pending')::BIGINT AS prior_count, \
                  MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
                  MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
                  COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
@@ -2089,6 +2058,9 @@ async fn save_dns_scanner_results(
             return Ok(0);
         }
     } else {
+        if already_succeeded {
+            return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+        }
         transaction
             .execute(
                 "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
@@ -2113,8 +2085,12 @@ async fn save_dns_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
     drop(client);
+    let dns_references = elasticsearch
+        .pin_dns_batch_storage(pool, execution_db_id, &context)
+        .await
+        .map_err(SaveScannerResultsError::Storage)?;
     elasticsearch
-        .persist_dns_observations(&context, "default", &observations)
+        .persist_dns_observations(&context, "default", &observations, &dns_references[0])
         .await
         .map_err(SaveScannerResultsError::Storage)?;
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
@@ -2126,13 +2102,21 @@ async fn save_dns_scanner_results(
         .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '10s';")
         .await
         .map_err(scanner_result_database_error)?;
-    transaction
-        .query_one(
-            "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
-            &[&execution_db_id],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
+    let current_execution = transaction
+        .query_one("SELECT execution_status, assigned_scanner_id FROM scan_task_execution WHERE id = $1 FOR UPDATE", &[&execution_db_id])
+        .await.map_err(scanner_result_database_error)?;
+    if !matches!(
+        current_execution
+            .get::<_, String>("execution_status")
+            .as_str(),
+        "running" | "succeeded"
+    ) || current_execution
+        .get::<_, Option<String>>("assigned_scanner_id")
+        .as_deref()
+        != Some(scanner_id.as_str())
+    {
+        return Err(SaveScannerResultsError::TaskNotOwned);
+    }
     let receipt_updated = transaction
         .execute(
             "UPDATE scan_result_batch SET storage_backend = 'elasticsearch', storage_references = $4 \
@@ -2142,7 +2126,7 @@ async fn save_dns_scanner_results(
                 &execution_db_id,
                 &upload_id,
                 &batch_index,
-                &serde_json::json!(["dns-observations", "dns-records"]),
+                &serde_json::json!(dns_references),
             ],
         )
         .await
@@ -2178,8 +2162,8 @@ async fn save_dns_scanner_results(
                 "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
                  lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false, \
                  maintenance_hold = FALSE, maintenance_hold_until = NULL, \
-                 result_ip_count = 0, result_port_count = 0, result_observation_count = $3 WHERE id = $2;",
-                &[&get_unix_epoch_ms(), &execution_db_id, &i64::from(observation_count)],
+                 result_ip_count = 0, result_port_count = 0, result_observation_count = (SELECT COALESCE(SUM(observation_count), 0) FROM scan_result_batch WHERE execution_id = $2) WHERE id = $2;",
+                &[&get_unix_epoch_ms(), &execution_db_id],
             )
             .await
             .map_err(scanner_result_database_error)?;
@@ -2650,7 +2634,6 @@ pub async fn save_scanner_results(
     }
 
     let normalized_observations = normalize_upload_observations(upload)?;
-    let storage_mode = elasticsearch.scan_storage_mode();
 
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
@@ -2687,39 +2670,9 @@ pub async fn save_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
 
-    if let Some(row) = task_row.as_ref()
-        && row.get::<_, String>("execution_status") == "succeeded"
-    {
-        let execution_db_id: i32 = row.get("execution_id");
-        let context = ScanBatchContext {
-            task_id: upload.task_id.to_string(),
-            execution_id: row.get("public_execution_id"),
-            user_id: row.get("user_id"),
-            task_source: row.get("task_source"),
-            scanner_id: scanner_id.clone(),
-            scanner_name: row.get("scanner_name"),
-            upload_id: upload
-                .upload_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| row.get("public_execution_id")),
-            batch_index: upload
-                .batch_index
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or_default(),
-            is_final: true,
-        };
-        transaction
-            .commit()
-            .await
-            .map_err(scanner_result_database_error)?;
-        if storage_mode.writes_elasticsearch() {
-            elasticsearch
-                .finalize_scan_projection(pool, execution_db_id, &context)
-                .await
-                .map_err(SaveScannerResultsError::Storage)?;
-        }
-        return Ok(0);
-    }
+    let already_succeeded = task_row
+        .as_ref()
+        .is_some_and(|row| row.get::<_, String>("execution_status") == "succeeded");
 
     let (
         task_db_id,
@@ -2730,7 +2683,7 @@ pub async fn save_scanner_results(
         task_source,
         scanner_name,
     ): (i32, i32, i32, String, Option<i64>, String, Option<String>) = match task_row {
-        Some(row) if row.get::<_, String>("execution_status") == "running" => (
+        Some(row) => (
             row.get("task_id"),
             row.get("user_id"),
             row.get("execution_id"),
@@ -2739,7 +2692,6 @@ pub async fn save_scanner_results(
             row.get("task_source"),
             row.get("scanner_name"),
         ),
-        Some(_) => return Err(SaveScannerResultsError::TaskNotOwned),
         None => return Err(SaveScannerResultsError::TaskNotFound),
     };
 
@@ -2782,7 +2734,7 @@ pub async fn save_scanner_results(
     if is_final {
         let sequence = transaction
             .query_one(
-                "SELECT COUNT(*) FILTER (WHERE batch_index < $3)::BIGINT AS prior_count, \
+                "SELECT COUNT(*) FILTER (WHERE batch_index < $3 AND storage_backend <> 'pending')::BIGINT AS prior_count, \
                     MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
                     MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
                     COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
@@ -2903,7 +2855,7 @@ pub async fn save_scanner_results(
             "longitude": intel.longitude,
         }));
     }
-    if storage_mode.writes_elasticsearch() && !observation_rows.is_empty() {
+    if !observation_rows.is_empty() {
         let addresses = observation_rows
             .iter()
             .filter_map(|row| {
@@ -2946,12 +2898,8 @@ pub async fn save_scanner_results(
                 .insert("tags".to_owned(), tags);
         }
     }
-    let storage_backend = match storage_mode {
-        config::ScanStorageMode::Postgres => "postgres",
-        config::ScanStorageMode::Dual => "dual",
-        config::ScanStorageMode::Elasticsearch => "elasticsearch",
-    };
-    let (transaction, batch_db_id, es_execution_summary) = if storage_mode.writes_elasticsearch() {
+    let storage_backend = "elasticsearch";
+    let (transaction, es_execution_summary) = {
         let expected_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
             .map_err(SaveScannerResultsError::Storage)?;
         if let Some(existing) = transaction
@@ -2968,7 +2916,7 @@ pub async fn save_scanner_results(
                 || existing.get::<_, i32>("observation_count") != observation_count
                 || existing_checksum
                     .as_deref()
-                    .is_some_and(|checksum| checksum != expected_checksum)
+                    .is_none_or(|checksum| checksum != expected_checksum)
             {
                 return Err(SaveScannerResultsError::InvalidUpload(
                     "batch identity was already used with different content".into(),
@@ -2979,9 +2927,17 @@ pub async fn save_scanner_results(
                     .commit()
                     .await
                     .map_err(scanner_result_database_error)?;
+                drop(client);
+                if already_succeeded && is_final {
+                    elasticsearch.finalize_scan_projection(pool, execution_db_id, &batch_context)
+                        .await.map_err(SaveScannerResultsError::Storage)?;
+                }
                 return Ok(0);
             }
         } else {
+            if already_succeeded {
+                return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+            }
             transaction
                 .execute(
                     "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
@@ -3024,13 +2980,21 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
-        transaction
-            .query_one(
-                "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
-                &[&execution_db_id],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
+        let current_execution = transaction
+            .query_one("SELECT execution_status, assigned_scanner_id FROM scan_task_execution WHERE id = $1 FOR UPDATE", &[&execution_db_id])
+            .await.map_err(scanner_result_database_error)?;
+        if !matches!(
+            current_execution
+                .get::<_, String>("execution_status")
+                .as_str(),
+            "running" | "succeeded"
+        ) || current_execution
+            .get::<_, Option<String>>("assigned_scanner_id")
+            .as_deref()
+            != Some(scanner_id.as_str())
+        {
+            return Err(SaveScannerResultsError::TaskNotOwned);
+        }
         let receipt = transaction
             .query_opt(
                 "UPDATE scan_result_batch SET storage_backend = $4, storage_references = $5 \
@@ -3046,154 +3010,16 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
-        let Some(receipt) = receipt else {
+        let Some(_) = receipt else {
             transaction
                 .commit()
                 .await
                 .map_err(scanner_result_database_error)?;
             return Ok(0);
         };
-        (
-            transaction,
-            receipt.get::<_, i64>("id"),
-            result.execution_summary,
-        )
-    } else {
-        let payload_checksum = openssl::sha::sha256(
-            &serde_json::to_vec(&serde_json::json!({
-                "execution_id": public_execution_id,
-                "upload_id": upload_id,
-                "batch_index": batch_index,
-                "is_final": is_final,
-                "observations": observation_rows.iter().map(immutable_scan_observation).collect::<Vec<_>>(),
-            }))
-            .map_err(scanner_result_database_error)?,
-        )
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-        let storage_references = Value::Array(Vec::new());
-        let row = transaction
-            .query_opt(
-                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
-                    protocol_version, payload_checksum, storage_backend, storage_references) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                 ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING RETURNING id;",
-                &[
-                    &execution_db_id,
-                    &upload_id,
-                    &batch_index,
-                    &is_final,
-                    &observation_count,
-                    &protocol_version,
-                    &payload_checksum,
-                    &storage_backend,
-                    &storage_references,
-                ],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
-        let Some(row) = row else {
-            let existing = transaction
-                .query_one(
-                    "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
-                     WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
-                    &[&execution_db_id, &upload_id, &batch_index],
-                )
-                .await
-                .map_err(scanner_result_database_error)?;
-            let existing_checksum: Option<String> = existing.get("payload_checksum");
-            if existing.get::<_, bool>("is_final") != is_final
-                || existing.get::<_, i32>("observation_count") != observation_count
-                || existing_checksum
-                    .as_deref()
-                    .is_some_and(|checksum| checksum != payload_checksum)
-            {
-                return Err(SaveScannerResultsError::InvalidUpload(
-                    "batch identity was already used with different content".into(),
-                ));
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(scanner_result_database_error)?;
-            return Ok(0);
-        };
-        (transaction, row.get::<_, i64>("id"), None)
+        (transaction, result.execution_summary)
     };
-    let observation_rows = Value::Array(observation_rows);
-    // Keep the fact rows and their asset projection in one set-based statement. The
-    // projection reads only rows inserted by this batch and deduplicates both IPs and
-    // endpoints, so port/service observations do not repeat the same UPSERT work.
-    let saved = if storage_mode.writes_postgres() {
-        let saved_row = transaction
-            .query_one(
-            "WITH input AS MATERIALIZED ( \
-                SELECT item.*, COALESCE(item.ip_network, item.ip_address) AS storage_ip_address \
-                FROM jsonb_to_recordset($4::jsonb) AS item( \
-                    observation_key TEXT, kind TEXT, ip_address INET, ip_network INET, port INT, \
-                    protocol TEXT, service TEXT, banner TEXT, title TEXT, http_body TEXT, \
-                    http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
-                    search_content_extracted BOOLEAN, observed_at BIGINT, \
-                    asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
-                    country_name TEXT, region_name TEXT, city_name TEXT, \
-                    latitude DOUBLE PRECISION, longitude DOUBLE PRECISION) \
-             ), inserted_observations AS ( \
-                INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
-                    ip_address, port, protocol, service, banner, title, http_body, \
-                    http_body_truncated, tls_subject, search_content_extracted, source, data, observed_at) \
-                SELECT $2, $3, observation_key, kind, storage_ip_address, port, protocol, service, \
-                    banner, title, http_body, http_body_truncated, tls_subject, \
-                    search_content_extracted, source, data, to_timestamp(observed_at / 1000.0) FROM input \
-                ON CONFLICT (execution_id, observation_key) DO NOTHING \
-                RETURNING ip_address, port \
-             ), inserted_endpoints AS MATERIALIZED ( \
-                SELECT DISTINCT ip_address, port FROM inserted_observations \
-             ), inserted_ip_addresses AS MATERIALIZED ( \
-                SELECT DISTINCT ip_address FROM inserted_endpoints \
-             ), upserted_ips AS ( \
-                INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
-                    country_code, country_name, region_name, city_name, latitude, longitude) \
-                SELECT DISTINCT ON (item.storage_ip_address) $1, $2, item.storage_ip_address, item.asn, \
-                    item.isp, item.as_org, item.country_code, item.country_name, \
-                    item.region_name, item.city_name, item.latitude, item.longitude \
-                FROM input item \
-                JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.storage_ip_address \
-                ORDER BY item.storage_ip_address \
-                ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
-                    asn = COALESCE(EXCLUDED.asn, ips.asn), \
-                    isp = COALESCE(EXCLUDED.isp, ips.isp), \
-                    as_org = COALESCE(EXCLUDED.as_org, ips.as_org), \
-                    country_code = COALESCE(EXCLUDED.country_code, ips.country_code), \
-                    country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
-                    region_name = COALESCE(EXCLUDED.region_name, ips.region_name), \
-                    city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
-                    latitude = COALESCE(EXCLUDED.latitude, ips.latitude), \
-                    longitude = COALESCE(EXCLUDED.longitude, ips.longitude), \
-                    update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
-                RETURNING ip_id, ip_address \
-             ), upserted_ports AS ( \
-                INSERT INTO ports (ip_id, port) \
-                SELECT ip.ip_id, endpoint.port FROM inserted_endpoints endpoint \
-                JOIN upserted_ips ip ON ip.ip_address = endpoint.ip_address \
-                ON CONFLICT (ip_id, port) DO UPDATE SET \
-                    update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
-                RETURNING port_id \
-             ) \
-             SELECT COUNT(*)::BIGINT AS saved FROM inserted_observations;",
-            &[
-                &task_db_id,
-                &execution_db_id,
-                &batch_db_id,
-                &observation_rows,
-            ],
-        )
-            .await
-            .map_err(scanner_result_database_error)?;
-        usize::try_from(saved_row.get::<_, i64>("saved")).map_err(scanner_result_database_error)?
-    } else {
-        normalized_observations.len()
-    };
+    let saved = normalized_observations.len();
 
     if !is_typed || upload.is_final == Some(true) {
         let batch_sequence = transaction
@@ -3219,23 +3045,7 @@ pub async fn save_scanner_results(
                 "final batch requires one contiguous sequence starting at batch_index 0".into(),
             ));
         }
-        let execution_summary = if storage_mode.writes_postgres() {
-            let row = transaction
-                .query_one(
-                    "SELECT (SELECT COUNT(*)::BIGINT FROM ips WHERE execution_id = $1) AS ip_count, \
-                        (SELECT COUNT(*)::BIGINT FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
-                            WHERE i.execution_id = $1) AS port_count, \
-                        (SELECT COUNT(*)::BIGINT FROM scan_observation WHERE execution_id = $1) AS observation_count;",
-                    &[&execution_db_id],
-                )
-                .await
-                .map_err(scanner_result_database_error)?;
-            elasticsearch::ScanExecutionSummary {
-                ip_count: row.get("ip_count"),
-                port_count: row.get("port_count"),
-                observation_count: row.get("observation_count"),
-            }
-        } else {
+        let execution_summary = {
             es_execution_summary.ok_or_else(|| {
                 SaveScannerResultsError::Storage(
                     "final batch did not produce execution counters".into(),
@@ -3270,12 +3080,8 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
-        if storage_mode.writes_postgres() {
-            search_projection::refresh_for_execution(&transaction, execution_db_id)
-                .await
-                .map_err(scanner_result_database_error)?;
-        }
-        if storage_mode.writes_elasticsearch() {
+
+        {
             transaction
                 .execute(
                     "INSERT INTO scan_projection_outbox (execution_id, attempts, available_at, processed_at, last_error) \
@@ -3295,7 +3101,7 @@ pub async fn save_scanner_results(
         .commit()
         .await
         .map_err(scanner_result_database_error)?;
-    if is_final && storage_mode.writes_elasticsearch() {
+    if is_final {
         elasticsearch
             .finalize_scan_projection(pool, execution_db_id, &batch_context)
             .await

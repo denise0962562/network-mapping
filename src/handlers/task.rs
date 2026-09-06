@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::IpAddr;
 use tracing::error;
 use uuid::Uuid;
@@ -1373,7 +1373,6 @@ async fn get_task(
         );
         return HttpResponse::InternalServerError().finish();
     };
-    let selected_execution_pk: i32 = selected_execution.get("id");
     let executions: Vec<Value> = execution_rows.iter().map(|row| serde_json::json!({
         "execution_id": row.get::<_, String>("execution_id"),
         "requested_scanner_id": row.get::<_, Option<String>>("requested_scanner_id"),
@@ -1393,7 +1392,7 @@ async fn get_task(
     let ip_count = selected_execution.get::<_, i64>("ip_count");
     let port_count = selected_execution.get::<_, i64>("port_count");
     let result_count = selected_execution.get::<_, i64>("result_count");
-    let results = if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+    let results = {
         match load_execution_results_from_elasticsearch(
             elasticsearch.get_ref(),
             selected_execution.get::<_, String>("execution_id").as_str(),
@@ -1409,92 +1408,8 @@ async fn get_task(
                     .json(json!({"message": "扫描结果索引暂时不可用"}));
             }
         }
-    } else {
-        let ip_rows = match connection
-            .query(
-                "SELECT ip_id, ip_address::text AS ip, asn, isp, as_org, \
-                 country_code, country_name, region_name, city_name FROM ips \
-                 WHERE execution_id = $1 ORDER BY ip_address LIMIT $2 OFFSET $3;",
-                &[&selected_execution_pk, &page_size, &offset],
-            )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                error_logs_error(&req, "GetTaskResultsError", "load_task_results", &error);
-                return HttpResponse::InternalServerError().finish();
-            }
-        };
-        let ip_ids: Vec<i32> = ip_rows.iter().map(|row| row.get("ip_id")).collect();
-        let mut ports_by_ip: HashMap<i32, Vec<TaskResultPort>> = HashMap::new();
-        if !ip_ids.is_empty() {
-            let port_rows = match connection
-                .query(
-                    "SELECT p.ip_id, p.port, latest.protocol, latest.service, latest.banner, \
-                     CASE WHEN latest.kind IS NULL THEN NULL \
-                     WHEN latest.kind = 'port' THEN jsonb_strip_nulls(jsonb_build_object( \
-                        'observation_kind', latest.kind, 'state', latest.data->>'state', 'source', latest.source)) \
-                     ELSE jsonb_strip_nulls(jsonb_build_object('observation_kind', latest.kind, \
-                        'source', latest.source, 'data', latest.data)) END AS other, \
-                     latest.scan_time FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
-                     LEFT JOIN LATERAL ( \
-                        SELECT o.kind, o.protocol, o.service, o.banner, o.source, o.data, \
-                            FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
-                        FROM scan_observation o \
-                        WHERE o.execution_id = i.execution_id \
-                            AND o.ip_address = i.ip_address AND o.port = p.port \
-                            AND o.kind IN ('port', 'service') \
-                        ORDER BY (o.kind = 'service') DESC, \
-                            (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
-                            o.observed_at DESC, o.id DESC LIMIT 1 \
-                     ) latest ON true \
-                     WHERE p.ip_id = ANY($1) ORDER BY p.ip_id, p.port;",
-                    &[&ip_ids],
-                )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    error_logs_error(&req, "GetTaskPortsError", "load_task_ports", &error);
-                    return HttpResponse::InternalServerError().finish();
-                }
-            };
-            for row in port_rows {
-                ports_by_ip
-                    .entry(row.get("ip_id"))
-                    .or_default()
-                    .push(TaskResultPort {
-                        port: row.get("port"),
-                        protocol: row.get("protocol"),
-                        service: row.get("service"),
-                        banner: row.get("banner"),
-                        other: row.get("other"),
-                        scan_time: row.get("scan_time"),
-                    });
-            }
-        }
-        ip_rows
-            .into_iter()
-            .map(|row| {
-                let ip_id: i32 = row.get("ip_id");
-                TaskResultIp {
-                    ip: row.get("ip"),
-                    asn: row.get("asn"),
-                    isp: row.get("isp"),
-                    as_org: row.get("as_org"),
-                    country_code: row.get("country_code"),
-                    country_name: row.get("country_name"),
-                    region_name: row.get("region_name"),
-                    city_name: row.get("city_name"),
-                    ports: ports_by_ip.remove(&ip_id).unwrap_or_default(),
-                }
-            })
-            .collect()
     };
-    let (vulnerabilities, vulnerability_count) = if elasticsearch
-        .scan_storage_mode()
-        .reads_elasticsearch()
-    {
+    let (vulnerabilities, vulnerability_count) = {
         match load_vulnerabilities_from_elasticsearch(
             elasticsearch.get_ref(),
             selected_execution.get::<_, String>("execution_id").as_str(),
@@ -1508,44 +1423,6 @@ async fn get_task(
                     .json(json!({"message": "漏洞结果索引暂时不可用"}));
             }
         }
-    } else {
-        let rows = match connection
-                .query(
-                    "SELECT jsonb_build_object( \
-                        'ip', host(ip_address), 'port', port, 'protocol', protocol, \
-                        'observed_at', FLOOR(EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT, \
-                        'template_id', data->>'template_id', 'name', data->>'name', \
-                        'severity', data->>'severity', 'matcher_name', data->>'matcher_name', \
-                        'matched_at', data->>'matched_at', 'description', data->>'description', \
-                        'remediation', data->>'remediation', 'tags', COALESCE(data->'tags', '[]'::jsonb), \
-                        'references', COALESCE(data->'references', '[]'::jsonb), \
-                        'classification', data->'classification', \
-                        'extracted_results', COALESCE(data->'extracted_results', '[]'::jsonb)) AS finding, \
-                        COUNT(*) OVER()::BIGINT AS total \
-                     FROM scan_observation WHERE execution_id = $1 AND kind = 'vulnerability' \
-                     ORDER BY observed_at DESC, id DESC LIMIT 500;",
-                    &[&selected_execution_pk],
-                )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    error_logs_error(
-                        &req,
-                        "GetTaskVulnerabilitiesError",
-                        "load_task_vulnerabilities",
-                        &error,
-                    );
-                    return HttpResponse::InternalServerError().finish();
-                }
-            };
-        let total = rows.first().map(|row| row.get("total")).unwrap_or(0_i64);
-        (
-            rows.into_iter()
-                .map(|row| row.get::<_, Value>("finding"))
-                .collect(),
-            total,
-        )
     };
     let generation_metadata = task.get::<_, Option<Value>>("generation_metadata");
     let stored_scan_profile = task.get::<_, String>("scan_profile");

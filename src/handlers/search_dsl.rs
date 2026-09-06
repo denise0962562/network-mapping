@@ -110,16 +110,10 @@ impl SearchSyntaxError {
 }
 
 #[derive(Debug)]
-pub(crate) struct CompiledFilter {
-    pub(crate) sql: String,
-    pub(crate) parameters: Vec<String>,
-}
-
-#[derive(Debug)]
 pub(crate) enum ElasticsearchCompilation {
     Supported(Value),
     RequiresElasticsearch(Value),
-    RequiresPostgres,
+    Unsupported,
 }
 
 pub(crate) fn parse_and_compile_elasticsearch(
@@ -128,7 +122,7 @@ pub(crate) fn parse_and_compile_elasticsearch(
     let (expression, normalized_query) = parse_expression(query)?;
     let mut compiler = ElasticsearchCompiler::default();
     let Some(filter) = compiler.compile_expr(&expression, false)? else {
-        return Ok(ElasticsearchCompilation::RequiresPostgres);
+        return Ok(ElasticsearchCompilation::Unsupported);
     };
     if compiler.predicate_count > MAX_PREDICATES {
         return Err(SearchSyntaxError::new(
@@ -685,23 +679,6 @@ impl Field {
     }
 }
 
-pub(crate) fn parse_and_compile(query: &str) -> Result<CompiledFilter, SearchSyntaxError> {
-    let (expression, query) = parse_expression(query)?;
-    let mut compiler = Compiler::default();
-    let sql = compiler.compile_expr(&expression, "result", false)?;
-    if compiler.predicate_count > MAX_PREDICATES {
-        return Err(SearchSyntaxError::new(
-            format!("查询条件不能超过 {MAX_PREDICATES} 个"),
-            0,
-            query.len(),
-        ));
-    }
-    Ok(CompiledFilter {
-        sql,
-        parameters: compiler.parameters,
-    })
-}
-
 fn parse_expression(query: &str) -> Result<(Expr, &str), SearchSyntaxError> {
     let query = query.trim();
     if query.is_empty() {
@@ -1128,425 +1105,6 @@ impl Parser {
     }
 }
 
-#[derive(Default)]
-struct Compiler {
-    parameters: Vec<String>,
-    predicate_count: usize,
-}
-
-impl Compiler {
-    fn compile_expr(
-        &mut self,
-        expression: &Expr,
-        alias: &str,
-        endpoint_scope: bool,
-    ) -> Result<String, SearchSyntaxError> {
-        match expression {
-            Expr::Predicate(predicate) => {
-                if endpoint_scope && !predicate.field.is_endpoint() {
-                    return Err(SearchSyntaxError::new(
-                        format!(
-                            "has_endpoint 中不能使用资产字段 {}",
-                            predicate.field.display_name()
-                        ),
-                        0,
-                        0,
-                    ));
-                }
-                self.predicate_count += 1;
-                self.compile_predicate(predicate, alias)
-            }
-            Expr::And(left, right) => Ok(format!(
-                "({} AND {})",
-                self.compile_expr(left, alias, endpoint_scope)?,
-                self.compile_expr(right, alias, endpoint_scope)?
-            )),
-            Expr::Or(left, right) => Ok(format!(
-                "({} OR {})",
-                self.compile_expr(left, alias, endpoint_scope)?,
-                self.compile_expr(right, alias, endpoint_scope)?
-            )),
-            Expr::Not(inner) => Ok(format!(
-                "(NOT {})",
-                self.compile_expr(inner, alias, endpoint_scope)?
-            )),
-            Expr::HasEndpoint(inner) => {
-                if endpoint_scope {
-                    return Err(SearchSyntaxError::new("has_endpoint 不能嵌套", 0, 0));
-                }
-                let predicate = self.compile_expr(inner, "candidate", true)?;
-                Ok(format!(
-                    "EXISTS (SELECT 1 FROM search_rows candidate WHERE candidate.ip_address = {alias}.ip_address AND {predicate})"
-                ))
-            }
-        }
-    }
-
-    fn compile_predicate(
-        &mut self,
-        predicate: &Predicate,
-        alias: &str,
-    ) -> Result<String, SearchSyntaxError> {
-        let operator = if predicate.operator == Operator::Colon {
-            predicate.field.default_colon_operator()
-        } else {
-            predicate.operator
-        };
-        if operator == Operator::Exists {
-            return self.compile_exists(predicate.field, alias);
-        }
-        if predicate.values.is_empty() {
-            return Err(SearchSyntaxError::new("搜索值不能为空", 0, 0));
-        }
-        match predicate.field {
-            Field::Ip => self.compile_ip(operator, &predicate.values, alias),
-            Field::Domain => Err(SearchSyntaxError::new(
-                "domain 搜索需要 Elasticsearch",
-                0,
-                0,
-            )),
-            Field::Port | Field::TagId => {
-                self.compile_integer(predicate.field, operator, &predicate.values, alias)
-            }
-            Field::FirstSeen | Field::LastSeen => {
-                self.compile_time(predicate.field, operator, &predicate.values, alias)
-            }
-            Field::Tag | Field::TagKind | Field::TagCategory => {
-                self.compile_tag(predicate.field, operator, &predicate.values, alias)
-            }
-            Field::Asn
-            | Field::Isp
-            | Field::Org
-            | Field::Country
-            | Field::City
-            | Field::Protocol
-            | Field::Service
-            | Field::Banner
-            | Field::Title
-            | Field::HttpBody
-            | Field::TlsSubject
-            | Field::Source
-            | Field::Scanner => {
-                self.compile_text(predicate.field, operator, &predicate.values, alias)
-            }
-        }
-    }
-
-    fn compile_exists(&self, field: Field, alias: &str) -> Result<String, SearchSyntaxError> {
-        let sql = match field {
-            Field::Ip => "TRUE".to_owned(),
-            Field::Domain => return Err(SearchSyntaxError::new("字段 domain 不支持 EXISTS", 0, 0)),
-            Field::Port => format!("{alias}.port > 0"),
-            Field::Tag | Field::TagId | Field::TagKind | Field::TagCategory => format!(
-                "EXISTS (SELECT 1 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id JOIN asset_tag_category category ON category.id = tag.category_id WHERE assignment.ip_address = {alias}.ip_address AND tag.is_active AND category.is_active)"
-            ),
-            Field::FirstSeen => format!("{alias}.first_seen_at IS NOT NULL"),
-            Field::LastSeen => format!("{alias}.last_seen_at IS NOT NULL"),
-            field => format!(
-                "NULLIF(BTRIM({}), '') IS NOT NULL",
-                text_column(field, alias).ok_or_else(|| {
-                    SearchSyntaxError::new(
-                        format!("字段 {} 不支持 EXISTS", field.display_name()),
-                        0,
-                        0,
-                    )
-                })?
-            ),
-        };
-        Ok(sql)
-    }
-
-    fn compile_ip(
-        &mut self,
-        operator: Operator,
-        values: &[String],
-        alias: &str,
-    ) -> Result<String, SearchSyntaxError> {
-        if matches!(
-            operator,
-            Operator::Contains
-                | Operator::NotContains
-                | Operator::Greater
-                | Operator::GreaterEq
-                | Operator::Less
-                | Operator::LessEq
-        ) {
-            return Err(unsupported_operator(Field::Ip));
-        }
-        let mut clauses = Vec::new();
-        for value in values {
-            if value.contains('/') {
-                let network = normalize_network(value)?;
-                let parameter = self.push_parameter(network);
-                clauses.push(format!("{alias}.ip_address <<= {parameter}::TEXT::INET"));
-            } else {
-                let ip = IpAddr::from_str(value)
-                    .map_err(|_| SearchSyntaxError::new("IP 地址格式无效", 0, 0))?;
-                let parameter = self.push_parameter(ip.to_string());
-                clauses.push(format!("{alias}.ip_address = {parameter}::TEXT::INET"));
-            }
-        }
-        let joined = join_exact_clauses(operator, clauses)?;
-        Ok(joined)
-    }
-
-    fn compile_integer(
-        &mut self,
-        field: Field,
-        operator: Operator,
-        values: &[String],
-        alias: &str,
-    ) -> Result<String, SearchSyntaxError> {
-        if matches!(operator, Operator::Contains | Operator::NotContains) {
-            return Err(unsupported_operator(field));
-        }
-        if !matches!(operator, Operator::In | Operator::NotIn) && values.len() != 1 {
-            return Err(unsupported_operator(field));
-        }
-        let column = if field == Field::Port {
-            format!("{alias}.port")
-        } else {
-            "tag.id".to_owned()
-        };
-        let mut clauses = Vec::new();
-        for value in values {
-            let parsed = value.parse::<i64>().map_err(|_| {
-                SearchSyntaxError::new(format!("{} 必须是数字", field.display_name()), 0, 0)
-            })?;
-            if field == Field::Port && !(1..=65_535).contains(&parsed) {
-                return Err(SearchSyntaxError::new("端口必须在 1 到 65535 之间", 0, 0));
-            }
-            if field == Field::TagId && parsed <= 0 {
-                return Err(SearchSyntaxError::new("tag.id 必须是正整数", 0, 0));
-            }
-            let parameter = self.push_parameter(parsed.to_string());
-            clauses.push(format!("{column} = {parameter}::TEXT::BIGINT"));
-        }
-        if field == Field::TagId {
-            return self.wrap_tag_exists(operator, clauses, alias);
-        }
-        if matches!(
-            operator,
-            Operator::Greater
-                | Operator::GreaterEq
-                | Operator::Less
-                | Operator::LessEq
-                | Operator::Eq
-                | Operator::NotEq
-        ) {
-            let parameter = clauses.into_iter().next().expect("one clause");
-            let eq_fragment = parameter
-                .split_once(" = ")
-                .map(|(_, value)| value)
-                .expect("integer equality fragment");
-            let symbol = sql_operator(operator)?;
-            return Ok(format!("{column} {symbol} {eq_fragment}"));
-        }
-        join_exact_clauses(operator, clauses)
-    }
-
-    fn compile_time(
-        &mut self,
-        field: Field,
-        operator: Operator,
-        values: &[String],
-        alias: &str,
-    ) -> Result<String, SearchSyntaxError> {
-        if values.len() != 1
-            || !matches!(
-                operator,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Greater
-                    | Operator::GreaterEq
-                    | Operator::Less
-                    | Operator::LessEq
-            )
-        {
-            return Err(unsupported_operator(field));
-        }
-        let normalized = normalize_time(&values[0])?;
-        let parameter = self.push_parameter(normalized);
-        let column = if field == Field::FirstSeen {
-            format!("{alias}.first_seen_at")
-        } else {
-            format!("{alias}.last_seen_at")
-        };
-        Ok(format!(
-            "{column} {} {parameter}::TEXT::TIMESTAMPTZ",
-            sql_operator(operator)?
-        ))
-    }
-
-    fn compile_tag(
-        &mut self,
-        field: Field,
-        operator: Operator,
-        values: &[String],
-        alias: &str,
-    ) -> Result<String, SearchSyntaxError> {
-        if matches!(
-            operator,
-            Operator::Greater | Operator::GreaterEq | Operator::Less | Operator::LessEq
-        ) {
-            return Err(unsupported_operator(field));
-        }
-        let column = match field {
-            Field::Tag => "tag.name",
-            Field::TagKind => "tag.kind",
-            Field::TagCategory => "category.name",
-            _ => unreachable!("compile_tag only accepts tag text fields"),
-        };
-        let mut clauses = Vec::new();
-        for value in values {
-            validate_text_value(field, value)?;
-            let parameter = self.push_parameter(
-                if matches!(operator, Operator::Contains | Operator::NotContains) {
-                    escape_like(value)
-                } else {
-                    value.to_owned()
-                },
-            );
-            let clause = if matches!(operator, Operator::Contains | Operator::NotContains) {
-                format!("{column} ILIKE '%' || {parameter} || '%' ESCAPE E'\\\\'")
-            } else {
-                format!("LOWER({column}) = LOWER({parameter})")
-            };
-            clauses.push(clause);
-        }
-        self.wrap_tag_exists(operator, clauses, alias)
-    }
-
-    fn wrap_tag_exists(
-        &self,
-        operator: Operator,
-        clauses: Vec<String>,
-        alias: &str,
-    ) -> Result<String, SearchSyntaxError> {
-        let negative = matches!(
-            operator,
-            Operator::NotEq | Operator::NotContains | Operator::NotIn
-        );
-        if !matches!(
-            operator,
-            Operator::Eq
-                | Operator::NotEq
-                | Operator::Contains
-                | Operator::NotContains
-                | Operator::In
-                | Operator::NotIn
-        ) {
-            return Err(SearchSyntaxError::new("标签不支持该操作符", 0, 0));
-        }
-        let condition = clauses.join(" OR ");
-        Ok(format!(
-            "{}EXISTS (SELECT 1 FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id JOIN asset_tag_category category ON category.id = tag.category_id WHERE assignment.ip_address = {alias}.ip_address AND tag.is_active AND category.is_active AND ({condition}))",
-            if negative { "NOT " } else { "" }
-        ))
-    }
-
-    fn compile_text(
-        &mut self,
-        field: Field,
-        operator: Operator,
-        values: &[String],
-        alias: &str,
-    ) -> Result<String, SearchSyntaxError> {
-        if matches!(
-            operator,
-            Operator::Greater | Operator::GreaterEq | Operator::Less | Operator::LessEq
-        ) {
-            return Err(unsupported_operator(field));
-        }
-        let column = text_column(field, alias).ok_or_else(|| unsupported_operator(field))?;
-        let mut clauses = Vec::new();
-        for raw_value in values {
-            validate_text_value(field, raw_value)?;
-            let value = if field == Field::Asn {
-                raw_value
-                    .strip_prefix("AS")
-                    .or_else(|| raw_value.strip_prefix("as"))
-                    .unwrap_or(raw_value)
-                    .to_owned()
-            } else if matches!(operator, Operator::Contains | Operator::NotContains) {
-                escape_like(raw_value)
-            } else {
-                raw_value.to_owned()
-            };
-            let parameter = self.push_parameter(value);
-            let clause = if matches!(operator, Operator::Contains | Operator::NotContains) {
-                format!("{column} ILIKE '%' || {parameter} || '%' ESCAPE E'\\\\'")
-            } else if field == Field::Asn {
-                format!(
-                    "REGEXP_REPLACE(UPPER(COALESCE({column}, '')), '^AS', '') = REGEXP_REPLACE(UPPER({parameter}), '^AS', '')"
-                )
-            } else {
-                format!("LOWER({column}) = LOWER({parameter})")
-            };
-            clauses.push(clause);
-        }
-        if matches!(operator, Operator::Eq | Operator::Contains) && values.len() == 1 {
-            return Ok(clauses.remove(0));
-        }
-        if matches!(operator, Operator::NotEq | Operator::NotContains) && values.len() == 1 {
-            return Ok(format!("NOT ({})", clauses.remove(0)));
-        }
-        join_exact_clauses(operator, clauses)
-    }
-
-    fn push_parameter(&mut self, value: String) -> String {
-        self.parameters.push(value);
-        format!("${}", self.parameters.len() + 2)
-    }
-}
-
-fn text_column(field: Field, alias: &str) -> Option<String> {
-    let name = match field {
-        Field::Asn => "asn",
-        Field::Isp => "isp",
-        Field::Org => "as_org",
-        Field::Country => "country_code",
-        Field::City => "city_name",
-        Field::Protocol => "protocol",
-        Field::Service => "service",
-        Field::Banner => "banner",
-        Field::Title => "title",
-        Field::HttpBody => "http_body",
-        Field::TlsSubject => "tls_subject",
-        Field::Source => "source",
-        Field::Scanner => "scanner_name",
-        _ => return None,
-    };
-    Some(format!("{alias}.{name}"))
-}
-
-fn join_exact_clauses(
-    operator: Operator,
-    clauses: Vec<String>,
-) -> Result<String, SearchSyntaxError> {
-    match operator {
-        Operator::Eq | Operator::Contains | Operator::In => {
-            Ok(format!("({})", clauses.join(" OR ")))
-        }
-        Operator::NotEq | Operator::NotContains | Operator::NotIn => {
-            Ok(format!("NOT ({})", clauses.join(" OR ")))
-        }
-        _ => Err(SearchSyntaxError::new("字段不支持该操作符", 0, 0)),
-    }
-}
-
-fn sql_operator(operator: Operator) -> Result<&'static str, SearchSyntaxError> {
-    match operator {
-        Operator::Eq => Ok("="),
-        Operator::NotEq => Ok("<>"),
-        Operator::Greater => Ok(">"),
-        Operator::GreaterEq => Ok(">="),
-        Operator::Less => Ok("<"),
-        Operator::LessEq => Ok("<="),
-        _ => Err(SearchSyntaxError::new("字段不支持该操作符", 0, 0)),
-    }
-}
-
 fn normalize_network(value: &str) -> Result<String, SearchSyntaxError> {
     let Some((ip, prefix)) = value.split_once('/') else {
         return Err(SearchSyntaxError::new("CIDR 必须包含前缀长度", 0, 0));
@@ -1639,13 +1197,6 @@ fn normalize_domain(value: &str) -> Result<String, SearchSyntaxError> {
         .map_err(|_| SearchSyntaxError::new("domain 必须是有效域名", 0, 0))
 }
 
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn unsupported_operator(field: Field) -> SearchSyntaxError {
     SearchSyntaxError::new(
         format!("字段 {} 不支持该操作符", field.display_name()),
@@ -1656,57 +1207,53 @@ fn unsupported_operator(field: Field) -> SearchSyntaxError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ElasticsearchCompilation, parse_and_compile, parse_and_compile_elasticsearch};
+    use super::{ElasticsearchCompilation, parse_and_compile_elasticsearch};
+    fn filter(query: &str) -> serde_json::Value {
+        match parse_and_compile_elasticsearch(query).unwrap() {
+            ElasticsearchCompilation::Supported(value)
+            | ElasticsearchCompilation::RequiresElasticsearch(value) => value,
+            ElasticsearchCompilation::Unsupported => panic!("unsupported query: {query}"),
+        }
+    }
 
     #[test]
     fn compiles_boolean_precedence_and_bound_values() {
-        let compiled = parse_and_compile("country = CN OR port = 443 AND service = \"https\"")
-            .expect("query should compile");
-
-        assert!(compiled.sql.contains(" OR ("));
-        assert!(compiled.sql.contains("result.port = $4::TEXT::BIGINT"));
-        assert_eq!(compiled.parameters, vec!["CN", "443", "https"]);
+        let value = filter("country = CN OR port = 443 AND service = \"https\"");
+        let text = value.to_string();
+        assert!(text.contains("should"));
+        assert!(text.contains("443"));
+        assert!(text.contains("https"));
     }
 
     #[test]
     fn supports_legacy_syntax_and_ipv6() {
-        let service = parse_and_compile("service:https").expect("legacy service query");
-        assert!(service.sql.contains("ILIKE"));
-        assert_eq!(service.parameters, vec!["https"]);
-
-        let ipv6 = parse_and_compile("2001:db8::1").expect("bare ipv6 query");
-        assert!(ipv6.sql.contains("result.ip_address = $3::TEXT::INET"));
-        assert_eq!(ipv6.parameters, vec!["2001:db8::1"]);
+        assert!(filter("service:https").to_string().contains("*https*"));
+        assert!(filter("2001:db8::1").to_string().contains("2001:db8::1"));
     }
 
     #[test]
     fn normalizes_cidr_and_compiles_tag_existence() {
-        let compiled = parse_and_compile("ip IN 192.168.1.123/24 AND tag = \"生产环境\"")
-            .expect("network and tag query");
-        assert_eq!(compiled.parameters[0], "192.168.1.0/24");
-        assert!(compiled.sql.contains("asset_ip_tag"));
+        let text = filter("ip IN 192.168.1.123/24 AND tag = \"生产环境\"").to_string();
+        assert!(text.contains("192.168.1.0/24"));
+        assert!(text.contains("生产环境"));
     }
 
     #[test]
     fn compiles_asset_level_endpoint_requirements() {
-        let compiled = parse_and_compile("has_endpoint(port = 80) AND has_endpoint(port = 443)")
-            .expect("endpoint requirements");
-        assert_eq!(
-            compiled.sql.matches("FROM search_rows candidate").count(),
-            2
-        );
+        let text = filter("has_endpoint(port = 80) AND has_endpoint(port = 443)").to_string();
+        assert_eq!(text.matches("network_mapping_has_endpoint").count(), 2);
     }
 
     #[test]
     fn rejects_asset_fields_inside_endpoint_scope() {
-        let error = parse_and_compile("has_endpoint(tag = prod)")
+        let error = parse_and_compile_elasticsearch("has_endpoint(tag = prod)")
             .expect_err("asset field must be rejected");
         assert!(error.message.contains("不能使用资产字段"));
     }
 
     #[test]
     fn reports_missing_boolean_operator() {
-        let error = parse_and_compile("port = 80 service = http")
+        let error = parse_and_compile_elasticsearch("port = 80 service = http")
             .expect_err("implicit boolean operator must be rejected");
         assert_eq!(error.message, "条件之间需要使用 AND 或 OR");
         assert!(error.start > 0);
@@ -1718,28 +1265,27 @@ mod tests {
             .map(|port| format!("port != {port}"))
             .collect::<Vec<_>>()
             .join(" AND ");
-        parse_and_compile(&query).expect("flat conditions are not nested expressions");
+        parse_and_compile_elasticsearch(&query)
+            .expect("flat conditions are not nested expressions");
     }
 
     #[test]
     fn negative_tag_means_not_exists() {
-        let compiled = parse_and_compile("tag != retired").expect("negative tag query");
-        assert!(compiled.sql.contains("NOT EXISTS"));
+        assert!(filter("tag != retired").to_string().contains("must_not"));
     }
 
     #[test]
     fn rejects_overflowing_relative_time_without_panicking() {
-        let error = parse_and_compile("last_seen >= now-9223372036854775807w")
+        let error = parse_and_compile_elasticsearch("last_seen >= now-9223372036854775807w")
             .expect_err("overflowing relative time must be rejected");
         assert_eq!(error.message, "相对时间超出允许范围");
     }
 
     #[test]
-    fn keeps_search_values_out_of_generated_sql() {
-        let compiled = parse_and_compile("service = \"https' OR TRUE --\"")
-            .expect("hostile-looking text remains a bound value");
-        assert!(!compiled.sql.contains("OR TRUE"));
-        assert_eq!(compiled.parameters, vec!["https' OR TRUE --"]);
+    fn keeps_search_values_as_literal_dsl_values() {
+        let value = filter("service = \"https' OR TRUE --\"");
+        assert!(value.to_string().contains("https' or true --"));
+        assert!(value.get("term").is_some() || value.get("bool").is_some());
     }
 
     #[test]
@@ -1825,28 +1371,20 @@ mod tests {
 
     #[test]
     fn supports_http_and_tls_search_fields() {
-        let sql =
-            parse_and_compile("title ~ camera AND http.body ~ hikvision AND tls.subject ~ example")
-                .expect("new searchable fields should compile");
-        assert!(sql.sql.contains("result.title ILIKE"));
-        assert!(sql.sql.contains("result.http_body ILIKE"));
-        assert!(sql.sql.contains("result.tls_subject ILIKE"));
+        let text = filter("title ~ camera AND http.body ~ hikvision AND tls.subject ~ example")
+            .to_string();
+        for field in ["title", "http_body", "tls_subject"] {
+            assert!(text.contains(field));
+        }
     }
 
     #[test]
-    fn compiles_tag_category_for_postgres_and_elasticsearch() {
-        let sql = parse_and_compile("tag.category = \"运行环境\"")
-            .expect("tag category should compile for PostgreSQL");
-        assert!(sql.sql.contains("asset_tag_category category"));
-        assert!(sql.sql.contains("LOWER(category.name)"));
-
-        let ElasticsearchCompilation::Supported(filter) =
-            parse_and_compile_elasticsearch("tag.category = \"运行环境\"")
-                .expect("tag category should compile for Elasticsearch")
-        else {
-            panic!("tag category should be supported by Elasticsearch");
-        };
-        assert!(filter.to_string().contains("tags.category_name"));
+    fn compiles_tag_category_for_elasticsearch() {
+        assert!(
+            filter("tag.category = \"运行环境\"")
+                .to_string()
+                .contains("tags.category_name")
+        );
     }
 
     #[test]
@@ -1868,7 +1406,7 @@ mod tests {
         ];
 
         for query in queries {
-            parse_and_compile(query).unwrap_or_else(|error| {
+            parse_and_compile_elasticsearch(query).unwrap_or_else(|error| {
                 panic!("documented query failed: {query}: {}", error.message)
             });
         }
