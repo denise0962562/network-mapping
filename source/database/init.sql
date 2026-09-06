@@ -440,6 +440,16 @@ CREATE TABLE IF NOT EXISTS analytics_watermark (
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- A fixed set of executions, independent of arrivals during a backfill.
+CREATE TABLE IF NOT EXISTS analytics_snapshot_build (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS analytics_snapshot_build_execution (
+    execution_id INT PRIMARY KEY REFERENCES analytics_outbox(execution_id) ON DELETE CASCADE
+);
+
 -- 将尚未进入 typed observation 模型的 v1 scaninfo 历史记录回填到合成批次。
 -- 使用动态 SQL，确保 scaninfo 已由用户手动删除或新安装不存在时仍可正常初始化。
 -- 限定为完全没有 observation 的 execution，避免把旧双写时期的兼容镜像重复导入。

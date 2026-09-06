@@ -431,6 +431,7 @@ impl ElasticsearchService {
                 |request| request.json(body),
             )
             .await?;
+        validate_scan_search_response(&result)?;
         self.mark_success();
         Ok(result)
     }
@@ -2784,6 +2785,21 @@ impl ElasticsearchService {
     }
 }
 
+pub(crate) fn validate_scan_search_response(result: &Value) -> Result<(), String> {
+    if result.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        return Err("Elasticsearch 扫描查询超时，拒绝使用不完整统计".to_owned());
+    }
+    if result
+        .pointer("/_shards/failed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        return Err("Elasticsearch 扫描查询存在失败分片，拒绝使用不完整统计".to_owned());
+    }
+    Ok(())
+}
+
 fn dns_task_observations_search_body(task_id: &str) -> Value {
     json!({
         "size": 10_000,
@@ -4096,6 +4112,27 @@ fn index_definition() -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scan_search_rejects_partial_results_even_with_http_success() {
+        assert!(
+            super::validate_scan_search_response(&serde_json::json!({
+                "timed_out": false, "_shards": {"failed": 0}
+            }))
+            .is_ok()
+        );
+        assert!(
+            super::validate_scan_search_response(&serde_json::json!({
+                "timed_out": true, "_shards": {"failed": 0}, "hits": {"hits": []}
+            }))
+            .is_err()
+        );
+        assert!(
+            super::validate_scan_search_response(&serde_json::json!({
+                "timed_out": false, "_shards": {"failed": 1}, "hits": {"hits": []}
+            }))
+            .is_err()
+        );
+    }
     use super::{
         ENSURE_LEGACY_SEARCH_PROJECTION_INDEX_SQL, ENSURE_SCAN_MIGRATION_INDEX_SQL,
         ElasticsearchOperation, ElasticsearchService, ScanBatchContext, bulk_response_is_retryable,

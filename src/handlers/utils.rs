@@ -107,6 +107,7 @@ pub async fn get_server_config_h(
 async fn get_runtime_config_h(
     namespace: web::Path<String>,
     settings: web::Data<RuntimeSettings>,
+    pool: web::Data<deadpool_postgres::Pool>,
     user: UserBaseI,
 ) -> impl Responder {
     if user.role != 1 {
@@ -132,7 +133,17 @@ async fn get_runtime_config_h(
         }
         ANALYTICS_SNAPSHOT_NAMESPACE => {
             let value = settings.analytics_snapshot.get().await;
-            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: ANALYTICS_SNAPSHOT_NAMESPACE, revision: value.revision, document: value.value }}))
+            let progress = match pool.get().await {
+                Ok(client) => crate::analytics_snapshot::snapshot_progress(&client)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            HttpResponse::Ok().json(json!({"success": true,
+                "data": RuntimeConfigResponse { namespace: ANALYTICS_SNAPSHOT_NAMESPACE, revision: value.revision, document: value.value },
+                "progress": progress.as_ref().ok(),
+                "progress_error": progress.as_ref().err()
+            }))
         }
         _ => {
             HttpResponse::NotFound().json(json!({"success": false, "message": "未知运行时配置域"}))

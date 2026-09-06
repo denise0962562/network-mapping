@@ -430,6 +430,25 @@ async fn snapshot_data_as_of(
     Ok(row.map(|row| row.get("data_as_of")))
 }
 
+async fn snapshot_not_ready(client: &deadpool_postgres::Client, user: &UserBaseI) -> HttpResponse {
+    if user.role == 1 {
+        match crate::analytics_snapshot::snapshot_progress(client).await {
+            Ok(progress) => return HttpResponse::ServiceUnavailable().json(json!({
+                "success": false, "code": "analytics_backfill_pending",
+                "message": format!("分析快照历史回填尚未完成：本轮剩余 {} 个执行，队列待处理 {} 个、处理中 {} 个、失败待重试 {} 个。",
+                    progress.remaining, progress.pending, progress.running, progress.retrying),
+                "progress": progress
+            })),
+            Err(_) => return HttpResponse::ServiceUnavailable().json(json!({
+                "success": false, "code": "analytics_progress_unavailable", "message": "分析快照状态读取失败，请检查数据库及迁移状态"
+            })),
+        }
+    }
+    HttpResponse::ServiceUnavailable().json(json!({
+        "success": false, "code": "analytics_backfill_pending", "message": "分析快照尚未完成历史回填，请联系管理员查看统计任务进度"
+    }))
+}
+
 async fn analysis_distribution_from_snapshot(
     req: &HttpRequest,
     pool: &Pool,
@@ -453,8 +472,7 @@ async fn analysis_distribution_from_snapshot(
     let data_as_of = match snapshot_data_as_of(&client).await {
         Ok(Some(value)) => value,
         Ok(None) => {
-            return HttpResponse::ServiceUnavailable()
-                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+            return snapshot_not_ready(&client, user).await;
         }
         Err(error) => {
             error_logs_error(
@@ -464,7 +482,7 @@ async fn analysis_distribution_from_snapshot(
                 &error,
             );
             return HttpResponse::ServiceUnavailable()
-                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+                .json(json!({"success": false, "code": "analytics_watermark_unavailable", "message": "分析快照水位读取失败，请检查数据库及迁移状态"}));
         }
     };
     let mut conditions = vec![
@@ -560,8 +578,7 @@ async fn analysis_heatmap_from_snapshot(
     let data_as_of = match snapshot_data_as_of(&client).await {
         Ok(Some(value)) => value,
         Ok(None) => {
-            return HttpResponse::ServiceUnavailable()
-                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+            return snapshot_not_ready(&client, user).await;
         }
         Err(error) => {
             error_logs_error(
@@ -571,7 +588,7 @@ async fn analysis_heatmap_from_snapshot(
                 &error,
             );
             return HttpResponse::ServiceUnavailable()
-                .json(json!({"success": false, "message": "分析快照尚未完成历史回填"}));
+                .json(json!({"success": false, "code": "analytics_watermark_unavailable", "message": "分析快照水位读取失败，请检查数据库及迁移状态"}));
         }
     };
     let mut conditions = vec![
