@@ -453,6 +453,31 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_network_rtt_us BIGINT;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_server_processing_us BIGINT;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_measured_at TIMESTAMPTZ;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_probe_id UUID;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS applied_config_revision BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS config_status TEXT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS config_error TEXT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS config_reported_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS scanner_runtime_configuration (
+	scanner_id VARCHAR(36) PRIMARY KEY REFERENCES scanner_info(scanner_id) ON DELETE CASCADE,
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+	schema_version INT NOT NULL DEFAULT 1 CHECK (schema_version > 0),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_by_user_id INT REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS scanner_runtime_configuration_revision (
+	id BIGSERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL REFERENCES scanner_info(scanner_id) ON DELETE CASCADE,
+	revision BIGINT NOT NULL CHECK (revision > 0),
+	schema_version INT NOT NULL CHECK (schema_version > 0),
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	changed_by_user_id INT REFERENCES users(id),
+	change_reason TEXT NOT NULL DEFAULT '',
+	UNIQUE(scanner_id, revision)
+);
 
 -- 扫描器到服务端的 HTTPS 心跳延迟历史。最新值同时冗余在 scanner_info，
 -- 避免扫描器列表查询历史表。

@@ -31,6 +31,7 @@ pub mod open_source;
 pub mod request_log;
 pub mod runtime_config;
 pub mod scan_migration;
+pub mod scanner_config;
 pub mod scanner_latency;
 mod search_content;
 pub mod search_projection;

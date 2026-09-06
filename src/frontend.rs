@@ -134,6 +134,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::head().to(spa_entry)),
     )
     .service(
+        web::resource("/scanner/{scanner_id}/configuration")
+            .route(web::get().to(spa_entry))
+            .route(web::head().to(spa_entry)),
+    )
+    .service(
         web::resource("/login")
             .route(web::get().to(login_page))
             .route(web::head().to(login_page)),
@@ -180,6 +185,16 @@ pub fn is_spa_path(path: &str) -> bool {
     }
 
     if let Some(scanner_id) = single_path_parameter(path, "/scanner/") {
+        return uuid::Uuid::parse_str(scanner_id)
+            .map(|value| value.get_variant() == Variant::RFC4122)
+            .unwrap_or(false);
+    }
+
+    if let Some(scanner_id) = path
+        .strip_prefix("/scanner/")
+        .and_then(|value| value.strip_suffix("/configuration"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
         return uuid::Uuid::parse_str(scanner_id)
             .map(|value| value.get_variant() == Variant::RFC4122)
             .unwrap_or(false);
@@ -352,12 +367,16 @@ mod tests {
         assert!(!is_spa_path("/asset"));
         assert!(is_spa_path("/task/019c0000-0000-7000-8000-000000000001"));
         assert!(is_spa_path("/scanner/019c0000-0000-4000-8000-000000000001"));
+        assert!(is_spa_path(
+            "/scanner/019c0000-0000-4000-8000-000000000001/configuration"
+        ));
 
         assert!(!is_spa_path("/unknown"));
         assert!(!is_spa_path("/api/audit/events"));
         assert!(!is_spa_path("/task/not-a-uuid"));
         assert!(!is_spa_path("/task/019c0000-0000-4000-8000-000000000001"));
         assert!(!is_spa_path("/scanner/id/extra"));
+        assert!(!is_spa_path("/scanner/not-a-uuid/configuration"));
         assert!(!is_spa_path(
             "/scanner/00000000-0000-0000-0000-000000000000"
         ));

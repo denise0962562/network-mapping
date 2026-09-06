@@ -191,6 +191,18 @@ struct ScannerHeartbeatResponse {
     lease: Option<ScannerHeartbeatLease>,
     command: Option<ScannerHeartbeatCommand>,
     maintenance: Option<MaintenanceSnapshot>,
+    configuration: Option<crate::scanner_config::ScannerConfigurationNotice>,
+}
+
+#[derive(Default, Deserialize)]
+struct ScannerConfigurationState {
+    #[serde(default)]
+    supported_schema_versions: Vec<i32>,
+    applied_revision: Option<i64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +228,8 @@ pub struct ScannerHeartbeat {
     scan_capabilities: ScannerScanCapabilities,
     #[serde(default)]
     latency_report: Option<ScannerLatencyReport>,
+    #[serde(default)]
+    config_state: ScannerConfigurationState,
 }
 
 const LATENCY_PROTOCOL_VERSION: u16 = 1;
@@ -715,6 +729,29 @@ pub(crate) async fn scanner_heartbeat_handler(
     if let Err(message) = heartbeat.scan_capabilities.validate() {
         return HttpResponse::BadRequest().body(message);
     }
+    if heartbeat.config_state.supported_schema_versions.len() > 8
+        || heartbeat
+            .config_state
+            .supported_schema_versions
+            .iter()
+            .any(|value| *value <= 0)
+        || heartbeat
+            .config_state
+            .applied_revision
+            .is_some_and(|value| value <= 0)
+        || heartbeat
+            .config_state
+            .error
+            .as_ref()
+            .is_some_and(|value| value.len() > 500)
+        || heartbeat
+            .config_state
+            .status
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "local" | "staged" | "applied" | "rejected"))
+    {
+        return HttpResponse::BadRequest().body("invalid scanner configuration state");
+    }
     let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
         Ok(value) => value,
         Err(error) => {
@@ -881,6 +918,52 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     }
+    let configuration =
+        match crate::scanner_config::load_configuration(&scanner_transaction, &scanner_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => return HttpResponse::Unauthorized().finish(),
+            Err(error) => {
+                error_logs_error(
+                    &req,
+                    "ScannerConfigurationHeartbeatError",
+                    "load_configuration",
+                    error.as_ref(),
+                );
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+    if !heartbeat.config_state.supported_schema_versions.is_empty()
+        && let Err(error) = scanner_transaction
+            .execute(
+                "UPDATE scanner_info SET applied_config_revision = $1, config_status = $2, \
+                 config_error = $3, config_reported_at = NOW() WHERE scanner_id = $4;",
+                &[
+                    &heartbeat.config_state.applied_revision,
+                    &heartbeat.config_state.status,
+                    &heartbeat.config_state.error,
+                    &scanner_id,
+                ],
+            )
+            .await
+    {
+        error_logs_error(
+            &req,
+            "ScannerConfigurationStateError",
+            "update_configuration_state",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
+    let configuration_notice = heartbeat
+        .config_state
+        .supported_schema_versions
+        .contains(&configuration.schema_version)
+        .then_some(configuration)
+        .filter(|value| heartbeat.config_state.applied_revision != Some(value.revision))
+        .map(|value| crate::scanner_config::ScannerConfigurationNotice {
+            revision: value.revision,
+            schema_version: value.schema_version,
+        });
     // 扫描器状态行与任务执行行使用两个短事务。过去这里会在等待任务租约锁时一直
     // 持有 scanner_info 行锁，导致同一扫描器后续心跳形成分钟级锁队列。
     if let Err(error) = scanner_transaction.commit().await {
@@ -1002,6 +1085,7 @@ pub(crate) async fn scanner_heartbeat_handler(
             task_id,
         }),
         maintenance: maintenance_snapshot.enabled.then_some(maintenance_snapshot),
+        configuration: configuration_notice,
     })
 }
 
@@ -2646,6 +2730,7 @@ mod tests {
             }),
             command: None,
             maintenance: None,
+            configuration: None,
         })
         .unwrap();
 
