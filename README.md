@@ -112,6 +112,8 @@ API 请求响应和限制参见[资产搜索语法与 API](docs/SEARCH_SYNTAX.md
 服务端可分阶段将 Elasticsearch 9.5.2 从搜索读模型升级为扫描事实的权威存储，PostgreSQL
 仅保留用户、权限、任务、标签和上传回执等控制面数据。双写迁移、幂等回填、切换检查、
 查询覆盖、快照和回滚流程参见[Elasticsearch 9.5.2 扫描存储与搜索](docs/ELASTICSEARCH.md)。
+扫描事实统一使用 ES、逐步退役 PG 事实兼容路径的实施顺序和验收门槛参见
+[扫描结果 ES 存储实施方案](docs/ES_SCAN_STORAGE_PLAN.md)。
 
 ## 扫描器调度
 
