@@ -12,9 +12,9 @@ use crate::system_maintenance::{
     MaintenanceSnapshot, SystemMaintenanceState, maintenance_response,
 };
 use crate::{
-    ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
-    TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
-    validate_scanner_credentials,
+    ApplyTaskError, ApplyTaskQuery, CreateTask, CurrentTaskQuery, ReceiveTaskItemQueryInfo, STask,
+    TargetIP, TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
+    recover_scanner_task, validate_scanner_credentials,
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
@@ -2209,6 +2209,67 @@ async fn create_dns_task(
     }))
 }
 
+/// 返回并续租当前扫描器已经持有的未完成任务。
+#[get("/api/task/current")]
+async fn current_task_handler(
+    req: HttpRequest,
+    query: web::Query<CurrentTaskQuery>,
+    pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
+    maintenance: web::Data<SystemMaintenanceState>,
+) -> impl Responder {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+
+    let maintenance_snapshot = maintenance.snapshot().await;
+    let blocks_recovery = maintenance_snapshot.blocks_all_scanner_requests()
+        || (query.taskid.is_none() && maintenance_snapshot.blocks_new_work());
+    if let Some(response) = maintenance_gate_for_runtime_scanner(
+        pool.get_ref(),
+        security.get_ref(),
+        query.scannerid,
+        token,
+        maintenance_snapshot,
+        blocks_recovery,
+    )
+    .await
+    {
+        return response;
+    }
+
+    match recover_scanner_task(
+        pool.get_ref(),
+        query.scannerid,
+        query.taskid,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
+        Ok(task) => HttpResponse::Ok().json(task),
+        Err(ApplyTaskError::ScannerUnauthorized) => {
+            HttpResponse::Unauthorized().body("unauthorized")
+        }
+        Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
+        Err(ApplyTaskError::UnfinishedTask(_)) => unreachable!("recovery never claims new work"),
+        Err(ApplyTaskError::Database(error)) => {
+            error_logs_error(
+                &req,
+                "RecoverTaskDatabaseError",
+                "recover_scanner_task",
+                error.as_ref(),
+            );
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
 /// 用于扫描器申请一个扫描目标
 #[get("/api/task/apply")]
 async fn apply_task_handler(
@@ -2256,6 +2317,11 @@ async fn apply_task_handler(
             Err(ApplyTaskError::ScannerUnauthorized) => {
                 HttpResponse::Unauthorized().body("unauthorized")
             }
+            Err(ApplyTaskError::UnfinishedTask(task_id)) => HttpResponse::Conflict().json(json!({
+                "success": false,
+                "code": "unfinished_task_exists",
+                "task_id": task_id,
+            })),
             Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
             Err(ApplyTaskError::Database(e)) => {
                 error_logs_error(
@@ -2281,6 +2347,11 @@ async fn apply_task_handler(
         Err(ApplyTaskError::ScannerUnauthorized) => {
             HttpResponse::Unauthorized().body("unauthorized")
         }
+        Err(ApplyTaskError::UnfinishedTask(task_id)) => HttpResponse::Conflict().json(json!({
+            "success": false,
+            "code": "unfinished_task_exists",
+            "task_id": task_id,
+        })),
         Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
         Err(ApplyTaskError::Database(e)) => {
             error_logs_error(
@@ -2664,6 +2735,13 @@ mod tests {
                 "database schema must allow {profile}"
             );
         }
+    }
+
+    #[test]
+    fn database_schema_indexes_running_execution_recovery() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+        assert!(initialization_sql.contains("idx_scan_task_execution_running_scanner"));
+        assert!(initialization_sql.contains("ON scan_task_execution (assigned_scanner_id)"));
     }
 
     #[test]

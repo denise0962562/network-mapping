@@ -656,6 +656,9 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_execution_maintenance_hold
 CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	ON scan_task_execution (task_id, assigned_scanner_id)
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_running_scanner
+	ON scan_task_execution (assigned_scanner_id)
+	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
 CREATE INDEX IF NOT EXISTS idx_scan_task_user_list

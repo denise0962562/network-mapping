@@ -1516,6 +1516,7 @@ pub enum SaveScannerResultsError {
 pub enum ApplyTaskError {
     Database(Box<dyn std::error::Error + Send + Sync>),
     ScannerUnauthorized,
+    UnfinishedTask(Uuid),
     NoTask,
 }
 
@@ -1555,6 +1556,7 @@ impl fmt::Display for ApplyTaskError {
         match self {
             Self::Database(e) => write!(f, "{}", e),
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
+            Self::UnfinishedTask(task_id) => write!(f, "扫描器仍有未完成任务 {task_id}"),
             Self::NoTask => write!(f, "没有可领取的任务"),
         }
     }
@@ -1564,7 +1566,7 @@ impl std::error::Error for ApplyTaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(e) => Some(e.as_ref()),
-            Self::ScannerUnauthorized | Self::NoTask => None,
+            Self::ScannerUnauthorized | Self::UnfinishedTask(_) | Self::NoTask => None,
         }
     }
 }
@@ -3144,8 +3146,147 @@ pub async fn refresh_task_aggregate(
     Ok(())
 }
 
-/// 通过该函数实现扫描器申请任务
-/// 首先搜索合适的任务，如果没有任务则会创建一个系统任务，该任务也会写入 scan_task 中
+fn assigned_task_from_row(
+    row: &tokio_postgres::Row,
+    lease_expires_at_ms: i64,
+) -> Result<ApplyTask, ApplyTaskError> {
+    let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
+        .map_err(apply_task_database_error)?;
+    Ok(ApplyTask {
+        user_id: row.get("user_id"),
+        task_id,
+        task_target: row.get("task_target"),
+        task_port: row.get("task_port"),
+        address_family: row.get("address_family"),
+        scan_plan: row.get("scan_plan"),
+        dns_resolvers: row.get("dns_resolvers"),
+        lease_expires_at_ms,
+        lease_ttl_ms: TASK_LEASE_MS,
+    })
+}
+
+/// Return and renew a running task already owned by this scanner.
+///
+/// When `task_id` is supplied, only that exact task is considered. This is used
+/// to reconcile a durable local upload before any new work is requested.
+pub async fn recover_scanner_task(
+    pool: &deadpool_postgres::Pool,
+    scanner_id: Uuid,
+    task_id: Option<Uuid>,
+    token: &str,
+    token_pepper: &str,
+) -> Result<ApplyTask, ApplyTaskError> {
+    let mut connection = pool.get().await.map_err(apply_task_database_error)?;
+    let transaction = connection
+        .transaction()
+        .await
+        .map_err(apply_task_database_error)?;
+    let token_hash = hash_scanner_token(token, token_pepper).map_err(apply_task_database_error)?;
+    validate_scanner_credentials_with_client(&transaction, scanner_id, &token_hash).await?;
+
+    let scanner_id = scanner_id.to_string();
+    // Serialize recovery and claiming for one scanner so two requests cannot
+    // assign different work to the same scanner concurrently.
+    transaction
+        .query_one(
+            "SELECT id FROM scanner_info WHERE scanner_id = $1 FOR UPDATE;",
+            &[&scanner_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+
+    let requested_task_id = task_id.map(|value| value.to_string());
+    let now = get_unix_epoch_ms();
+    let cancelled = transaction
+        .query(
+            "UPDATE scan_task_execution e SET execution_status = 'cancelled', task_end_time = $1, \
+             lease_expires_at = NULL, cancel_requested = false FROM scan_task t \
+             WHERE e.task_id = t.id AND e.execution_status = 'running' \
+               AND e.assigned_scanner_id = $2 AND e.cancel_requested = true \
+               AND ($3::TEXT IS NULL OR t.task_id = $3) RETURNING e.task_id;",
+            &[&now, &scanner_id, &requested_task_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+    for task_id in cancelled
+        .iter()
+        .map(|row| row.get::<_, i32>("task_id"))
+        .collect::<std::collections::HashSet<_>>()
+    {
+        refresh_task_aggregate(&transaction, task_id)
+            .await
+            .map_err(apply_task_database_error)?;
+    }
+
+    let row = transaction
+        .query_opt(
+            "SELECT t.id AS task_pk, e.id AS execution_pk, e.execution_status, t.user_id, t.task_id, \
+             CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::text[] END AS task_target, \
+             t.task_port, t.address_family, t.scan_plan, t.dns_resolvers \
+             FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+             JOIN scanner_info s ON s.scanner_id = $1 \
+             WHERE e.cancel_requested = false AND ( \
+                 (e.execution_status = 'running' AND e.assigned_scanner_id = $1 \
+                  AND ($2::TEXT IS NULL OR t.task_id = $2)) \
+                 OR ($2::TEXT IS NOT NULL AND t.task_id = $2 AND e.execution_status = 'pending' \
+                     AND e.assigned_scanner_id IS NULL \
+                     AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $1) \
+                     AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
+                       OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
+                     AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
+                     AND (jsonb_array_length(t.dns_resolvers) = 0 \
+                       OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)))) \
+             ORDER BY CASE WHEN e.execution_status = 'running' THEN 0 ELSE 1 END, \
+                 e.task_start_time NULLS FIRST, e.id \
+             FOR UPDATE OF e SKIP LOCKED LIMIT 1;",
+            &[&scanner_id, &requested_task_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+
+    let Some(row) = row else {
+        transaction
+            .commit()
+            .await
+            .map_err(apply_task_database_error)?;
+        return Err(ApplyTaskError::NoTask);
+    };
+
+    let lease_expires_at = now + TASK_LEASE_MS;
+    transaction
+        .execute(
+            "UPDATE scan_task_execution SET execution_status = 'running', assigned_scanner_id = $1, \
+             task_start_time = COALESCE(task_start_time, $2::BIGINT), task_end_time = NULL, \
+             lease_expires_at = CASE WHEN maintenance_hold THEN NULL ELSE $3::BIGINT END, \
+             failure_reason = NULL WHERE id = $4;",
+            &[
+                &scanner_id,
+                &now,
+                &lease_expires_at,
+                &row.get::<_, i32>("execution_pk"),
+            ],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+    refresh_task_aggregate(&transaction, row.get("task_pk"))
+        .await
+        .map_err(apply_task_database_error)?;
+    let task = assigned_task_from_row(&row, lease_expires_at)?;
+    transaction
+        .commit()
+        .await
+        .map_err(apply_task_database_error)?;
+    info!(
+        event = "RECOVER-TASK",
+        scanner_id,
+        task_id = %task.task_id,
+        "scanner recovered an unfinished task"
+    );
+    Ok(task)
+}
+
+/// 通过该函数实现扫描器申请任务。
+/// 调用方必须先清空该扫描器的未完成任务；本函数也在事务内再次强制检查。
 pub async fn apply_task(
     pool: &deadpool_postgres::Pool,
     scanner_id: Uuid,
@@ -3156,6 +3297,7 @@ pub async fn apply_task(
     let transaction = p.transaction().await.map_err(apply_task_database_error)?;
     let token_hash = hash_scanner_token(token, token_pepper).map_err(apply_task_database_error)?;
     validate_scanner_credentials_with_client(&transaction, scanner_id, &token_hash).await?;
+    let scanner_id = scanner_id.to_string();
 
     let cancelled = transaction
         .query(
@@ -3175,6 +3317,29 @@ pub async fn apply_task(
             .map_err(apply_task_database_error)?;
     }
 
+    transaction
+        .query_one(
+            "SELECT id FROM scanner_info WHERE scanner_id = $1 FOR UPDATE;",
+            &[&scanner_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+
+    if let Some(row) = transaction
+        .query_opt(
+            "SELECT t.task_id FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+             WHERE e.execution_status = 'running' AND e.assigned_scanner_id = $1 \
+             ORDER BY e.task_start_time NULLS FIRST, e.id FOR UPDATE OF e LIMIT 1;",
+            &[&scanner_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?
+    {
+        let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
+            .map_err(apply_task_database_error)?;
+        return Err(ApplyTaskError::UnfinishedTask(task_id));
+    }
+
     let row = transaction
         .query_opt(
             "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, \
@@ -3190,10 +3355,11 @@ pub async fn apply_task(
            AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
            AND (jsonb_array_length(t.dns_resolvers) = 0 \
              OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
-         ORDER BY t.task_level DESC, t.task_create_time, e.id \
+         ORDER BY CASE WHEN e.execution_status = 'pending' AND e.requested_scanner_id = $2 THEN 0 ELSE 1 END, \
+             t.task_level DESC, t.task_create_time, e.id \
          FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",
-            &[&get_unix_epoch_ms(), &scanner_id.to_string()],
+            &[&get_unix_epoch_ms(), &scanner_id],
         )
         .await
         .map_err(apply_task_database_error)?;
@@ -3209,7 +3375,7 @@ pub async fn apply_task(
 
     let task_pk: i32 = row.get("task_pk");
     let execution_pk: i32 = row.get("execution_pk");
-    let lease_expires_at = get_unix_epoch_ms() + 90_000;
+    let lease_expires_at = get_unix_epoch_ms() + TASK_LEASE_MS;
     transaction
         .execute(
             "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1::BIGINT), task_end_time = NULL, \
@@ -3218,7 +3384,7 @@ pub async fn apply_task(
              attempt_count = attempt_count + 1, failure_reason = NULL WHERE id = $4;",
             &[
                 &get_unix_epoch_ms(),
-                &scanner_id.to_string(),
+                &scanner_id,
                 &lease_expires_at,
                 &execution_pk,
             ],
@@ -3229,19 +3395,7 @@ pub async fn apply_task(
         .await
         .map_err(apply_task_database_error)?;
 
-    let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
-        .map_err(apply_task_database_error)?;
-    let apply_task = ApplyTask {
-        user_id: row.get("user_id"),
-        task_id,
-        task_target: row.get("task_target"),
-        task_port: row.get("task_port"),
-        address_family: row.get("address_family"),
-        scan_plan: row.get("scan_plan"),
-        dns_resolvers: row.get("dns_resolvers"),
-        lease_expires_at_ms: lease_expires_at,
-        lease_ttl_ms: TASK_LEASE_MS,
-    };
+    let apply_task = assigned_task_from_row(&row, lease_expires_at)?;
 
     transaction
         .commit()
@@ -3259,6 +3413,12 @@ pub async fn apply_task(
 pub struct ApplyTaskQuery {
     pub scannerid: Uuid,
     pub dryrun: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct CurrentTaskQuery {
+    pub scannerid: Uuid,
+    pub taskid: Option<Uuid>,
 }
 
 /// 该函数用于退出登录

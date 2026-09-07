@@ -1683,6 +1683,7 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::task::create_task)
         .service(handlers::task::create_dns_task)
         .service(handlers::task::get_dns_resolver_presets)
+        .service(handlers::task::current_task_handler)
         .service(handlers::task::apply_task_handler) //更换了 apply_task_handler 和 get_task的注册顺序
         .service(handlers::task::scanner_public_ip_handler)
         .service(handlers::task::scanner_heartbeat_handler)
