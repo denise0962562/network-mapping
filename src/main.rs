@@ -217,6 +217,7 @@ async fn main() -> io::Result<()> {
             monitor: monitor_config,
             automatic_target: automatic_target_config,
             dns_follow_up: dns_follow_up_config,
+            dns_resolvers: Default::default(),
             analytics_snapshot: analytics_snapshot_config,
         },
     )

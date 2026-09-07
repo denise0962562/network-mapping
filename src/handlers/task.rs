@@ -107,6 +107,23 @@ fn default_follow_up_scan_profile() -> String {
     "port_only".into()
 }
 
+#[get("/api/dns/resolvers")]
+async fn get_dns_resolver_presets(
+    settings: web::Data<crate::runtime_config::RuntimeSettings>,
+    _user: UserBaseI,
+) -> impl Responder {
+    let presets = settings
+        .dns_resolvers
+        .get()
+        .await
+        .value
+        .resolvers
+        .into_iter()
+        .filter(|resolver| resolver.enabled)
+        .collect::<Vec<_>>();
+    HttpResponse::Ok().json(json!({"success": true, "data": presets}))
+}
+
 fn resolve_dns_task_port(
     scan_profile: &str,
     follow_up_port_scan: bool,
@@ -1983,6 +2000,12 @@ async fn create_dns_task(
     };
     let dispatch_mode = input.dispatch_mode.trim().to_ascii_lowercase();
     let requires_explicit_resolvers = !dns_resolvers.is_empty();
+    let requires_ipv6_resolver = dns_resolvers.iter().any(|resolver| {
+        resolver
+            .ip
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_ipv6())
+    });
     let requested_scanners: Vec<Option<String>> = match dispatch_mode.as_str() {
         "automatic" if input.scanner_ids.is_empty() => {
             match connection
@@ -1990,8 +2013,9 @@ async fn create_dns_task(
                     "SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
                      AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
                      AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     AND ($3 = FALSE OR (supports_ipv6 AND ipv6_ready)) \
                      LIMIT 1;",
-                    &[&resolved_scan.task_profile, &requires_explicit_resolvers],
+                    &[&resolved_scan.task_profile, &requires_explicit_resolvers, &requires_ipv6_resolver],
                 )
                 .await
             {
@@ -2020,8 +2044,9 @@ async fn create_dns_task(
                      AND is_enable = true AND deleted_at IS NULL AND supports_ipv4 AND ipv4_ready \
                      AND scan_capabilities->'profiles' ? $2 \
                      AND ($3 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     AND ($4 = FALSE OR (supports_ipv6 AND ipv6_ready)) \
                      ORDER BY scanner_id;",
-                    &[&values, &resolved_scan.task_profile, &requires_explicit_resolvers],
+                    &[&values, &resolved_scan.task_profile, &requires_explicit_resolvers, &requires_ipv6_resolver],
                 )
                 .await
             {
@@ -2047,8 +2072,9 @@ async fn create_dns_task(
                     "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
                      AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
                      AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     AND ($3 = FALSE OR (supports_ipv6 AND ipv6_ready)) \
                      ORDER BY scanner_id;",
-                    &[&resolved_scan.task_profile, &requires_explicit_resolvers],
+                    &[&resolved_scan.task_profile, &requires_explicit_resolvers, &requires_ipv6_resolver],
                 )
                 .await
             {

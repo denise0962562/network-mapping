@@ -19,9 +19,10 @@ use crate::config::{
 use crate::monitor::MonitorHandle;
 use crate::runtime_config::{
     ANALYTICS_SNAPSHOT_NAMESPACE, AUTOMATIC_TARGET_NAMESPACE, DNS_FOLLOW_UP_NAMESPACE,
-    MONITOR_NAMESPACE, PersistError, REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings,
-    UpdateRuntimeConfigRequest, parse_analytics_snapshot, parse_automatic_target,
-    parse_dns_follow_up, parse_monitor, parse_requests, persist,
+    DNS_RESOLVERS_NAMESPACE, MONITOR_NAMESPACE, PersistError, REQUESTS_NAMESPACE,
+    RuntimeConfigResponse, RuntimeSettings, UpdateRuntimeConfigRequest, parse_analytics_snapshot,
+    parse_automatic_target, parse_dns_follow_up, parse_dns_resolvers, parse_monitor,
+    parse_requests, persist,
 };
 use crate::trusted_proxy::{
     MAX_CLIENT_IP_HEADER_LENGTH, MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState,
@@ -131,6 +132,10 @@ async fn get_runtime_config_h(
             let value = settings.dns_follow_up.get().await;
             HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: DNS_FOLLOW_UP_NAMESPACE, revision: value.revision, document: value.value }}))
         }
+        DNS_RESOLVERS_NAMESPACE => {
+            let value = settings.dns_resolvers.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: DNS_RESOLVERS_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
         ANALYTICS_SNAPSHOT_NAMESPACE => {
             let value = settings.analytics_snapshot.get().await;
             let progress = match pool.get().await {
@@ -216,6 +221,12 @@ async fn save_runtime_config_h(
             DNS_FOLLOW_UP_NAMESPACE,
             parse_dns_follow_up,
             dns_follow_up,
+            |_| {}
+        ),
+        DNS_RESOLVERS_NAMESPACE => publish!(
+            DNS_RESOLVERS_NAMESPACE,
+            parse_dns_resolvers,
+            dns_resolvers,
             |_| {}
         ),
         ANALYTICS_SNAPSHOT_NAMESPACE => publish!(

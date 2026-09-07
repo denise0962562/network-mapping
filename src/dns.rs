@@ -2,6 +2,10 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
+pub const DNS_RECORD_TYPES: [&str; 12] = [
+    "A", "AAAA", "CNAME", "NS", "MX", "PTR", "SRV", "TXT", "CAA", "SOA", "SVCB", "HTTPS",
+];
+
 /// A DNS response as reported by a scanner.  This is deliberately separate
 /// from endpoint observations: DNS has no mandatory IP or port and a single
 /// response can contain several resource records.
@@ -109,20 +113,7 @@ pub fn canonical_scan_domain(value: &str) -> Result<String, String> {
 
 pub fn canonical_record_type(value: &str) -> Result<String, String> {
     let value = value.trim().to_ascii_uppercase();
-    if !matches!(
-        value.as_str(),
-        "A" | "AAAA"
-            | "CNAME"
-            | "NS"
-            | "MX"
-            | "PTR"
-            | "SRV"
-            | "TXT"
-            | "CAA"
-            | "SOA"
-            | "SVCB"
-            | "HTTPS"
-    ) {
+    if !DNS_RECORD_TYPES.contains(&value.as_str()) {
         return Err(format!("unsupported DNS record type '{value}'"));
     }
     Ok(value)

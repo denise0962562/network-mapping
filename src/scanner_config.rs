@@ -77,7 +77,10 @@ impl Default for ScannerRuntimeConfig {
             },
             dns: DnsRuntimeConfig {
                 enabled: true,
-                record_types: vec!["A".into(), "AAAA".into()],
+                record_types: crate::dns::DNS_RECORD_TYPES
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
                 query_timeout_seconds: 5,
             },
             nuclei: NucleiRuntimeConfig {
@@ -157,14 +160,14 @@ impl ScannerRuntimeConfig {
             60,
         )?;
         if self.dns.record_types.is_empty()
-            || self.dns.record_types.len() > 8
+            || self.dns.record_types.len() > crate::dns::DNS_RECORD_TYPES.len()
             || self
                 .dns
                 .record_types
                 .iter()
-                .any(|value| !matches!(value.as_str(), "A" | "AAAA"))
+                .any(|value| crate::dns::canonical_record_type(value).is_err())
         {
-            return Err("dns.record_types must contain 1-8 A/AAAA values".into());
+            return Err("dns.record_types contains an unsupported record type".into());
         }
         if self.nuclei.severities.is_empty()
             || self.nuclei.severities.len() > 5

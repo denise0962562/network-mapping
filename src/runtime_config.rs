@@ -15,11 +15,13 @@ use crate::config::{
     AnalyticsSnapshotConfig, AutomaticTargetConfig, MonitorConfig, RequestsConfig, SelfChecking,
 };
 use crate::dns_follow_up::DnsFollowUpConfig;
+use crate::dns_resolvers::DnsResolverSettings;
 
 pub const REQUESTS_NAMESPACE: &str = "requests";
 pub const MONITOR_NAMESPACE: &str = "monitor";
 pub const AUTOMATIC_TARGET_NAMESPACE: &str = "automatic_target";
 pub const DNS_FOLLOW_UP_NAMESPACE: &str = "dns_follow_up";
+pub const DNS_RESOLVERS_NAMESPACE: &str = "dns_resolvers";
 pub const ANALYTICS_SNAPSHOT_NAMESPACE: &str = "analytics_snapshot";
 
 #[derive(Clone, Debug)]
@@ -63,6 +65,7 @@ pub struct RuntimeSettings {
     pub monitor: RuntimeConfig<MonitorConfig>,
     pub automatic_target: RuntimeConfig<AutomaticTargetConfig>,
     pub dns_follow_up: RuntimeConfig<DnsFollowUpConfig>,
+    pub dns_resolvers: RuntimeConfig<DnsResolverSettings>,
     pub analytics_snapshot: RuntimeConfig<AnalyticsSnapshotConfig>,
 }
 
@@ -72,6 +75,7 @@ pub struct RuntimeSettingsBootstrap {
     pub monitor: MonitorConfig,
     pub automatic_target: AutomaticTargetConfig,
     pub dns_follow_up: DnsFollowUpConfig,
+    pub dns_resolvers: DnsResolverSettings,
     pub analytics_snapshot: AnalyticsSnapshotConfig,
 }
 
@@ -128,6 +132,14 @@ impl RuntimeSettings {
                 bootstrap.dns_follow_up.clone(),
                 DnsFollowUpConfig::default(),
                 validate_dns_follow_up,
+            )
+            .await?,
+            dns_resolvers: load_namespace(
+                pool,
+                DNS_RESOLVERS_NAMESPACE,
+                bootstrap.dns_resolvers,
+                DnsResolverSettings::default(),
+                validate_dns_resolvers,
             )
             .await?,
             analytics_snapshot: load_namespace(
@@ -260,6 +272,9 @@ fn validate_automatic_target(value: &AutomaticTargetConfig) -> Result<(), String
 fn validate_dns_follow_up(value: &DnsFollowUpConfig) -> Result<(), String> {
     value.validate().map_err(|error| error.to_string())
 }
+fn validate_dns_resolvers(value: &DnsResolverSettings) -> Result<(), String> {
+    value.validate()
+}
 fn validate_analytics_snapshot(value: &AnalyticsSnapshotConfig) -> Result<(), String> {
     value
         .try_check()
@@ -278,6 +293,9 @@ pub fn parse_automatic_target(value: Value) -> Result<AutomaticTargetConfig, Str
 }
 pub fn parse_dns_follow_up(value: Value) -> Result<DnsFollowUpConfig, String> {
     parse(value, validate_dns_follow_up)
+}
+pub fn parse_dns_resolvers(value: Value) -> Result<DnsResolverSettings, String> {
+    parse(value, validate_dns_resolvers)
 }
 pub fn parse_analytics_snapshot(value: Value) -> Result<AnalyticsSnapshotConfig, String> {
     parse(value, validate_analytics_snapshot)
