@@ -285,6 +285,10 @@ CREATE TABLE IF NOT EXISTS analytics_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_analytics_outbox_pending
 	ON analytics_outbox(available_at, execution_id) WHERE status <> 'completed';
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_pending_ready
+	ON analytics_outbox(available_at, execution_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_running_locked
+	ON analytics_outbox(locked_at, execution_id) WHERE status = 'running';
 
 -- One compact, additive row per execution/window/dimension/label. It avoids repeatedly
 -- aggregating the raw observation history on interactive requests.

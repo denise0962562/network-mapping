@@ -16,11 +16,12 @@ use tokio::time::Duration;
 use tracing::{info, warn};
 
 use crate::config::AnalyticsSnapshotConfig;
-use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
+use crate::elasticsearch::ElasticsearchService;
 use crate::runtime_config::RuntimeConfig;
 
 const WORKER_LOCK_KEY: i64 = 0x4e4d_4153_4e50_0001;
 const MAX_EXECUTIONS_PER_TICK: usize = 100;
+const READ_BATCH_SIZE: usize = 5000;
 const WRITE_BATCH_SIZE: usize = 1000;
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -33,6 +34,7 @@ struct ExecutionContext {
     task_source: String,
     locked_at: DateTime<Utc>,
     expected_observations: i64,
+    observation_indices: Vec<String>,
 }
 
 #[derive(Default)]
@@ -355,29 +357,45 @@ async fn claim_execution(pool: &Pool) -> Result<Option<ExecutionContext>, String
         return Ok(None);
     }
 
-    let row = transaction
-        .query_opt(
-            "WITH candidate AS ( \
-            SELECT o.execution_id FROM analytics_outbox o \
-            WHERE (o.status = 'pending' AND o.available_at <= NOW()) \
-               OR (o.status = 'running' AND o.locked_at < NOW() - INTERVAL '60 minutes') \
-            ORDER BY EXISTS (SELECT 1 FROM analytics_snapshot_build_execution b WHERE b.execution_id = o.execution_id) DESC, \
-                o.available_at, o.execution_id FOR UPDATE SKIP LOCKED LIMIT 1 \
-         ), claimed AS ( \
-            UPDATE analytics_outbox o SET status = 'running', attempts = attempts + 1, \
-                locked_at = clock_timestamp(), updated_at = NOW() \
-            FROM candidate WHERE o.execution_id = candidate.execution_id \
-            RETURNING o.execution_id, o.locked_at \
-         ) \
-         SELECT e.id, e.execution_id, t.user_id, \
-                COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
-                t.task_source, claimed.locked_at, COALESCE(e.result_observation_count, 0) AS expected_observations \
-         FROM claimed JOIN scan_task_execution e ON e.id = claimed.execution_id \
-         JOIN scan_task t ON t.id = e.task_id;",
+    // Normalize abandoned work first so the hot candidate path only needs the pending index.
+    transaction
+        .execute(
+            "UPDATE analytics_outbox SET status = 'pending', available_at = NOW(), locked_at = NULL, \
+             updated_at = NOW() WHERE status = 'running' \
+             AND locked_at < NOW() - INTERVAL '60 minutes';",
             &[],
         )
         .await
         .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
+
+    // The xact lock serializes claimers. Refuse another claim while a healthy execution is
+    // running so multiple server replicas cannot multiply Elasticsearch and PostgreSQL load.
+    let active = transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM analytics_outbox \
+             WHERE status = 'running' AND locked_at >= NOW() - INTERVAL '60 minutes');",
+            &[],
+        )
+        .await
+        .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?
+        .get::<_, bool>(0);
+    if active {
+        transaction
+            .commit()
+            .await
+            .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
+        return Ok(None);
+    }
+
+    // Avoid sorting the complete outbox by a correlated EXISTS expression for every claim.
+    // Claim the immutable build cohort through its primary key first, then use the ordinary
+    // pending queue only when no build member is currently available.
+    let row = claim_build_execution(&transaction).await?;
+    let row = if row.is_some() {
+        row
+    } else {
+        claim_pending_execution(&transaction).await?
+    };
     transaction
         .commit()
         .await
@@ -391,13 +409,86 @@ async fn claim_execution(pool: &Pool) -> Result<Option<ExecutionContext>, String
         task_source: row.get("task_source"),
         locked_at: row.get("locked_at"),
         expected_observations: row.get("expected_observations"),
+        observation_indices: row.get("observation_indices"),
     }))
+}
+
+async fn claim_build_execution(
+    transaction: &deadpool_postgres::Transaction<'_>,
+) -> Result<Option<tokio_postgres::Row>, String> {
+    transaction
+        .query_opt(
+            "WITH candidate AS ( \
+                SELECT o.execution_id FROM analytics_snapshot_build_execution b \
+                JOIN analytics_outbox o ON o.execution_id = b.execution_id \
+                WHERE o.status = 'pending' AND o.available_at <= NOW() \
+                ORDER BY o.available_at, o.execution_id \
+                FOR UPDATE OF o SKIP LOCKED LIMIT 1 \
+             ), claimed AS ( \
+                UPDATE analytics_outbox o SET status = 'running', attempts = attempts + 1, \
+                    locked_at = clock_timestamp(), updated_at = NOW() \
+                FROM candidate WHERE o.execution_id = candidate.execution_id \
+                RETURNING o.execution_id, o.locked_at \
+             ) \
+             SELECT e.id, e.execution_id, t.user_id, \
+                    COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
+                    t.task_source, claimed.locked_at, \
+                    COALESCE(e.result_observation_count, 0) AS expected_observations, \
+                    ARRAY(SELECT DISTINCT ref.index_name \
+                          FROM scan_result_batch batch \
+                          CROSS JOIN LATERAL jsonb_array_elements_text(batch.storage_references) ref(index_name) \
+                          WHERE batch.execution_id = e.id \
+                            AND batch.storage_backend IN ('elasticsearch', 'dual') \
+                          ORDER BY ref.index_name) AS observation_indices \
+             FROM claimed JOIN scan_task_execution e ON e.id = claimed.execution_id \
+             JOIN scan_task t ON t.id = e.task_id;",
+            &[],
+        )
+        .await
+        .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))
+}
+
+async fn claim_pending_execution(
+    transaction: &deadpool_postgres::Transaction<'_>,
+) -> Result<Option<tokio_postgres::Row>, String> {
+    transaction
+        .query_opt(
+            "WITH candidate AS ( \
+                SELECT o.execution_id FROM analytics_outbox o \
+                WHERE o.status = 'pending' AND o.available_at <= NOW() \
+                ORDER BY o.available_at, o.execution_id \
+                FOR UPDATE SKIP LOCKED LIMIT 1 \
+             ), claimed AS ( \
+                UPDATE analytics_outbox o SET status = 'running', attempts = attempts + 1, \
+                    locked_at = clock_timestamp(), updated_at = NOW() \
+                FROM candidate WHERE o.execution_id = candidate.execution_id \
+                RETURNING o.execution_id, o.locked_at \
+             ) \
+             SELECT e.id, e.execution_id, t.user_id, \
+                    COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
+                    t.task_source, claimed.locked_at, \
+                    COALESCE(e.result_observation_count, 0) AS expected_observations, \
+                    ARRAY(SELECT DISTINCT ref.index_name \
+                          FROM scan_result_batch batch \
+                          CROSS JOIN LATERAL jsonb_array_elements_text(batch.storage_references) ref(index_name) \
+                          WHERE batch.execution_id = e.id \
+                            AND batch.storage_backend IN ('elasticsearch', 'dual') \
+                          ORDER BY ref.index_name) AS observation_indices \
+             FROM claimed JOIN scan_task_execution e ON e.id = claimed.execution_id \
+             JOIN scan_task t ON t.id = e.task_id;",
+            &[],
+        )
+        .await
+        .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))
 }
 
 async fn facts_from_elasticsearch(
     elasticsearch: &ElasticsearchService,
     context: &ExecutionContext,
 ) -> Result<ExecutionFacts, String> {
+    if context.expected_observations == 0 && context.observation_indices.is_empty() {
+        return Ok(ExecutionFacts::default());
+    }
     let mut facts = ExecutionFacts::default();
     let mut endpoint_first = BTreeMap::<(String, String, String), DateTime<Utc>>::new();
     let mut ip_first = BTreeMap::<IpAddr, DateTime<Utc>>::new();
@@ -405,7 +496,7 @@ async fn facts_from_elasticsearch(
     let mut observed_count = 0_i64;
     loop {
         let mut body = json!({
-            "size": 1000,
+            "size": READ_BATCH_SIZE,
             "track_total_hits": false,
             "_source": ["kind", "service", "ip_address", "port", "endpoint_id", "observed_at"],
             "query": {"term": {"execution_id": &context.execution_id}},
@@ -417,7 +508,7 @@ async fn facts_from_elasticsearch(
                 .insert("search_after".to_owned(), after.clone());
         }
         let response = elasticsearch
-            .scan_query(ScanQueryIndex::Observations, &body)
+            .scan_observations(&context.observation_indices, &body)
             .await?;
         let hits = response
             .pointer("/hits/hits")
@@ -470,11 +561,11 @@ async fn facts_from_elasticsearch(
             update_first(&mut ip_first, ip_address, timestamp);
         }
         let next = hits.last().and_then(|hit| hit.get("sort")).cloned();
-        if hits.len() == 1000 && (next.is_none() || next == after) {
+        if hits.len() == READ_BATCH_SIZE && (next.is_none() || next == after) {
             return Err("Elasticsearch 统计分页游标缺失或未推进".to_owned());
         }
         after = next;
-        if hits.len() < 1000 {
+        if hits.len() < READ_BATCH_SIZE {
             break;
         }
     }
@@ -698,9 +789,14 @@ mod tests {
              CREATE TEMP TABLE scan_task(id INT PRIMARY KEY, user_id INT, task_source TEXT, task_kind TEXT); \
              CREATE TEMP TABLE scan_task_execution(id INT PRIMARY KEY, execution_id TEXT, task_id INT, \
                  execution_status TEXT, assigned_scanner_id TEXT, requested_scanner_id TEXT, result_observation_count BIGINT); \
+             CREATE TEMP TABLE scan_result_batch(execution_id INT, storage_backend TEXT, storage_references JSONB); \
              INSERT INTO scan_task VALUES (1, 1, 'manual', 'ip'); \
              INSERT INTO scan_task_execution VALUES (1, 'one', 1, 'succeeded', 'scanner', NULL, 0), \
-                 (2, 'two', 1, 'succeeded', 'scanner', NULL, 0);"
+                 (2, 'two', 1, 'succeeded', 'scanner', NULL, 0); \
+             INSERT INTO scan_result_batch VALUES \
+                 (1, 'elasticsearch', '[\"scan-observations-2026.08\", \"scan-observations-2026.09\"]'), \
+                 (1, 'elasticsearch', '[\"scan-observations-2026.09\"]'), \
+                 (1, 'postgres', '[\"ignored\"]');"
         ).await.unwrap();
         let schema = include_str!("../source/database/init.sql");
         let start = schema
@@ -732,6 +828,14 @@ mod tests {
         reconcile(&pool).await.unwrap();
         let first = claim_execution(&pool).await.unwrap().unwrap();
         assert_eq!(first.database_id, 1);
+        assert_eq!(
+            first.observation_indices,
+            [
+                "scan-observations-2026.08".to_owned(),
+                "scan-observations-2026.09".to_owned()
+            ]
+        );
+        assert!(claim_execution(&pool).await.unwrap().is_none());
         let timestamp = Utc.with_ymd_and_hms(2026, 9, 1, 10, 30, 0).unwrap();
         let mut facts = ExecutionFacts::default();
         for i in 0..1005 {

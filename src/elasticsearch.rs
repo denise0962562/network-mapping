@@ -382,6 +382,29 @@ impl ElasticsearchService {
         Ok(result)
     }
 
+    pub(crate) async fn scan_observations(
+        &self,
+        indices: &[String],
+        body: &Value,
+    ) -> Result<Value, String> {
+        if !self.can_read() {
+            return Err("Elasticsearch 扫描事实读路径尚未就绪".to_owned());
+        }
+        let target =
+            observation_search_target(&self.inner.config.observation_index_prefix, indices)?;
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::ScanQuery,
+                Method::POST,
+                &format!("/{target}/_search?allow_no_indices=true&ignore_unavailable=true"),
+                |request| request.json(body),
+            )
+            .await?;
+        validate_scan_search_response(&result)?;
+        self.mark_success();
+        Ok(result)
+    }
+
     /// Returns the immutable DNS observations for one task. Comparison is
     /// intentionally derived from these source observations, never from the
     /// mutable current-record projection.
@@ -3261,6 +3284,30 @@ fn scan_observation_index(prefix: &str, observed_at_ms: i64) -> Result<String, S
     Ok(format!("{}-{}", prefix, observed_at.format("%Y.%m")))
 }
 
+fn observation_search_target(prefix: &str, indices: &[String]) -> Result<String, String> {
+    if indices.is_empty() {
+        return Ok(format!("{prefix}-*"));
+    }
+    let expected_prefix = format!("{prefix}-");
+    let indices = indices.iter().collect::<BTreeSet<_>>();
+    for index in &indices {
+        if !index.starts_with(&expected_prefix)
+            || !index.bytes().all(|value| {
+                value.is_ascii_lowercase() || value.is_ascii_digit() || b"-_.".contains(&value)
+            })
+        {
+            return Err(format!(
+                "扫描批次记录了无效的 Elasticsearch 观察索引：{index}"
+            ));
+        }
+    }
+    Ok(indices
+        .into_iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 fn observation_progress(completed: u64, total: Option<u64>) -> String {
     match total {
         Some(total) => format!("观察 {completed}/{total} 条"),
@@ -3735,6 +3782,33 @@ fn index_mapping_update() -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn observation_search_uses_recorded_indices_and_validates_them() {
+        let indices = vec![
+            "scan-observations-2026.09".to_owned(),
+            "scan-observations-2026.08".to_owned(),
+            "scan-observations-2026.09".to_owned(),
+        ];
+        assert_eq!(
+            observation_search_target("scan-observations", &indices).unwrap(),
+            "scan-observations-2026.08,scan-observations-2026.09"
+        );
+        assert_eq!(
+            observation_search_target("scan-observations", &[]).unwrap(),
+            "scan-observations-*"
+        );
+        assert!(
+            observation_search_target("scan-observations", &["other-index".to_owned()]).is_err()
+        );
+        assert!(
+            observation_search_target(
+                "scan-observations",
+                &["scan-observations-2026.09/_search".to_owned()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn scan_search_rejects_partial_results_even_with_http_success() {
         assert!(
             super::validate_scan_search_response(&serde_json::json!({
@@ -3759,9 +3833,9 @@ mod tests {
         ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchOperation, ElasticsearchService,
         ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay, collect_domain_addresses,
         dns_task_observations_search_body, initialization_retry_delay, new_trace_context,
-        parse_asn, parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
-        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
-        scan_observation_template,
+        observation_search_target, parse_asn, parse_storage_metrics, replace_domain_filters,
+        scan_batch_payload_checksum, scan_endpoint_index_definition,
+        scan_observation_compatibility_mapping, scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::collections::BTreeSet;
