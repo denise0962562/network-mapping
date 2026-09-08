@@ -10,6 +10,7 @@ pub mod config;
 pub mod db;
 pub mod dns;
 pub mod dns_follow_up;
+pub mod dns_resolvers;
 pub mod elasticsearch;
 pub mod frontend;
 pub mod handlers;
@@ -30,6 +31,8 @@ pub mod middlewares;
 pub mod open_source;
 pub mod request_log;
 pub mod runtime_config;
+pub mod scan_migration;
+pub mod scanner_config;
 pub mod scanner_latency;
 mod search_content;
 pub mod search_projection;
@@ -1513,6 +1516,7 @@ pub enum SaveScannerResultsError {
 pub enum ApplyTaskError {
     Database(Box<dyn std::error::Error + Send + Sync>),
     ScannerUnauthorized,
+    UnfinishedTask(Uuid),
     NoTask,
 }
 
@@ -1552,6 +1556,7 @@ impl fmt::Display for ApplyTaskError {
         match self {
             Self::Database(e) => write!(f, "{}", e),
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
+            Self::UnfinishedTask(task_id) => write!(f, "扫描器仍有未完成任务 {task_id}"),
             Self::NoTask => write!(f, "没有可领取的任务"),
         }
     }
@@ -1561,7 +1566,7 @@ impl std::error::Error for ApplyTaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(e) => Some(e.as_ref()),
-            Self::ScannerUnauthorized | Self::NoTask => None,
+            Self::ScannerUnauthorized | Self::UnfinishedTask(_) | Self::NoTask => None,
         }
     }
 }
@@ -1640,33 +1645,6 @@ fn sanitize_result_item(item: ScannerResultItem) -> ScannerResultItem {
         other: item.other.map(sanitize_json_value),
         ..item
     }
-}
-
-fn immutable_scan_observation(value: &Value) -> Value {
-    let mut value = value.clone();
-    if let Some(object) = value.as_object_mut() {
-        // `ip_network` was split from `ip_address` for Elasticsearch mapping
-        // compatibility. Hash the network under the legacy field name so
-        // pending batches created before this change retain the same checksum.
-        if let Some(network) = object.remove("ip_network") {
-            object.insert("ip_address".to_owned(), network);
-        }
-        for field in [
-            "asn",
-            "isp",
-            "as_org",
-            "country_code",
-            "country_name",
-            "region_name",
-            "city_name",
-            "latitude",
-            "longitude",
-            "tags",
-        ] {
-            object.remove(field);
-        }
-    }
-    value
 }
 
 fn normalize_upload_observations(
@@ -1983,13 +1961,8 @@ async fn save_dns_scanner_results(
     let Some(task) = task else {
         return Err(SaveScannerResultsError::TaskNotFound);
     };
-    if task.get::<_, String>("execution_status") == "succeeded" {
-        transaction
-            .commit()
-            .await
-            .map_err(scanner_result_database_error)?;
-        return Ok(0);
-    }
+    let already_succeeded = task.get::<_, String>("execution_status") == "succeeded";
+
     let task_db_id: i32 = task.get("task_id");
     let execution_db_id: i32 = task.get("execution_id");
     let context = ScanBatchContext {
@@ -2024,7 +1997,7 @@ async fn save_dns_scanner_results(
     if is_final {
         let sequence = transaction
             .query_one(
-                "SELECT COUNT(*) FILTER (WHERE batch_index < $3)::BIGINT AS prior_count, \
+                "SELECT COUNT(*) FILTER (WHERE batch_index < $3 AND storage_backend <> 'pending')::BIGINT AS prior_count, \
                  MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
                  MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
                  COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
@@ -2089,6 +2062,9 @@ async fn save_dns_scanner_results(
             return Ok(0);
         }
     } else {
+        if already_succeeded {
+            return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+        }
         transaction
             .execute(
                 "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
@@ -2113,8 +2089,12 @@ async fn save_dns_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
     drop(client);
+    let dns_references = elasticsearch
+        .pin_dns_batch_storage(pool, execution_db_id, &context)
+        .await
+        .map_err(SaveScannerResultsError::Storage)?;
     elasticsearch
-        .persist_dns_observations(&context, "default", &observations)
+        .persist_dns_observations(&context, "default", &observations, &dns_references[0])
         .await
         .map_err(SaveScannerResultsError::Storage)?;
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
@@ -2126,13 +2106,21 @@ async fn save_dns_scanner_results(
         .batch_execute("SET LOCAL lock_timeout = '1500ms'; SET LOCAL statement_timeout = '10s';")
         .await
         .map_err(scanner_result_database_error)?;
-    transaction
-        .query_one(
-            "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
-            &[&execution_db_id],
-        )
-        .await
-        .map_err(scanner_result_database_error)?;
+    let current_execution = transaction
+        .query_one("SELECT execution_status, assigned_scanner_id FROM scan_task_execution WHERE id = $1 FOR UPDATE", &[&execution_db_id])
+        .await.map_err(scanner_result_database_error)?;
+    if !matches!(
+        current_execution
+            .get::<_, String>("execution_status")
+            .as_str(),
+        "running" | "succeeded"
+    ) || current_execution
+        .get::<_, Option<String>>("assigned_scanner_id")
+        .as_deref()
+        != Some(scanner_id.as_str())
+    {
+        return Err(SaveScannerResultsError::TaskNotOwned);
+    }
     let receipt_updated = transaction
         .execute(
             "UPDATE scan_result_batch SET storage_backend = 'elasticsearch', storage_references = $4 \
@@ -2142,7 +2130,7 @@ async fn save_dns_scanner_results(
                 &execution_db_id,
                 &upload_id,
                 &batch_index,
-                &serde_json::json!(["dns-observations", "dns-records"]),
+                &serde_json::json!(dns_references),
             ],
         )
         .await
@@ -2178,8 +2166,8 @@ async fn save_dns_scanner_results(
                 "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
                  lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false, \
                  maintenance_hold = FALSE, maintenance_hold_until = NULL, \
-                 result_ip_count = 0, result_port_count = 0, result_observation_count = $3 WHERE id = $2;",
-                &[&get_unix_epoch_ms(), &execution_db_id, &i64::from(observation_count)],
+                 result_ip_count = 0, result_port_count = 0, result_observation_count = (SELECT COALESCE(SUM(observation_count), 0) FROM scan_result_batch WHERE execution_id = $2) WHERE id = $2;",
+                &[&get_unix_epoch_ms(), &execution_db_id],
             )
             .await
             .map_err(scanner_result_database_error)?;
@@ -2650,7 +2638,6 @@ pub async fn save_scanner_results(
     }
 
     let normalized_observations = normalize_upload_observations(upload)?;
-    let storage_mode = elasticsearch.scan_storage_mode();
 
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
@@ -2687,39 +2674,9 @@ pub async fn save_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
 
-    if let Some(row) = task_row.as_ref()
-        && row.get::<_, String>("execution_status") == "succeeded"
-    {
-        let execution_db_id: i32 = row.get("execution_id");
-        let context = ScanBatchContext {
-            task_id: upload.task_id.to_string(),
-            execution_id: row.get("public_execution_id"),
-            user_id: row.get("user_id"),
-            task_source: row.get("task_source"),
-            scanner_id: scanner_id.clone(),
-            scanner_name: row.get("scanner_name"),
-            upload_id: upload
-                .upload_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| row.get("public_execution_id")),
-            batch_index: upload
-                .batch_index
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or_default(),
-            is_final: true,
-        };
-        transaction
-            .commit()
-            .await
-            .map_err(scanner_result_database_error)?;
-        if storage_mode.writes_elasticsearch() {
-            elasticsearch
-                .finalize_scan_projection(pool, execution_db_id, &context)
-                .await
-                .map_err(SaveScannerResultsError::Storage)?;
-        }
-        return Ok(0);
-    }
+    let already_succeeded = task_row
+        .as_ref()
+        .is_some_and(|row| row.get::<_, String>("execution_status") == "succeeded");
 
     let (
         task_db_id,
@@ -2730,7 +2687,7 @@ pub async fn save_scanner_results(
         task_source,
         scanner_name,
     ): (i32, i32, i32, String, Option<i64>, String, Option<String>) = match task_row {
-        Some(row) if row.get::<_, String>("execution_status") == "running" => (
+        Some(row) => (
             row.get("task_id"),
             row.get("user_id"),
             row.get("execution_id"),
@@ -2739,7 +2696,6 @@ pub async fn save_scanner_results(
             row.get("task_source"),
             row.get("scanner_name"),
         ),
-        Some(_) => return Err(SaveScannerResultsError::TaskNotOwned),
         None => return Err(SaveScannerResultsError::TaskNotFound),
     };
 
@@ -2782,7 +2738,7 @@ pub async fn save_scanner_results(
     if is_final {
         let sequence = transaction
             .query_one(
-                "SELECT COUNT(*) FILTER (WHERE batch_index < $3)::BIGINT AS prior_count, \
+                "SELECT COUNT(*) FILTER (WHERE batch_index < $3 AND storage_backend <> 'pending')::BIGINT AS prior_count, \
                     MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
                     MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
                     COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
@@ -2903,7 +2859,7 @@ pub async fn save_scanner_results(
             "longitude": intel.longitude,
         }));
     }
-    if storage_mode.writes_elasticsearch() && !observation_rows.is_empty() {
+    if !observation_rows.is_empty() {
         let addresses = observation_rows
             .iter()
             .filter_map(|row| {
@@ -2946,12 +2902,8 @@ pub async fn save_scanner_results(
                 .insert("tags".to_owned(), tags);
         }
     }
-    let storage_backend = match storage_mode {
-        config::ScanStorageMode::Postgres => "postgres",
-        config::ScanStorageMode::Dual => "dual",
-        config::ScanStorageMode::Elasticsearch => "elasticsearch",
-    };
-    let (transaction, batch_db_id, es_execution_summary) = if storage_mode.writes_elasticsearch() {
+    let storage_backend = "elasticsearch";
+    let (transaction, es_execution_summary) = {
         let expected_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
             .map_err(SaveScannerResultsError::Storage)?;
         if let Some(existing) = transaction
@@ -2968,7 +2920,7 @@ pub async fn save_scanner_results(
                 || existing.get::<_, i32>("observation_count") != observation_count
                 || existing_checksum
                     .as_deref()
-                    .is_some_and(|checksum| checksum != expected_checksum)
+                    .is_none_or(|checksum| checksum != expected_checksum)
             {
                 return Err(SaveScannerResultsError::InvalidUpload(
                     "batch identity was already used with different content".into(),
@@ -2979,9 +2931,17 @@ pub async fn save_scanner_results(
                     .commit()
                     .await
                     .map_err(scanner_result_database_error)?;
+                drop(client);
+                if already_succeeded && is_final {
+                    elasticsearch.finalize_scan_projection(pool, execution_db_id, &batch_context)
+                        .await.map_err(SaveScannerResultsError::Storage)?;
+                }
                 return Ok(0);
             }
         } else {
+            if already_succeeded {
+                return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+            }
             transaction
                 .execute(
                     "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
@@ -3024,13 +2984,21 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
-        transaction
-            .query_one(
-                "SELECT id FROM scan_task_execution WHERE id = $1 FOR UPDATE",
-                &[&execution_db_id],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
+        let current_execution = transaction
+            .query_one("SELECT execution_status, assigned_scanner_id FROM scan_task_execution WHERE id = $1 FOR UPDATE", &[&execution_db_id])
+            .await.map_err(scanner_result_database_error)?;
+        if !matches!(
+            current_execution
+                .get::<_, String>("execution_status")
+                .as_str(),
+            "running" | "succeeded"
+        ) || current_execution
+            .get::<_, Option<String>>("assigned_scanner_id")
+            .as_deref()
+            != Some(scanner_id.as_str())
+        {
+            return Err(SaveScannerResultsError::TaskNotOwned);
+        }
         let receipt = transaction
             .query_opt(
                 "UPDATE scan_result_batch SET storage_backend = $4, storage_references = $5 \
@@ -3046,154 +3014,16 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
-        let Some(receipt) = receipt else {
+        let Some(_) = receipt else {
             transaction
                 .commit()
                 .await
                 .map_err(scanner_result_database_error)?;
             return Ok(0);
         };
-        (
-            transaction,
-            receipt.get::<_, i64>("id"),
-            result.execution_summary,
-        )
-    } else {
-        let payload_checksum = openssl::sha::sha256(
-            &serde_json::to_vec(&serde_json::json!({
-                "execution_id": public_execution_id,
-                "upload_id": upload_id,
-                "batch_index": batch_index,
-                "is_final": is_final,
-                "observations": observation_rows.iter().map(immutable_scan_observation).collect::<Vec<_>>(),
-            }))
-            .map_err(scanner_result_database_error)?,
-        )
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-        let storage_references = Value::Array(Vec::new());
-        let row = transaction
-            .query_opt(
-                "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
-                    protocol_version, payload_checksum, storage_backend, storage_references) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                 ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING RETURNING id;",
-                &[
-                    &execution_db_id,
-                    &upload_id,
-                    &batch_index,
-                    &is_final,
-                    &observation_count,
-                    &protocol_version,
-                    &payload_checksum,
-                    &storage_backend,
-                    &storage_references,
-                ],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
-        let Some(row) = row else {
-            let existing = transaction
-                .query_one(
-                    "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
-                     WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
-                    &[&execution_db_id, &upload_id, &batch_index],
-                )
-                .await
-                .map_err(scanner_result_database_error)?;
-            let existing_checksum: Option<String> = existing.get("payload_checksum");
-            if existing.get::<_, bool>("is_final") != is_final
-                || existing.get::<_, i32>("observation_count") != observation_count
-                || existing_checksum
-                    .as_deref()
-                    .is_some_and(|checksum| checksum != payload_checksum)
-            {
-                return Err(SaveScannerResultsError::InvalidUpload(
-                    "batch identity was already used with different content".into(),
-                ));
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(scanner_result_database_error)?;
-            return Ok(0);
-        };
-        (transaction, row.get::<_, i64>("id"), None)
+        (transaction, result.execution_summary)
     };
-    let observation_rows = Value::Array(observation_rows);
-    // Keep the fact rows and their asset projection in one set-based statement. The
-    // projection reads only rows inserted by this batch and deduplicates both IPs and
-    // endpoints, so port/service observations do not repeat the same UPSERT work.
-    let saved = if storage_mode.writes_postgres() {
-        let saved_row = transaction
-            .query_one(
-            "WITH input AS MATERIALIZED ( \
-                SELECT item.*, COALESCE(item.ip_network, item.ip_address) AS storage_ip_address \
-                FROM jsonb_to_recordset($4::jsonb) AS item( \
-                    observation_key TEXT, kind TEXT, ip_address INET, ip_network INET, port INT, \
-                    protocol TEXT, service TEXT, banner TEXT, title TEXT, http_body TEXT, \
-                    http_body_truncated BOOLEAN, tls_subject TEXT, source TEXT, data JSONB, \
-                    search_content_extracted BOOLEAN, observed_at BIGINT, \
-                    asn TEXT, isp TEXT, as_org TEXT, country_code TEXT, \
-                    country_name TEXT, region_name TEXT, city_name TEXT, \
-                    latitude DOUBLE PRECISION, longitude DOUBLE PRECISION) \
-             ), inserted_observations AS ( \
-                INSERT INTO scan_observation (execution_id, batch_id, observation_key, kind, \
-                    ip_address, port, protocol, service, banner, title, http_body, \
-                    http_body_truncated, tls_subject, search_content_extracted, source, data, observed_at) \
-                SELECT $2, $3, observation_key, kind, storage_ip_address, port, protocol, service, \
-                    banner, title, http_body, http_body_truncated, tls_subject, \
-                    search_content_extracted, source, data, to_timestamp(observed_at / 1000.0) FROM input \
-                ON CONFLICT (execution_id, observation_key) DO NOTHING \
-                RETURNING ip_address, port \
-             ), inserted_endpoints AS MATERIALIZED ( \
-                SELECT DISTINCT ip_address, port FROM inserted_observations \
-             ), inserted_ip_addresses AS MATERIALIZED ( \
-                SELECT DISTINCT ip_address FROM inserted_endpoints \
-             ), upserted_ips AS ( \
-                INSERT INTO ips (task_id, execution_id, ip_address, asn, isp, as_org, \
-                    country_code, country_name, region_name, city_name, latitude, longitude) \
-                SELECT DISTINCT ON (item.storage_ip_address) $1, $2, item.storage_ip_address, item.asn, \
-                    item.isp, item.as_org, item.country_code, item.country_name, \
-                    item.region_name, item.city_name, item.latitude, item.longitude \
-                FROM input item \
-                JOIN inserted_ip_addresses inserted ON inserted.ip_address = item.storage_ip_address \
-                ORDER BY item.storage_ip_address \
-                ON CONFLICT (execution_id, ip_address) DO UPDATE SET \
-                    asn = COALESCE(EXCLUDED.asn, ips.asn), \
-                    isp = COALESCE(EXCLUDED.isp, ips.isp), \
-                    as_org = COALESCE(EXCLUDED.as_org, ips.as_org), \
-                    country_code = COALESCE(EXCLUDED.country_code, ips.country_code), \
-                    country_name = COALESCE(EXCLUDED.country_name, ips.country_name), \
-                    region_name = COALESCE(EXCLUDED.region_name, ips.region_name), \
-                    city_name = COALESCE(EXCLUDED.city_name, ips.city_name), \
-                    latitude = COALESCE(EXCLUDED.latitude, ips.latitude), \
-                    longitude = COALESCE(EXCLUDED.longitude, ips.longitude), \
-                    update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
-                RETURNING ip_id, ip_address \
-             ), upserted_ports AS ( \
-                INSERT INTO ports (ip_id, port) \
-                SELECT ip.ip_id, endpoint.port FROM inserted_endpoints endpoint \
-                JOIN upserted_ips ip ON ip.ip_address = endpoint.ip_address \
-                ON CONFLICT (ip_id, port) DO UPDATE SET \
-                    update_time = (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
-                RETURNING port_id \
-             ) \
-             SELECT COUNT(*)::BIGINT AS saved FROM inserted_observations;",
-            &[
-                &task_db_id,
-                &execution_db_id,
-                &batch_db_id,
-                &observation_rows,
-            ],
-        )
-            .await
-            .map_err(scanner_result_database_error)?;
-        usize::try_from(saved_row.get::<_, i64>("saved")).map_err(scanner_result_database_error)?
-    } else {
-        normalized_observations.len()
-    };
+    let saved = normalized_observations.len();
 
     if !is_typed || upload.is_final == Some(true) {
         let batch_sequence = transaction
@@ -3219,23 +3049,7 @@ pub async fn save_scanner_results(
                 "final batch requires one contiguous sequence starting at batch_index 0".into(),
             ));
         }
-        let execution_summary = if storage_mode.writes_postgres() {
-            let row = transaction
-                .query_one(
-                    "SELECT (SELECT COUNT(*)::BIGINT FROM ips WHERE execution_id = $1) AS ip_count, \
-                        (SELECT COUNT(*)::BIGINT FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
-                            WHERE i.execution_id = $1) AS port_count, \
-                        (SELECT COUNT(*)::BIGINT FROM scan_observation WHERE execution_id = $1) AS observation_count;",
-                    &[&execution_db_id],
-                )
-                .await
-                .map_err(scanner_result_database_error)?;
-            elasticsearch::ScanExecutionSummary {
-                ip_count: row.get("ip_count"),
-                port_count: row.get("port_count"),
-                observation_count: row.get("observation_count"),
-            }
-        } else {
+        let execution_summary = {
             es_execution_summary.ok_or_else(|| {
                 SaveScannerResultsError::Storage(
                     "final batch did not produce execution counters".into(),
@@ -3270,12 +3084,8 @@ pub async fn save_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
-        if storage_mode.writes_postgres() {
-            search_projection::refresh_for_execution(&transaction, execution_db_id)
-                .await
-                .map_err(scanner_result_database_error)?;
-        }
-        if storage_mode.writes_elasticsearch() {
+
+        {
             transaction
                 .execute(
                     "INSERT INTO scan_projection_outbox (execution_id, attempts, available_at, processed_at, last_error) \
@@ -3295,7 +3105,7 @@ pub async fn save_scanner_results(
         .commit()
         .await
         .map_err(scanner_result_database_error)?;
-    if is_final && storage_mode.writes_elasticsearch() {
+    if is_final {
         elasticsearch
             .finalize_scan_projection(pool, execution_db_id, &batch_context)
             .await
@@ -3336,8 +3146,147 @@ pub async fn refresh_task_aggregate(
     Ok(())
 }
 
-/// 通过该函数实现扫描器申请任务
-/// 首先搜索合适的任务，如果没有任务则会创建一个系统任务，该任务也会写入 scan_task 中
+fn assigned_task_from_row(
+    row: &tokio_postgres::Row,
+    lease_expires_at_ms: i64,
+) -> Result<ApplyTask, ApplyTaskError> {
+    let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
+        .map_err(apply_task_database_error)?;
+    Ok(ApplyTask {
+        user_id: row.get("user_id"),
+        task_id,
+        task_target: row.get("task_target"),
+        task_port: row.get("task_port"),
+        address_family: row.get("address_family"),
+        scan_plan: row.get("scan_plan"),
+        dns_resolvers: row.get("dns_resolvers"),
+        lease_expires_at_ms,
+        lease_ttl_ms: TASK_LEASE_MS,
+    })
+}
+
+/// Return and renew a running task already owned by this scanner.
+///
+/// When `task_id` is supplied, only that exact task is considered. This is used
+/// to reconcile a durable local upload before any new work is requested.
+pub async fn recover_scanner_task(
+    pool: &deadpool_postgres::Pool,
+    scanner_id: Uuid,
+    task_id: Option<Uuid>,
+    token: &str,
+    token_pepper: &str,
+) -> Result<ApplyTask, ApplyTaskError> {
+    let mut connection = pool.get().await.map_err(apply_task_database_error)?;
+    let transaction = connection
+        .transaction()
+        .await
+        .map_err(apply_task_database_error)?;
+    let token_hash = hash_scanner_token(token, token_pepper).map_err(apply_task_database_error)?;
+    validate_scanner_credentials_with_client(&transaction, scanner_id, &token_hash).await?;
+
+    let scanner_id = scanner_id.to_string();
+    // Serialize recovery and claiming for one scanner so two requests cannot
+    // assign different work to the same scanner concurrently.
+    transaction
+        .query_one(
+            "SELECT id FROM scanner_info WHERE scanner_id = $1 FOR UPDATE;",
+            &[&scanner_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+
+    let requested_task_id = task_id.map(|value| value.to_string());
+    let now = get_unix_epoch_ms();
+    let cancelled = transaction
+        .query(
+            "UPDATE scan_task_execution e SET execution_status = 'cancelled', task_end_time = $1, \
+             lease_expires_at = NULL, cancel_requested = false FROM scan_task t \
+             WHERE e.task_id = t.id AND e.execution_status = 'running' \
+               AND e.assigned_scanner_id = $2 AND e.cancel_requested = true \
+               AND ($3::TEXT IS NULL OR t.task_id = $3) RETURNING e.task_id;",
+            &[&now, &scanner_id, &requested_task_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+    for task_id in cancelled
+        .iter()
+        .map(|row| row.get::<_, i32>("task_id"))
+        .collect::<std::collections::HashSet<_>>()
+    {
+        refresh_task_aggregate(&transaction, task_id)
+            .await
+            .map_err(apply_task_database_error)?;
+    }
+
+    let row = transaction
+        .query_opt(
+            "SELECT t.id AS task_pk, e.id AS execution_pk, e.execution_status, t.user_id, t.task_id, \
+             CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::text[] END AS task_target, \
+             t.task_port, t.address_family, t.scan_plan, t.dns_resolvers \
+             FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+             JOIN scanner_info s ON s.scanner_id = $1 \
+             WHERE e.cancel_requested = false AND ( \
+                 (e.execution_status = 'running' AND e.assigned_scanner_id = $1 \
+                  AND ($2::TEXT IS NULL OR t.task_id = $2)) \
+                 OR ($2::TEXT IS NOT NULL AND t.task_id = $2 AND e.execution_status = 'pending' \
+                     AND e.assigned_scanner_id IS NULL \
+                     AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $1) \
+                     AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
+                       OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
+                     AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
+                     AND (jsonb_array_length(t.dns_resolvers) = 0 \
+                       OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)))) \
+             ORDER BY CASE WHEN e.execution_status = 'running' THEN 0 ELSE 1 END, \
+                 e.task_start_time NULLS FIRST, e.id \
+             FOR UPDATE OF e SKIP LOCKED LIMIT 1;",
+            &[&scanner_id, &requested_task_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+
+    let Some(row) = row else {
+        transaction
+            .commit()
+            .await
+            .map_err(apply_task_database_error)?;
+        return Err(ApplyTaskError::NoTask);
+    };
+
+    let lease_expires_at = now + TASK_LEASE_MS;
+    transaction
+        .execute(
+            "UPDATE scan_task_execution SET execution_status = 'running', assigned_scanner_id = $1, \
+             task_start_time = COALESCE(task_start_time, $2::BIGINT), task_end_time = NULL, \
+             lease_expires_at = CASE WHEN maintenance_hold THEN NULL ELSE $3::BIGINT END, \
+             failure_reason = NULL WHERE id = $4;",
+            &[
+                &scanner_id,
+                &now,
+                &lease_expires_at,
+                &row.get::<_, i32>("execution_pk"),
+            ],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+    refresh_task_aggregate(&transaction, row.get("task_pk"))
+        .await
+        .map_err(apply_task_database_error)?;
+    let task = assigned_task_from_row(&row, lease_expires_at)?;
+    transaction
+        .commit()
+        .await
+        .map_err(apply_task_database_error)?;
+    info!(
+        event = "RECOVER-TASK",
+        scanner_id,
+        task_id = %task.task_id,
+        "scanner recovered an unfinished task"
+    );
+    Ok(task)
+}
+
+/// 通过该函数实现扫描器申请任务。
+/// 调用方必须先清空该扫描器的未完成任务；本函数也在事务内再次强制检查。
 pub async fn apply_task(
     pool: &deadpool_postgres::Pool,
     scanner_id: Uuid,
@@ -3348,6 +3297,7 @@ pub async fn apply_task(
     let transaction = p.transaction().await.map_err(apply_task_database_error)?;
     let token_hash = hash_scanner_token(token, token_pepper).map_err(apply_task_database_error)?;
     validate_scanner_credentials_with_client(&transaction, scanner_id, &token_hash).await?;
+    let scanner_id = scanner_id.to_string();
 
     let cancelled = transaction
         .query(
@@ -3367,6 +3317,29 @@ pub async fn apply_task(
             .map_err(apply_task_database_error)?;
     }
 
+    transaction
+        .query_one(
+            "SELECT id FROM scanner_info WHERE scanner_id = $1 FOR UPDATE;",
+            &[&scanner_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+
+    if let Some(row) = transaction
+        .query_opt(
+            "SELECT t.task_id FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+             WHERE e.execution_status = 'running' AND e.assigned_scanner_id = $1 \
+             ORDER BY e.task_start_time NULLS FIRST, e.id FOR UPDATE OF e LIMIT 1;",
+            &[&scanner_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?
+    {
+        let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
+            .map_err(apply_task_database_error)?;
+        return Err(ApplyTaskError::UnfinishedTask(task_id));
+    }
+
     let row = transaction
         .query_opt(
             "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, \
@@ -3382,10 +3355,11 @@ pub async fn apply_task(
            AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
            AND (jsonb_array_length(t.dns_resolvers) = 0 \
              OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
-         ORDER BY t.task_level DESC, t.task_create_time, e.id \
+         ORDER BY CASE WHEN e.execution_status = 'pending' AND e.requested_scanner_id = $2 THEN 0 ELSE 1 END, \
+             t.task_level DESC, t.task_create_time, e.id \
          FOR UPDATE OF e SKIP LOCKED \
          LIMIT 1;",
-            &[&get_unix_epoch_ms(), &scanner_id.to_string()],
+            &[&get_unix_epoch_ms(), &scanner_id],
         )
         .await
         .map_err(apply_task_database_error)?;
@@ -3401,7 +3375,7 @@ pub async fn apply_task(
 
     let task_pk: i32 = row.get("task_pk");
     let execution_pk: i32 = row.get("execution_pk");
-    let lease_expires_at = get_unix_epoch_ms() + 90_000;
+    let lease_expires_at = get_unix_epoch_ms() + TASK_LEASE_MS;
     transaction
         .execute(
             "UPDATE scan_task_execution SET task_start_time = COALESCE(task_start_time, $1::BIGINT), task_end_time = NULL, \
@@ -3410,7 +3384,7 @@ pub async fn apply_task(
              attempt_count = attempt_count + 1, failure_reason = NULL WHERE id = $4;",
             &[
                 &get_unix_epoch_ms(),
-                &scanner_id.to_string(),
+                &scanner_id,
                 &lease_expires_at,
                 &execution_pk,
             ],
@@ -3421,19 +3395,7 @@ pub async fn apply_task(
         .await
         .map_err(apply_task_database_error)?;
 
-    let task_id = Uuid::parse_str(row.get::<_, String>("task_id").as_str())
-        .map_err(apply_task_database_error)?;
-    let apply_task = ApplyTask {
-        user_id: row.get("user_id"),
-        task_id,
-        task_target: row.get("task_target"),
-        task_port: row.get("task_port"),
-        address_family: row.get("address_family"),
-        scan_plan: row.get("scan_plan"),
-        dns_resolvers: row.get("dns_resolvers"),
-        lease_expires_at_ms: lease_expires_at,
-        lease_ttl_ms: TASK_LEASE_MS,
-    };
+    let apply_task = assigned_task_from_row(&row, lease_expires_at)?;
 
     transaction
         .commit()
@@ -3451,6 +3413,12 @@ pub async fn apply_task(
 pub struct ApplyTaskQuery {
     pub scannerid: Uuid,
     pub dryrun: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct CurrentTaskQuery {
+    pub scannerid: Uuid,
+    pub taskid: Option<Uuid>,
 }
 
 /// 该函数用于退出登录

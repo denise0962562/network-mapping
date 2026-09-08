@@ -147,43 +147,6 @@ CREATE TABLE IF NOT EXISTS automatic_target_state (
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 表 ips 用于存储ip数据，并配置了级联更新
-CREATE TABLE IF NOT EXISTS ips ( 
-	task_id INT NOT NULL, 
-	execution_id INT NOT NULL,
-	ip_id SERIAL PRIMARY KEY, 
-	ip_address INET NOT NULL,
-	asn TEXT DEFAULT NULL,
-	isp TEXT DEFAULT NULL,
-	as_org TEXT DEFAULT NULL,
-	country_code VARCHAR(2) DEFAULT NULL,
-	country_name TEXT DEFAULT NULL,
-	region_name TEXT DEFAULT NULL,
-	city_name TEXT DEFAULT NULL,
-	latitude DOUBLE PRECISION DEFAULT NULL,
-	longitude DOUBLE PRECISION DEFAULT NULL,
-	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
-	update_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
-	CONSTRAINT fk_task
-        FOREIGN KEY (task_id)
-        REFERENCES scan_task(id)
-	        ON UPDATE CASCADE,
-	CONSTRAINT fk_execution
-		FOREIGN KEY (execution_id)
-		REFERENCES scan_task_execution(id)
-		ON DELETE CASCADE
-		ON UPDATE CASCADE
-);
-
--- 兼容已有数据库；CREATE TABLE IF NOT EXISTS 不会为现有表补充列。
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS as_org TEXT DEFAULT NULL;
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) DEFAULT NULL;
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS country_name TEXT DEFAULT NULL;
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS region_name TEXT DEFAULT NULL;
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS city_name TEXT DEFAULT NULL;
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION DEFAULT NULL;
-ALTER TABLE ips ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION DEFAULT NULL;
-
 -- 标签分类用于在 Web 端组织标签；风险语义仍由 asset_tag.kind 控制。
 CREATE TABLE IF NOT EXISTS asset_tag_category (
 	id BIGSERIAL PRIMARY KEY,
@@ -262,24 +225,6 @@ CREATE INDEX IF NOT EXISTS idx_asset_ip_tag_address
 CREATE INDEX IF NOT EXISTS idx_asset_ip_tag_tag_address
 	ON asset_ip_tag (tag_id, ip_address);
 
--- 表 ports 用于存储扫描出的端口，其中ip_id通过外键关联到表ips，并配置了级联更新删除
-CREATE TABLE IF NOT EXISTS ports ( 
-	ip_id INT NOT NULL, 
-	port_id SERIAL PRIMARY KEY, 
-	port INT NOT NULL CHECK (port >=0 AND port <= 65535), 
-	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,
-	update_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
-	UNIQUE( ip_id, port), 
-	CONSTRAINT fk_ip 
-		FOREIGN KEY (ip_id) 
-		REFERENCES ips(ip_id) 
-		ON DELETE CASCADE 
-		ON UPDATE CASCADE 
-); 
-
--- scaninfo 是旧版本遗留表。初始化流程不会创建、清空或删除该表；
--- 若升级时该表仍存在，下方迁移块只读取它并幂等回填 observation。
-
 -- Versioned, idempotent scanner uploads. A retry with the same execution/upload/batch
 -- identity is acknowledged without inserting observations again.
 CREATE TABLE IF NOT EXISTS scan_result_batch (
@@ -293,7 +238,7 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	payload_checksum VARCHAR(64),
 	-- `pending` reserves an upload while its idempotent Elasticsearch write runs outside
 	-- the PostgreSQL transaction. A retry resumes the same receipt after a crash/timeout.
-	storage_backend TEXT NOT NULL DEFAULT 'postgres',
+	storage_backend TEXT NOT NULL DEFAULT 'pending',
 	storage_references JSONB NOT NULL DEFAULT '[]'::JSONB,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	UNIQUE(execution_id, upload_id, batch_index)
@@ -324,69 +269,6 @@ ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_references JSONB 
 ALTER TABLE scan_result_batch DROP CONSTRAINT IF EXISTS scan_result_batch_protocol_version_check;
 ALTER TABLE scan_result_batch ADD CONSTRAINT scan_result_batch_protocol_version_check
 	CHECK (protocol_version IN (1, 2, 3));
-
-CREATE TABLE IF NOT EXISTS scan_observation (
-	id BIGSERIAL PRIMARY KEY,
-	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
-	batch_id BIGINT NOT NULL REFERENCES scan_result_batch(id) ON DELETE CASCADE,
-	observation_key TEXT NOT NULL,
-	kind TEXT NOT NULL CHECK (kind IN ('port', 'service', 'vulnerability')),
-	ip_address INET NOT NULL,
-	port INT NOT NULL CHECK (port >= 0 AND port <= 65535),
-	protocol TEXT NOT NULL,
-	service TEXT,
-	banner TEXT,
-	title TEXT,
-	http_body TEXT,
-	http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
-	tls_subject TEXT,
-	search_content_extracted BOOLEAN NOT NULL DEFAULT FALSE,
-	source TEXT NOT NULL,
-	data JSONB,
-	observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	UNIQUE(execution_id, observation_key)
-);
-
-ALTER TABLE scan_observation DROP CONSTRAINT IF EXISTS scan_observation_kind_check;
-ALTER TABLE scan_observation ADD CONSTRAINT scan_observation_kind_check
-	CHECK (kind IN ('port', 'service', 'vulnerability'));
-
--- 旧版结果允许协议为空；类型化上传仍由应用层要求协议非空。
-ALTER TABLE scan_observation ALTER COLUMN protocol DROP NOT NULL;
-ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS title TEXT;
-ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS http_body TEXT;
-ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS tls_subject TEXT;
-ALTER TABLE scan_observation ADD COLUMN IF NOT EXISTS search_content_extracted BOOLEAN NOT NULL DEFAULT FALSE;
-
-CREATE INDEX IF NOT EXISTS idx_scan_observation_execution_kind
-	ON scan_observation(execution_id, kind);
-CREATE INDEX IF NOT EXISTS idx_scan_observation_endpoint_latest
-	ON scan_observation(execution_id, ip_address, port, kind, observed_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_scan_observation_observed_at
-	ON scan_observation(observed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_scan_observation_service
-	ON scan_observation(service)
-	WHERE kind = 'service' AND service IS NOT NULL;
-
--- One-time compatibility backfill. These are execution-level control-plane counters;
--- scan facts remain in scan_observation for PostgreSQL/dual mode or Elasticsearch after cutover.
-UPDATE scan_task_execution execution SET
-	result_ip_count = (SELECT COUNT(*) FROM ips WHERE execution_id = execution.id),
-	result_port_count = (SELECT COUNT(*) FROM ports p JOIN ips i ON i.ip_id = p.ip_id WHERE i.execution_id = execution.id),
-	result_observation_count = (SELECT COUNT(*) FROM scan_observation WHERE execution_id = execution.id)
-WHERE execution.result_ip_count IS NULL
-	OR execution.result_port_count IS NULL
-	OR execution.result_observation_count IS NULL;
-CREATE INDEX IF NOT EXISTS idx_scan_observation_asset_endpoint_latest
-	ON scan_observation(ip_address, port, observed_at DESC, id DESC)
-	WHERE port > 0;
-CREATE INDEX IF NOT EXISTS idx_scan_observation_port_latest
-	ON scan_observation(port, observed_at DESC, id DESC)
-	WHERE port > 0;
-CREATE INDEX IF NOT EXISTS idx_scan_observation_service_lower
-	ON scan_observation(LOWER(service))
-	WHERE kind = 'service' AND service IS NOT NULL;
 
 -- Analysis snapshots are deliberately independent from scan facts. Existing installations can
 -- upgrade safely: the worker reconciles already succeeded executions into this outbox.
@@ -440,118 +322,15 @@ CREATE TABLE IF NOT EXISTS analytics_watermark (
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 将尚未进入 typed observation 模型的 v1 scaninfo 历史记录回填到合成批次。
--- 使用动态 SQL，确保 scaninfo 已由用户手动删除或新安装不存在时仍可正常初始化。
--- 限定为完全没有 observation 的 execution，避免把旧双写时期的兼容镜像重复导入。
-DO $scaninfo_migration$
-BEGIN
-	IF to_regclass('public.scaninfo') IS NOT NULL THEN
-		EXECUTE $sql$
-			INSERT INTO scan_result_batch (
-				execution_id, upload_id, batch_index, is_final, observation_count, protocol_version
-			)
-			SELECT e.id, e.execution_id, 0, true, COUNT(si.scan_info_id)::INT, 1
-			FROM scan_task_execution e
-			JOIN ips i ON i.execution_id = e.id
-			JOIN ports p ON p.ip_id = i.ip_id
-			JOIN scaninfo si ON si.port_id = p.port_id
-			WHERE NOT EXISTS (
-				SELECT 1 FROM scan_observation existing WHERE existing.execution_id = e.id
-			)
-			GROUP BY e.id, e.execution_id
-			ON CONFLICT (execution_id, upload_id, batch_index) DO NOTHING
-		$sql$;
-
-		EXECUTE $sql$
-			INSERT INTO scan_observation (
-				execution_id, batch_id, observation_key, kind, ip_address, port,
-				protocol, service, banner, source, data, observed_at
-			)
-			SELECT
-				e.id,
-				b.id,
-				'legacy:' || si.scan_info_id,
-				CASE
-					WHEN si.other->>'observation_kind' IN ('port', 'service')
-						THEN si.other->>'observation_kind'
-					WHEN NULLIF(BTRIM(si.service), '') IS NOT NULL OR NULLIF(BTRIM(si.banner), '') IS NOT NULL
-						THEN 'service'
-					ELSE 'port'
-				END,
-				i.ip_address,
-				p.port,
-				si.protocol,
-				si.service,
-				si.banner,
-				COALESCE(NULLIF(si.other->>'source', ''), 'legacy'),
-				CASE
-					WHEN COALESCE(si.other->>'observation_kind', '') = 'service'
-						OR NULLIF(BTRIM(si.service), '') IS NOT NULL
-						OR NULLIF(BTRIM(si.banner), '') IS NOT NULL
-						THEN COALESCE(si.other->'data', si.other)
-					ELSE jsonb_strip_nulls(jsonb_build_object(
-						'state', COALESCE(NULLIF(si.other->>'state', ''), 'open'),
-						'legacy_other', si.other
-					))
-				END,
-				COALESCE(to_timestamp(si.scan_time / 1000.0), NOW())
-			FROM scaninfo si
-			JOIN ports p ON p.port_id = si.port_id
-			JOIN ips i ON i.ip_id = p.ip_id
-			JOIN scan_task_execution e ON e.id = i.execution_id
-			JOIN scan_result_batch b
-				ON b.execution_id = e.id
-				AND b.upload_id = e.execution_id
-				AND b.batch_index = 0
-				AND b.protocol_version = 1
-			WHERE NOT EXISTS (
-				SELECT 1
-				FROM scan_observation existing
-				WHERE existing.execution_id = e.id
-					AND existing.observation_key = 'legacy:' || si.scan_info_id
-			)
-			ON CONFLICT (execution_id, observation_key) DO NOTHING
-		$sql$;
-	END IF;
-END
-$scaninfo_migration$;
-
--- 统一定义一次执行内端口的展示结果：服务识别优先，其次取最近观察。
-CREATE OR REPLACE VIEW scan_execution_endpoint_latest AS
-SELECT
-	ranked.id AS observation_id,
-	ranked.execution_id,
-	ranked.ip_address,
-	ranked.port,
-	ranked.kind,
-	ranked.protocol,
-	ranked.service,
-	ranked.banner,
-	ranked.source,
-	ranked.data,
-	ranked.observed_at,
-	FLOOR(EXTRACT(EPOCH FROM ranked.observed_at) * 1000)::BIGINT AS scan_time
-FROM (
-	SELECT
-		o.*,
-		ROW_NUMBER() OVER (
-			PARTITION BY o.execution_id, o.ip_address, o.port
-			ORDER BY
-				(o.kind = 'service') DESC,
-				(o.service IS NOT NULL OR o.banner IS NOT NULL) DESC,
-				o.observed_at DESC,
-				o.id DESC
-		) AS row_number
-	FROM scan_observation o
-	WHERE o.kind IN ('port', 'service')
-) ranked
-WHERE ranked.row_number = 1;
-
--- 数据分析查询按观察时间筛选，并通过端口、任务和执行记录进行权限过滤。
-CREATE INDEX IF NOT EXISTS idx_ips_create_time_task
-	ON ips(create_time, task_id);
-CREATE INDEX IF NOT EXISTS idx_ips_address_update
-	ON ips(ip_address, update_time DESC, ip_id DESC);
+-- A fixed set of executions, independent of arrivals during a backfill.
+CREATE TABLE IF NOT EXISTS analytics_snapshot_build (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS analytics_snapshot_build_execution (
+    execution_id INT PRIMARY KEY REFERENCES analytics_outbox(execution_id) ON DELETE CASCADE
+);
 
 -- 表 session 用于存储cookie，其中包括在有效期内的和有效期外的
 CREATE TABLE IF NOT EXISTS session (
@@ -674,6 +453,31 @@ ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_network_rtt_us BIGINT;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_server_processing_us BIGINT;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_measured_at TIMESTAMPTZ;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS latency_probe_id UUID;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS applied_config_revision BIGINT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS config_status TEXT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS config_error TEXT;
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS config_reported_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS scanner_runtime_configuration (
+	scanner_id VARCHAR(36) PRIMARY KEY REFERENCES scanner_info(scanner_id) ON DELETE CASCADE,
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+	schema_version INT NOT NULL DEFAULT 1 CHECK (schema_version > 0),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_by_user_id INT REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS scanner_runtime_configuration_revision (
+	id BIGSERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL REFERENCES scanner_info(scanner_id) ON DELETE CASCADE,
+	revision BIGINT NOT NULL CHECK (revision > 0),
+	schema_version INT NOT NULL CHECK (schema_version > 0),
+	document JSONB NOT NULL CHECK (jsonb_typeof(document) = 'object'),
+	changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	changed_by_user_id INT REFERENCES users(id),
+	change_reason TEXT NOT NULL DEFAULT '',
+	UNIQUE(scanner_id, revision)
+);
 
 -- 扫描器到服务端的 HTTPS 心跳延迟历史。最新值同时冗余在 scanner_info，
 -- 避免扫描器列表查询历史表。
@@ -842,7 +646,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_event_request
 	ON audit_event (request_id) WHERE request_id IS NOT NULL;
 
 -- 任务调度与结果索引。当前开发环境直接按上述定义创建全新表结构。
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_execution_address ON ips (execution_id, ip_address);
+
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
 	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
 
@@ -851,6 +655,9 @@ CREATE INDEX IF NOT EXISTS idx_scan_task_execution_maintenance_hold
 	WHERE execution_status = 'running' AND maintenance_hold = TRUE;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_task_execution_running_owner
 	ON scan_task_execution (task_id, assigned_scanner_id)
+	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_running_scanner
+	ON scan_task_execution (assigned_scanner_id)
 	WHERE execution_status = 'running' AND assigned_scanner_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_scan_task_dispatch
 	ON scan_task (task_status, lease_expires_at, task_level DESC, task_create_time);
@@ -1182,47 +989,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_job_single_active
 
 -- 搜索读模型：按用户权限范围和管理员全局范围预先维护每个 IP:port 的当前状态。
 -- 历史 observation 仍是权威事实；此表和 Elasticsearch 索引均可重建。
-CREATE SEQUENCE IF NOT EXISTS asset_endpoint_projection_version_seq;
-
-CREATE TABLE IF NOT EXISTS asset_endpoint_current (
-	scope_type TEXT NOT NULL CHECK (scope_type IN ('global', 'user')),
-	scope_id INT NOT NULL CHECK (
-		(scope_type = 'global' AND scope_id = 0)
-		OR (scope_type = 'user' AND scope_id > 0)
-	),
-	ip_address INET NOT NULL,
-	port INT NOT NULL CHECK (port > 0 AND port <= 65535),
-	protocol TEXT,
-	service TEXT,
-	banner TEXT,
-	title TEXT,
-	http_body TEXT,
-	http_body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
-	tls_subject TEXT,
-	source TEXT NOT NULL,
-	scanner_name TEXT,
-	first_seen_at TIMESTAMPTZ NOT NULL,
-	last_seen_at TIMESTAMPTZ NOT NULL,
-	asn TEXT,
-	isp TEXT,
-	as_org TEXT,
-	country_code VARCHAR(2),
-	country_name TEXT,
-	region_name TEXT,
-	city_name TEXT,
-	latest_endpoint_observation_id BIGINT NOT NULL,
-	latest_service_observation_id BIGINT,
-	projection_version BIGINT NOT NULL DEFAULT nextval('asset_endpoint_projection_version_seq'),
-	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	PRIMARY KEY (scope_type, scope_id, ip_address, port)
-);
-
-CREATE INDEX IF NOT EXISTS idx_asset_endpoint_current_scope_latest
-	ON asset_endpoint_current(scope_type, scope_id, last_seen_at DESC, ip_address, port);
-CREATE INDEX IF NOT EXISTS idx_asset_endpoint_current_ip
-	ON asset_endpoint_current(ip_address, scope_type, scope_id);
-
--- Outbox 与扫描结果或标签变更位于同一 PostgreSQL 事务，ES 故障不会阻塞扫描写入。
 CREATE TABLE IF NOT EXISTS search_index_outbox (
 	id BIGSERIAL PRIMARY KEY,
 	event_kind TEXT NOT NULL CHECK (event_kind IN ('execution', 'ip', 'full')),
@@ -1240,71 +1006,5 @@ CREATE INDEX IF NOT EXISTS idx_search_index_outbox_pending
 	ON search_index_outbox(available_at, id)
 	WHERE processed_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS search_projection_state (
-	state_key TEXT PRIMARY KEY,
-	state_value TEXT NOT NULL,
-	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 
--- 该视图只在投影刷新/全量重建时读取。普通搜索直接读取 asset_endpoint_current，
--- 避免每个请求都在完整历史上执行窗口函数和聚合。
-CREATE OR REPLACE VIEW asset_endpoint_search_source AS
-WITH eligible AS MATERIALIZED (
-	SELECT scope.scope_type, scope.scope_id, observation.*,
-		COALESCE(scanner.name, execution.assigned_scanner_id, execution.requested_scanner_id) AS scanner_name
-	FROM scan_observation observation
-	JOIN scan_task_execution execution ON execution.id = observation.execution_id
-	JOIN scan_task task ON task.id = execution.task_id
-	LEFT JOIN scanner_info scanner
-		ON scanner.scanner_id = COALESCE(execution.assigned_scanner_id, execution.requested_scanner_id)
-	CROSS JOIN LATERAL (
-		VALUES ('global'::TEXT, 0), ('user'::TEXT, task.user_id)
-	) AS scope(scope_type, scope_id)
-	WHERE execution.execution_status = 'succeeded'
-		AND observation.port > 0
-		AND observation.kind IN ('port', 'service')
-), endpoint_stats AS (
-	SELECT scope_type, scope_id, ip_address, port,
-		MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at
-	FROM eligible
-	GROUP BY scope_type, scope_id, ip_address, port
-), latest_endpoint AS (
-	SELECT DISTINCT ON (scope_type, scope_id, ip_address, port)
-		scope_type, scope_id, ip_address, port, protocol, source, scanner_name, id
-	FROM eligible
-	ORDER BY scope_type, scope_id, ip_address, port, observed_at DESC, id DESC
-), latest_service AS (
-	SELECT DISTINCT ON (scope_type, scope_id, ip_address, port)
-		scope_type, scope_id, ip_address, port, service, banner, title, http_body,
-		http_body_truncated, tls_subject, source, id
-	FROM eligible
-	WHERE kind = 'service'
-	ORDER BY scope_type, scope_id, ip_address, port, observed_at DESC, id DESC
-), eligible_intel AS MATERIALIZED (
-	SELECT scope.scope_type, scope.scope_id, intel.*
-	FROM ips intel
-	JOIN scan_task_execution execution ON execution.id = intel.execution_id
-	JOIN scan_task task ON task.id = execution.task_id
-	CROSS JOIN LATERAL (
-		VALUES ('global'::TEXT, 0), ('user'::TEXT, task.user_id)
-	) AS scope(scope_type, scope_id)
-	WHERE execution.execution_status = 'succeeded'
-), latest_intel AS (
-	SELECT DISTINCT ON (scope_type, scope_id, ip_address)
-		scope_type, scope_id, ip_address, asn, isp, as_org, country_code,
-		country_name, region_name, city_name
-	FROM eligible_intel
-	ORDER BY scope_type, scope_id, ip_address, update_time DESC, ip_id DESC
-)
-SELECT stats.scope_type, stats.scope_id, stats.ip_address, stats.port,
-	endpoint.protocol, service.service, service.banner, service.title, service.http_body,
-	COALESCE(service.http_body_truncated, FALSE) AS http_body_truncated,
-	service.tls_subject, COALESCE(service.source, endpoint.source) AS source,
-	endpoint.scanner_name, stats.first_seen_at, stats.last_seen_at,
-	intel.asn, intel.isp, intel.as_org, intel.country_code, intel.country_name,
-	intel.region_name, intel.city_name, endpoint.id AS latest_endpoint_observation_id,
-	service.id AS latest_service_observation_id
-FROM endpoint_stats stats
-JOIN latest_endpoint endpoint USING (scope_type, scope_id, ip_address, port)
-LEFT JOIN latest_service service USING (scope_type, scope_id, ip_address, port)
-LEFT JOIN latest_intel intel USING (scope_type, scope_id, ip_address);
+ALTER TABLE scan_result_batch ALTER COLUMN storage_backend SET DEFAULT 'pending';

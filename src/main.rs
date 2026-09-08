@@ -130,6 +130,13 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    let _storage_lease = network_mapping_server::scan_migration::acquire_storage_lease(
+        &db_config,
+        args.migrate_scan_data_to_elasticsearch,
+    )
+    .await
+    .map_err(io::Error::other)?;
+
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(error_value) => {
@@ -149,35 +156,23 @@ async fn main() -> io::Result<()> {
             panic!("初始化数据库错误：{diagnostics}");
         }
     };
-    if !args.rebuild_elasticsearch
-        && !args.refresh_ip_intel
-        && !args.migrate_scan_data_to_elasticsearch
-        && !args.rebuild_analytics_snapshots
-        && !elasticsearch_config.scan_storage.reads_elasticsearch()
-    {
-        match network_mapping_server::search_projection::ensure_initialized(&db_pool).await {
-            Ok(true) => info!(target: "server::startup", "历史数据已生成 PostgreSQL 当前端点投影"),
-            Ok(false) => {}
-            Err(error_value) => {
-                let diagnostics = error_chain_diagnostics(error_value.as_ref());
-                error!(
-                    target: "server::startup",
-                    event = "DatabaseStartupFailed",
-                    startup_stage = "search_projection_initialization",
-                    database_host = %db_config.host,
-                    database_port = db_config.port,
-                    database_name = %db_config.db_name,
-                    message = %diagnostics,
-                    error = ?error_value,
-                    "PostgreSQL 当前端点投影初始化失败，服务即将终止"
-                );
-                panic!("初始化当前端点投影失败：{diagnostics}");
-            }
-        }
-    }
     let elasticsearch_service = ElasticsearchService::new(elasticsearch_config)
         .map_err(|error| io::Error::other(format!("创建 Elasticsearch 客户端失败：{error}")))?;
     if args.migrate_scan_data_to_elasticsearch {
+        if args.refresh_ip_intel {
+            network_mapping_server::scan_migration::prepare(
+                &db_pool,
+                &network_mapping_server::cli_progress::NoopProgressReporter,
+            )
+            .await
+            .map_err(io::Error::other)?;
+            let maxmind = MaxMindState::from_directory(&maxmind_directory);
+            let progress = CliProgressReporter::new("迁移前刷新 PG IP 情报");
+            maxmind
+                .refresh_ip_intel_with_progress(&db_pool, &progress)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
         let progress = CliProgressReporter::new("扫描数据迁移");
         let report = match elasticsearch_service
             .migrate_scan_data_with_progress(&db_pool, &progress)
@@ -201,40 +196,6 @@ async fn main() -> io::Result<()> {
         );
         return Ok(());
     }
-    if args.rebuild_elasticsearch {
-        if !elasticsearch_service.enabled() {
-            return Err(io::Error::other(
-                "--rebuild-elasticsearch 要求 elasticsearch.enabled=true",
-            ));
-        }
-        let progress = CliProgressReporter::new("Elasticsearch 重建");
-        let projected = match network_mapping_server::search_projection::rebuild_with_progress(
-            &db_pool, &progress,
-        )
-        .await
-        {
-            Ok(projected) => projected,
-            Err(error) => {
-                progress.fail(format!("重建当前端点投影失败：{error}"));
-                return Err(io::Error::other(format!("重建当前端点投影失败：{error}")));
-            }
-        };
-        let indexed = match elasticsearch_service
-            .full_sync_with_progress(&db_pool, &progress)
-            .await
-        {
-            Ok(indexed) => indexed,
-            Err(error) => {
-                progress.fail(format!("重建 Elasticsearch 索引失败：{error}"));
-                return Err(io::Error::other(format!(
-                    "重建 Elasticsearch 索引失败：{error}"
-                )));
-            }
-        };
-        progress.finish(format!("PostgreSQL 投影 {projected} 条，索引 {indexed} 条"));
-        println!("Elasticsearch 重建完成：PostgreSQL 投影 {projected} 条，索引 {indexed} 条");
-        return Ok(());
-    }
     elasticsearch_service
         .validate_scan_cutover(&db_pool)
         .await
@@ -256,6 +217,7 @@ async fn main() -> io::Result<()> {
             monitor: monitor_config,
             automatic_target: automatic_target_config,
             dns_follow_up: dns_follow_up_config,
+            dns_resolvers: Default::default(),
             analytics_snapshot: analytics_snapshot_config,
         },
     )
@@ -289,44 +251,7 @@ async fn main() -> io::Result<()> {
     }
 
     let maxmind_state = MaxMindState::from_directory(&maxmind_directory);
-    if args.refresh_ip_intel {
-        let progress = CliProgressReporter::new("IP 情报刷新");
-        match maxmind_state
-            .refresh_ip_intel_with_progress(&db_pool, &progress)
-            .await
-        {
-            Ok(report) => {
-                let projected =
-                    match network_mapping_server::search_projection::rebuild_with_progress(
-                        &db_pool, &progress,
-                    )
-                    .await
-                    {
-                        Ok(projected) => projected,
-                        Err(error) => {
-                            progress.fail(format!("搜索投影重建失败：{error}"));
-                            return Err(io::Error::other(format!(
-                                "刷新 IP 情报后的搜索投影重建失败：{error}"
-                            )));
-                        }
-                    };
-                progress.finish(format!(
-                    "扫描 {} 条，更新 {} 条，无匹配 {} 条，搜索投影 {} 条",
-                    report.scanned, report.updated, report.unmatched, projected
-                ));
-                println!(
-                    "IP 情报刷新完成：扫描 {} 条，更新 {} 条，无匹配 {} 条，搜索投影 {} 条",
-                    report.scanned, report.updated, report.unmatched, projected
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                progress.fail(error.to_string());
-                error!(event = "RefreshIpIntelError", message = %error);
-                return Err(io::Error::other("刷新历史 IP 情报失败"));
-            }
-        }
-    }
+
     let elasticsearch_data = web::Data::new(elasticsearch_service.clone());
     if elasticsearch_service.enabled() {
         tokio::spawn(run_elasticsearch_worker(

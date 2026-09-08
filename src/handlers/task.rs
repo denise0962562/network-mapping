@@ -12,9 +12,9 @@ use crate::system_maintenance::{
     MaintenanceSnapshot, SystemMaintenanceState, maintenance_response,
 };
 use crate::{
-    ApplyTaskError, ApplyTaskQuery, CreateTask, ReceiveTaskItemQueryInfo, STask, TargetIP,
-    TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
-    validate_scanner_credentials,
+    ApplyTaskError, ApplyTaskQuery, CreateTask, CurrentTaskQuery, ReceiveTaskItemQueryInfo, STask,
+    TargetIP, TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
+    recover_scanner_task, validate_scanner_credentials,
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::IpAddr;
 use tracing::error;
 use uuid::Uuid;
@@ -105,6 +105,23 @@ fn default_dns_scan_profile() -> String {
 
 fn default_follow_up_scan_profile() -> String {
     "port_only".into()
+}
+
+#[get("/api/dns/resolvers")]
+async fn get_dns_resolver_presets(
+    settings: web::Data<crate::runtime_config::RuntimeSettings>,
+    _user: UserBaseI,
+) -> impl Responder {
+    let presets = settings
+        .dns_resolvers
+        .get()
+        .await
+        .value
+        .resolvers
+        .into_iter()
+        .filter(|resolver| resolver.enabled)
+        .collect::<Vec<_>>();
+    HttpResponse::Ok().json(json!({"success": true, "data": presets}))
 }
 
 fn resolve_dns_task_port(
@@ -191,6 +208,18 @@ struct ScannerHeartbeatResponse {
     lease: Option<ScannerHeartbeatLease>,
     command: Option<ScannerHeartbeatCommand>,
     maintenance: Option<MaintenanceSnapshot>,
+    configuration: Option<crate::scanner_config::ScannerConfigurationNotice>,
+}
+
+#[derive(Default, Deserialize)]
+struct ScannerConfigurationState {
+    #[serde(default)]
+    supported_schema_versions: Vec<i32>,
+    applied_revision: Option<i64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +245,8 @@ pub struct ScannerHeartbeat {
     scan_capabilities: ScannerScanCapabilities,
     #[serde(default)]
     latency_report: Option<ScannerLatencyReport>,
+    #[serde(default)]
+    config_state: ScannerConfigurationState,
 }
 
 const LATENCY_PROTOCOL_VERSION: u16 = 1;
@@ -715,6 +746,29 @@ pub(crate) async fn scanner_heartbeat_handler(
     if let Err(message) = heartbeat.scan_capabilities.validate() {
         return HttpResponse::BadRequest().body(message);
     }
+    if heartbeat.config_state.supported_schema_versions.len() > 8
+        || heartbeat
+            .config_state
+            .supported_schema_versions
+            .iter()
+            .any(|value| *value <= 0)
+        || heartbeat
+            .config_state
+            .applied_revision
+            .is_some_and(|value| value <= 0)
+        || heartbeat
+            .config_state
+            .error
+            .as_ref()
+            .is_some_and(|value| value.len() > 500)
+        || heartbeat
+            .config_state
+            .status
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "local" | "staged" | "applied" | "rejected"))
+    {
+        return HttpResponse::BadRequest().body("invalid scanner configuration state");
+    }
     let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
         Ok(value) => value,
         Err(error) => {
@@ -881,6 +935,52 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::InternalServerError().finish();
         }
     }
+    let configuration =
+        match crate::scanner_config::load_configuration(&scanner_transaction, &scanner_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => return HttpResponse::Unauthorized().finish(),
+            Err(error) => {
+                error_logs_error(
+                    &req,
+                    "ScannerConfigurationHeartbeatError",
+                    "load_configuration",
+                    error.as_ref(),
+                );
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+    if !heartbeat.config_state.supported_schema_versions.is_empty()
+        && let Err(error) = scanner_transaction
+            .execute(
+                "UPDATE scanner_info SET applied_config_revision = $1, config_status = $2, \
+                 config_error = $3, config_reported_at = NOW() WHERE scanner_id = $4;",
+                &[
+                    &heartbeat.config_state.applied_revision,
+                    &heartbeat.config_state.status,
+                    &heartbeat.config_state.error,
+                    &scanner_id,
+                ],
+            )
+            .await
+    {
+        error_logs_error(
+            &req,
+            "ScannerConfigurationStateError",
+            "update_configuration_state",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
+    let configuration_notice = heartbeat
+        .config_state
+        .supported_schema_versions
+        .contains(&configuration.schema_version)
+        .then_some(configuration)
+        .filter(|value| heartbeat.config_state.applied_revision != Some(value.revision))
+        .map(|value| crate::scanner_config::ScannerConfigurationNotice {
+            revision: value.revision,
+            schema_version: value.schema_version,
+        });
     // 扫描器状态行与任务执行行使用两个短事务。过去这里会在等待任务租约锁时一直
     // 持有 scanner_info 行锁，导致同一扫描器后续心跳形成分钟级锁队列。
     if let Err(error) = scanner_transaction.commit().await {
@@ -1002,6 +1102,7 @@ pub(crate) async fn scanner_heartbeat_handler(
             task_id,
         }),
         maintenance: maintenance_snapshot.enabled.then_some(maintenance_snapshot),
+        configuration: configuration_notice,
     })
 }
 
@@ -1373,7 +1474,6 @@ async fn get_task(
         );
         return HttpResponse::InternalServerError().finish();
     };
-    let selected_execution_pk: i32 = selected_execution.get("id");
     let executions: Vec<Value> = execution_rows.iter().map(|row| serde_json::json!({
         "execution_id": row.get::<_, String>("execution_id"),
         "requested_scanner_id": row.get::<_, Option<String>>("requested_scanner_id"),
@@ -1393,7 +1493,7 @@ async fn get_task(
     let ip_count = selected_execution.get::<_, i64>("ip_count");
     let port_count = selected_execution.get::<_, i64>("port_count");
     let result_count = selected_execution.get::<_, i64>("result_count");
-    let results = if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+    let results = {
         match load_execution_results_from_elasticsearch(
             elasticsearch.get_ref(),
             selected_execution.get::<_, String>("execution_id").as_str(),
@@ -1409,92 +1509,8 @@ async fn get_task(
                     .json(json!({"message": "扫描结果索引暂时不可用"}));
             }
         }
-    } else {
-        let ip_rows = match connection
-            .query(
-                "SELECT ip_id, ip_address::text AS ip, asn, isp, as_org, \
-                 country_code, country_name, region_name, city_name FROM ips \
-                 WHERE execution_id = $1 ORDER BY ip_address LIMIT $2 OFFSET $3;",
-                &[&selected_execution_pk, &page_size, &offset],
-            )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                error_logs_error(&req, "GetTaskResultsError", "load_task_results", &error);
-                return HttpResponse::InternalServerError().finish();
-            }
-        };
-        let ip_ids: Vec<i32> = ip_rows.iter().map(|row| row.get("ip_id")).collect();
-        let mut ports_by_ip: HashMap<i32, Vec<TaskResultPort>> = HashMap::new();
-        if !ip_ids.is_empty() {
-            let port_rows = match connection
-                .query(
-                    "SELECT p.ip_id, p.port, latest.protocol, latest.service, latest.banner, \
-                     CASE WHEN latest.kind IS NULL THEN NULL \
-                     WHEN latest.kind = 'port' THEN jsonb_strip_nulls(jsonb_build_object( \
-                        'observation_kind', latest.kind, 'state', latest.data->>'state', 'source', latest.source)) \
-                     ELSE jsonb_strip_nulls(jsonb_build_object('observation_kind', latest.kind, \
-                        'source', latest.source, 'data', latest.data)) END AS other, \
-                     latest.scan_time FROM ports p JOIN ips i ON i.ip_id = p.ip_id \
-                     LEFT JOIN LATERAL ( \
-                        SELECT o.kind, o.protocol, o.service, o.banner, o.source, o.data, \
-                            FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
-                        FROM scan_observation o \
-                        WHERE o.execution_id = i.execution_id \
-                            AND o.ip_address = i.ip_address AND o.port = p.port \
-                            AND o.kind IN ('port', 'service') \
-                        ORDER BY (o.kind = 'service') DESC, \
-                            (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
-                            o.observed_at DESC, o.id DESC LIMIT 1 \
-                     ) latest ON true \
-                     WHERE p.ip_id = ANY($1) ORDER BY p.ip_id, p.port;",
-                    &[&ip_ids],
-                )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    error_logs_error(&req, "GetTaskPortsError", "load_task_ports", &error);
-                    return HttpResponse::InternalServerError().finish();
-                }
-            };
-            for row in port_rows {
-                ports_by_ip
-                    .entry(row.get("ip_id"))
-                    .or_default()
-                    .push(TaskResultPort {
-                        port: row.get("port"),
-                        protocol: row.get("protocol"),
-                        service: row.get("service"),
-                        banner: row.get("banner"),
-                        other: row.get("other"),
-                        scan_time: row.get("scan_time"),
-                    });
-            }
-        }
-        ip_rows
-            .into_iter()
-            .map(|row| {
-                let ip_id: i32 = row.get("ip_id");
-                TaskResultIp {
-                    ip: row.get("ip"),
-                    asn: row.get("asn"),
-                    isp: row.get("isp"),
-                    as_org: row.get("as_org"),
-                    country_code: row.get("country_code"),
-                    country_name: row.get("country_name"),
-                    region_name: row.get("region_name"),
-                    city_name: row.get("city_name"),
-                    ports: ports_by_ip.remove(&ip_id).unwrap_or_default(),
-                }
-            })
-            .collect()
     };
-    let (vulnerabilities, vulnerability_count) = if elasticsearch
-        .scan_storage_mode()
-        .reads_elasticsearch()
-    {
+    let (vulnerabilities, vulnerability_count) = {
         match load_vulnerabilities_from_elasticsearch(
             elasticsearch.get_ref(),
             selected_execution.get::<_, String>("execution_id").as_str(),
@@ -1508,44 +1524,6 @@ async fn get_task(
                     .json(json!({"message": "漏洞结果索引暂时不可用"}));
             }
         }
-    } else {
-        let rows = match connection
-                .query(
-                    "SELECT jsonb_build_object( \
-                        'ip', host(ip_address), 'port', port, 'protocol', protocol, \
-                        'observed_at', FLOOR(EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT, \
-                        'template_id', data->>'template_id', 'name', data->>'name', \
-                        'severity', data->>'severity', 'matcher_name', data->>'matcher_name', \
-                        'matched_at', data->>'matched_at', 'description', data->>'description', \
-                        'remediation', data->>'remediation', 'tags', COALESCE(data->'tags', '[]'::jsonb), \
-                        'references', COALESCE(data->'references', '[]'::jsonb), \
-                        'classification', data->'classification', \
-                        'extracted_results', COALESCE(data->'extracted_results', '[]'::jsonb)) AS finding, \
-                        COUNT(*) OVER()::BIGINT AS total \
-                     FROM scan_observation WHERE execution_id = $1 AND kind = 'vulnerability' \
-                     ORDER BY observed_at DESC, id DESC LIMIT 500;",
-                    &[&selected_execution_pk],
-                )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => {
-                    error_logs_error(
-                        &req,
-                        "GetTaskVulnerabilitiesError",
-                        "load_task_vulnerabilities",
-                        &error,
-                    );
-                    return HttpResponse::InternalServerError().finish();
-                }
-            };
-        let total = rows.first().map(|row| row.get("total")).unwrap_or(0_i64);
-        (
-            rows.into_iter()
-                .map(|row| row.get::<_, Value>("finding"))
-                .collect(),
-            total,
-        )
     };
     let generation_metadata = task.get::<_, Option<Value>>("generation_metadata");
     let stored_scan_profile = task.get::<_, String>("scan_profile");
@@ -2022,6 +2000,12 @@ async fn create_dns_task(
     };
     let dispatch_mode = input.dispatch_mode.trim().to_ascii_lowercase();
     let requires_explicit_resolvers = !dns_resolvers.is_empty();
+    let requires_ipv6_resolver = dns_resolvers.iter().any(|resolver| {
+        resolver
+            .ip
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_ipv6())
+    });
     let requested_scanners: Vec<Option<String>> = match dispatch_mode.as_str() {
         "automatic" if input.scanner_ids.is_empty() => {
             match connection
@@ -2029,8 +2013,9 @@ async fn create_dns_task(
                     "SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
                      AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
                      AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     AND ($3 = FALSE OR (supports_ipv6 AND ipv6_ready)) \
                      LIMIT 1;",
-                    &[&resolved_scan.task_profile, &requires_explicit_resolvers],
+                    &[&resolved_scan.task_profile, &requires_explicit_resolvers, &requires_ipv6_resolver],
                 )
                 .await
             {
@@ -2059,8 +2044,9 @@ async fn create_dns_task(
                      AND is_enable = true AND deleted_at IS NULL AND supports_ipv4 AND ipv4_ready \
                      AND scan_capabilities->'profiles' ? $2 \
                      AND ($3 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     AND ($4 = FALSE OR (supports_ipv6 AND ipv6_ready)) \
                      ORDER BY scanner_id;",
-                    &[&values, &resolved_scan.task_profile, &requires_explicit_resolvers],
+                    &[&values, &resolved_scan.task_profile, &requires_explicit_resolvers, &requires_ipv6_resolver],
                 )
                 .await
             {
@@ -2086,8 +2072,9 @@ async fn create_dns_task(
                     "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
                      AND supports_ipv4 AND ipv4_ready AND scan_capabilities->'profiles' ? $1 \
                      AND ($2 = FALSE OR COALESCE((scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                     AND ($3 = FALSE OR (supports_ipv6 AND ipv6_ready)) \
                      ORDER BY scanner_id;",
-                    &[&resolved_scan.task_profile, &requires_explicit_resolvers],
+                    &[&resolved_scan.task_profile, &requires_explicit_resolvers, &requires_ipv6_resolver],
                 )
                 .await
             {
@@ -2222,6 +2209,67 @@ async fn create_dns_task(
     }))
 }
 
+/// 返回并续租当前扫描器已经持有的未完成任务。
+#[get("/api/task/current")]
+async fn current_task_handler(
+    req: HttpRequest,
+    query: web::Query<CurrentTaskQuery>,
+    pool: web::Data<Pool>,
+    security: web::Data<SecurityConfig>,
+    maintenance: web::Data<SystemMaintenanceState>,
+) -> impl Responder {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return HttpResponse::Unauthorized().body("missing scanner token");
+    };
+
+    let maintenance_snapshot = maintenance.snapshot().await;
+    let blocks_recovery = maintenance_snapshot.blocks_all_scanner_requests()
+        || (query.taskid.is_none() && maintenance_snapshot.blocks_new_work());
+    if let Some(response) = maintenance_gate_for_runtime_scanner(
+        pool.get_ref(),
+        security.get_ref(),
+        query.scannerid,
+        token,
+        maintenance_snapshot,
+        blocks_recovery,
+    )
+    .await
+    {
+        return response;
+    }
+
+    match recover_scanner_task(
+        pool.get_ref(),
+        query.scannerid,
+        query.taskid,
+        token,
+        &security.scanner_token_pepper,
+    )
+    .await
+    {
+        Ok(task) => HttpResponse::Ok().json(task),
+        Err(ApplyTaskError::ScannerUnauthorized) => {
+            HttpResponse::Unauthorized().body("unauthorized")
+        }
+        Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
+        Err(ApplyTaskError::UnfinishedTask(_)) => unreachable!("recovery never claims new work"),
+        Err(ApplyTaskError::Database(error)) => {
+            error_logs_error(
+                &req,
+                "RecoverTaskDatabaseError",
+                "recover_scanner_task",
+                error.as_ref(),
+            );
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
 /// 用于扫描器申请一个扫描目标
 #[get("/api/task/apply")]
 async fn apply_task_handler(
@@ -2269,6 +2317,11 @@ async fn apply_task_handler(
             Err(ApplyTaskError::ScannerUnauthorized) => {
                 HttpResponse::Unauthorized().body("unauthorized")
             }
+            Err(ApplyTaskError::UnfinishedTask(task_id)) => HttpResponse::Conflict().json(json!({
+                "success": false,
+                "code": "unfinished_task_exists",
+                "task_id": task_id,
+            })),
             Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
             Err(ApplyTaskError::Database(e)) => {
                 error_logs_error(
@@ -2294,6 +2347,11 @@ async fn apply_task_handler(
         Err(ApplyTaskError::ScannerUnauthorized) => {
             HttpResponse::Unauthorized().body("unauthorized")
         }
+        Err(ApplyTaskError::UnfinishedTask(task_id)) => HttpResponse::Conflict().json(json!({
+            "success": false,
+            "code": "unfinished_task_exists",
+            "task_id": task_id,
+        })),
         Err(ApplyTaskError::NoTask) => HttpResponse::NoContent().finish(),
         Err(ApplyTaskError::Database(e)) => {
             error_logs_error(
@@ -2680,6 +2738,13 @@ mod tests {
     }
 
     #[test]
+    fn database_schema_indexes_running_execution_recovery() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+        assert!(initialization_sql.contains("idx_scan_task_execution_running_scanner"));
+        assert!(initialization_sql.contains("ON scan_task_execution (assigned_scanner_id)"));
+    }
+
+    #[test]
     fn dns_port_scan_uses_all_ports_when_port_is_blank() {
         for port in [None, Some(""), Some("  ")] {
             assert_eq!(
@@ -2769,6 +2834,7 @@ mod tests {
             }),
             command: None,
             maintenance: None,
+            configuration: None,
         })
         .unwrap();
 

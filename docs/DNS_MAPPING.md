@@ -22,11 +22,11 @@
 ```toml
 [dns]
 enabled = true
-record_types = ["A", "AAAA"]
+record_types = ["A", "AAAA", "CNAME", "NS", "MX", "PTR", "SRV", "TXT", "CAA", "SOA", "SVCB", "HTTPS"]
 query_timeout_seconds = 5
 ```
 
-初始 DNS engine 使用系统递归解析器，只主动查询 A/AAAA；服务端 ingestion 模型已能接收 CNAME、NS、MX、PTR、SRV、TXT、CAA、SOA、SVCB、HTTPS 的规范化 payload，扩展扫描器支持时不需改变索引身份规则。
+DNS engine 默认逐类查询 A、AAAA、CNAME、NS、MX、PTR、SRV、TXT、CAA、SOA、SVCB 和 HTTPS。A/AAAA 用于生成后续地址任务；MX 和 SRV 会额外保留 priority、weight 与 port 等结构化字段。
 
 创建扫描页对 IP/CIDR 和域名使用同一组模式：`vulnerability_scan`（全部）、`port_only`
 （仅端口）、`service_inventory`（服务识别）和 `dns_records`（仅 DNS）。前三种域名任务先执行

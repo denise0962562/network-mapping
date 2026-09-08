@@ -602,10 +602,8 @@ pub(crate) async fn update_tag_category(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "UpdateTagCategoryCommitError", &error_value);
     }
-    if elasticsearch.scan_storage_mode().writes_elasticsearch()
-        && let Err(error) =
-            refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &affected_ips)
-                .await
+    if let Err(error) =
+        refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &affected_ips).await
     {
         error_logs(
             &req,
@@ -981,10 +979,8 @@ pub(crate) async fn update_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "UpdateTagCommitError", &error_value);
     }
-    if elasticsearch.scan_storage_mode().writes_elasticsearch()
-        && let Err(error) =
-            refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &assigned_ips)
-                .await
+    if let Err(error) =
+        refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &assigned_ips).await
     {
         error_logs(&req, "UpdateTagElasticsearchProjectionError", &error);
         return HttpResponse::ServiceUnavailable()
@@ -1072,10 +1068,8 @@ pub(crate) async fn delete_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "DeleteTagCommitError", &error_value);
     }
-    if elasticsearch.scan_storage_mode().writes_elasticsearch()
-        && let Err(error) =
-            refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &assigned_ips)
-                .await
+    if let Err(error) =
+        refresh_elasticsearch_tag_ips(pool.get_ref(), elasticsearch.get_ref(), &assigned_ips).await
     {
         error_logs(&req, "DeleteTagElasticsearchProjectionError", &error);
         return HttpResponse::ServiceUnavailable()
@@ -1107,29 +1101,13 @@ pub(crate) async fn get_asset_tags(
         Ok(value) => value,
         Err(error_value) => return database_error(&req, "GetAssetTagsPoolError", &error_value),
     };
-    let exists = if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+    let exists = {
         match elasticsearch.scan_asset_exists(&ip).await {
             Ok(value) => value,
             Err(error) => {
                 error_logs(&req, "GetAssetTagsElasticsearchError", &error);
                 return HttpResponse::ServiceUnavailable()
                     .json(json!({"success": false, "message": "扫描结果索引暂时不可用"}));
-            }
-        }
-    } else {
-        match connection
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM scan_observation observation \
-                 JOIN scan_task_execution execution ON execution.id = observation.execution_id \
-                 WHERE observation.ip_address = $1::TEXT::INET \
-                   AND execution.execution_status = 'succeeded') AS exists;",
-                &[&ip],
-            )
-            .await
-        {
-            Ok(row) => row.get("exists"),
-            Err(error_value) => {
-                return database_error(&req, "GetAssetTagsAssetLookupError", &error_value);
             }
         }
     };
@@ -1185,7 +1163,7 @@ pub(crate) async fn assign_tag(
         Ok(value) => value,
         Err(error_value) => return database_error(&req, "AssignTagTransactionError", &error_value),
     };
-    let exists = if elasticsearch.scan_storage_mode().reads_elasticsearch() {
+    let exists = {
         match elasticsearch.scan_asset_exists(&ip).await {
             Ok(value) => value,
             Err(error) => {
@@ -1193,19 +1171,6 @@ pub(crate) async fn assign_tag(
                 return HttpResponse::ServiceUnavailable()
                     .json(json!({"success": false, "message": "扫描结果索引暂时不可用"}));
             }
-        }
-    } else {
-        match transaction
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM scan_observation observation \
-                 JOIN scan_task_execution execution ON execution.id = observation.execution_id \
-                 WHERE observation.ip_address = $1::TEXT::INET AND execution.execution_status = 'succeeded') AS exists;",
-                &[&ip],
-            )
-            .await
-        {
-            Ok(row) => row.get("exists"),
-            Err(error_value) => return database_error(&req, "AssignTagAssetLookupError", &error_value),
         }
     };
     if !exists {
@@ -1294,9 +1259,8 @@ pub(crate) async fn assign_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "AssignTagCommitError", &error_value);
     }
-    if elasticsearch.scan_storage_mode().writes_elasticsearch()
-        && let Err(error) =
-            refresh_elasticsearch_tags(pool.get_ref(), elasticsearch.get_ref(), &ip).await
+    if let Err(error) =
+        refresh_elasticsearch_tags(pool.get_ref(), elasticsearch.get_ref(), &ip).await
     {
         error_logs(&req, "AssignTagElasticsearchProjectionError", &error);
         return HttpResponse::ServiceUnavailable()
@@ -1373,9 +1337,8 @@ pub(crate) async fn remove_tag(
     if let Err(error_value) = transaction.commit().await {
         return database_error(&req, "RemoveTagCommitError", &error_value);
     }
-    if elasticsearch.scan_storage_mode().writes_elasticsearch()
-        && let Err(error) =
-            refresh_elasticsearch_tags(pool.get_ref(), elasticsearch.get_ref(), &ip).await
+    if let Err(error) =
+        refresh_elasticsearch_tags(pool.get_ref(), elasticsearch.get_ref(), &ip).await
     {
         error_logs(&req, "RemoveTagElasticsearchProjectionError", &error);
         return HttpResponse::ServiceUnavailable()

@@ -39,9 +39,11 @@ impl ExpectedCsrfToken {
 
 pub(crate) fn is_scanner_api_request(method: &Method, path: &str) -> bool {
     match path {
-        "/api/task/apply" | "/api/scanner/network/public-ip" | "/api/scanner/maintenance" => {
-            method == Method::GET
-        }
+        "/api/task/apply"
+        | "/api/task/current"
+        | "/api/scanner/network/public-ip"
+        | "/api/scanner/maintenance"
+        | "/api/scanner/runtime-config" => method == Method::GET,
         "/api/scanner/register"
         | "/api/scanner/heartbeat"
         | "/api/scanner/result"
@@ -222,6 +224,7 @@ mod tests {
             "/api/scanner/task/cancelled"
         ));
         assert!(is_scanner_api_request(&Method::GET, "/api/task/apply"));
+        assert!(is_scanner_api_request(&Method::GET, "/api/task/current"));
         assert!(is_scanner_api_request(
             &Method::GET,
             "/api/scanner/network/public-ip"
@@ -229,11 +232,16 @@ mod tests {
         assert!(is_scanner_api_request(
             &Method::GET,
             "/api/scanner/maintenance"
+        ));
+        assert!(is_scanner_api_request(
+            &Method::GET,
+            "/api/scanner/runtime-config"
         ));
 
         assert!(!is_scanner_api_request(&Method::GET, "/api/scanner/result"));
         assert!(!is_scanner_api_request(&Method::PUT, "/api/scanner/result"));
         assert!(!is_scanner_api_request(&Method::POST, "/api/task/apply"));
+        assert!(!is_scanner_api_request(&Method::POST, "/api/task/current"));
         assert!(!is_scanner_api_request(
             &Method::POST,
             "/api/scanner/network/public-ip"
@@ -241,6 +249,10 @@ mod tests {
         assert!(!is_scanner_api_request(
             &Method::POST,
             "/api/scanner/maintenance"
+        ));
+        assert!(!is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/runtime-config"
         ));
         assert!(!is_scanner_api_request(
             &Method::GET,
@@ -264,6 +276,10 @@ mod tests {
                     web::get().to(|| async { HttpResponse::NoContent().finish() }),
                 )
                 .route(
+                    "/api/task/current",
+                    web::get().to(|| async { HttpResponse::NoContent().finish() }),
+                )
+                .route(
                     "/api/task/apply-extra",
                     web::get().to(|| async { HttpResponse::NoContent().finish() }),
                 )
@@ -279,6 +295,12 @@ mod tests {
             .to_request();
         let scanner_response = actix_test::call_service(&app, scanner_request).await;
         assert_eq!(scanner_response.status(), StatusCode::NO_CONTENT);
+
+        let recovery_request = actix_test::TestRequest::get()
+            .uri("/api/task/current?scannerid=019fe6b8-1b2b-7720-91d2-132d8c0c724e")
+            .to_request();
+        let recovery_response = actix_test::call_service(&app, recovery_request).await;
+        assert_eq!(recovery_response.status(), StatusCode::NO_CONTENT);
 
         let public_ip_request = actix_test::TestRequest::get()
             .uri("/api/scanner/network/public-ip?scannerid=019fe6b8-1b2b-7720-91d2-132d8c0c724e")

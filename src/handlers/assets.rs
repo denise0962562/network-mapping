@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::admin::UserBaseI;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
 use crate::handlers::tags::{AssetTag, tags_from_json};
-use crate::logs::write::{error_logs, error_logs_error};
+use crate::logs::write::error_logs;
 
 const DEFAULT_PORT_LIMIT: i64 = 20;
 const MAX_PORT_LIMIT: i64 = 100;
@@ -144,127 +144,20 @@ pub(crate) async fn get_asset_summary(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
-        return get_asset_summary_from_elasticsearch(
-            &req,
-            pool.get_ref(),
-            elasticsearch.get_ref(),
-            &ip,
-            &user,
-        )
-        .await;
-    }
-    let connection = match pool.get().await {
-        Ok(value) => value,
-        Err(error) => {
-            error_logs_error(&req, "AssetSummaryPoolError", "database_operation", &error);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
 
-    let row = match connection
-        .query_one(
-            "WITH eligible AS (\
-                SELECT o.port, o.service, o.observed_at, \
-                       COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name \
-                FROM scan_observation o \
-                JOIN scan_task_execution e ON e.id = o.execution_id \
-                JOIN scan_task t ON t.id = e.task_id \
-                LEFT JOIN scanner_info scanner \
-                    ON scanner.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
-                WHERE o.ip_address = $1::TEXT::INET \
-                  AND e.execution_status = 'succeeded' \
-                  AND ($2 = 1 OR t.user_id = $3)\
-             ), endpoints AS (\
-                SELECT port, MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at \
-                FROM eligible WHERE port > 0 GROUP BY port\
-             ), stats AS (\
-                SELECT COUNT(*)::BIGINT AS port_count, \
-                       FLOOR(EXTRACT(EPOCH FROM MIN(first_seen_at)) * 1000)::BIGINT AS first_seen_at, \
-                       FLOOR(EXTRACT(EPOCH FROM MAX(last_seen_at)) * 1000)::BIGINT AS last_seen_at \
-                FROM endpoints\
-             ), latest_intel AS (\
-                SELECT i.asn, i.isp, i.as_org, i.country_code, i.country_name, \
-                       i.region_name, i.city_name, i.latitude, i.longitude \
-                FROM ips i \
-                JOIN scan_task_execution e ON e.id = i.execution_id \
-                JOIN scan_task t ON t.id = e.task_id \
-                WHERE i.ip_address = $1::TEXT::INET \
-                  AND e.execution_status = 'succeeded' \
-                  AND ($2 = 1 OR t.user_id = $3) \
-                ORDER BY i.update_time DESC, i.ip_id DESC LIMIT 1\
-             ), asset_tags AS (\
-                SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(\
-                    'id', tag.id, 'name', tag.name, 'kind', tag.kind, 'description', tag.description, \
-                    'category_id', category.id, 'category_name', category.name\
-                    ) ORDER BY category.sort_order, LOWER(category.name), CASE tag.kind WHEN 'malicious' THEN 1 WHEN 'benign' THEN 2 ELSE 3 END, LOWER(tag.name), tag.id), '[]'::JSONB) AS tags \
-                FROM asset_ip_tag assignment JOIN asset_tag tag ON tag.id = assignment.tag_id \
-                JOIN asset_tag_category category ON category.id = tag.category_id \
-                WHERE assignment.ip_address = $1::TEXT::INET AND tag.is_active AND category.is_active\
-             ) \
-             SELECT stats.*, \
-                    (SELECT COUNT(DISTINCT service)::BIGINT FROM eligible \
-                     WHERE NULLIF(BTRIM(service), '') IS NOT NULL) AS service_count, \
-                    (SELECT COUNT(DISTINCT scanner_name)::BIGINT FROM eligible \
-                     WHERE scanner_name IS NOT NULL) AS scanner_count, \
-                    (SELECT COUNT(*)::BIGINT FROM eligible) AS observation_count, \
-                    latest_intel.asn, latest_intel.isp, latest_intel.as_org, \
-                    latest_intel.country_code, latest_intel.country_name, \
-                    latest_intel.region_name, latest_intel.city_name, \
-                    latest_intel.latitude, latest_intel.longitude, \
-                    asset_tags.tags \
-             FROM stats LEFT JOIN latest_intel ON true CROSS JOIN asset_tags;",
-            &[&ip, &user.role, &user.id],
-        )
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            error_logs_error(&req, "AssetSummaryQueryError", "database_operation", &error);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
-    let observation_count = row.get("observation_count");
-    if observation_count == 0_i64 {
-        return HttpResponse::NotFound().json(serde_json::json!({
-            "message": "没有可访问的资产观察记录"
-        }));
-    }
-
-    let summary = AssetSummary {
-        ip,
-        asn: row.get("asn"),
-        isp: row.get("isp"),
-        as_org: row.get("as_org"),
-        country_code: row.get("country_code"),
-        country_name: row.get("country_name"),
-        region_name: row.get("region_name"),
-        city_name: row.get("city_name"),
-        latitude: row.get("latitude"),
-        longitude: row.get("longitude"),
-        port_count: row.get("port_count"),
-        service_count: row.get("service_count"),
-        scanner_count: row.get("scanner_count"),
-        observation_count,
-        first_seen_at: row.get("first_seen_at"),
-        last_seen_at: row.get("last_seen_at"),
-        tags: tags_from_json(row.get("tags")),
-        can_manage_tags: user.role == 1,
-    };
-
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": {
-            "summary": summary,
-        }
-    }))
+    return get_asset_summary_from_elasticsearch(
+        &req,
+        pool.get_ref(),
+        elasticsearch.get_ref(),
+        &ip,
+        &user,
+    )
+    .await;
 }
 
 #[get("/api/assets/ports")]
 pub(crate) async fn get_asset_ports(
     req: HttpRequest,
-    pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<AssetPortsQuery>,
     user: UserBaseI,
@@ -277,111 +170,21 @@ pub(crate) async fn get_asset_ports(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
-    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
-        return get_asset_ports_from_elasticsearch(
-            &req,
-            elasticsearch.get_ref(),
-            &ip,
-            limit,
-            offset,
-            &user,
-        )
-        .await;
-    }
-    let connection = match pool.get().await {
-        Ok(value) => value,
-        Err(error) => {
-            error_logs_error(&req, "AssetPortsPoolError", "database_operation", &error);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
 
-    let rows = match connection
-        .query(
-            "WITH eligible AS (\
-                SELECT o.*, e.execution_id AS public_execution_id, t.task_id AS public_task_id \
-                FROM scan_observation o \
-                JOIN scan_task_execution e ON e.id = o.execution_id \
-                JOIN scan_task t ON t.id = e.task_id \
-                WHERE o.ip_address = $1::TEXT::INET \
-                  AND e.execution_status = 'succeeded' \
-                  AND ($2 = 1 OR t.user_id = $3)\
-             ), endpoint AS (\
-                SELECT port, MIN(observed_at) AS first_seen_at, MAX(observed_at) AS last_seen_at \
-                FROM eligible WHERE port > 0 GROUP BY port\
-             ) \
-             SELECT endpoint.port, latest.protocol, \
-                    service.service, service.banner, latest.source, service.source AS service_source, \
-                    FLOOR(EXTRACT(EPOCH FROM endpoint.first_seen_at) * 1000)::BIGINT AS first_seen_at, \
-                    FLOOR(EXTRACT(EPOCH FROM endpoint.last_seen_at) * 1000)::BIGINT AS last_seen_at, \
-                    FLOOR(EXTRACT(EPOCH FROM service.observed_at) * 1000)::BIGINT AS service_observed_at, \
-                    COALESCE(service.observed_at < endpoint.last_seen_at, false) AS service_stale, \
-                    latest.public_execution_id AS execution_id, latest.public_task_id AS task_id, \
-                    COUNT(*) OVER()::BIGINT AS total \
-             FROM endpoint \
-             JOIN LATERAL (\
-                SELECT protocol, source, observed_at, id, public_execution_id, public_task_id \
-                FROM eligible WHERE eligible.port = endpoint.port \
-                ORDER BY observed_at DESC, id DESC LIMIT 1\
-             ) latest ON true \
-             LEFT JOIN LATERAL (\
-                SELECT service, banner, source, observed_at, id \
-                FROM eligible WHERE eligible.port = endpoint.port AND kind = 'service' \
-                ORDER BY observed_at DESC, id DESC LIMIT 1\
-             ) service ON true \
-             ORDER BY endpoint.port LIMIT $4 OFFSET $5;",
-            &[&ip, &user.role, &user.id, &limit, &offset],
-        )
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            error_logs_error(&req, "AssetPortsQueryError", "database_operation", &error);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
-    if rows.is_empty() {
-        return HttpResponse::NotFound().json(serde_json::json!({
-            "message": "没有可访问的资产观察记录"
-        }));
-    }
-
-    let total = rows.first().map(|row| row.get("total")).unwrap_or(0_i64);
-    let items: Vec<AssetPortCurrent> = rows
-        .into_iter()
-        .map(|row| AssetPortCurrent {
-            port: row.get("port"),
-            protocol: row.get("protocol"),
-            service: row.get("service"),
-            banner: row.get("banner"),
-            source: row.get("source"),
-            service_source: row.get("service_source"),
-            first_seen_at: row.get("first_seen_at"),
-            last_seen_at: row.get("last_seen_at"),
-            service_observed_at: row.get("service_observed_at"),
-            service_stale: row.get("service_stale"),
-            execution_id: row.get("execution_id"),
-            task_id: row.get("task_id"),
-        })
-        .collect();
-
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": {
-            "ip": ip,
-            "items": items,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-        }
-    }))
+    return get_asset_ports_from_elasticsearch(
+        &req,
+        elasticsearch.get_ref(),
+        &ip,
+        limit,
+        offset,
+        &user,
+    )
+    .await;
 }
 
 #[get("/api/assets/port-history")]
 pub(crate) async fn get_asset_port_history(
     req: HttpRequest,
-    pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
     query: web::Query<AssetPortHistoryQuery>,
     user: UserBaseI,
@@ -398,91 +201,17 @@ pub(crate) async fn get_asset_port_history(
         Err(message) => return bad_request(message),
     };
     let port = i32::from(query.port);
-    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
-        return get_asset_history_from_elasticsearch(
-            &req,
-            elasticsearch.get_ref(),
-            &ip,
-            port,
-            limit,
-            offset,
-            &user,
-        )
-        .await;
-    }
-    let connection = match pool.get().await {
-        Ok(value) => value,
-        Err(error) => {
-            error_logs_error(
-                &req,
-                "AssetPortHistoryPoolError",
-                "database_operation",
-                &error,
-            );
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
 
-    let rows = match connection
-        .query(
-            "SELECT o.id, o.kind, COALESCE(o.data->>'state', 'open') AS state, \
-                    o.protocol, o.service, o.banner, o.source, o.data, \
-                    FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS observed_at, \
-                    e.execution_id, t.task_id, \
-                    COALESCE(scanner.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, \
-                    b.upload_id, b.batch_index, COUNT(*) OVER()::BIGINT AS total \
-             FROM scan_observation o \
-             JOIN scan_result_batch b ON b.id = o.batch_id \
-             JOIN scan_task_execution e ON e.id = o.execution_id \
-             JOIN scan_task t ON t.id = e.task_id \
-             LEFT JOIN scanner_info scanner \
-                ON scanner.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
-             WHERE o.ip_address = $1::TEXT::INET AND o.port = $2 \
-               AND e.execution_status <> 'superseded' \
-               AND ($3 = 1 OR t.user_id = $4) \
-             ORDER BY o.observed_at DESC, o.id DESC LIMIT $5 OFFSET $6;",
-            &[&ip, &port, &user.role, &user.id, &limit, &offset],
-        )
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            error_logs_error(&req, "AssetPortHistoryQueryError", "database_operation", &error);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-    let total = rows.first().map(|row| row.get("total")).unwrap_or(0_i64);
-    let items: Vec<AssetObservationHistoryItem> = rows
-        .into_iter()
-        .map(|row| AssetObservationHistoryItem {
-            id: row.get("id"),
-            kind: row.get("kind"),
-            state: row.get("state"),
-            protocol: row.get("protocol"),
-            service: row.get("service"),
-            banner: row.get("banner"),
-            source: row.get("source"),
-            data: row.get("data"),
-            observed_at: row.get("observed_at"),
-            execution_id: row.get("execution_id"),
-            task_id: row.get("task_id"),
-            scanner_name: row.get("scanner_name"),
-            upload_id: row.get("upload_id"),
-            batch_index: row.get("batch_index"),
-        })
-        .collect();
-
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "data": {
-            "ip": ip,
-            "port": port,
-            "items": items,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-        }
-    }))
+    return get_asset_history_from_elasticsearch(
+        &req,
+        elasticsearch.get_ref(),
+        &ip,
+        port,
+        limit,
+        offset,
+        &user,
+    )
+    .await;
 }
 
 fn current_scope_filters(user: &UserBaseI) -> Vec<Value> {

@@ -282,120 +282,21 @@ fn csv_cell(value: &str) -> String {
 #[get("/api/task/{task_id}/export")]
 pub(crate) async fn export_task(
     req: HttpRequest,
-    pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
     task_id: web::Path<Uuid>,
     query: web::Query<ExportQuery>,
     user: UserBaseI,
 ) -> impl Responder {
     let id = task_id.into_inner().to_string();
-    if elasticsearch.scan_storage_mode().reads_elasticsearch() {
-        return export_task_from_elasticsearch(
-            &req,
-            elasticsearch.get_ref(),
-            &id,
-            query.format.as_deref(),
-            &user,
-        )
-        .await;
-    }
-    let connection = match pool.get().await {
-        Ok(value) => value,
-        Err(error) => {
-            log_database_error(&req, "ExportTaskDatabaseError", &error);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-    let mut conditions = vec![
-        "t.task_id = $1".to_owned(),
-        "e.execution_status <> 'superseded'".to_owned(),
-    ];
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id];
-    push_task_owner_scope(&mut conditions, &mut params, &user, "t.user_id");
-    let sql = format!(
-        "SELECT e.execution_id, e.assigned_scanner_id, COALESCE(s.name, e.assigned_scanner_id) AS scanner_name, \
-         host(i.ip_address) AS ip, i.asn, i.isp, i.as_org, i.country_code, i.country_name, i.city_name, \
-         p.port, latest.protocol, latest.service, latest.banner, latest.scan_time \
-         FROM scan_task t JOIN scan_task_execution e ON e.task_id = t.id JOIN ips i ON i.execution_id = e.id \
-         LEFT JOIN scanner_info s ON s.scanner_id = e.assigned_scanner_id LEFT JOIN ports p ON p.ip_id = i.ip_id \
-         LEFT JOIN LATERAL ( \
-            SELECT o.protocol, o.service, o.banner, \
-                FLOOR(EXTRACT(EPOCH FROM o.observed_at) * 1000)::BIGINT AS scan_time \
-            FROM scan_observation o \
-            WHERE o.execution_id = e.id AND o.ip_address = i.ip_address AND o.port = p.port \
-                AND o.kind IN ('port', 'service') \
-            ORDER BY (o.kind = 'service') DESC, \
-                (o.service IS NOT NULL OR o.banner IS NOT NULL) DESC, \
-                o.observed_at DESC, o.id DESC LIMIT 1 \
-         ) latest ON true \
-         WHERE {} ORDER BY i.ip_address, p.port;",
-        conditions.join(" AND ")
-    );
-    let rows = match connection.query(&sql, &params).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            log_database_error(&req, "ExportTaskDatabaseError", &error);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-    if query.format.as_deref() == Some("json") {
-        let data: Vec<Value> = rows.iter().map(|row| json!({
-            "execution_id": row.get::<_, String>("execution_id"), "scanner_id": row.get::<_, Option<String>>("assigned_scanner_id"),
-            "scanner_name": row.get::<_, Option<String>>("scanner_name"), "ip": row.get::<_, String>("ip"), "asn": row.get::<_, Option<String>>("asn"),
-            "isp": row.get::<_, Option<String>>("isp"), "port": row.get::<_, Option<i32>>("port"),
-            "as_org": row.get::<_, Option<String>>("as_org"), "country_code": row.get::<_, Option<String>>("country_code"),
-            "country_name": row.get::<_, Option<String>>("country_name"), "city_name": row.get::<_, Option<String>>("city_name"),
-            "protocol": row.get::<_, Option<String>>("protocol"), "service": row.get::<_, Option<String>>("service"),
-            "banner": row.get::<_, Option<String>>("banner"), "scan_time": row.get::<_, Option<i64>>("scan_time")
-        })).collect();
-        return HttpResponse::Ok().json(json!({"task_id": id, "results": data}));
-    }
-    let mut csv = String::from(
-        "execution_id,scanner_id,scanner_name,ip,asn,as_org,isp,country_code,country_name,city_name,port,protocol,service,banner,scan_time\n",
-    );
-    for row in rows {
-        let values = [
-            row.get::<_, String>("execution_id"),
-            row.get::<_, Option<String>>("assigned_scanner_id")
-                .unwrap_or_default(),
-            row.get::<_, Option<String>>("scanner_name")
-                .unwrap_or_default(),
-            row.get::<_, String>("ip"),
-            row.get::<_, Option<String>>("asn").unwrap_or_default(),
-            row.get::<_, Option<String>>("as_org").unwrap_or_default(),
-            row.get::<_, Option<String>>("isp").unwrap_or_default(),
-            row.get::<_, Option<String>>("country_code")
-                .unwrap_or_default(),
-            row.get::<_, Option<String>>("country_name")
-                .unwrap_or_default(),
-            row.get::<_, Option<String>>("city_name")
-                .unwrap_or_default(),
-            row.get::<_, Option<i32>>("port")
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            row.get::<_, Option<String>>("protocol").unwrap_or_default(),
-            row.get::<_, Option<String>>("service").unwrap_or_default(),
-            row.get::<_, Option<String>>("banner").unwrap_or_default(),
-            row.get::<_, Option<i64>>("scan_time")
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-        ];
-        csv.push_str(
-            &values
-                .iter()
-                .map(|value| csv_cell(value))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        csv.push('\n');
-    }
-    HttpResponse::Ok()
-        .insert_header((
-            "Content-Disposition",
-            format!("attachment; filename=task-{id}.csv"),
-        ))
-        .content_type("text/csv; charset=utf-8")
-        .body(csv)
+
+    return export_task_from_elasticsearch(
+        &req,
+        elasticsearch.get_ref(),
+        &id,
+        query.format.as_deref(),
+        &user,
+    )
+    .await;
 }
 
 async fn export_task_from_elasticsearch(
