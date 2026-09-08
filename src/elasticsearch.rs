@@ -661,6 +661,32 @@ impl ElasticsearchService {
         body: &str,
         create_conflict_is_success: bool,
     ) -> Result<Value, String> {
+        self.send_bulk(
+            path,
+            body,
+            create_conflict_is_success,
+            self.inner.config.bulk_max_retries,
+        )
+        .await
+    }
+
+    async fn send_bulk_once(
+        &self,
+        path: &str,
+        body: &str,
+        create_conflict_is_success: bool,
+    ) -> Result<Value, String> {
+        self.send_bulk(path, body, create_conflict_is_success, 0)
+            .await
+    }
+
+    async fn send_bulk(
+        &self,
+        path: &str,
+        body: &str,
+        create_conflict_is_success: bool,
+        max_retries: u32,
+    ) -> Result<Value, String> {
         let (trace_id, traceparent) = new_trace_context();
         let started = Instant::now();
         let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
@@ -671,8 +697,14 @@ impl ElasticsearchService {
                 .acquire()
                 .await
                 .map_err(|_| "Elasticsearch Bulk 并发控制器已关闭".to_owned())?;
-            self.send_bulk_with_retry_inner(path, body, create_conflict_is_success, &traceparent)
-                .await
+            self.send_bulk_with_retry_inner(
+                path,
+                body,
+                create_conflict_is_success,
+                max_retries,
+                &traceparent,
+            )
+            .await
         })
         .await
         {
@@ -705,9 +737,9 @@ impl ElasticsearchService {
         path: &str,
         body: &str,
         create_conflict_is_success: bool,
+        max_retries: u32,
         traceparent: &str,
     ) -> Result<Value, String> {
-        let max_retries = self.inner.config.bulk_max_retries;
         for attempt in 0..=max_retries {
             let response = self
                 .request(
@@ -993,24 +1025,14 @@ impl ElasticsearchService {
             .await
     }
 
-    /// Pin a DNS batch to one backing index so data-stream rollover cannot duplicate a retry.
-    pub(crate) async fn pin_dns_batch_storage(
+    async fn load_dns_batch_observations(
         &self,
-        pool: &Pool,
-        execution_id: i32,
         context: &ScanBatchContext,
-    ) -> Result<Vec<String>, String> {
-        let read = |value: Value| -> Result<Vec<String>, String> {
-            serde_json::from_value(value).map_err(|error| error.to_string())
-        };
-        let client = pool.get().await.map_err(|error| error.to_string())?;
-        let refs = read(client.query_one("SELECT storage_references FROM scan_result_batch WHERE execution_id=$1 AND upload_id=$2 AND batch_index=$3",
-            &[&execution_id, &context.upload_id, &context.batch_index]).await.map_err(|error| error.to_string())?.get(0))?;
-        if !refs.is_empty() {
-            return Ok(refs);
+        expected_ids: &BTreeSet<String>,
+    ) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+        if expected_ids.is_empty() {
+            return Ok((BTreeSet::new(), BTreeSet::new()));
         }
-        drop(client);
-        self.ensure_dns_indices().await?;
         let stream = &self.inner.config.dns_observation_data_stream;
         let refreshed = self
             .send_json_request(
@@ -1021,62 +1043,159 @@ impl ElasticsearchService {
             )
             .await?;
         validate_scan_search_response(&refreshed)?;
-        // Recover pre-upgrade pending batches that may already contain DNS evidence.
-        let existing = self
+        let size = expected_ids
+            .len()
+            .checked_add(1)
+            .ok_or("DNS 批次观察数量溢出")?;
+        let result = self
             .send_json_request(
                 ElasticsearchOperation::ScanQuery,
                 Method::POST,
                 &format!("/{stream}/_search"),
                 |request| {
                     request.json(&json!({
-                        "size": 0, "query": {"bool": {"filter": [
+                        "size": size,
+                        "track_total_hits": true,
+                        "_source": false,
+                        "query": {"bool": {"filter": [
                             {"term": {"scan.execution_id": context.execution_id}},
                             {"term": {"scan.upload_id": context.upload_id}},
                             {"term": {"scan.batch_index": context.batch_index}}
-                        ]}}, "aggs": {"indices": {"terms": {"field": "_index", "size": 2}}}
+                        ]}}
                     }))
                 },
             )
             .await?;
-        validate_scan_search_response(&existing)?;
-        let buckets = existing
-            .pointer("/aggregations/indices/buckets")
+        validate_scan_search_response(&result)?;
+        let hits = result
+            .pointer("/hits/hits")
             .and_then(Value::as_array)
-            .ok_or("DNS 索引定位响应不完整")?;
-        if buckets.len() > 1 {
-            return Err("旧 DNS 批次跨多个 backing index，须先对账去重".into());
+            .ok_or("DNS 批次对账响应缺少 hits")?;
+        let total = result
+            .pointer("/hits/total/value")
+            .and_then(Value::as_u64)
+            .ok_or("DNS 批次对账响应缺少总数")?;
+        if result
+            .pointer("/hits/total/relation")
+            .and_then(Value::as_str)
+            != Some("eq")
+            || total != hits.len() as u64
+        {
+            return Err("DNS 批次对账结果被截断".into());
         }
-        let index = if let Some(bucket) = buckets.first() {
-            bucket
-                .get("key")
+        let mut existing_ids = BTreeSet::new();
+        let mut indices = BTreeSet::new();
+        for hit in hits {
+            let id = hit
+                .get("_id")
                 .and_then(Value::as_str)
-                .ok_or("DNS 索引定位缺少 key")?
-                .to_owned()
-        } else {
-            let metadata = self
-                .send_json_request(
-                    ElasticsearchOperation::IndexAdmin,
-                    Method::GET,
-                    &format!("/_data_stream/{stream}"),
-                    |request| request,
-                )
+                .ok_or("DNS 批次对账结果缺少 _id")?;
+            let index = hit
+                .get("_index")
+                .and_then(Value::as_str)
+                .ok_or("DNS 批次对账结果缺少 _index")?;
+            if !expected_ids.contains(id) {
+                return Err(format!("DNS 批次包含非预期事实：{id}"));
+            }
+            if !existing_ids.insert(id.to_owned()) {
+                return Err(format!("DNS 事实跨 backing index 重复：{id}"));
+            }
+            indices.insert(index.to_owned());
+        }
+        Ok((existing_ids, indices))
+    }
+
+    async fn persist_dns_observation_documents(
+        &self,
+        context: &ScanBatchContext,
+        documents: &BTreeMap<String, Value>,
+    ) -> Result<Vec<String>, String> {
+        let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
+        match timeout(
+            budget,
+            self.persist_dns_observation_documents_inner(context, documents),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "DNS Elasticsearch Bulk 超过总时间预算 {} 秒",
+                self.inner.config.bulk_total_timeout_seconds
+            )),
+        }
+    }
+
+    async fn persist_dns_observation_documents_inner(
+        &self,
+        context: &ScanBatchContext,
+        documents: &BTreeMap<String, Value>,
+    ) -> Result<Vec<String>, String> {
+        let stream = &self.inner.config.dns_observation_data_stream;
+        if documents.is_empty() {
+            return Ok(vec![stream.clone()]);
+        }
+        let expected_ids = documents.keys().cloned().collect::<BTreeSet<_>>();
+        let max_writes = self.inner.config.bulk_max_retries as usize + 1;
+        let mut write_attempts = 0_usize;
+        let mut last_error = None;
+        loop {
+            let (existing_ids, indices) = self
+                .load_dns_batch_observations(context, &expected_ids)
                 .await?;
-            metadata
-                .pointer("/data_streams/0/indices")
-                .and_then(Value::as_array)
-                .and_then(|indices| indices.last())
-                .and_then(|index| index.get("index_name"))
-                .and_then(Value::as_str)
-                .ok_or("DNS 数据流缺少 write index")?
-                .to_owned()
-        };
-        let candidate = json!([index, self.inner.config.dns_record_index]);
-        let client = pool.get().await.map_err(|error| error.to_string())?;
-        // Concurrent retries all use the first committed target.
-        let row = client.query_one("UPDATE scan_result_batch SET storage_references = CASE WHEN storage_references = '[]'::jsonb THEN $4 ELSE storage_references END \
-            WHERE execution_id=$1 AND upload_id=$2 AND batch_index=$3 RETURNING storage_references",
-            &[&execution_id, &context.upload_id, &context.batch_index, &candidate]).await.map_err(|error| error.to_string())?;
-        read(row.get(0))
+            if existing_ids.len() == documents.len() {
+                return Ok(indices.into_iter().collect());
+            }
+            if write_attempts >= max_writes {
+                return Err(last_error.unwrap_or_else(|| {
+                    "DNS Elasticsearch Bulk 未能持久化全部观察".into()
+                }));
+            }
+            let mut body = String::new();
+            for (id, document) in documents {
+                if existing_ids.contains(id) {
+                    continue;
+                }
+                body.push_str(
+                    &serde_json::to_string(&json!({"create": {"_index": stream, "_id": id}}))
+                        .map_err(|error| error.to_string())?,
+                );
+                body.push('\n');
+                body.push_str(&serde_json::to_string(document).map_err(|error| error.to_string())?);
+                body.push('\n');
+            }
+            let result = self
+                .send_bulk_once(
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
+                    &body,
+                    true,
+                )
+                .await;
+            write_attempts += 1;
+            let retry_delay = match result {
+                Ok(result) => match validate_dns_bulk_result(&result) {
+                    Ok(()) => false,
+                    Err(error) if bulk_response_is_retryable(&result, true) => {
+                        last_error = Some(error);
+                        true
+                    }
+                    Err(error) => return Err(error),
+                },
+                Err(error) => {
+                    last_error = Some(error);
+                    true
+                }
+            };
+            if retry_delay && write_attempts < max_writes {
+                sleep(bulk_retry_delay(
+                    self.inner.config.bulk_retry_initial_ms,
+                    (write_attempts - 1) as u32,
+                ))
+                .await;
+            }
+        }
     }
 
     /// Persists immutable DNS query observations and projects successful answer
@@ -1088,8 +1207,7 @@ impl ElasticsearchService {
         context: &ScanBatchContext,
         tenant_id: &str,
         observations: &[DnsObservation],
-        observation_index: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         if !self.enabled() {
             return Err("Elasticsearch 未启用，无法保存 DNS 观察".to_owned());
         }
@@ -1098,8 +1216,7 @@ impl ElasticsearchService {
         }
         self.ensure_dns_indices().await?;
 
-        self.require_existing_index(observation_index).await?;
-        let mut observation_bulk = String::new();
+        let mut observation_documents = BTreeMap::new();
         let mut record_bulk = String::new();
         for (position, input) in observations.iter().cloned().enumerate() {
             let observation = input.normalize()?;
@@ -1144,17 +1261,7 @@ impl ElasticsearchService {
                 },
                 "latency_ms": observation.latency_ms
             });
-            observation_bulk.push_str(
-                &serde_json::to_string(&json!({"create": {
-                    "_index": observation_index, "_id": document_id
-                }}))
-                .map_err(|error| error.to_string())?,
-            );
-            observation_bulk.push('\n');
-            observation_bulk.push_str(
-                &serde_json::to_string(&observation_document).map_err(|error| error.to_string())?,
-            );
-            observation_bulk.push('\n');
+            observation_documents.insert(document_id, observation_document);
 
             if observation.response_code != "NOERROR" {
                 continue;
@@ -1193,19 +1300,9 @@ impl ElasticsearchService {
                 )?;
             }
         }
-        if !observation_bulk.is_empty() {
-            let response = self
-                .send_bulk_with_retry(
-                    &format!(
-                        "/_bulk?wait_for_active_shards={}",
-                        self.inner.config.write_wait_for_active_shards
-                    ),
-                    &observation_bulk,
-                    true,
-                )
-                .await?;
-            validate_dns_bulk_result(&response)?;
-        }
+        let mut storage_references = self
+            .persist_dns_observation_documents(context, &observation_documents)
+            .await?;
         if !record_bulk.is_empty() {
             let response = self
                 .send_bulk_with_retry(
@@ -1219,8 +1316,11 @@ impl ElasticsearchService {
                 .await?;
             validate_dns_bulk_result(&response)?;
         }
+        if !storage_references.contains(&self.inner.config.dns_record_index) {
+            storage_references.push(self.inner.config.dns_record_index.clone());
+        }
         self.mark_success();
-        Ok(())
+        Ok(storage_references)
     }
 
     async fn persist_scan_batch_prepared(

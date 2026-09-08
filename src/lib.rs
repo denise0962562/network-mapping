@@ -2089,14 +2089,37 @@ async fn save_dns_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
     drop(client);
+    // A transaction-scoped advisory lock serializes the same batch across
+    // service instances without keeping the task row locked during ES I/O.
+    // This closes the race where two retries straddle a data-stream rollover.
+    let mut write_lock_client = pool.get().await.map_err(scanner_result_database_error)?;
+    let write_lock = write_lock_client
+        .transaction()
+        .await
+        .map_err(scanner_result_database_error)?;
+    let write_lock_key = format!("dns-batch:{execution_db_id}:{upload_id}:{batch_index}");
+    let write_lock_acquired: bool = write_lock
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0));",
+            &[&write_lock_key],
+        )
+        .await
+        .map_err(scanner_result_database_error)?
+        .get(0);
+    if !write_lock_acquired {
+        return Err(SaveScannerResultsError::Storage(
+            "相同 DNS 批次正在写入，请稍后重试".into(),
+        ));
+    }
     let dns_references = elasticsearch
-        .pin_dns_batch_storage(pool, execution_db_id, &context)
+        .persist_dns_observations(&context, "default", &observations)
         .await
         .map_err(SaveScannerResultsError::Storage)?;
-    elasticsearch
-        .persist_dns_observations(&context, "default", &observations, &dns_references[0])
+    write_lock
+        .commit()
         .await
-        .map_err(SaveScannerResultsError::Storage)?;
+        .map_err(scanner_result_database_error)?;
+    drop(write_lock_client);
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()

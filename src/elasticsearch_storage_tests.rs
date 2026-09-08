@@ -129,12 +129,20 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
         let mut items = Vec::new();
         for pair in lines.chunks_exact(2) {
             let (operation, action) = pair[0].as_object().unwrap().iter().next().unwrap();
+            let requested_index = action["_index"].as_str().unwrap();
+            let backing_create = operation == "create" && requested_index.starts_with(".ds-");
+            let actual_index = if requested_index == "network-mapping-dns-observations" {
+                format!(".ds-dns-{}", state.dns_generation)
+            } else {
+                requested_index.to_owned()
+            };
             let key = (
-                action["_index"].as_str().unwrap().to_owned(),
+                actual_index.clone(),
                 action["_id"].as_str().unwrap().to_owned(),
             );
-            let conflict = operation == "create" && state.documents.contains_key(&key);
-            if !conflict {
+            let conflict =
+                !backing_create && operation == "create" && state.documents.contains_key(&key);
+            if !backing_create && !conflict {
                 let document = if operation == "update" {
                     pair[1]["script"]["params"]["doc"].clone()
                 } else {
@@ -142,9 +150,31 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
                 };
                 state.documents.insert(key, document);
             }
-            items.push(json!({(operation): {"status": if conflict {409} else {201}, "_index": action["_index"], "_id": action["_id"]}}));
+            let status = if backing_create {
+                400
+            } else if conflict {
+                409
+            } else {
+                201
+            };
+            let mut result = json!({
+                "status": status,
+                "_index": actual_index,
+                "_id": action["_id"]
+            });
+            if backing_create {
+                result["error"] = json!({"reason":
+                    "index request with op_type=create targeting backing indices is disallowed"
+                });
+            }
+            items.push(json!({(operation): result}));
         }
-        return json!({"errors": items.iter().any(|item| item.to_string().contains("409")), "items": items});
+        return json!({
+            "errors": items.iter().any(|item| item.as_object().unwrap().values().any(|action| {
+                action["status"].as_u64().is_some_and(|status| status >= 300)
+            })),
+            "items": items
+        });
     }
     if path.contains("_mget") {
         let request: Value = serde_json::from_str(body).unwrap();
@@ -159,6 +189,20 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
     }
     if path.contains("_search") {
         let request: Value = serde_json::from_str(body).unwrap();
+        if path.contains("network-mapping-dns-observations/_search")
+            && request.pointer("/query/bool/filter").is_some()
+        {
+            let hits = state
+                .documents
+                .iter()
+                .filter(|((index, _), _)| index.starts_with(".ds-dns-"))
+                .map(|((index, id), _)| json!({"_index": index, "_id": id}))
+                .collect::<Vec<_>>();
+            return json!({
+                "hits": {"total": {"value": hits.len(), "relation": "eq"}, "hits": hits},
+                "_shards": {"failed": 0}
+            });
+        }
         if request.pointer("/aggs/indices").is_some() {
             return json!({"aggregations": {"indices": {"buckets": []}}, "_shards": {"failed":0}});
         }
@@ -343,15 +387,8 @@ async fn pg_migration_is_explicit_repeatable_and_checks_batch_completeness() {
         .unwrap();
 }
 
-#[tokio::test]
-#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
-async fn dns_retry_pins_backing_index_across_rollover() {
-    let (pool, schema) = isolated_pool().await;
-    seed_execution(&pool).await;
-    let fixture = EsFixture::start();
-    let service = fixture.service();
-    pool.get().await.unwrap().batch_execute("INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count) VALUES(1,'upload',0,true,0);").await.unwrap();
-    let context = ScanBatchContext {
+fn dns_test_context() -> ScanBatchContext {
+    ScanBatchContext {
         task_id: "task".into(),
         execution_id: "execution".into(),
         user_id: 1,
@@ -361,24 +398,144 @@ async fn dns_retry_pins_backing_index_across_rollover() {
         upload_id: "upload".into(),
         batch_index: 0,
         is_final: true,
-    };
+    }
+}
+
+fn dns_test_observation(name: &str) -> DnsObservation {
+    DnsObservation {
+        observed_at: 1_788_883_200_000,
+        question: crate::dns::DnsQuestion {
+            name: name.into(),
+            record_type: "A".into(),
+            class: "IN".into(),
+        },
+        response_code: "NXDOMAIN".into(),
+        authoritative: false,
+        truncated: false,
+        dnssec_authenticated: false,
+        answers: Vec::new(),
+        authority: Vec::new(),
+        additional: Vec::new(),
+        resolver_ip: None,
+        resolver_id: None,
+        resolver_label: None,
+        resolver_port: None,
+        resolver_transport: None,
+        latency_ms: Some(1),
+    }
+}
+
+#[tokio::test]
+async fn dns_retry_reconciles_through_data_stream_across_rollover() {
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let context = dns_test_context();
+    let observations = vec![dns_test_observation("example.com")];
     let first = service
-        .pin_dns_batch_storage(&pool, 1, &context)
+        .persist_dns_observations(&context, "default", &observations)
         .await
         .unwrap();
     fixture.state.lock().unwrap().dns_generation = 1;
     let retried = service
-        .pin_dns_batch_storage(&pool, 1, &context)
+        .persist_dns_observations(&context, "default", &observations)
         .await
         .unwrap();
     assert_eq!(first, retried);
     assert_eq!(first[0], ".ds-dns-0");
-    pool.get()
-        .await
-        .unwrap()
-        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+    assert_eq!(first[1], "network-mapping-dns-records-v1");
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(
+        state
+            .documents
+            .keys()
+            .filter(|(index, _)| index.starts_with(".ds-dns-"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .requests
+            .iter()
+            .filter(|request| request.contains("/_bulk"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn dns_retry_only_writes_missing_documents_after_rollover() {
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let context = dns_test_context();
+    let observations = vec![
+        dns_test_observation("example.com"),
+        dns_test_observation("www.example.com"),
+    ];
+    service
+        .persist_dns_observations(&context, "default", &observations)
         .await
         .unwrap();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let removed = state
+            .documents
+            .keys()
+            .find(|(index, _)| index.starts_with(".ds-dns-"))
+            .cloned()
+            .unwrap();
+        state.documents.remove(&removed);
+        state.dns_generation = 1;
+    }
+
+    let references = service
+        .persist_dns_observations(&context, "default", &observations)
+        .await
+        .unwrap();
+    assert_eq!(
+        references,
+        vec![
+            ".ds-dns-0".to_owned(),
+            ".ds-dns-1".to_owned(),
+            "network-mapping-dns-records-v1".to_owned()
+        ]
+    );
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(
+        state
+            .documents
+            .keys()
+            .filter(|(index, _)| index.starts_with(".ds-dns-"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn dns_reconciliation_rejects_duplicate_id_across_backing_indices() {
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let context = dns_test_context();
+    let observations = vec![dns_test_observation("example.com")];
+    service
+        .persist_dns_observations(&context, "default", &observations)
+        .await
+        .unwrap();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let ((_, id), document) = state
+            .documents
+            .iter()
+            .find(|((index, _), _)| index.starts_with(".ds-dns-"))
+            .map(|(key, document)| (key.clone(), document.clone()))
+            .unwrap();
+        state.documents.insert((".ds-dns-1".into(), id), document);
+    }
+
+    let error = service
+        .persist_dns_observations(&context, "default", &observations)
+        .await
+        .unwrap_err();
+    assert!(error.contains("跨 backing index 重复"));
 }
 
 #[tokio::test]
