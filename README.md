@@ -108,9 +108,9 @@ AND tag = "生产环境"
 `banner:nginx` 等旧输入仍然兼容。完整字段表、标签否定语义、逻辑优先级、跨端点查询、
 API 请求响应和限制参见[资产搜索语法与 API](docs/SEARCH_SYNTAX.md)。
 
-服务端仅支持 Elasticsearch 9.5.2 存储扫描结果，PostgreSQL 保留用户、权限、任务、标签、
+服务端仅支持 Elasticsearch 9.5.3 存储扫描结果，PostgreSQL 保留用户、权限、任务、标签、
 上传回执和派生分析快照。PG 旧结果仅支持通过独立命令迁移到 ES。幂等回填、启动检查、
-查询覆盖、快照和回滚流程参见[Elasticsearch 9.5.2 扫描存储与搜索](docs/ELASTICSEARCH.md)。
+查询覆盖、快照和回滚流程参见[Elasticsearch 9.5.3 扫描存储与搜索](docs/ELASTICSEARCH.md)。
 存储职责、迁移验收和旧数据归档边界参见
 [扫描结果 ES 存储实施方案](docs/ES_SCAN_STORAGE_PLAN.md)。
 

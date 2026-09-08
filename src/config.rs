@@ -387,7 +387,7 @@ impl Default for ElasticsearchConfig {
             dns_observation_retention_days: 180,
             scan_number_of_replicas: 0,
             write_wait_for_active_shards: "1".to_owned(),
-            expected_version: "9.5.2".to_owned(),
+            expected_version: "9.5.3".to_owned(),
             api_key: None,
             username: None,
             password: None,
@@ -454,8 +454,8 @@ impl SelfChecking for ElasticsearchConfig {
         if !url.username().is_empty() || url.password().is_some() {
             return Err("elasticsearch.url 不得包含用户名或密码，请使用独立认证字段".into());
         }
-        if self.expected_version != "9.5.2" {
-            return Err("当前接入固定要求 elasticsearch.expected_version = 9.5.2".into());
+        if self.expected_version != "9.5.3" {
+            return Err("当前接入固定要求 elasticsearch.expected_version = 9.5.3".into());
         }
         for (name, value) in [
             ("observation_index_prefix", &self.observation_index_prefix),
@@ -1472,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn elasticsearch_config_is_safe_by_default_and_requires_9_5_2() {
+    fn elasticsearch_config_is_safe_by_default_and_requires_9_5_3() {
         let mut config = ElasticsearchConfig::default();
         assert!(config.enabled);
         assert!(config.read_enabled);
@@ -1486,9 +1486,9 @@ mod tests {
         assert!(config.try_check().unwrap());
 
         config.enabled = true;
-        config.expected_version = "9.5.1".to_owned();
-        assert!(config.try_check().is_err());
         config.expected_version = "9.5.2".to_owned();
+        assert!(config.try_check().is_err());
+        config.expected_version = "9.5.3".to_owned();
         assert!(config.try_check().unwrap());
         config.read_enabled = true;
         config.enabled = false;

@@ -1,4 +1,4 @@
-# Elasticsearch 9.5.2 扫描结果存储
+# Elasticsearch 9.5.3 扫描结果存储
 
 服务端正常运行仅支持 Elasticsearch 扫描结果存储。PostgreSQL 保留用户、权限、标签、
 任务、执行状态、扫描器、上传回执、补偿队列和紧凑分析快照，不再读写完整扫描事实。
@@ -21,7 +21,7 @@ dns_record_index = "network-mapping-dns-records-v1"
 dns_observation_retention_days = 180
 scan_number_of_replicas = 1
 write_wait_for_active_shards = "all"
-expected_version = "9.5.2"
+expected_version = "9.5.3"
 # api_key 和 CA 路径由部署环境提供。
 ```
 
@@ -111,7 +111,7 @@ ANALYTICS_TEST_DATABASE_URL='host=127.0.0.1 port=5432 dbname=storage_test user=t
 ```
 
 存储集成测试使用真实 PG 隔离 schema 与本地 ES HTTP fixture，验证协议和恢复边界；它不替代
-实际 ES 9.5.2 的 mapping、Painless、rollover、副本故障、性能和 Snapshot/Restore 验收。
+实际 ES 9.5.3 的 mapping、Painless、rollover、副本故障、性能和 Snapshot/Restore 验收。
 
 ## 慢查询诊断
 

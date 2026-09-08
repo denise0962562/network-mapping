@@ -116,7 +116,7 @@ impl Drop for EsFixture {
 
 fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &str) -> Value {
     if path == "/" {
-        return json!({"version": {"number": "9.5.2"}});
+        return json!({"version": {"number": "9.5.3"}});
     }
     if path.starts_with("/_data_stream/") {
         return json!({"data_streams": [{"indices": [{"index_name": format!(".ds-dns-{}", state.dns_generation)}]}]});
