@@ -45,7 +45,17 @@ enum Field {
     Banner,
     Title,
     HttpBody,
+    TlsMode,
+    TlsVersion,
+    TlsCipherSuite,
     TlsSubject,
+    TlsIssuer,
+    TlsNames,
+    TlsSerialNumber,
+    TlsNotBefore,
+    TlsNotAfter,
+    TlsFingerprintSha256,
+    TlsSelfSigned,
     Source,
     Scanner,
     FirstSeen,
@@ -282,8 +292,11 @@ impl ElasticsearchCompiler {
             Field::Port | Field::TagId => {
                 self.compile_integer(predicate.field, operator, &predicate.values)
             }
-            Field::FirstSeen | Field::LastSeen => {
+            Field::FirstSeen | Field::LastSeen | Field::TlsNotBefore | Field::TlsNotAfter => {
                 self.compile_time(predicate.field, operator, &predicate.values)
+            }
+            Field::TlsSelfSigned => {
+                self.compile_boolean(predicate.field, operator, &predicate.values)
             }
             field => self.compile_text(field, operator, &predicate.values),
         }
@@ -466,6 +479,12 @@ impl ElasticsearchCompiler {
                 | Field::Tag
                 | Field::TagKind
                 | Field::TagCategory
+                | Field::TlsMode
+                | Field::TlsVersion
+                | Field::TlsCipherSuite
+                | Field::TlsNames
+                | Field::TlsSerialNumber
+                | Field::TlsFingerprintSha256
         );
         let normalized_values = values
             .iter()
@@ -518,6 +537,31 @@ impl ElasticsearchCompiler {
             missing_matches_negative,
         ))
     }
+
+    fn compile_boolean(
+        &self,
+        field: Field,
+        operator: Operator,
+        values: &[String],
+    ) -> Result<Value, SearchSyntaxError> {
+        if values.len() != 1 || !matches!(operator, Operator::Eq | Operator::NotEq) {
+            return Err(unsupported_operator(field));
+        }
+        let value = values[0].parse::<bool>().map_err(|_| {
+            SearchSyntaxError::new(
+                format!("{} 只支持 true 或 false", field.display_name()),
+                0,
+                0,
+            )
+        })?;
+        let name = es_field(field);
+        Ok(negative_filter(
+            operator,
+            name,
+            json!({"term": {(name): value}}),
+            false,
+        ))
+    }
 }
 
 fn negative_filter(
@@ -558,7 +602,17 @@ fn es_field(field: Field) -> &'static str {
         Field::Banner => "banner",
         Field::Title => "title",
         Field::HttpBody => "http_body",
+        Field::TlsMode => "tls_mode",
+        Field::TlsVersion => "tls_version",
+        Field::TlsCipherSuite => "tls_cipher_suite",
         Field::TlsSubject => "tls_subject",
+        Field::TlsIssuer => "tls_issuer",
+        Field::TlsNames => "tls_names",
+        Field::TlsSerialNumber => "tls_serial_number",
+        Field::TlsNotBefore => "tls_not_before",
+        Field::TlsNotAfter => "tls_not_after",
+        Field::TlsFingerprintSha256 => "tls_fingerprint_sha256",
+        Field::TlsSelfSigned => "tls_self_signed",
         Field::Source => "source",
         Field::Scanner => "scanner_name",
         Field::FirstSeen => "first_seen",
@@ -601,7 +655,17 @@ impl Field {
             "banner" => Some(Self::Banner),
             "title" | "http.title" => Some(Self::Title),
             "http_body" | "http.body" => Some(Self::HttpBody),
+            "tls.mode" => Some(Self::TlsMode),
+            "tls.version" => Some(Self::TlsVersion),
+            "tls.cipher" | "tls.cipher_suite" => Some(Self::TlsCipherSuite),
             "tls_subject" | "tls.subject" => Some(Self::TlsSubject),
+            "tls.issuer" => Some(Self::TlsIssuer),
+            "tls.names" | "tls.san" => Some(Self::TlsNames),
+            "tls.serial" | "tls.serial_number" => Some(Self::TlsSerialNumber),
+            "tls.not_before" => Some(Self::TlsNotBefore),
+            "tls.not_after" => Some(Self::TlsNotAfter),
+            "tls.fingerprint" | "tls.fingerprint_sha256" => Some(Self::TlsFingerprintSha256),
+            "tls.self_signed" => Some(Self::TlsSelfSigned),
             "source" => Some(Self::Source),
             "scanner" | "scanner_name" => Some(Self::Scanner),
             "first_seen" => Some(Self::FirstSeen),
@@ -629,7 +693,17 @@ impl Field {
             Self::Banner => "banner",
             Self::Title => "title",
             Self::HttpBody => "http_body",
+            Self::TlsMode => "tls.mode",
+            Self::TlsVersion => "tls.version",
+            Self::TlsCipherSuite => "tls.cipher",
             Self::TlsSubject => "tls_subject",
+            Self::TlsIssuer => "tls.issuer",
+            Self::TlsNames => "tls.names",
+            Self::TlsSerialNumber => "tls.serial",
+            Self::TlsNotBefore => "tls.not_before",
+            Self::TlsNotAfter => "tls.not_after",
+            Self::TlsFingerprintSha256 => "tls.fingerprint",
+            Self::TlsSelfSigned => "tls.self_signed",
             Self::Source => "source",
             Self::Scanner => "scanner",
             Self::FirstSeen => "first_seen",
@@ -646,7 +720,17 @@ impl Field {
                 | Self::Banner
                 | Self::Title
                 | Self::HttpBody
+                | Self::TlsMode
+                | Self::TlsVersion
+                | Self::TlsCipherSuite
                 | Self::TlsSubject
+                | Self::TlsIssuer
+                | Self::TlsNames
+                | Self::TlsSerialNumber
+                | Self::TlsNotBefore
+                | Self::TlsNotAfter
+                | Self::TlsFingerprintSha256
+                | Self::TlsSelfSigned
                 | Self::Source
         )
     }
@@ -658,6 +742,8 @@ impl Field {
             | Self::Title
             | Self::HttpBody
             | Self::TlsSubject
+            | Self::TlsIssuer
+            | Self::TlsNames
             | Self::Isp
             | Self::Org
             | Self::City
@@ -672,6 +758,14 @@ impl Field {
             | Self::TagCategory
             | Self::Port
             | Self::Protocol
+            | Self::TlsMode
+            | Self::TlsVersion
+            | Self::TlsCipherSuite
+            | Self::TlsSerialNumber
+            | Self::TlsNotBefore
+            | Self::TlsNotAfter
+            | Self::TlsFingerprintSha256
+            | Self::TlsSelfSigned
             | Self::Source
             | Self::FirstSeen
             | Self::LastSeen => Operator::Eq,
@@ -1371,11 +1465,35 @@ mod tests {
 
     #[test]
     fn supports_http_and_tls_search_fields() {
-        let text = filter("title ~ camera AND http.body ~ hikvision AND tls.subject ~ example")
-            .to_string();
-        for field in ["title", "http_body", "tls_subject"] {
+        let text = filter(
+            "title ~ camera AND http.body ~ hikvision AND tls.subject ~ example \
+             AND tls.issuer ~ example AND tls.san = mail.example.com \
+             AND tls.mode = starttls AND tls.version = TLSv1.3",
+        )
+        .to_string();
+        for field in [
+            "title",
+            "http_body",
+            "tls_subject",
+            "tls_issuer",
+            "tls_names",
+            "tls_mode",
+            "tls_version",
+        ] {
             assert!(text.contains(field));
         }
+    }
+
+    #[test]
+    fn compiles_tls_certificate_dates_and_boolean_fields() {
+        let text = filter(
+            "tls.not_after < 2027-01-01T00:00:00Z AND tls.self_signed = false \
+             AND tls.fingerprint = AABBCCDD",
+        )
+        .to_string();
+        assert!(text.contains("tls_not_after"));
+        assert!(text.contains("tls_self_signed"));
+        assert!(text.contains("tls_fingerprint_sha256"));
     }
 
     #[test]

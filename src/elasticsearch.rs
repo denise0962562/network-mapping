@@ -21,7 +21,7 @@ use crate::handlers::tags::AssetTag;
 use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
 
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
-const SCAN_INDEX_SCHEMA_VERSION: &str = "4";
+const SCAN_INDEX_SCHEMA_VERSION: &str = "5";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const MAX_DOMAIN_RECORDS: usize = 10_000;
 const MAX_DOMAIN_NAMES: usize = 1_000;
@@ -151,7 +151,18 @@ struct SearchSource {
     service: Option<String>,
     banner: Option<String>,
     title: Option<String>,
+    tls_mode: Option<String>,
+    tls_version: Option<String>,
+    tls_cipher_suite: Option<String>,
     tls_subject: Option<String>,
+    tls_issuer: Option<String>,
+    #[serde(default)]
+    tls_names: Vec<String>,
+    tls_serial_number: Option<String>,
+    tls_not_before: Option<DateTime<Utc>>,
+    tls_not_after: Option<DateTime<Utc>>,
+    tls_fingerprint_sha256: Option<String>,
+    tls_self_signed: Option<bool>,
     scanner_name: Option<String>,
     last_seen: DateTime<Utc>,
     asn: Option<String>,
@@ -173,7 +184,17 @@ pub(crate) struct ElasticsearchSearchItem {
     pub(crate) service: Option<String>,
     pub(crate) banner: Option<String>,
     pub(crate) title: Option<String>,
+    pub(crate) tls_mode: Option<String>,
+    pub(crate) tls_version: Option<String>,
+    pub(crate) tls_cipher_suite: Option<String>,
     pub(crate) tls_subject: Option<String>,
+    pub(crate) tls_issuer: Option<String>,
+    pub(crate) tls_names: Vec<String>,
+    pub(crate) tls_serial_number: Option<String>,
+    pub(crate) tls_not_before: Option<i64>,
+    pub(crate) tls_not_after: Option<i64>,
+    pub(crate) tls_fingerprint_sha256: Option<String>,
+    pub(crate) tls_self_signed: Option<bool>,
     pub(crate) scanner_name: Option<String>,
     pub(crate) scan_time: i64,
     pub(crate) asn: Option<String>,
@@ -1146,9 +1167,8 @@ impl ElasticsearchService {
                 return Ok(indices.into_iter().collect());
             }
             if write_attempts >= max_writes {
-                return Err(last_error.unwrap_or_else(|| {
-                    "DNS Elasticsearch Bulk 未能持久化全部观察".into()
-                }));
+                return Err(last_error
+                    .unwrap_or_else(|| "DNS Elasticsearch Bulk 未能持久化全部观察".into()));
             }
             let mut body = String::new();
             for (id, document) in documents {
@@ -1893,7 +1913,17 @@ impl ElasticsearchService {
                 service: source.service,
                 banner: source.banner,
                 title: source.title,
+                tls_mode: source.tls_mode,
+                tls_version: source.tls_version,
+                tls_cipher_suite: source.tls_cipher_suite,
                 tls_subject: source.tls_subject,
+                tls_issuer: source.tls_issuer,
+                tls_names: source.tls_names,
+                tls_serial_number: source.tls_serial_number,
+                tls_not_before: source.tls_not_before.map(|value| value.timestamp_millis()),
+                tls_not_after: source.tls_not_after.map(|value| value.timestamp_millis()),
+                tls_fingerprint_sha256: source.tls_fingerprint_sha256,
+                tls_self_signed: source.tls_self_signed,
                 scanner_name: source.scanner_name,
                 scan_time: source.last_seen.timestamp_millis(),
                 asn: source.asn,
@@ -2539,6 +2569,12 @@ impl ElasticsearchService {
                     let port: i32 = row.get("port");
                     let endpoint_id =
                         sha256_hex(format!("{execution_id}\0{network}\0{port}").as_bytes());
+                    let data = row.get::<_, Option<Value>>("data");
+                    let extracted = crate::search_content::extract_search_content(data.as_ref());
+                    let title = row.get::<_, Option<String>>("title").or(extracted.title);
+                    let tls_subject = row
+                        .get::<_, Option<String>>("tls_subject")
+                        .or(extracted.tls_subject);
                     json!({
                         "observation_key": row.get::<_, String>("observation_key"),
                         "endpoint_id": endpoint_id,
@@ -2547,12 +2583,22 @@ impl ElasticsearchService {
                         "protocol": row.get::<_, Option<String>>("protocol"),
                         "service": row.get::<_, Option<String>>("service"),
                         "banner": row.get::<_, Option<String>>("banner"),
-                        "title": row.get::<_, Option<String>>("title"),
+                        "title": title,
                         "http_body": row.get::<_, Option<String>>("http_body"),
                         "http_body_truncated": row.get::<_, bool>("http_body_truncated"),
-                        "tls_subject": row.get::<_, Option<String>>("tls_subject"),
+                        "tls_mode": extracted.tls_mode,
+                        "tls_version": extracted.tls_version,
+                        "tls_cipher_suite": extracted.tls_cipher_suite,
+                        "tls_subject": tls_subject,
+                        "tls_issuer": extracted.tls_issuer,
+                        "tls_names": extracted.tls_names,
+                        "tls_serial_number": extracted.tls_serial_number,
+                        "tls_not_before": extracted.tls_not_before,
+                        "tls_not_after": extracted.tls_not_after,
+                        "tls_fingerprint_sha256": extracted.tls_fingerprint_sha256,
+                        "tls_self_signed": extracted.tls_self_signed,
                         "search_content_extracted": row.get::<_, bool>("search_content_extracted"),
-                        "source": row.get::<_, String>("source"), "data": row.get::<_, Option<Value>>("data"),
+                        "source": row.get::<_, String>("source"), "data": data,
                         "observed_at": row.get::<_, i64>("observed_at"),
                         "asn": row.get::<_, Option<String>>("asn"), "isp": row.get::<_, Option<String>>("isp"),
                         "as_org": row.get::<_, Option<String>>("as_org"),
@@ -3451,7 +3497,17 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "title": {"type": "text", "fields": {"raw": {"type": "keyword", "ignore_above": 512}}},
                     "http_body": {"type": "match_only_text"},
                     "http_body_truncated": {"type": "boolean"},
+                    "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                    "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                    "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                     "tls_subject": {"type": "wildcard"},
+                    "tls_issuer": {"type": "wildcard"},
+                    "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                    "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                    "tls_not_before": {"type": "date"},
+                    "tls_not_after": {"type": "date"},
+                    "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+                    "tls_self_signed": {"type": "boolean"},
                     "search_content_extracted": {"type": "boolean", "index": false},
                     "source": {"type": "keyword"},
                     "data": {"type": "object", "enabled": false},
@@ -3477,6 +3533,16 @@ fn scan_observation_compatibility_mapping() -> Value {
         "ip_network": {"type": "ip_range"},
         "latitude": {"type": "double"},
         "longitude": {"type": "double"},
+        "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "tls_issuer": {"type": "wildcard"},
+        "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+        "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+        "tls_not_before": {"type": "date"},
+        "tls_not_after": {"type": "date"},
+        "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+        "tls_self_signed": {"type": "boolean"},
         "tags": {"properties": scan_observation_tag_mapping_properties()}
     }})
 }
@@ -3691,8 +3757,19 @@ fn scan_endpoint_index_definition(replicas: u32) -> Value {
                 "http_body": {"type": "match_only_text", "copy_to": "http_body_contains"},
                 "http_body_contains": {"type": "wildcard"},
                 "http_body_truncated": {"type": "boolean"},
+                "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tls_subject": {"type": "wildcard", "copy_to": "tls_subject_text"},
                 "tls_subject_text": {"type": "text"},
+                "tls_issuer": {"type": "wildcard", "copy_to": "tls_issuer_text"},
+                "tls_issuer_text": {"type": "text"},
+                "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                "tls_not_before": {"type": "date"},
+                "tls_not_after": {"type": "date"},
+                "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+                "tls_self_signed": {"type": "boolean"},
                 "source": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "kind": {"type": "keyword"},
                 "first_seen": {"type": "date"},
@@ -3770,7 +3847,17 @@ fn endpoint_projection_document(
         "title": observation.get("title").cloned().unwrap_or(Value::Null),
         "http_body": observation.get("http_body").cloned().unwrap_or(Value::Null),
         "http_body_truncated": observation.get("http_body_truncated").cloned().unwrap_or(json!(false)),
+        "tls_mode": observation.get("tls_mode").cloned().unwrap_or(Value::Null),
+        "tls_version": observation.get("tls_version").cloned().unwrap_or(Value::Null),
+        "tls_cipher_suite": observation.get("tls_cipher_suite").cloned().unwrap_or(Value::Null),
         "tls_subject": observation.get("tls_subject").cloned().unwrap_or(Value::Null),
+        "tls_issuer": observation.get("tls_issuer").cloned().unwrap_or(Value::Null),
+        "tls_names": observation.get("tls_names").cloned().unwrap_or_else(|| json!([])),
+        "tls_serial_number": observation.get("tls_serial_number").cloned().unwrap_or(Value::Null),
+        "tls_not_before": observation.get("tls_not_before").cloned().unwrap_or(Value::Null),
+        "tls_not_after": observation.get("tls_not_after").cloned().unwrap_or(Value::Null),
+        "tls_fingerprint_sha256": observation.get("tls_fingerprint_sha256").cloned().unwrap_or(Value::Null),
+        "tls_self_signed": observation.get("tls_self_signed").cloned().unwrap_or(Value::Null),
         "source": observation.get("source").cloned().unwrap_or(Value::Null),
         "kind": kind,
         "first_seen": observed_at,
@@ -3808,7 +3895,17 @@ fn append_projection_update(
             def title = ctx._source.title;
             def httpBody = ctx._source.http_body;
             def httpBodyTruncated = ctx._source.http_body_truncated;
+            def tlsMode = ctx._source.tls_mode;
+            def tlsVersion = ctx._source.tls_version;
+            def tlsCipherSuite = ctx._source.tls_cipher_suite;
             def tlsSubject = ctx._source.tls_subject;
+            def tlsIssuer = ctx._source.tls_issuer;
+            def tlsNames = ctx._source.tls_names;
+            def tlsSerialNumber = ctx._source.tls_serial_number;
+            def tlsNotBefore = ctx._source.tls_not_before;
+            def tlsNotAfter = ctx._source.tls_not_after;
+            def tlsFingerprintSha256 = ctx._source.tls_fingerprint_sha256;
+            def tlsSelfSigned = ctx._source.tls_self_signed;
             def serviceObserved = ctx._source.service_observed_at_ms;
             if (params.doc.observed_at_ms < ctx._source.observed_at_ms) {
                 if (firstSeenMs == null || params.doc.observed_at_ms < firstSeenMs) {
@@ -3825,7 +3922,17 @@ fn append_projection_update(
                     ctx._source.title = title;
                     ctx._source.http_body = httpBody;
                     ctx._source.http_body_truncated = httpBodyTruncated;
+                    ctx._source.tls_mode = tlsMode;
+                    ctx._source.tls_version = tlsVersion;
+                    ctx._source.tls_cipher_suite = tlsCipherSuite;
                     ctx._source.tls_subject = tlsSubject;
+                    ctx._source.tls_issuer = tlsIssuer;
+                    ctx._source.tls_names = tlsNames;
+                    ctx._source.tls_serial_number = tlsSerialNumber;
+                    ctx._source.tls_not_before = tlsNotBefore;
+                    ctx._source.tls_not_after = tlsNotAfter;
+                    ctx._source.tls_fingerprint_sha256 = tlsFingerprintSha256;
+                    ctx._source.tls_self_signed = tlsSelfSigned;
                     ctx._source.service_observed_at_ms = serviceObserved;
                 }
             }
@@ -3836,7 +3943,17 @@ fn append_projection_update(
                 ctx._source.title = params.doc.title;
                 ctx._source.http_body = params.doc.http_body;
                 ctx._source.http_body_truncated = params.doc.http_body_truncated;
+                ctx._source.tls_mode = params.doc.tls_mode;
+                ctx._source.tls_version = params.doc.tls_version;
+                ctx._source.tls_cipher_suite = params.doc.tls_cipher_suite;
                 ctx._source.tls_subject = params.doc.tls_subject;
+                ctx._source.tls_issuer = params.doc.tls_issuer;
+                ctx._source.tls_names = params.doc.tls_names;
+                ctx._source.tls_serial_number = params.doc.tls_serial_number;
+                ctx._source.tls_not_before = params.doc.tls_not_before;
+                ctx._source.tls_not_after = params.doc.tls_not_after;
+                ctx._source.tls_fingerprint_sha256 = params.doc.tls_fingerprint_sha256;
+                ctx._source.tls_self_signed = params.doc.tls_self_signed;
                 ctx._source.service_observed_at_ms = params.doc.observed_at_ms;
             }
         }
@@ -3874,6 +3991,17 @@ fn tag_mapping_properties() -> Value {
 fn index_mapping_update() -> Value {
     json!({
         "properties": {
+            "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+            "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+            "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+            "tls_issuer": {"type": "wildcard", "copy_to": "tls_issuer_text"},
+            "tls_issuer_text": {"type": "text"},
+            "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+            "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+            "tls_not_before": {"type": "date"},
+            "tls_not_after": {"type": "date"},
+            "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+            "tls_self_signed": {"type": "boolean"},
             "tags": {"properties": tag_mapping_properties()}
         }
     })
@@ -3932,9 +4060,9 @@ mod tests {
     use super::{
         ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchOperation, ElasticsearchService,
         ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay, collect_domain_addresses,
-        dns_task_observations_search_body, initialization_retry_delay, new_trace_context,
-        observation_search_target, parse_asn, parse_storage_metrics, replace_domain_filters,
-        scan_batch_payload_checksum, scan_endpoint_index_definition,
+        dns_task_observations_search_body, index_mapping_update, initialization_retry_delay,
+        new_trace_context, observation_search_target, parse_asn, parse_storage_metrics,
+        replace_domain_filters, scan_batch_payload_checksum, scan_endpoint_index_definition,
         scan_observation_compatibility_mapping, scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
@@ -3992,7 +4120,7 @@ mod tests {
         let template = scan_observation_template("observations", 0);
         assert_eq!(
             template.pointer("/_meta/schema_version"),
-            Some(&serde_json::json!("4"))
+            Some(&serde_json::json!("5"))
         );
         assert_eq!(
             template.pointer("/template/mappings/properties/ip_address/type"),
@@ -4017,6 +4145,25 @@ mod tests {
                 Some(&serde_json::json!("double"))
             );
         }
+        for field in ["tls_not_before", "tls_not_after"] {
+            assert_eq!(
+                template.pointer(&format!("/template/mappings/properties/{field}/type")),
+                Some(&serde_json::json!("date"))
+            );
+            assert_eq!(
+                scan_observation_compatibility_mapping()
+                    .pointer(&format!("/properties/{field}/type")),
+                Some(&serde_json::json!("date"))
+            );
+        }
+        assert_eq!(
+            scan_endpoint_index_definition(0).pointer("/mappings/properties/tls_names/type"),
+            Some(&serde_json::json!("keyword"))
+        );
+        assert_eq!(
+            index_mapping_update().pointer("/properties/tls_self_signed/type"),
+            Some(&serde_json::json!("boolean"))
+        );
         assert_eq!(
             scan_observation_compatibility_mapping()
                 .pointer("/properties/tags/properties/category_id/type"),

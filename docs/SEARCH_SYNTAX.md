@@ -175,7 +175,7 @@ tag:生产环境
 
 冒号会根据字段转换为不同操作：
 
-- `service`、`banner`、`title`、`http_body`、`tls_subject`、`isp`、`org`、`city`、
+- `service`、`banner`、`title`、`http_body`、`tls_subject`、`tls.issuer`、`tls.san`、`isp`、`org`、`city`、
   `scanner`：转换为包含匹配 `~`；
 - 其他字段：转换为精确匹配 `=`；
 - `ip` 的值为 CIDR 时，按网段包含关系处理。
@@ -249,6 +249,15 @@ ip IN "2001:db8::/32"
 | `title`、`http.title` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新 HTTP 页面标题 |
 | `http_body`、`http.body` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 截断后的最新 HTTP 正文，仅用于搜索 |
 | `tls_subject`、`tls.subject` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新 TLS 证书 Subject |
+| `tls.issuer` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 最新 TLS 证书签发者 |
+| `tls.names`、`tls.san` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 证书名称及 DNS/IP SAN |
+| `tls.mode` | 枚举 | `=`、`!=`、`IN`、`NOT IN` | `direct`、`implicit` 或 `starttls` |
+| `tls.version` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 协商出的 TLS 版本 |
+| `tls.cipher`、`tls.cipher_suite` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 协商出的密码套件 |
+| `tls.serial`、`tls.serial_number` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 叶子证书序列号 |
+| `tls.fingerprint`、`tls.fingerprint_sha256` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | 叶子证书 SHA-256 指纹 |
+| `tls.self_signed` | 布尔 | `=`、`!=` | 是否为自签名证书 |
+| `tls.not_before`、`tls.not_after` | 时间 | `=`、`!=`、`>`、`>=`、`<`、`<=` | 叶子证书有效期 |
 | `source` | 文本 | `=`、`!=`、`~`、`!~`、`IN`、`NOT IN` | observation 来源 |
 
 示例：
@@ -259,6 +268,10 @@ protocol = tcp AND port IN (22, 80, 443)
 service = "https" AND banner ~ "nginx"
 title ~ "camera" AND http.body ~ "hikvision"
 tls.subject ~ "example.com"
+service = "smtps" AND tls.self_signed = true
+service = "smtp" AND tls.mode = starttls
+tls.not_after < "2026-10-01T00:00:00Z"
+tls.san = "mail.example.com"
 EXISTS(service) AND NOT EXISTS(banner)
 ```
 
@@ -281,6 +294,8 @@ scanner ~ "上海" AND port = 443
 |---|---|---|---|
 | `first_seen` | 时间 | `=`、`!=`、`>`、`>=`、`<`、`<=` | 首次观察时间 |
 | `last_seen` | 时间 | `=`、`!=`、`>`、`>=`、`<`、`<=` | 最近观察时间 |
+| `tls.not_before` | 时间 | `=`、`!=`、`>`、`>=`、`<`、`<=` | 证书生效时间 |
+| `tls.not_after` | 时间 | `=`、`!=`、`>`、`>=`、`<`、`<=` | 证书失效时间 |
 
 支持 RFC 3339：
 
@@ -361,7 +376,7 @@ port = 80 AND has_endpoint(port = 443 AND service = "https")
 `has_endpoint(...)` 内只允许使用端点字段：
 
 ```text
-port, protocol, service, banner, title, http_body, tls_subject, source
+port, protocol, service, banner, title, http_body, tls.*, source
 ```
 
 资产字段应写在函数外部：
