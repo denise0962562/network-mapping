@@ -369,9 +369,9 @@ pub async fn update_scanner_configuration(
     if let Err(message) = body.document.validate() {
         return HttpResponse::BadRequest().json(json!({"success": false, "message": message}));
     }
-    if body.change_reason.trim().is_empty() || body.change_reason.chars().count() > 500 {
+    if body.change_reason.chars().count() > 500 {
         return HttpResponse::BadRequest().json(
-            json!({"success": false, "message": "changeReason must contain 1-500 characters"}),
+            json!({"success": false, "message": "changeReason must contain at most 500 characters"}),
         );
     }
     let scanner_id = scanner_id.into_inner().to_string();
