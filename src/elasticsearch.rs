@@ -43,6 +43,12 @@ pub(crate) struct ScanBatchContext {
     pub(crate) is_final: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DnsWriteMode {
+    Fresh,
+    Reconcile,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ScanBatchWriteResult {
     pub(crate) payload_checksum: String,
@@ -1130,11 +1136,12 @@ impl ElasticsearchService {
         &self,
         context: &ScanBatchContext,
         documents: &BTreeMap<String, Value>,
+        mode: DnsWriteMode,
     ) -> Result<Vec<String>, String> {
         let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
         match timeout(
             budget,
-            self.persist_dns_observation_documents_inner(context, documents),
+            self.persist_dns_observation_documents_inner(context, documents, mode),
         )
         .await
         {
@@ -1150,6 +1157,7 @@ impl ElasticsearchService {
         &self,
         context: &ScanBatchContext,
         documents: &BTreeMap<String, Value>,
+        mode: DnsWriteMode,
     ) -> Result<Vec<String>, String> {
         let stream = &self.inner.config.dns_observation_data_stream;
         if documents.is_empty() {
@@ -1159,10 +1167,14 @@ impl ElasticsearchService {
         let max_writes = self.inner.config.bulk_max_retries as usize + 1;
         let mut write_attempts = 0_usize;
         let mut last_error = None;
+        let mut reconcile = mode == DnsWriteMode::Reconcile;
         loop {
-            let (existing_ids, indices) = self
-                .load_dns_batch_observations(context, &expected_ids)
-                .await?;
+            let (existing_ids, mut indices) = if reconcile {
+                self.load_dns_batch_observations(context, &expected_ids)
+                    .await?
+            } else {
+                (BTreeSet::new(), BTreeSet::new())
+            };
             if existing_ids.len() == documents.len() {
                 return Ok(indices.into_iter().collect());
             }
@@ -1171,10 +1183,12 @@ impl ElasticsearchService {
                     .unwrap_or_else(|| "DNS Elasticsearch Bulk 未能持久化全部观察".into()));
             }
             let mut body = String::new();
+            let mut submitted_ids = BTreeSet::new();
             for (id, document) in documents {
                 if existing_ids.contains(id) {
                     continue;
                 }
+                submitted_ids.insert(id.clone());
                 body.push_str(
                     &serde_json::to_string(&json!({"create": {"_index": stream, "_id": id}}))
                         .map_err(|error| error.to_string())?,
@@ -1195,10 +1209,13 @@ impl ElasticsearchService {
                 .await;
             write_attempts += 1;
             let retry_delay = match result {
-                Ok(result) => match validate_dns_bulk_result(&result) {
-                    Ok(()) => false,
-                    Err(error) if bulk_response_is_retryable(&result, true) => {
-                        last_error = Some(error);
+                Ok(result) => match parse_dns_observation_bulk_result(&result, &submitted_ids) {
+                    Ok(outcome) => {
+                        indices.extend(outcome.indices);
+                        if !outcome.requires_reconciliation {
+                            return Ok(indices.into_iter().collect());
+                        }
+                        last_error = Some("DNS Elasticsearch Bulk 结果需要对账".into());
                         true
                     }
                     Err(error) => return Err(error),
@@ -1215,6 +1232,7 @@ impl ElasticsearchService {
                 ))
                 .await;
             }
+            reconcile = true;
         }
     }
 
@@ -1227,6 +1245,7 @@ impl ElasticsearchService {
         context: &ScanBatchContext,
         tenant_id: &str,
         observations: &[DnsObservation],
+        mode: DnsWriteMode,
     ) -> Result<Vec<String>, String> {
         if !self.enabled() {
             return Err("Elasticsearch 未启用，无法保存 DNS 观察".to_owned());
@@ -1321,7 +1340,7 @@ impl ElasticsearchService {
             }
         }
         let mut storage_references = self
-            .persist_dns_observation_documents(context, &observation_documents)
+            .persist_dns_observation_documents(context, &observation_documents, mode)
             .await?;
         if !record_bulk.is_empty() {
             let response = self
@@ -3684,6 +3703,81 @@ fn append_dns_record_update(
     Ok(())
 }
 
+struct DnsObservationBulkOutcome {
+    indices: BTreeSet<String>,
+    requires_reconciliation: bool,
+}
+
+fn parse_dns_observation_bulk_result(
+    result: &Value,
+    expected_ids: &BTreeSet<String>,
+) -> Result<DnsObservationBulkOutcome, String> {
+    let items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("DNS Elasticsearch Bulk 响应缺少 items")?;
+    if items.len() != expected_ids.len() {
+        return Err(format!(
+            "DNS Elasticsearch Bulk 响应条目数量不匹配：预期 {}，实际 {}",
+            expected_ids.len(),
+            items.len()
+        ));
+    }
+
+    let mut seen_ids = BTreeSet::new();
+    let mut indices = BTreeSet::new();
+    let mut requires_reconciliation = false;
+    for item in items {
+        let action = item
+            .get("create")
+            .ok_or("DNS Elasticsearch Bulk 响应缺少 create 条目")?;
+        let id = action
+            .get("_id")
+            .and_then(Value::as_str)
+            .ok_or("DNS Elasticsearch Bulk create 条目缺少 _id")?;
+        if !expected_ids.contains(id) {
+            return Err(format!("DNS Elasticsearch Bulk 返回非预期事实：{id}"));
+        }
+        if !seen_ids.insert(id.to_owned()) {
+            return Err(format!("DNS Elasticsearch Bulk 重复返回事实：{id}"));
+        }
+        let status = action
+            .get("status")
+            .and_then(Value::as_u64)
+            .ok_or("DNS Elasticsearch Bulk create 条目缺少 status")?;
+        if (200..300).contains(&status) {
+            let index = action
+                .get("_index")
+                .and_then(Value::as_str)
+                .ok_or("DNS Elasticsearch Bulk 成功条目缺少 _index")?;
+            indices.insert(index.to_owned());
+            continue;
+        }
+        let retryable = u16::try_from(status)
+            .ok()
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .is_some_and(is_retryable_bulk_status);
+        if status == 409 || retryable {
+            requires_reconciliation = true;
+            continue;
+        }
+        let reason = action
+            .pointer("/error/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Elasticsearch bulk error");
+        return Err(format!(
+            "DNS Elasticsearch bulk create failed with HTTP {status}: {reason}"
+        ));
+    }
+    if seen_ids != *expected_ids {
+        return Err("DNS Elasticsearch Bulk 响应未覆盖所有事实".into());
+    }
+    Ok(DnsObservationBulkOutcome {
+        indices,
+        requires_reconciliation,
+    })
+}
+
 fn validate_dns_bulk_result(result: &Value) -> Result<(), String> {
     if result.get("errors").and_then(Value::as_bool) != Some(true) {
         return Ok(());
@@ -4061,9 +4155,10 @@ mod tests {
         ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchOperation, ElasticsearchService,
         ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay, collect_domain_addresses,
         dns_task_observations_search_body, index_mapping_update, initialization_retry_delay,
-        new_trace_context, observation_search_target, parse_asn, parse_storage_metrics,
-        replace_domain_filters, scan_batch_payload_checksum, scan_endpoint_index_definition,
-        scan_observation_compatibility_mapping, scan_observation_template,
+        new_trace_context, observation_search_target, parse_asn, parse_dns_observation_bulk_result,
+        parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
+        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
+        scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::collections::BTreeSet;
@@ -4308,6 +4403,50 @@ mod tests {
         });
         assert!(!bulk_response_is_retryable(&existing, true));
         assert!(!bulk_response_is_retryable(&existing, false));
+    }
+
+    #[test]
+    fn dns_observation_bulk_collects_indices_without_reconciliation() {
+        let expected = BTreeSet::from(["one".to_owned(), "two".to_owned()]);
+        let response = serde_json::json!({
+            "errors": false,
+            "items": [
+                {"create": {"status": 201, "_id": "one", "_index": ".ds-dns-1"}},
+                {"create": {"status": 201, "_id": "two", "_index": ".ds-dns-1"}}
+            ]
+        });
+        let outcome = parse_dns_observation_bulk_result(&response, &expected).unwrap();
+        assert_eq!(outcome.indices, BTreeSet::from([".ds-dns-1".to_owned()]));
+        assert!(!outcome.requires_reconciliation);
+    }
+
+    #[test]
+    fn dns_observation_bulk_reconciles_conflicts_and_transient_items() {
+        let expected = BTreeSet::from(["one".to_owned(), "two".to_owned()]);
+        let response = serde_json::json!({
+            "errors": true,
+            "items": [
+                {"create": {"status": 409, "_id": "one", "_index": ".ds-dns-1"}},
+                {"create": {"status": 429, "_id": "two", "_index": ".ds-dns-1"}}
+            ]
+        });
+        let outcome = parse_dns_observation_bulk_result(&response, &expected).unwrap();
+        assert!(outcome.indices.is_empty());
+        assert!(outcome.requires_reconciliation);
+    }
+
+    #[test]
+    fn dns_observation_bulk_rejects_incomplete_or_unknown_items() {
+        let expected = BTreeSet::from(["one".to_owned()]);
+        for response in [
+            serde_json::json!({"errors": false, "items": []}),
+            serde_json::json!({
+                "errors": false,
+                "items": [{"create": {"status": 201, "_id": "other", "_index": ".ds-dns-1"}}]
+            }),
+        ] {
+            assert!(parse_dns_observation_bulk_result(&response, &expected).is_err());
+        }
     }
 
     #[test]

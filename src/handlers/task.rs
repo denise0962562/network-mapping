@@ -2442,6 +2442,11 @@ async fn upload_scanner_result_handler(
                 SaveScannerResultsError::Storage(_) => {
                     HttpResponse::ServiceUnavailable().body("scan storage unavailable")
                 }
+                SaveScannerResultsError::BatchBusy {
+                    retry_after_seconds,
+                } => HttpResponse::ServiceUnavailable()
+                    .insert_header((header::RETRY_AFTER, retry_after_seconds.to_string()))
+                    .body("scan result batch is already being written"),
             }
         }
     }
@@ -2742,6 +2747,23 @@ mod tests {
         let initialization_sql = include_str!("../../source/database/init.sql");
         assert!(initialization_sql.contains("idx_scan_task_execution_running_scanner"));
         assert!(initialization_sql.contains("ON scan_task_execution (assigned_scanner_id)"));
+    }
+
+    #[test]
+    fn database_schema_indexes_bounded_task_claim_paths() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+        for index in [
+            "idx_scan_task_claim_priority",
+            "idx_scan_task_execution_selected_pending",
+            "idx_scan_task_execution_public_pending",
+            "idx_scan_task_execution_expired_running",
+            "idx_scan_task_execution_cancel_reaper",
+        ] {
+            assert!(initialization_sql.contains(index));
+        }
+        let online_migration =
+            include_str!("../../source/database/migrate_dns_lease_and_dispatch.sql");
+        assert!(online_migration.contains("CREATE INDEX CONCURRENTLY"));
     }
 
     #[test]

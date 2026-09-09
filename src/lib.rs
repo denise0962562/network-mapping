@@ -73,7 +73,9 @@ use uuid::Uuid;
 use admin::TotpInfo;
 use config::PasswordHashConfig;
 use db::get_sql_from_file;
-use elasticsearch::{ElasticsearchService, ScanBatchContext, scan_batch_payload_checksum};
+use elasticsearch::{
+    DnsWriteMode, ElasticsearchService, ScanBatchContext, scan_batch_payload_checksum,
+};
 use logs::write::{database_error_diagnostics, error_chain_diagnostics};
 use maxmind::MaxMindState;
 
@@ -86,6 +88,8 @@ pub const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 pub const APPLICATION_JSON: &str = "application/json";
 pub const _SYSTEM_TIME_ZONE: &str = "Asia/Shanghai";
 pub const TASK_LEASE_MS: i64 = 90_000;
+const DNS_BATCH_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const DNS_BATCH_WRITE_LEASE_SECONDS: i64 = 45;
 
 pub fn generate_scanner_token(prefix: &str) -> Result<String, io::Error> {
     let mut token_buffer = [0u8; 36];
@@ -1505,6 +1509,7 @@ struct NormalizedObservation {
 pub enum SaveScannerResultsError {
     Database(Box<dyn std::error::Error + Send + Sync>),
     Storage(String),
+    BatchBusy { retry_after_seconds: u64 },
     InvalidIp { ip: String, source: AddrParseError },
     ScannerUnauthorized,
     TaskNotFound,
@@ -1583,6 +1588,9 @@ impl fmt::Display for SaveScannerResultsError {
         match self {
             Self::Database(e) => write!(f, "{}", e),
             Self::Storage(message) => write!(f, "扫描事实存储失败：{message}"),
+            Self::BatchBusy {
+                retry_after_seconds,
+            } => write!(f, "DNS 批次正在写入，请在 {retry_after_seconds} 秒后重试"),
             Self::InvalidIp { ip, source } => write!(f, "无效 IP/CIDR: {} ({})", ip, source),
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
             Self::TaskNotFound => write!(f, "任务不存在"),
@@ -1596,7 +1604,7 @@ impl std::error::Error for SaveScannerResultsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(e) => Some(e.as_ref()),
-            Self::Storage(_) => None,
+            Self::Storage(_) | Self::BatchBusy { .. } => None,
             Self::InvalidIp { source, .. } => Some(source),
             Self::ScannerUnauthorized
             | Self::TaskNotFound
@@ -1611,6 +1619,48 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     SaveScannerResultsError::Database(Box::new(value))
+}
+
+async fn record_dns_batch_write_error(
+    pool: &deadpool_postgres::Pool,
+    execution_id: i32,
+    upload_id: &str,
+    batch_index: i32,
+    write_token: Uuid,
+    message: &str,
+) {
+    let message = message.chars().take(2_000).collect::<String>();
+    let Ok(Ok(client)) = tokio::time::timeout(Duration::from_secs(1), pool.get()).await else {
+        warn!(
+            event = "DnsBatchWriteErrorNotRecorded",
+            execution_id, upload_id, batch_index, "无法获取 PostgreSQL 连接记录 DNS 批次写入错误"
+        );
+        return;
+    };
+    if let Err(error) = client
+        .execute(
+            "UPDATE scan_result_batch SET last_write_error = $5 \
+             WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3 \
+               AND storage_backend = 'pending' AND write_token = $4;",
+            &[
+                &execution_id,
+                &upload_id,
+                &batch_index,
+                &write_token,
+                &message,
+            ],
+        )
+        .await
+    {
+        warn!(
+            event = "DnsBatchWriteErrorNotRecorded",
+            execution_id,
+            upload_id,
+            batch_index,
+            %error,
+            "记录 DNS 批次写入错误失败"
+        );
+    }
 }
 
 /// PostgreSQL 的 text/jsonb 类型不接受 NUL 字节，写入会报
@@ -1977,8 +2027,9 @@ async fn save_dns_scanner_results(
         is_final,
     };
     let follow_up_enabled = task
-        .get::<_, Value>("generation_metadata")
-        .pointer("/dns_follow_up/enabled")
+        .get::<_, Option<Value>>("generation_metadata")
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/dns_follow_up/enabled"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let payload_checksum = openssl::sha::sha256(
@@ -2034,7 +2085,8 @@ async fn save_dns_scanner_results(
             ));
         }
     }
-    if let Some(existing) = transaction
+    let write_token = Uuid::new_v4();
+    let (write_attempts, write_mode) = if let Some(existing) = transaction
         .query_opt(
             "SELECT is_final, observation_count, payload_checksum, storage_backend FROM scan_result_batch \
              WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
@@ -2061,15 +2113,59 @@ async fn save_dns_scanner_results(
                 .map_err(scanner_result_database_error)?;
             return Ok(0);
         }
+        let claimed = transaction
+            .query_opt(
+                "UPDATE scan_result_batch SET write_token = $4, \
+                 write_lease_expires_at = clock_timestamp() + ($5::BIGINT * INTERVAL '1 second'), \
+                 write_started_at = clock_timestamp(), write_attempts = write_attempts + 1, \
+                 last_write_error = NULL \
+                 WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3 \
+                   AND storage_backend = 'pending' \
+                   AND (write_token IS NULL OR write_lease_expires_at IS NULL \
+                        OR write_lease_expires_at <= clock_timestamp()) \
+                 RETURNING write_attempts;",
+                &[
+                    &execution_db_id,
+                    &upload_id,
+                    &batch_index,
+                    &write_token,
+                    &DNS_BATCH_WRITE_LEASE_SECONDS,
+                ],
+            )
+            .await
+            .map_err(scanner_result_database_error)?;
+        let Some(claimed) = claimed else {
+            let retry_after: i64 = transaction
+                .query_one(
+                    "SELECT GREATEST(1, CEIL(EXTRACT(EPOCH FROM \
+                     (write_lease_expires_at - clock_timestamp())))::BIGINT) \
+                     FROM scan_result_batch \
+                     WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
+                    &[&execution_db_id, &upload_id, &batch_index],
+                )
+                .await
+                .map_err(scanner_result_database_error)?
+                .get(0);
+            return Err(SaveScannerResultsError::BatchBusy {
+                retry_after_seconds: u64::try_from(retry_after).unwrap_or(1),
+            });
+        };
+        (
+            claimed.get::<_, i32>("write_attempts"),
+            DnsWriteMode::Reconcile,
+        )
     } else {
         if already_succeeded {
             return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
         }
-        transaction
-            .execute(
+        let write_attempts = transaction
+            .query_one(
                 "INSERT INTO scan_result_batch (execution_id, upload_id, batch_index, is_final, observation_count, \
-                 protocol_version, payload_checksum, storage_backend, storage_references) \
-                 VALUES ($1, $2, $3, $4, $5, 2, $6, 'pending', '[]'::JSONB);",
+                 protocol_version, payload_checksum, storage_backend, storage_references, write_token, \
+                 write_lease_expires_at, write_attempts, write_started_at) \
+                 VALUES ($1, $2, $3, $4, $5, 2, $6, 'pending', '[]'::JSONB, $7, \
+                         clock_timestamp() + ($8::BIGINT * INTERVAL '1 second'), 1, clock_timestamp()) \
+                 RETURNING write_attempts;",
                 &[
                     &execution_db_id,
                     &upload_id,
@@ -2077,11 +2173,15 @@ async fn save_dns_scanner_results(
                     &is_final,
                     &observation_count,
                     &payload_checksum,
+                    &write_token,
+                    &DNS_BATCH_WRITE_LEASE_SECONDS,
                 ],
             )
             .await
-            .map_err(scanner_result_database_error)?;
-    }
+            .map_err(scanner_result_database_error)?
+            .get::<_, i32>("write_attempts");
+        (write_attempts, DnsWriteMode::Fresh)
+    };
     // `pending` 是持久化的上传占位符。先提交占位符再访问 ES，可以释放任务行锁和
     // PostgreSQL 连接；进程中断后，同一批次会从 pending 状态幂等重试。
     transaction
@@ -2089,37 +2189,48 @@ async fn save_dns_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
     drop(client);
-    // A transaction-scoped advisory lock serializes the same batch across
-    // service instances without keeping the task row locked during ES I/O.
-    // This closes the race where two retries straddle a data-stream rollover.
-    let mut write_lock_client = pool.get().await.map_err(scanner_result_database_error)?;
-    let write_lock = write_lock_client
-        .transaction()
-        .await
-        .map_err(scanner_result_database_error)?;
-    let write_lock_key = format!("dns-batch:{execution_db_id}:{upload_id}:{batch_index}");
-    let write_lock_acquired: bool = write_lock
-        .query_one(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0));",
-            &[&write_lock_key],
-        )
-        .await
-        .map_err(scanner_result_database_error)?
-        .get(0);
-    if !write_lock_acquired {
-        return Err(SaveScannerResultsError::Storage(
-            "相同 DNS 批次正在写入，请稍后重试".into(),
-        ));
-    }
-    let dns_references = elasticsearch
-        .persist_dns_observations(&context, "default", &observations)
-        .await
-        .map_err(SaveScannerResultsError::Storage)?;
-    write_lock
-        .commit()
-        .await
-        .map_err(scanner_result_database_error)?;
-    drop(write_lock_client);
+    info!(
+        event = "DnsBatchWriteClaimed",
+        execution_id = execution_db_id,
+        upload_id,
+        batch_index,
+        write_attempts,
+        mode = ?write_mode,
+        "DNS 批次写入租约已领取"
+    );
+    let dns_references = match tokio::time::timeout(
+        DNS_BATCH_WRITE_TIMEOUT,
+        elasticsearch.persist_dns_observations(&context, "default", &observations, write_mode),
+    )
+    .await
+    {
+        Ok(Ok(references)) => references,
+        Ok(Err(message)) => {
+            record_dns_batch_write_error(
+                pool,
+                execution_db_id,
+                &upload_id,
+                batch_index,
+                write_token,
+                &message,
+            )
+            .await;
+            return Err(SaveScannerResultsError::Storage(message));
+        }
+        Err(_) => {
+            let message = "DNS Elasticsearch 持久化超过固定 30 秒时间预算".to_owned();
+            record_dns_batch_write_error(
+                pool,
+                execution_db_id,
+                &upload_id,
+                batch_index,
+                write_token,
+                &message,
+            )
+            .await;
+            return Err(SaveScannerResultsError::Storage(message));
+        }
+    };
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()
@@ -2146,24 +2257,42 @@ async fn save_dns_scanner_results(
     }
     let receipt_updated = transaction
         .execute(
-            "UPDATE scan_result_batch SET storage_backend = 'elasticsearch', storage_references = $4 \
+            "UPDATE scan_result_batch SET storage_backend = 'elasticsearch', storage_references = $4, \
+             write_token = NULL, write_lease_expires_at = NULL, last_write_error = NULL \
              WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3 \
-             AND storage_backend = 'pending';",
+             AND storage_backend = 'pending' AND write_token = $5;",
             &[
                 &execution_db_id,
                 &upload_id,
                 &batch_index,
                 &serde_json::json!(dns_references),
+                &write_token,
             ],
         )
         .await
         .map_err(scanner_result_database_error)?;
     if receipt_updated == 0 {
-        transaction
-            .commit()
+        let receipt = transaction
+            .query_one(
+                "SELECT storage_backend, GREATEST(1, COALESCE(CEIL(EXTRACT(EPOCH FROM \
+                 (write_lease_expires_at - clock_timestamp())))::BIGINT, 1)) AS retry_after \
+                 FROM scan_result_batch \
+                 WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
+                &[&execution_db_id, &upload_id, &batch_index],
+            )
             .await
             .map_err(scanner_result_database_error)?;
-        return Ok(0);
+        if receipt.get::<_, String>("storage_backend") != "pending" {
+            transaction
+                .commit()
+                .await
+                .map_err(scanner_result_database_error)?;
+            return Ok(0);
+        }
+        let retry_after: i64 = receipt.get("retry_after");
+        return Err(SaveScannerResultsError::BatchBusy {
+            retry_after_seconds: u64::try_from(retry_after).unwrap_or(1),
+        });
     }
     if follow_up_enabled {
         let resolved_ips = resolved_dns_answer_ips(&observations);
@@ -3334,10 +3463,18 @@ pub async fn apply_task(
 
     let cancelled = transaction
         .query(
-            "UPDATE scan_task_execution SET execution_status = 'cancelled', task_end_time = $1, \
-             lease_expires_at = NULL, cancel_requested = false \
-             WHERE execution_status = 'running' AND cancel_requested = true \
-               AND (lease_expires_at IS NULL OR lease_expires_at < $1) RETURNING task_id;",
+            "/* nm:reap_cancelled_executions */ \
+             WITH candidates AS ( \
+                 SELECT id FROM scan_task_execution \
+                 WHERE execution_status = 'running' AND cancel_requested = true \
+                   AND (lease_expires_at IS NULL OR lease_expires_at < $1) \
+                 ORDER BY lease_expires_at NULLS FIRST, id \
+                 FOR UPDATE SKIP LOCKED LIMIT 32 \
+             ) \
+             UPDATE scan_task_execution e \
+             SET execution_status = 'cancelled', task_end_time = $1, \
+                 lease_expires_at = NULL, cancel_requested = false \
+             FROM candidates c WHERE e.id = c.id RETURNING e.task_id;",
             &[&get_unix_epoch_ms()],
         )
         .await
@@ -3375,27 +3512,63 @@ pub async fn apply_task(
 
     let row = transaction
         .query_opt(
-            "SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, \
+            "/* nm:claim_selected_pending */ \
+             SELECT t.id AS task_pk, e.id AS execution_pk, t.user_id, t.task_id, \
              CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::text[] END AS task_target, \
              t.task_port, t.address_family, t.scan_plan, t.dns_resolvers \
-         FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
-         JOIN scanner_info s ON s.scanner_id = $2 \
-         WHERE (e.execution_status = 'pending' OR (e.execution_status = 'running' AND e.maintenance_hold = FALSE AND e.cancel_requested = false \
-              AND (e.lease_expires_at IS NULL OR e.lease_expires_at < $1))) \
-           AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
+         FROM scan_task_execution e \
+         JOIN scan_task t ON t.id = e.task_id \
+         JOIN scanner_info s ON s.scanner_id = $1 \
+         WHERE e.execution_status = 'pending' AND e.requested_scanner_id = $1 \
+           AND t.task_status IN ('pending', 'running') \
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
              OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
            AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
            AND (jsonb_array_length(t.dns_resolvers) = 0 \
              OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
-         ORDER BY CASE WHEN e.execution_status = 'pending' AND e.requested_scanner_id = $2 THEN 0 ELSE 1 END, \
-             t.task_level DESC, t.task_create_time, e.id \
-         FOR UPDATE OF e SKIP LOCKED \
-         LIMIT 1;",
-            &[&get_unix_epoch_ms(), &scanner_id],
+         ORDER BY t.task_level DESC, t.task_create_time, t.id, e.id \
+         FOR UPDATE OF e SKIP LOCKED LIMIT 1;",
+            &[&scanner_id],
         )
         .await
         .map_err(apply_task_database_error)?;
+    let row = if row.is_some() {
+        row
+    } else {
+        transaction
+            .query_opt(
+                "/* nm:claim_general */ \
+                 SELECT t.id AS task_pk, e.execution_pk, t.user_id, t.task_id, \
+                     CASE WHEN t.task_kind = 'dns' THEN t.dns_targets ELSE t.task_target::text[] END AS task_target, \
+                     t.task_port, t.address_family, t.scan_plan, t.dns_resolvers \
+                 FROM scan_task t \
+                 JOIN scanner_info s ON s.scanner_id = $2 \
+                 JOIN LATERAL ( \
+                     SELECT candidate.id AS execution_pk \
+                     FROM scan_task_execution candidate \
+                     WHERE candidate.task_id = t.id AND ( \
+                         (candidate.execution_status = 'pending' AND candidate.requested_scanner_id IS NULL) \
+                         OR (candidate.execution_status = 'running' \
+                             AND candidate.maintenance_hold = FALSE \
+                             AND candidate.cancel_requested = FALSE \
+                             AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < $1) \
+                             AND (candidate.requested_scanner_id IS NULL OR candidate.requested_scanner_id = $2)) \
+                     ) \
+                     ORDER BY candidate.id FOR UPDATE SKIP LOCKED LIMIT 1 \
+                 ) e ON TRUE \
+                 WHERE t.task_status IN ('pending', 'running') \
+                   AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
+                     OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
+                   AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
+                   AND (jsonb_array_length(t.dns_resolvers) = 0 \
+                     OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)) \
+                 ORDER BY t.task_level DESC, t.task_create_time, t.id, e.execution_pk \
+                 LIMIT 1;",
+                &[&get_unix_epoch_ms(), &scanner_id],
+            )
+            .await
+            .map_err(apply_task_database_error)?
+    };
 
     let Some(row) = row else {
         info!(
@@ -3403,6 +3576,10 @@ pub async fn apply_task(
             path = "fn apply_task",
             message = "没有可领取的扫描任务"
         );
+        transaction
+            .commit()
+            .await
+            .map_err(apply_task_database_error)?;
         return Err(ApplyTaskError::NoTask);
     };
 

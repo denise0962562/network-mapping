@@ -240,6 +240,11 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	-- the PostgreSQL transaction. A retry resumes the same receipt after a crash/timeout.
 	storage_backend TEXT NOT NULL DEFAULT 'pending',
 	storage_references JSONB NOT NULL DEFAULT '[]'::JSONB,
+	write_token UUID,
+	write_lease_expires_at TIMESTAMPTZ,
+	write_attempts INT NOT NULL DEFAULT 0,
+	write_started_at TIMESTAMPTZ,
+	last_write_error TEXT,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	UNIQUE(execution_id, upload_id, batch_index)
 );
@@ -266,6 +271,11 @@ ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS payload_checksum VARCHAR(64);
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_references JSONB NOT NULL DEFAULT '[]'::JSONB;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_token UUID;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_lease_expires_at TIMESTAMPTZ;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_started_at TIMESTAMPTZ;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS last_write_error TEXT;
 ALTER TABLE scan_result_batch DROP CONSTRAINT IF EXISTS scan_result_batch_protocol_version_check;
 ALTER TABLE scan_result_batch ADD CONSTRAINT scan_result_batch_protocol_version_check
 	CHECK (protocol_version IN (1, 2, 3));
@@ -653,6 +663,22 @@ CREATE INDEX IF NOT EXISTS idx_audit_event_request
 
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
 	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
+
+CREATE INDEX IF NOT EXISTS idx_scan_task_claim_priority
+	ON scan_task (task_level DESC, task_create_time, id)
+	WHERE task_status IN ('pending', 'running');
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_selected_pending
+	ON scan_task_execution (requested_scanner_id, task_id, id)
+	WHERE execution_status = 'pending' AND requested_scanner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_public_pending
+	ON scan_task_execution (task_id, id)
+	WHERE execution_status = 'pending' AND requested_scanner_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_expired_running
+	ON scan_task_execution (task_id, lease_expires_at, id)
+	WHERE execution_status = 'running' AND maintenance_hold = FALSE AND cancel_requested = FALSE;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_cancel_reaper
+	ON scan_task_execution (lease_expires_at, id)
+	WHERE execution_status = 'running' AND cancel_requested = TRUE;
 
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_maintenance_hold
 	ON scan_task_execution (maintenance_hold_until)
