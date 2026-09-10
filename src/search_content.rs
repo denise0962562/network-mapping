@@ -45,6 +45,7 @@ pub(crate) fn extract_search_content(data: Option<&Value>) -> SearchContent {
         .map(|value| truncate_utf8_bytes(&value, MAX_HTTP_BODY_BYTES))
         .map(|(value, truncated)| (Some(value), truncated))
         .unwrap_or((None, false));
+    let http_body_truncated = http_body_truncated || has_truncated_http_evidence(data);
     let title = http_body
         .as_deref()
         .and_then(extract_html_title)
@@ -131,6 +132,36 @@ pub(crate) fn extract_search_content(data: Option<&Value>) -> SearchContent {
         tls_fingerprint_sha256,
         tls_self_signed,
     }
+}
+
+// New scanners mark the retained response body. Older scanners replaced the
+// entire HTTP result with a truncation summary; keep that loss visible too.
+fn has_truncated_http_evidence(data: &Value) -> bool {
+    fn marked(value: &Value, depth: usize) -> bool {
+        if depth > MAX_JSON_DEPTH {
+            return false;
+        }
+        match value {
+            Value::Object(map) => {
+                map.get("body_truncated").and_then(Value::as_bool) == Some(true)
+                    || map.values().any(|child| marked(child, depth + 1))
+            }
+            Value::Array(items) => items.iter().any(|child| marked(child, depth + 1)),
+            _ => false,
+        }
+    }
+    marked(data, 0)
+        || data
+            .get("evidence")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    matches!(
+                        item.get("module").and_then(Value::as_str),
+                        Some("http" | "https")
+                    ) && item.pointer("/result/truncated").and_then(Value::as_bool) == Some(true)
+                })
+            })
 }
 
 fn find_tls_evidence(data: &Value) -> Option<(&str, &Value)> {
@@ -279,6 +310,28 @@ mod tests {
         assert!(content.http_body.as_deref().unwrap().contains("<html>"));
         assert_eq!(content.tls_subject.as_deref(), Some("CN=camera.example"));
         assert!(!content.http_body_truncated);
+    }
+
+    #[test]
+    fn scanner_truncation_survives_search_extraction() {
+        let data = json!({"evidence": [{"module": "https", "result": {
+            "response": {"body": "<title>Camera</title>partial", "body_truncated": true}
+        }}]});
+        let content = extract_search_content(Some(&data));
+        assert_eq!(content.title.as_deref(), Some("Camera"));
+        assert_eq!(
+            content.http_body.as_deref(),
+            Some("<title>Camera</title>partial")
+        );
+        assert!(content.http_body_truncated);
+        let legacy = json!({"evidence": [{"module": "http", "result": {
+            "status": "success", "truncated": true, "original_bytes": 65588
+        }}]});
+        let content = extract_search_content(Some(&legacy));
+        assert!(content.http_body_truncated);
+        assert!(content.http_body.is_none());
+        let non_http = json!({"evidence": [{"module": "ssh", "result": {"truncated": true}}]});
+        assert!(!extract_search_content(Some(&non_http)).http_body_truncated);
     }
 
     #[test]

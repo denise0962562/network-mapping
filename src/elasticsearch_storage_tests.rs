@@ -1292,3 +1292,121 @@ async fn uploads_recover_without_pg_facts_and_reject_changed_completed_batches()
         .await
         .unwrap();
 }
+
+#[test]
+fn failed_service_probe_does_not_advance_successful_service_clock() {
+    let context = dns_test_context();
+    let failed = json!({"kind": "service", "ip_address": "192.0.2.1", "port": 80,
+        "service": null, "banner": null, "data": {"evidence": [], "confidence": 0}});
+    let projection = endpoint_projection_document(&context, &failed, 2000);
+    assert_eq!(projection["observed_at_ms"], 2000);
+    assert!(projection["service_observed_at_ms"].is_null());
+    let mut successful = failed;
+    successful["service"] = json!("http");
+    assert_eq!(
+        endpoint_projection_document(&context, &successful, 1000)["service_observed_at_ms"],
+        1000
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires STORAGE_TEST_CONFIG_PATH and creates an isolated ES index"]
+async fn live_elasticsearch_preserves_successful_web_evidence_after_failed_probes() {
+    let config_path = std::env::var("STORAGE_TEST_CONFIG_PATH").expect("test config path");
+    let service =
+        ElasticsearchService::new(crate::config::Config::from_file(config_path).elasticsearch)
+            .unwrap();
+    let index = format!("nm-test-web-projection-{}", Uuid::new_v4().simple());
+    let context = dns_test_context();
+    let test = async {
+        service
+            .send_json_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::PUT,
+                &format!("/{index}"),
+                |request| request.json(&scan_endpoint_index_definition(0)),
+            )
+            .await?;
+        let success = json!({"kind": "service", "ip_address": "192.0.2.1", "port": 443,
+            "service": "https", "title": "Camera", "http_body": "<title>Camera</title>",
+            "banner": "HTTP/1.1 200 OK", "tls_subject": "CN=camera"});
+        let failed = json!({"kind": "service", "ip_address": "192.0.2.1", "port": 443});
+        let mut latest_success = success.clone();
+        latest_success["title"] = json!("Updated camera");
+        let documents = [
+            endpoint_projection_document(&context, &success, 1000),
+            endpoint_projection_document(&context, &failed, 2000),
+            endpoint_projection_document(&context, &latest_success, 1500),
+            endpoint_projection_document(&context, &success, 1200),
+            endpoint_projection_document(&context, &failed, 2500),
+        ];
+        for (position, document) in documents.iter().enumerate() {
+            let mut body = String::new();
+            append_projection_update(&mut body, &index, "endpoint", document)?;
+            let result = service.send_bulk_with_retry("/_bulk", &body, false).await?;
+            if result["errors"] != false {
+                return Err(format!("projection failed: {result}"));
+            }
+            let current = service
+                .send_json_request(
+                    ElasticsearchOperation::ScanQuery,
+                    Method::GET,
+                    &format!("/{index}/_doc/endpoint"),
+                    |request| request,
+                )
+                .await?;
+            let source = &current["_source"];
+            let expected_title = if position < 2 {
+                "Camera"
+            } else {
+                "Updated camera"
+            };
+            if source["title"] != expected_title
+                || source["tls_subject"] != "CN=camera"
+                || source["http_body"] != "<title>Camera</title>"
+            {
+                return Err(format!("web evidence lost at step {position}: {source}"));
+            }
+            if position == 4 {
+                if source["service_observed_at_ms"] != 1500 || source["observed_at_ms"] != 2500 {
+                    return Err(format!("incorrect observation clocks: {source}"));
+                }
+                // Promotion must carry the successful-service timestamp, even
+                // though a later failed probe set the endpoint timestamp.
+                let mut body = String::new();
+                append_projection_update(&mut body, &index, "promoted", source)?;
+                let newer = endpoint_projection_document(&context, &success, 1750);
+                append_projection_update(&mut body, &index, "promoted", &newer)?;
+                let result = service.send_bulk_with_retry("/_bulk", &body, false).await?;
+                if result["errors"] != false {
+                    return Err(format!("promotion failed: {result}"));
+                }
+                let promoted = service
+                    .send_json_request(
+                        ElasticsearchOperation::ScanQuery,
+                        Method::GET,
+                        &format!("/{index}/_doc/promoted"),
+                        |request| request,
+                    )
+                    .await?;
+                if promoted["_source"]["title"] != "Camera"
+                    || promoted["_source"]["service_observed_at_ms"] != 1750
+                {
+                    return Err(format!("promotion used endpoint clock: {promoted}"));
+                }
+            }
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    let cleanup = service
+        .send_json_request(
+            ElasticsearchOperation::IndexAdmin,
+            Method::DELETE,
+            &format!("/{index}"),
+            |request| request,
+        )
+        .await;
+    test.unwrap();
+    cleanup.unwrap();
+}

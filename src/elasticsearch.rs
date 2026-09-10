@@ -3900,7 +3900,24 @@ fn endpoint_projection_document(
         .unwrap_or(Value::Null);
     let port = observation.get("port").cloned().unwrap_or(Value::Null);
     let kind = observation.get("kind").cloned().unwrap_or(Value::Null);
-    let is_service = kind.as_str() == Some("service");
+    // Failed/unidentified probes remain immutable observations, but do not
+    // advance the successful-service clock or erase the last useful evidence.
+    let is_service = kind.as_str() == Some("service")
+        && [
+            "service",
+            "banner",
+            "title",
+            "http_body",
+            "tls_subject",
+            "tls_version",
+        ]
+        .iter()
+        .any(|field| {
+            observation
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
     let observed_at = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
         .expect("observed_at was validated")
         .to_rfc3339();
@@ -4001,6 +4018,9 @@ fn append_projection_update(
             def tlsFingerprintSha256 = ctx._source.tls_fingerprint_sha256;
             def tlsSelfSigned = ctx._source.tls_self_signed;
             def serviceObserved = ctx._source.service_observed_at_ms;
+            def incomingServiceObserved = params.doc.service_observed_at_ms;
+            boolean replaceService = incomingServiceObserved != null &&
+                (serviceObserved == null || incomingServiceObserved >= serviceObserved);
             if (params.doc.observed_at_ms < ctx._source.observed_at_ms) {
                 if (firstSeenMs == null || params.doc.observed_at_ms < firstSeenMs) {
                     ctx._source.first_seen = params.doc.first_seen;
@@ -4010,7 +4030,7 @@ fn append_projection_update(
                 ctx._source.putAll(params.doc);
                 ctx._source.first_seen = firstSeen;
                 ctx._source.first_seen_ms = firstSeenMs;
-                if (params.doc.kind != 'service') {
+                if (!replaceService) {
                     ctx._source.service = service;
                     ctx._source.banner = banner;
                     ctx._source.title = title;
@@ -4030,8 +4050,7 @@ fn append_projection_update(
                     ctx._source.service_observed_at_ms = serviceObserved;
                 }
             }
-            if (params.doc.kind == 'service' &&
-                (serviceObserved == null || params.doc.observed_at_ms >= serviceObserved)) {
+            if (replaceService) {
                 ctx._source.service = params.doc.service;
                 ctx._source.banner = params.doc.banner;
                 ctx._source.title = params.doc.title;
@@ -4048,7 +4067,7 @@ fn append_projection_update(
                 ctx._source.tls_not_after = params.doc.tls_not_after;
                 ctx._source.tls_fingerprint_sha256 = params.doc.tls_fingerprint_sha256;
                 ctx._source.tls_self_signed = params.doc.tls_self_signed;
-                ctx._source.service_observed_at_ms = params.doc.observed_at_ms;
+                ctx._source.service_observed_at_ms = incomingServiceObserved;
             }
         }
     "#;
