@@ -1941,6 +1941,56 @@ fn valid_vulnerability_data(data: Option<&Value>) -> bool {
         && string_array("extracted_results", 64, 2_048)
 }
 
+// DNS storage uses a deterministic child identity, while the scanner's original
+// identity owns the contiguous batch sequence and execution completion.
+fn dns_sidecar_upload_id(upload_id: Uuid) -> Uuid {
+    let digest = openssl::sha::sha256(format!("dns-observations:{upload_id}").as_bytes());
+    Uuid::from_slice(&digest[..16]).expect("SHA-256 prefix has UUID length")
+}
+
+async fn validate_execution_upload_ids(
+    transaction: &tokio_postgres::Transaction<'_>,
+    execution_id: i32,
+    upload_ids: &[String],
+) -> Result<(), SaveScannerResultsError> {
+    let conflicting: bool = transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM scan_result_batch \
+             WHERE execution_id = $1 AND NOT (upload_id = ANY($2::TEXT[])));",
+            &[&execution_id, &upload_ids],
+        )
+        .await
+        .map_err(scanner_result_database_error)?
+        .get(0);
+    if conflicting {
+        return Err(SaveScannerResultsError::InvalidUpload(
+            "an execution cannot contain batches from multiple upload_id values".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn dns_batch_payload_checksum(
+    execution_id: &str,
+    upload_id: &str,
+    batch_index: i32,
+    is_final: bool,
+    observations: &[&dns::DnsObservation],
+) -> Result<String, SaveScannerResultsError> {
+    let content = serde_json::to_vec(&serde_json::json!({
+        "execution_id": execution_id,
+        "upload_id": upload_id,
+        "batch_index": batch_index,
+        "is_final": is_final,
+        "observations": observations,
+    }))
+    .map_err(scanner_result_database_error)?;
+    Ok(openssl::sha::sha256(&content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 async fn save_dns_scanner_results(
     pool: &deadpool_postgres::Pool,
     elasticsearch: &ElasticsearchService,
@@ -1948,16 +1998,20 @@ async fn save_dns_scanner_results(
     upload: &ScannerResultUpload,
     token: &str,
     token_pepper: &str,
-    observations: Vec<dns::DnsObservation>,
+    parent_upload_id: Option<Uuid>,
 ) -> Result<usize, SaveScannerResultsError> {
     if !elasticsearch.enabled() {
         return Err(SaveScannerResultsError::Storage(
             "DNS observations require elasticsearch.enabled=true".into(),
         ));
     }
-    let observations = observations
-        .into_iter()
-        .map(dns::DnsObservation::normalize)
+    let observations = upload
+        .observations
+        .iter()
+        .map(|item| match item {
+            ScannerObservation::Dns { observation } => observation.clone().normalize(),
+            _ => Err("a DNS upload batch may contain only DNS observations".to_owned()),
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(SaveScannerResultsError::InvalidUpload)?;
     let observation_count = i32::try_from(observations.len())
@@ -2015,6 +2069,13 @@ async fn save_dns_scanner_results(
 
     let task_db_id: i32 = task.get("task_id");
     let execution_db_id: i32 = task.get("execution_id");
+    let mut allowed_upload_ids = vec![upload_id.clone()];
+    if let Some(parent) = parent_upload_id {
+        debug_assert_eq!(upload.upload_id, Some(dns_sidecar_upload_id(parent)));
+        debug_assert!(!is_final);
+        allowed_upload_ids.push(parent.to_string());
+    }
+    validate_execution_upload_ids(&transaction, execution_db_id, &allowed_upload_ids).await?;
     let context = ScanBatchContext {
         task_id: upload.task_id.to_string(),
         execution_id: task.get("public_execution_id"),
@@ -2032,19 +2093,13 @@ async fn save_dns_scanner_results(
         .and_then(|metadata| metadata.pointer("/dns_follow_up/enabled"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let payload_checksum = openssl::sha::sha256(
-        &serde_json::to_vec(&serde_json::json!({
-            "execution_id": context.execution_id,
-            "upload_id": upload_id,
-            "batch_index": batch_index,
-            "is_final": is_final,
-            "observations": observations,
-        }))
-        .map_err(scanner_result_database_error)?,
-    )
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect::<String>();
+    let payload_checksum = dns_batch_payload_checksum(
+        &context.execution_id,
+        &upload_id,
+        batch_index,
+        is_final,
+        &observations.iter().collect::<Vec<_>>(),
+    )?;
     if is_final {
         let sequence = transaction
             .query_one(
@@ -2691,108 +2746,56 @@ pub async fn save_scanner_results(
         ));
     }
 
-    if is_typed
-        && upload
-            .observations
-            .iter()
-            .any(|item| matches!(item, ScannerObservation::Dns { .. }))
-    {
-        let contains_non_dns = upload
-            .observations
-            .iter()
-            .any(|item| !matches!(item, ScannerObservation::Dns { .. }));
-        if contains_non_dns {
-            let mut dns_upload = upload.clone();
-            let upload_id = upload
-                .upload_id
-                .expect("protocol v2 upload ID was validated");
-            let dns_upload_id =
-                openssl::sha::sha256(format!("dns-observations:{upload_id}").as_bytes());
-            dns_upload.upload_id = Some(
-                Uuid::from_slice(&dns_upload_id[..16])
-                    .expect("a SHA-256 prefix always has a UUID-compatible length"),
-            );
-            dns_upload.batch_index = upload.batch_index;
-            dns_upload.is_final = Some(false);
-            dns_upload.observations = upload
-                .observations
-                .iter()
-                .filter(|item| matches!(item, ScannerObservation::Dns { .. }))
-                .cloned()
-                .collect();
-            let dns_observations = dns_upload
-                .observations
-                .iter()
-                .map(|item| match item {
-                    ScannerObservation::Dns { observation } => Ok(observation.clone()),
-                    _ => Err(SaveScannerResultsError::InvalidUpload(
-                        "a DNS upload batch may contain only DNS observations".into(),
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let dns_count = save_dns_scanner_results(
-                pool,
-                elasticsearch,
-                dns_follow_up,
-                &dns_upload,
-                token,
-                token_pepper,
-                dns_observations,
+    let mut regular_upload = upload.clone();
+    regular_upload
+        .observations
+        .retain(|item| !matches!(item, ScannerObservation::Dns { .. }));
+    let mut dns_upload = upload.clone();
+    dns_upload
+        .observations
+        .retain(|item| matches!(item, ScannerObservation::Dns { .. }));
+    // Route DNS-only tasks by their persisted profile, not by this batch's
+    // contents: a dns_full upload can start or end with a DNS-only batch.
+    if is_typed && regular_upload.observations.is_empty() {
+        let client = pool.get().await.map_err(scanner_result_database_error)?;
+        let dns_only = client
+            .query_opt(
+                "SELECT scan_profile FROM scan_task WHERE task_id = $1;",
+                &[&upload.task_id.to_string()],
             )
-            .await?;
-
-            let mut regular_upload = upload.clone();
-            regular_upload.observations = upload
-                .observations
-                .iter()
-                .filter(|item| !matches!(item, ScannerObservation::Dns { .. }))
-                .cloned()
-                .collect();
-            let regular_count = Box::pin(save_scanner_results(
+            .await
+            .map_err(scanner_result_database_error)?
+            .is_some_and(|row| row.get::<_, String>("scan_profile") == "dns_records");
+        drop(client);
+        if dns_only {
+            return save_dns_scanner_results(
                 pool,
-                maxmind,
                 elasticsearch,
                 dns_follow_up,
-                &regular_upload,
+                upload,
                 token,
                 token_pepper,
-            ))
-            .await?;
-            return Ok(dns_count.saturating_add(regular_count));
+                None,
+            )
+            .await;
         }
-        if !upload.results.is_empty()
-            || upload
-                .observations
-                .iter()
-                .any(|item| !matches!(item, ScannerObservation::Dns { .. }))
-        {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "a DNS upload batch may contain only DNS observations".into(),
-            ));
-        }
-        let dns_observations = upload
-            .observations
-            .iter()
-            .map(|item| match item {
-                ScannerObservation::Dns { observation } => Ok(observation.clone()),
-                _ => Err(SaveScannerResultsError::InvalidUpload(
-                    "a DNS upload batch may contain only DNS observations".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        return save_dns_scanner_results(
-            pool,
-            elasticsearch,
-            dns_follow_up,
-            upload,
-            token,
-            token_pepper,
-            dns_observations,
-        )
-        .await;
     }
-
-    let normalized_observations = normalize_upload_observations(upload)?;
+    let normalized_observations = normalize_upload_observations(&regular_upload)?;
+    // Normalize before reserving a primary receipt, so invalid DNS cannot leave
+    // a permanently pending batch behind.
+    for item in &mut dns_upload.observations {
+        if let ScannerObservation::Dns { observation } = item {
+            *observation = observation
+                .clone()
+                .normalize()
+                .map_err(SaveScannerResultsError::InvalidUpload)?;
+        }
+    }
+    if !dns_upload.observations.is_empty() && !elasticsearch.enabled() {
+        return Err(SaveScannerResultsError::Storage(
+            "DNS observations require elasticsearch.enabled=true".into(),
+        ));
+    }
 
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
@@ -2876,19 +2879,55 @@ pub async fn save_scanner_results(
         batch_index,
         is_final,
     };
-    let conflicting_uploads: i64 = transaction
-        .query_one(
-            "SELECT COUNT(*)::BIGINT AS count FROM scan_result_batch \
-             WHERE execution_id = $1 AND upload_id <> $2;",
-            &[&execution_db_id, &upload_id],
-        )
-        .await
-        .map_err(scanner_result_database_error)?
-        .get("count");
-    if conflicting_uploads > 0 {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "an execution cannot contain batches from multiple upload_id values".into(),
-        ));
+    let sidecar_upload_id = if is_typed {
+        upload.upload_id.map(dns_sidecar_upload_id)
+    } else {
+        None
+    };
+    let sidecar_identity = sidecar_upload_id.map(|id| id.to_string());
+    let mut allowed_upload_ids = vec![upload_id.clone()];
+    allowed_upload_ids.extend(sidecar_identity.iter().cloned());
+    validate_execution_upload_ids(&transaction, execution_db_id, &allowed_upload_ids).await?;
+    // Older servers may have committed the DNS child before creating the primary
+    // receipt. Validate that child first so a changed retry cannot reserve (and
+    // poison) the primary identity or silently drop already persisted DNS data.
+    if let Some(sidecar) = &sidecar_identity
+        && let Some(existing) = transaction
+            .query_opt(
+                "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+             WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
+                &[&execution_db_id, sidecar, &batch_index],
+            )
+            .await
+            .map_err(scanner_result_database_error)?
+    {
+        let observations = dns_upload
+            .observations
+            .iter()
+            .filter_map(|item| match item {
+                ScannerObservation::Dns { observation } => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected = dns_batch_payload_checksum(
+            &public_execution_id,
+            sidecar,
+            batch_index,
+            false,
+            &observations,
+        )?;
+        if observations.is_empty()
+            || existing.get::<_, bool>("is_final")
+            || existing.get::<_, i32>("observation_count") as usize != observations.len()
+            || existing
+                .get::<_, Option<String>>("payload_checksum")
+                .as_deref()
+                != Some(expected.as_str())
+        {
+            return Err(SaveScannerResultsError::InvalidUpload(
+                "batch identity was already used with different DNS content".into(),
+            ));
+        }
     }
     if is_final {
         let sequence = transaction
@@ -3069,8 +3108,24 @@ pub async fn save_scanner_results(
     }
     let storage_backend = "elasticsearch";
     let (transaction, es_execution_summary) = {
-        let expected_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
+        let es_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
             .map_err(SaveScannerResultsError::Storage)?;
+        let expected_checksum = if dns_upload.observations.is_empty() {
+            es_checksum.clone()
+        } else {
+            let content = serde_json::to_vec(&serde_json::json!({
+                "endpoint_checksum": es_checksum,
+                "dns_observations": dns_upload.observations.iter().filter_map(|item| match item {
+                    ScannerObservation::Dns { observation } => Some(observation),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+            }))
+            .map_err(scanner_result_database_error)?;
+            openssl::sha::sha256(&content)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
         if let Some(existing) = transaction
             .query_opt(
                 "SELECT is_final, observation_count, payload_checksum, storage_backend FROM scan_result_batch \
@@ -3131,11 +3186,25 @@ pub async fn save_scanner_results(
             .await
             .map_err(scanner_result_database_error)?;
         drop(client);
+        if !dns_upload.observations.is_empty() {
+            dns_upload.upload_id = sidecar_upload_id;
+            dns_upload.is_final = Some(false);
+            save_dns_scanner_results(
+                pool,
+                elasticsearch,
+                dns_follow_up,
+                &dns_upload,
+                token,
+                token_pepper,
+                upload.upload_id,
+            )
+            .await?;
+        }
         let result = elasticsearch
             .persist_scan_batch(&batch_context, &observation_rows)
             .await
             .map_err(SaveScannerResultsError::Storage)?;
-        debug_assert_eq!(result.payload_checksum, expected_checksum);
+        debug_assert_eq!(result.payload_checksum, es_checksum);
         let storage_references =
             Value::Array(result.indices.into_iter().map(Value::String).collect());
         client = pool.get().await.map_err(scanner_result_database_error)?;
@@ -3188,7 +3257,7 @@ pub async fn save_scanner_results(
         };
         (transaction, result.execution_summary)
     };
-    let saved = normalized_observations.len();
+    let saved = normalized_observations.len() + dns_upload.observations.len();
 
     if !is_typed || upload.is_final == Some(true) {
         let batch_sequence = transaction
@@ -3221,6 +3290,22 @@ pub async fn save_scanner_results(
                 )
             })?
         };
+        let dns_summary = transaction.query_one(
+            "SELECT COALESCE(SUM(d.observation_count), 0)::BIGINT AS count, \
+             COUNT(*) FILTER (WHERE d.storage_backend = 'pending' OR d.is_final \
+                 OR p.id IS NULL OR p.storage_backend = 'pending')::BIGINT AS incomplete \
+             FROM scan_result_batch d LEFT JOIN scan_result_batch p \
+                 ON p.execution_id = d.execution_id AND p.upload_id = $3 AND p.batch_index = d.batch_index \
+             WHERE d.execution_id = $1 AND d.upload_id = $2;",
+            &[&execution_db_id, &sidecar_identity, &upload_id],
+        ).await.map_err(scanner_result_database_error)?;
+        if dns_summary.get::<_, i64>("incomplete") != 0 {
+            return Err(SaveScannerResultsError::InvalidUpload(
+                "final batch requires completed DNS children with matching primary batches".into(),
+            ));
+        }
+        let total_observation_count =
+            execution_summary.observation_count + dns_summary.get::<_, i64>("count");
         transaction
             .execute(
                 "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
@@ -3232,7 +3317,7 @@ pub async fn save_scanner_results(
                     &execution_db_id,
                     &execution_summary.ip_count,
                     &execution_summary.port_count,
-                    &execution_summary.observation_count,
+                    &total_observation_count,
                 ],
             )
             .await
