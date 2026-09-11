@@ -847,7 +847,57 @@ pub const DEFAULT_COMMON_SCAN_PORTS: &str = "21,22,23,25,53,80,110,135,139,143,4
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
+pub struct SearchGenerationConfig {
+    pub enabled: bool,
+    pub stale_after_days: u32,
+    pub cooldown_minutes: u32,
+    pub max_pending_tasks: u32,
+    pub per_user_hourly_limit: u32,
+    pub domain_enabled: bool,
+    /// Exact domains and their subdomains; never inferred from search input.
+    pub authorized_domains: Vec<String>,
+}
+
+impl Default for SearchGenerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stale_after_days: 7,
+            cooldown_minutes: 1440,
+            max_pending_tasks: 100,
+            per_user_hourly_limit: 20,
+            domain_enabled: false,
+            authorized_domains: Vec::new(),
+        }
+    }
+}
+
+impl SearchGenerationConfig {
+    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if !(1..=3650).contains(&self.stale_after_days)
+            || !(1..=525600).contains(&self.cooldown_minutes)
+            || !(1..=10000).contains(&self.max_pending_tasks)
+            || !(1..=10000).contains(&self.per_user_hourly_limit)
+        {
+            return Err(
+                "搜索生成有效期须为 1-3650 天，冷却为 1-525600 分钟，队列和每小时额度为 1-10000"
+                    .into(),
+            );
+        }
+        if self.enabled && self.domain_enabled && self.authorized_domains.is_empty() {
+            return Err("启用域名搜索生成时必须配置授权域名".into());
+        }
+        for domain in &self.authorized_domains {
+            crate::dns::canonical_scan_domain(domain)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(default)]
 pub struct AutomaticTargetConfig {
+    pub search_generation: SearchGenerationConfig,
     pub enabled: bool,
     pub strategy: String,
     pub interval_seconds: u64,
@@ -870,6 +920,7 @@ pub struct AutomaticTargetConfig {
 impl Default for AutomaticTargetConfig {
     fn default() -> Self {
         Self {
+            search_generation: SearchGenerationConfig::default(),
             enabled: false,
             strategy: "sequential_subnet".to_owned(),
             interval_seconds: 30,
@@ -894,6 +945,7 @@ impl Default for AutomaticTargetConfig {
 
 impl AutomaticTargetConfig {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.search_generation.validate()?;
         if self.strategy != "sequential_subnet" {
             return Err(format!("不支持的自动目标生成策略：{}", self.strategy).into());
         }

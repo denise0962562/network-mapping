@@ -2337,6 +2337,9 @@ async fn save_dns_scanner_results(
             .await
             .map_err(scanner_result_database_error)?;
         }
+        target_generated::search::record_success(&transaction, task_db_id)
+            .await
+            .map_err(scanner_result_database_error)?;
     }
     transaction
         .commit()
@@ -3259,6 +3262,9 @@ pub async fn save_scanner_results(
                 .map_err(scanner_result_database_error)?;
         }
         refresh_task_aggregate(&transaction, task_db_id)
+            .await
+            .map_err(scanner_result_database_error)?;
+        target_generated::search::record_success(&transaction, task_db_id)
             .await
             .map_err(scanner_result_database_error)?;
     }

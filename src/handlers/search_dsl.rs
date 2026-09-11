@@ -148,6 +148,51 @@ pub(crate) fn parse_and_compile_elasticsearch(
     }
 }
 
+/// A single explicit target, independent of endpoint filters. Ambiguous boolean
+/// expressions deliberately do not authorize any task generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SearchTarget {
+    pub kind: &'static str,
+    pub key: String,
+}
+
+pub(crate) fn extract_search_target(query: &str) -> Option<SearchTarget> {
+    fn visit(expr: &Expr, target: &mut Option<SearchTarget>) -> Option<()> {
+        match expr {
+            Expr::And(left, right) => {
+                visit(left, target)?;
+                visit(right, target)
+            }
+            Expr::Predicate(p) if matches!(p.field, Field::Ip | Field::Domain) => {
+                if target.is_some()
+                    || p.values.len() != 1
+                    || !matches!(p.operator, Operator::Eq | Operator::Colon)
+                {
+                    return None;
+                }
+                *target = Some(match p.field {
+                    Field::Ip => SearchTarget {
+                        kind: "ip",
+                        key: p.values[0].parse::<IpAddr>().ok()?.to_string(),
+                    },
+                    Field::Domain => SearchTarget {
+                        kind: "domain",
+                        key: crate::dns::canonical_scan_domain(&p.values[0]).ok()?,
+                    },
+                    _ => return None,
+                });
+                Some(())
+            }
+            Expr::Predicate(_) => Some(()),
+            _ => None,
+        }
+    }
+    let (expr, _) = parse_expression(query).ok()?;
+    let mut target = None;
+    visit(&expr, &mut target)?;
+    target
+}
+
 #[derive(Default)]
 struct ElasticsearchCompiler {
     predicate_count: usize,

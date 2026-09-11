@@ -129,8 +129,8 @@ fn normalize_filters(query: &AnalysisFilterQuery) -> Result<AnalysisFilters, &'s
     }
 
     let task_source = query.task_source.as_deref().map(str::trim);
-    if task_source.is_some_and(|value| !matches!(value, "manual" | "automatic")) {
-        return Err("task_source must be manual or automatic");
+    if task_source.is_some_and(|value| !matches!(value, "manual" | "automatic" | "search")) {
+        return Err("task_source must be manual, automatic or search");
     }
 
     Ok(AnalysisFilters {

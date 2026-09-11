@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	id SERIAL PRIMARY KEY,
 	user_id INT NOT NULL,
 	task_id VARCHAR(36) NOT NULL,                                                             -- 任务的 ID ，应该为 UUIDV7
-	task_initiator VARCHAR(10) NOT NULL, 
+	task_initiator VARCHAR(200) NOT NULL,
 	task_target INET[] NOT NULL,                                                              -- 扫描的目标 IP/CIDR 数组
 	task_port TEXT DEFAULT '1-65535',                                                         -- 扫描目标的 PORT
 	task_create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,   -- 表示扫描任务的创建时间
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	cancel_requested BOOLEAN NOT NULL DEFAULT false,                                          -- 控制端请求扫描器终止当前任务
 	retry_of_task_id VARCHAR(36),                                                             -- 重试任务所引用的原任务
 	dispatch_mode TEXT NOT NULL DEFAULT 'automatic',                                          -- automatic/selected/all
-	task_source TEXT NOT NULL DEFAULT 'manual',                                               -- manual/automatic
+	task_source TEXT NOT NULL DEFAULT 'manual',                                               -- manual/automatic/search
 	generation_strategy TEXT,
 	generation_key TEXT,
 	generation_metadata JSONB,
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 );
 
 -- 兼容已有数据库中的任务表。
+ALTER TABLE scan_task ALTER COLUMN task_initiator TYPE VARCHAR(200);
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_source TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_strategy TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_key TEXT;
@@ -1038,3 +1039,25 @@ CREATE INDEX IF NOT EXISTS idx_search_index_outbox_pending
 
 
 ALTER TABLE scan_result_batch ALTER COLUMN storage_backend SET DEFAULT 'pending';
+
+-- Search-trigger state outlives task deletion so deleting tasks cannot bypass cooldown.
+CREATE TABLE IF NOT EXISTS search_target_state (
+    owner_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('ip', 'domain')),
+    target_key TEXT NOT NULL,
+    last_success_at BIGINT,
+    last_success_plan JSONB,
+    last_search_generated_at BIGINT,
+    last_search_task_id TEXT,
+    PRIMARY KEY (owner_id, target_kind, target_key)
+);
+CREATE INDEX IF NOT EXISTS idx_search_target_recent ON search_target_state(owner_id, last_search_generated_at);
+-- A durable rolling-hour admission log; independent from deletable tasks and targets.
+CREATE TABLE IF NOT EXISTS search_generation_admission (
+    owner_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    generated_at BIGINT NOT NULL,
+    task_id TEXT NOT NULL PRIMARY KEY
+);
+CREATE INDEX IF NOT EXISTS idx_search_generation_admission_owner_time ON search_generation_admission(owner_id, generated_at);
+CREATE INDEX IF NOT EXISTS idx_search_generation_admission_time ON search_generation_admission(generated_at);
+CREATE INDEX IF NOT EXISTS idx_scan_task_search_source ON scan_task(id) WHERE task_source = 'search';

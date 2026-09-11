@@ -11,7 +11,7 @@ pub mod operations;
 pub mod requests;
 pub mod scanner_latency;
 pub mod search;
-mod search_dsl;
+pub(crate) mod search_dsl;
 pub mod system_maintenance;
 pub mod system_resources;
 pub mod tags;
