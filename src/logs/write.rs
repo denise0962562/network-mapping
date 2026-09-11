@@ -7,6 +7,30 @@ use uuid::Uuid;
 use crate::audit::RequestId;
 use crate::{get_conn_ip, get_user_agent, logs::LoginLog};
 
+const MAX_ERROR_DIAGNOSTIC_CHARS: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseErrorDiagnostics {
+    pub sqlstate: String,
+    pub severity: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub column: Option<String>,
+    pub constraint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorDiagnostics {
+    pub error_message: String,
+    pub error_chain: String,
+    pub root_cause: String,
+    pub error_truncated: bool,
+    pub database: Option<DatabaseErrorDiagnostics>,
+}
+
 pub fn request_id(req: &HttpRequest) -> Uuid {
     req.extensions()
         .get::<RequestId>()
@@ -32,19 +56,63 @@ pub fn database_error_diagnostics(error: &tokio_postgres::Error) -> String {
     )
 }
 
-pub fn error_chain_diagnostics(error: &(dyn StdError + 'static)) -> String {
+fn truncate_diagnostic(value: String) -> (String, bool) {
+    if value.chars().count() <= MAX_ERROR_DIAGNOSTIC_CHARS {
+        return (value, false);
+    }
+    let mut truncated = value
+        .chars()
+        .take(MAX_ERROR_DIAGNOSTIC_CHARS.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    (truncated, true)
+}
+
+pub fn error_diagnostics(error: &(dyn StdError + 'static)) -> ErrorDiagnostics {
+    let error_message = error.to_string();
     let mut chain = Vec::new();
+    let mut database = None;
     let mut current = Some(error);
     while let Some(item) = current {
-        if let Some(database_error) = item.downcast_ref::<tokio_postgres::Error>() {
-            chain.push(database_error_diagnostics(database_error));
+        if let Some(error) = item.downcast_ref::<tokio_postgres::Error>() {
+            if let Some(db) = error.as_db_error() {
+                database = Some(DatabaseErrorDiagnostics {
+                    sqlstate: db.code().code().to_owned(),
+                    severity: db.severity().to_owned(),
+                    message: db.message().to_owned(),
+                    detail: db.detail().map(str::to_owned),
+                    hint: db.hint().map(str::to_owned),
+                    schema: db.schema().map(str::to_owned),
+                    table: db.table().map(str::to_owned),
+                    column: db.column().map(str::to_owned),
+                    constraint: db.constraint().map(str::to_owned),
+                });
+            }
+            chain.push(database_error_diagnostics(error));
         } else {
             chain.push(item.to_string());
         }
         current = item.source();
     }
     chain.dedup();
-    chain.join("; caused_by=")
+    let root_cause = chain
+        .last()
+        .cloned()
+        .unwrap_or_else(|| error_message.clone());
+    let (error_chain, chain_truncated) = truncate_diagnostic(chain.join("; caused_by="));
+    let (root_cause, root_truncated) = truncate_diagnostic(root_cause);
+    let (error_message, message_truncated) = truncate_diagnostic(error_message);
+    ErrorDiagnostics {
+        error_message,
+        error_chain,
+        root_cause,
+        error_truncated: chain_truncated || root_truncated || message_truncated,
+        database,
+    }
+}
+
+pub fn error_chain_diagnostics(error: &(dyn StdError + 'static)) -> String {
+    error_diagnostics(error).error_chain
 }
 
 //TODO:需要获取代理状态下用户的原始ip
@@ -57,7 +125,6 @@ pub fn info_logs(req: &HttpRequest, event: &str, message: &str) {
         method = %req_method,
         user_agent = get_user_agent(req),
         path = req_path,
-        request_id = %request_id(req),
         message,
     );
 }
@@ -71,7 +138,6 @@ pub fn warn_logs(req: &HttpRequest, event: &str, message: &str) {
         method = %req_method,
         user_agent = get_user_agent(req),
         path = req_path,
-        request_id = %request_id(req),
         message
     );
 }
@@ -85,7 +151,6 @@ pub fn error_logs(req: &HttpRequest, event: &str, message: &str) {
         method = %req_method,
         user_agent = get_user_agent(req),
         path = req_path,
-        request_id = %request_id(req),
         message
     );
 }
@@ -96,16 +161,51 @@ pub fn error_logs_error(
     operation: &str,
     error_value: &(dyn StdError + 'static),
 ) {
-    error!(
-        event,
-        operation,
-        client_ip = get_conn_ip(req),
-        method = %req.method(),
-        user_agent = get_user_agent(req),
-        path = req.path(),
-        request_id = %request_id(req),
-        message = %error_chain_diagnostics(error_value),
-    );
+    let diagnostics = error_diagnostics(error_value);
+    if let Some(database) = diagnostics.database.as_ref() {
+        error!(
+            event,
+            operation,
+            error_kind = "database",
+            error_code = "database_operation_failed",
+            error_message = %diagnostics.error_message,
+            error_chain = %diagnostics.error_chain,
+            root_cause = %diagnostics.root_cause,
+            error_truncated = diagnostics.error_truncated,
+            retryable = false,
+            outcome = "request_failed",
+            sqlstate = database.sqlstate,
+            db_severity = database.severity,
+            db_message = database.message,
+            db_detail = database.detail.as_deref(),
+            db_hint = database.hint.as_deref(),
+            db_schema = database.schema.as_deref(),
+            db_table = database.table.as_deref(),
+            db_column = database.column.as_deref(),
+            db_constraint = database.constraint.as_deref(),
+            client_ip = get_conn_ip(req),
+            method = %req.method(),
+            user_agent = get_user_agent(req),
+            path = req.path(),
+        );
+    } else {
+        error!(
+            event,
+            operation,
+            error_kind = "application",
+            error_code = "operation_failed",
+            error_message = %diagnostics.error_message,
+            error_chain = %diagnostics.error_chain,
+            root_cause = %diagnostics.root_cause,
+            error_truncated = diagnostics.error_truncated,
+            retryable = false,
+            outcome = "request_failed",
+            client_ip = get_conn_ip(req),
+            method = %req.method(),
+            user_agent = get_user_agent(req),
+            path = req.path(),
+        );
+    }
 }
 
 /// 该函数可以把登录日志数据写入数据库，返回一个 bool ,
@@ -176,7 +276,7 @@ pub async fn login_logs_to_db(pool: &deadpool_postgres::Pool, log: LoginLog) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::error_chain_diagnostics;
+    use super::{MAX_ERROR_DIAGNOSTIC_CHARS, error_chain_diagnostics, error_diagnostics};
     use std::error::Error;
     use std::fmt;
 
@@ -207,5 +307,38 @@ mod tests {
         assert!(diagnostics.contains("outer operation failed"));
         assert!(diagnostics.contains("database connection refused"));
         assert!(diagnostics.contains("caused_by="));
+    }
+
+    #[test]
+    fn structured_error_diagnostics_include_root_cause() {
+        let error = WrappedError(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "database connection refused",
+        ));
+        let diagnostics = error_diagnostics(&error);
+        assert_eq!(diagnostics.error_message, "outer operation failed");
+        assert_eq!(diagnostics.root_cause, "database connection refused");
+        assert!(!diagnostics.error_truncated);
+        assert!(diagnostics.database.is_none());
+    }
+
+    #[test]
+    fn structured_error_diagnostics_are_bounded() {
+        let message = "x".repeat(MAX_ERROR_DIAGNOSTIC_CHARS + 100);
+        let error = std::io::Error::other(message);
+        let diagnostics = error_diagnostics(&error);
+        assert!(diagnostics.error_truncated);
+        assert_eq!(
+            diagnostics.error_message.chars().count(),
+            MAX_ERROR_DIAGNOSTIC_CHARS
+        );
+        assert_eq!(
+            diagnostics.error_chain.chars().count(),
+            MAX_ERROR_DIAGNOSTIC_CHARS
+        );
+        assert_eq!(
+            diagnostics.root_cause.chars().count(),
+            MAX_ERROR_DIAGNOSTIC_CHARS
+        );
     }
 }

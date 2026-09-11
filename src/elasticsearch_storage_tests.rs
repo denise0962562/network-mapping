@@ -1527,7 +1527,7 @@ async fn mixed_upload_keeps_dns_only_and_endpoint_only_batches_in_one_sequence()
         };
         assert!(matches!(
             save_upload_fixture(&pool, &service, &upload).await,
-            Err(crate::SaveScannerResultsError::InvalidUpload(_))
+            Err(crate::SaveScannerResultsError::NonContiguousFinalBatch { .. })
         ));
         upload.batch_index = Some(1);
         assert_eq!(
@@ -1582,7 +1582,7 @@ async fn mixed_upload_recovers_after_dns_commit_and_rejects_changed_payload_or_i
     changed.observations.remove(0);
     assert!(matches!(
         save_upload_fixture(&pool, &service, &changed).await,
-        Err(crate::SaveScannerResultsError::InvalidUpload(_))
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
     ));
     changed = upload.clone();
     if let crate::ScannerObservation::Dns { observation } = &mut changed.observations[0] {
@@ -1590,13 +1590,13 @@ async fn mixed_upload_recovers_after_dns_commit_and_rejects_changed_payload_or_i
     }
     assert!(matches!(
         save_upload_fixture(&pool, &service, &changed).await,
-        Err(crate::SaveScannerResultsError::InvalidUpload(_))
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
     ));
     changed = upload.clone();
     changed.upload_id = Some(Uuid::new_v4());
     assert!(matches!(
         save_upload_fixture(&pool, &service, &changed).await,
-        Err(crate::SaveScannerResultsError::InvalidUpload(_))
+        Err(crate::SaveScannerResultsError::UploadIdentityConflict { .. })
     ));
     assert_eq!(fixture.state.lock().unwrap().documents.len(), documents);
     fixture.state.lock().unwrap().fail_path = None;
@@ -1650,7 +1650,7 @@ async fn mixed_upload_resumes_dns_sidecar_left_by_previous_server() {
     changed.observations.remove(0);
     assert!(matches!(
         save_upload_fixture(&pool, &service, &changed).await,
-        Err(crate::SaveScannerResultsError::InvalidUpload(_))
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
     ));
     changed = upload.clone();
     if let crate::ScannerObservation::Dns { observation } = &mut changed.observations[0] {
@@ -1658,7 +1658,7 @@ async fn mixed_upload_resumes_dns_sidecar_left_by_previous_server() {
     }
     assert!(matches!(
         save_upload_fixture(&pool, &service, &changed).await,
-        Err(crate::SaveScannerResultsError::InvalidUpload(_))
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
     ));
     assert_eq!(
         pool.get()
@@ -1718,7 +1718,7 @@ async fn mixed_upload_dns_only_results_and_empty_final_preserve_task_completion(
         unrelated.upload_id = Some(Uuid::new_v4());
         assert!(matches!(
             save_upload_fixture(&pool, &service, &unrelated).await,
-            Err(crate::SaveScannerResultsError::InvalidUpload(_))
+            Err(crate::SaveScannerResultsError::UploadIdentityConflict { .. })
         ));
         upload.batch_index = Some(1);
         upload.is_final = Some(true);

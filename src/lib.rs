@@ -1509,11 +1509,52 @@ struct NormalizedObservation {
 pub enum SaveScannerResultsError {
     Database(Box<dyn std::error::Error + Send + Sync>),
     Storage(String),
-    BatchBusy { retry_after_seconds: u64 },
-    InvalidIp { ip: String, source: AddrParseError },
+    BatchBusy {
+        retry_after_seconds: u64,
+    },
+    InvalidIp {
+        ip: String,
+        source: AddrParseError,
+    },
     ScannerUnauthorized,
     TaskNotFound,
     TaskNotOwned,
+    UnsupportedProtocolVersion {
+        received: u16,
+    },
+    InvalidBatchEnvelope {
+        protocol_version: u16,
+        reason: &'static str,
+    },
+    UploadIdentityConflict {
+        execution_id: i32,
+        received_upload_id: String,
+        conflicting_upload_id: String,
+        conflicting_upload_count: i64,
+    },
+    BatchPayloadConflict {
+        execution_id: i32,
+        upload_id: String,
+        batch_index: i32,
+        content_kind: &'static str,
+        expected_checksum: Option<String>,
+        received_checksum: String,
+    },
+    NonContiguousFinalBatch {
+        execution_id: i32,
+        upload_id: String,
+        batch_index: i32,
+        content_kind: &'static str,
+    },
+    CompletedExecutionNewBatch {
+        execution_id: i32,
+        upload_id: String,
+        batch_index: i32,
+    },
+    ObservationLimitExceeded {
+        actual: usize,
+        limit: usize,
+    },
     InvalidUpload(String),
 }
 
@@ -1595,7 +1636,153 @@ impl fmt::Display for SaveScannerResultsError {
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
             Self::TaskNotFound => write!(f, "任务不存在"),
             Self::TaskNotOwned => write!(f, "任务不属于当前扫描器或租约已失效"),
+            Self::UnsupportedProtocolVersion { received } => {
+                write!(
+                    f,
+                    "无效扫描结果上传: unsupported protocol_version {received}"
+                )
+            }
+            Self::InvalidBatchEnvelope { reason, .. } => {
+                write!(f, "无效扫描结果上传: {reason}")
+            }
+            Self::UploadIdentityConflict { .. } => write!(
+                f,
+                "无效扫描结果上传: an execution cannot contain batches from multiple upload_id values"
+            ),
+            Self::BatchPayloadConflict { content_kind, .. } => write!(
+                f,
+                "无效扫描结果上传: batch identity was already used with different {content_kind} content"
+            ),
+            Self::NonContiguousFinalBatch { content_kind, .. } => write!(
+                f,
+                "无效扫描结果上传: final {content_kind} batch requires one contiguous sequence starting at batch_index 0"
+            ),
+            Self::CompletedExecutionNewBatch { .. } => write!(
+                f,
+                "无效扫描结果上传: completed execution cannot accept a new batch"
+            ),
+            Self::ObservationLimitExceeded { actual, limit } => write!(
+                f,
+                "无效扫描结果上传: observation count {actual} exceeds limit {limit}"
+            ),
             Self::InvalidUpload(message) => write!(f, "无效扫描结果上传: {message}"),
+        }
+    }
+}
+
+impl SaveScannerResultsError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "database",
+            Self::Storage(_) => "storage",
+            Self::BatchBusy { .. } => "concurrency",
+            Self::ScannerUnauthorized => "authentication",
+            Self::TaskNotFound | Self::TaskNotOwned => "task_state",
+            Self::InvalidIp { .. }
+            | Self::UnsupportedProtocolVersion { .. }
+            | Self::InvalidBatchEnvelope { .. }
+            | Self::UploadIdentityConflict { .. }
+            | Self::BatchPayloadConflict { .. }
+            | Self::NonContiguousFinalBatch { .. }
+            | Self::CompletedExecutionNewBatch { .. }
+            | Self::ObservationLimitExceeded { .. }
+            | Self::InvalidUpload(_) => "validation",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "scan_result_database_operation_failed",
+            Self::Storage(_) => "scan_result_storage_operation_failed",
+            Self::BatchBusy { .. } => "scan_result_batch_busy",
+            Self::InvalidIp { .. } => "invalid_observation_ip",
+            Self::ScannerUnauthorized => "scanner_unauthorized",
+            Self::TaskNotFound => "scan_task_not_found",
+            Self::TaskNotOwned => "scan_task_not_owned",
+            Self::UnsupportedProtocolVersion { .. } => "unsupported_protocol_version",
+            Self::InvalidBatchEnvelope { .. } => "invalid_batch_envelope",
+            Self::UploadIdentityConflict { .. } => "execution_upload_id_conflict",
+            Self::BatchPayloadConflict { .. } => "batch_payload_conflict",
+            Self::NonContiguousFinalBatch { .. } => "non_contiguous_final_batch",
+            Self::CompletedExecutionNewBatch { .. } => "completed_execution_new_batch",
+            Self::ObservationLimitExceeded { .. } => "observation_limit_exceeded",
+            Self::InvalidUpload(_) => "invalid_scan_result_upload",
+        }
+    }
+
+    pub fn operation(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "persist_scan_result_database_state",
+            Self::Storage(_) => "persist_scan_result_elasticsearch_data",
+            Self::BatchBusy { .. } => "claim_scan_result_batch",
+            Self::InvalidIp { .. } => "normalize_scan_observation",
+            Self::ScannerUnauthorized => "authenticate_scanner",
+            Self::TaskNotFound | Self::TaskNotOwned => "validate_scan_task_lease",
+            Self::UnsupportedProtocolVersion { .. } | Self::InvalidBatchEnvelope { .. } => {
+                "validate_scan_result_envelope"
+            }
+            Self::UploadIdentityConflict { .. } => "validate_execution_upload_identity",
+            Self::BatchPayloadConflict { .. } => "validate_scan_result_batch_identity",
+            Self::NonContiguousFinalBatch { .. } => "validate_scan_result_batch_sequence",
+            Self::CompletedExecutionNewBatch { .. } => "validate_execution_state",
+            Self::ObservationLimitExceeded { .. } | Self::InvalidUpload(_) => {
+                "validate_scan_result_payload"
+            }
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::Storage(_) | Self::BatchBusy { .. })
+    }
+
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::InvalidIp { .. }
+            | Self::UnsupportedProtocolVersion { .. }
+            | Self::InvalidBatchEnvelope { .. }
+            | Self::UploadIdentityConflict { .. }
+            | Self::BatchPayloadConflict { .. }
+            | Self::NonContiguousFinalBatch { .. }
+            | Self::CompletedExecutionNewBatch { .. }
+            | Self::ObservationLimitExceeded { .. }
+            | Self::InvalidUpload(_) => 400,
+            Self::ScannerUnauthorized => 401,
+            Self::TaskNotFound => 404,
+            Self::TaskNotOwned => 409,
+            Self::Database(_) => 500,
+            Self::Storage(_) | Self::BatchBusy { .. } => 503,
+        }
+    }
+
+    pub fn execution_id(&self) -> Option<i32> {
+        match self {
+            Self::UploadIdentityConflict { execution_id, .. }
+            | Self::BatchPayloadConflict { execution_id, .. }
+            | Self::NonContiguousFinalBatch { execution_id, .. }
+            | Self::CompletedExecutionNewBatch { execution_id, .. } => Some(*execution_id),
+            _ => None,
+        }
+    }
+
+    pub fn conflicting_upload(&self) -> Option<(&str, i64)> {
+        match self {
+            Self::UploadIdentityConflict {
+                conflicting_upload_id,
+                conflicting_upload_count,
+                ..
+            } => Some((conflicting_upload_id, *conflicting_upload_count)),
+            _ => None,
+        }
+    }
+
+    pub fn batch_conflict_checksums(&self) -> Option<(Option<&str>, &str)> {
+        match self {
+            Self::BatchPayloadConflict {
+                expected_checksum,
+                received_checksum,
+                ..
+            } => Some((expected_checksum.as_deref(), received_checksum)),
+            _ => None,
         }
     }
 }
@@ -1609,8 +1796,50 @@ impl std::error::Error for SaveScannerResultsError {
             Self::ScannerUnauthorized
             | Self::TaskNotFound
             | Self::TaskNotOwned
+            | Self::UnsupportedProtocolVersion { .. }
+            | Self::InvalidBatchEnvelope { .. }
+            | Self::UploadIdentityConflict { .. }
+            | Self::BatchPayloadConflict { .. }
+            | Self::NonContiguousFinalBatch { .. }
+            | Self::CompletedExecutionNewBatch { .. }
+            | Self::ObservationLimitExceeded { .. }
             | Self::InvalidUpload(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod save_scanner_results_error_tests {
+    use super::SaveScannerResultsError;
+
+    #[test]
+    fn upload_identity_conflict_has_stable_diagnostics() {
+        let error = SaveScannerResultsError::UploadIdentityConflict {
+            execution_id: 17,
+            received_upload_id: "received".into(),
+            conflicting_upload_id: "existing".into(),
+            conflicting_upload_count: 2,
+        };
+        assert_eq!(error.kind(), "validation");
+        assert_eq!(error.code(), "execution_upload_id_conflict");
+        assert_eq!(error.operation(), "validate_execution_upload_identity");
+        assert_eq!(error.http_status(), 400);
+        assert!(!error.retryable());
+        assert_eq!(error.execution_id(), Some(17));
+        assert_eq!(error.conflicting_upload(), Some(("existing", 2)));
+        assert!(error.to_string().contains("multiple upload_id values"));
+    }
+
+    #[test]
+    fn busy_and_storage_errors_are_retryable() {
+        let busy = SaveScannerResultsError::BatchBusy {
+            retry_after_seconds: 3,
+        };
+        let storage = SaveScannerResultsError::Storage("temporarily unavailable".into());
+        assert!(busy.retryable());
+        assert!(storage.retryable());
+        assert_eq!(busy.http_status(), 503);
+        assert_eq!(storage.http_status(), 503);
     }
 }
 
@@ -1953,19 +2182,24 @@ async fn validate_execution_upload_ids(
     execution_id: i32,
     upload_ids: &[String],
 ) -> Result<(), SaveScannerResultsError> {
-    let conflicting: bool = transaction
+    let conflict = transaction
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM scan_result_batch \
-             WHERE execution_id = $1 AND NOT (upload_id = ANY($2::TEXT[])));",
+            "SELECT COUNT(DISTINCT upload_id)::BIGINT AS conflicting_count, \
+                    MIN(upload_id) AS conflicting_upload_id \
+             FROM scan_result_batch \
+             WHERE execution_id = $1 AND NOT (upload_id = ANY($2::TEXT[]));",
             &[&execution_id, &upload_ids],
         )
         .await
-        .map_err(scanner_result_database_error)?
-        .get(0);
-    if conflicting {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "an execution cannot contain batches from multiple upload_id values".into(),
-        ));
+        .map_err(scanner_result_database_error)?;
+    let conflicting_upload_count: i64 = conflict.get("conflicting_count");
+    if let Some(conflicting_upload_id) = conflict.get("conflicting_upload_id") {
+        return Err(SaveScannerResultsError::UploadIdentityConflict {
+            execution_id,
+            received_upload_id: upload_ids.first().cloned().unwrap_or_default(),
+            conflicting_upload_id,
+            conflicting_upload_count,
+        });
     }
     Ok(())
 }
@@ -2014,8 +2248,12 @@ async fn save_dns_scanner_results(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(SaveScannerResultsError::InvalidUpload)?;
-    let observation_count = i32::try_from(observations.len())
-        .map_err(|_| SaveScannerResultsError::InvalidUpload("too many DNS observations".into()))?;
+    let observation_count = i32::try_from(observations.len()).map_err(|_| {
+        SaveScannerResultsError::ObservationLimitExceeded {
+            actual: observations.len(),
+            limit: i32::MAX as usize,
+        }
+    })?;
     let upload_id = upload
         .upload_id
         .expect("protocol v2 upload ID was validated")
@@ -2135,9 +2373,12 @@ async fn save_dns_scanner_results(
             || sequence.get::<_, i64>("later_count") != 0
             || !existing_final_valid
         {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "final DNS batch requires one contiguous sequence starting at batch_index 0".into(),
-            ));
+            return Err(SaveScannerResultsError::NonContiguousFinalBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "DNS",
+            });
         }
     }
     let write_token = Uuid::new_v4();
@@ -2150,16 +2391,19 @@ async fn save_dns_scanner_results(
         .await
         .map_err(scanner_result_database_error)?
     {
+        let existing_checksum: Option<String> = existing.get("payload_checksum");
         let matches = existing.get::<_, bool>("is_final") == is_final
             && existing.get::<_, i32>("observation_count") == observation_count
-            && existing
-                .get::<_, Option<String>>("payload_checksum")
-                .as_deref()
-                == Some(payload_checksum.as_str());
+            && existing_checksum.as_deref() == Some(payload_checksum.as_str());
         if !matches {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "batch identity was already used with different content".into(),
-            ));
+            return Err(SaveScannerResultsError::BatchPayloadConflict {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "DNS",
+                expected_checksum: existing_checksum,
+                received_checksum: payload_checksum.clone(),
+            });
         }
         if existing.get::<_, String>("storage_backend") != "pending" {
             transaction
@@ -2211,7 +2455,11 @@ async fn save_dns_scanner_results(
         )
     } else {
         if already_succeeded {
-            return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+            return Err(SaveScannerResultsError::CompletedExecutionNewBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+            });
         }
         let write_attempts = transaction
             .query_one(
@@ -2714,26 +2962,32 @@ pub async fn save_scanner_results(
 ) -> Result<usize, SaveScannerResultsError> {
     let is_typed = matches!(upload.protocol_version, 2 | 3);
     if upload.protocol_version != 1 && !is_typed {
-        return Err(SaveScannerResultsError::InvalidUpload(format!(
-            "unsupported protocol_version {}",
-            upload.protocol_version
-        )));
+        return Err(SaveScannerResultsError::UnsupportedProtocolVersion {
+            received: upload.protocol_version,
+        });
     }
     if is_typed
         && (upload.upload_id.is_none()
             || upload.batch_index.is_none()
             || upload.is_final.is_none()
-            || !upload.results.is_empty()
-            || upload.observations.len() > 500)
+            || !upload.results.is_empty())
     {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "typed result protocols require upload_id, batch_index and is_final, accept only observations, and limit each batch to 500 observations".into(),
-        ));
+        return Err(SaveScannerResultsError::InvalidBatchEnvelope {
+            protocol_version: upload.protocol_version,
+            reason: "typed result protocols require upload_id, batch_index and is_final, accept only observations, and limit each batch to 500 observations",
+        });
+    }
+    if is_typed && upload.observations.len() > 500 {
+        return Err(SaveScannerResultsError::ObservationLimitExceeded {
+            actual: upload.observations.len(),
+            limit: 500,
+        });
     }
     if !is_typed && !upload.observations.is_empty() {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "typed observations require protocol_version 2 or 3".into(),
-        ));
+        return Err(SaveScannerResultsError::InvalidBatchEnvelope {
+            protocol_version: upload.protocol_version,
+            reason: "typed observations require protocol_version 2 or 3",
+        });
     }
     if upload.protocol_version == 2
         && upload
@@ -2741,9 +2995,10 @@ pub async fn save_scanner_results(
             .iter()
             .any(|item| matches!(item, ScannerObservation::Vulnerability { .. }))
     {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "vulnerability observations require protocol_version 3".into(),
-        ));
+        return Err(SaveScannerResultsError::InvalidBatchEnvelope {
+            protocol_version: upload.protocol_version,
+            reason: "vulnerability observations require protocol_version 3",
+        });
     }
 
     let mut regular_upload = upload.clone();
@@ -2916,17 +3171,20 @@ pub async fn save_scanner_results(
             false,
             &observations,
         )?;
+        let existing_checksum: Option<String> = existing.get("payload_checksum");
         if observations.is_empty()
             || existing.get::<_, bool>("is_final")
             || existing.get::<_, i32>("observation_count") as usize != observations.len()
-            || existing
-                .get::<_, Option<String>>("payload_checksum")
-                .as_deref()
-                != Some(expected.as_str())
+            || existing_checksum.as_deref() != Some(expected.as_str())
         {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "batch identity was already used with different DNS content".into(),
-            ));
+            return Err(SaveScannerResultsError::BatchPayloadConflict {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "DNS",
+                expected_checksum: existing_checksum,
+                received_checksum: expected,
+            });
         }
     }
     if is_final {
@@ -2962,13 +3220,19 @@ pub async fn save_scanner_results(
             None => final_count == 0,
         };
         if !prior_sequence_valid || later_count != 0 || !existing_final_valid {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "final batch requires one contiguous sequence starting at batch_index 0".into(),
-            ));
+            return Err(SaveScannerResultsError::NonContiguousFinalBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "scan result",
+            });
         }
     }
     let observation_count = i32::try_from(normalized_observations.len()).map_err(|_| {
-        SaveScannerResultsError::InvalidUpload("too many observations in one upload".into())
+        SaveScannerResultsError::ObservationLimitExceeded {
+            actual: normalized_observations.len(),
+            limit: i32::MAX as usize,
+        }
     })?;
     let protocol_version = i16::try_from(upload.protocol_version).expect("validated above");
     let mut observation_rows = Vec::with_capacity(normalized_observations.len());
@@ -3142,9 +3406,14 @@ pub async fn save_scanner_results(
                     .as_deref()
                     .is_none_or(|checksum| checksum != expected_checksum)
             {
-                return Err(SaveScannerResultsError::InvalidUpload(
-                    "batch identity was already used with different content".into(),
-                ));
+                return Err(SaveScannerResultsError::BatchPayloadConflict {
+                    execution_id: execution_db_id,
+                    upload_id: upload_id.clone(),
+                    batch_index,
+                    content_kind: "scan result",
+                    expected_checksum: existing_checksum,
+                    received_checksum: expected_checksum.clone(),
+                });
             }
             if existing.get::<_, String>("storage_backend") != "pending" {
                 transaction
@@ -3160,7 +3429,11 @@ pub async fn save_scanner_results(
             }
         } else {
             if already_succeeded {
-                return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+                return Err(SaveScannerResultsError::CompletedExecutionNewBatch {
+                    execution_id: execution_db_id,
+                    upload_id: upload_id.clone(),
+                    batch_index,
+                });
             }
             transaction
                 .execute(
@@ -3279,9 +3552,12 @@ pub async fn save_scanner_results(
             || count != i64::from(batch_index) + 1
             || final_count != 1
         {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "final batch requires one contiguous sequence starting at batch_index 0".into(),
-            ));
+            return Err(SaveScannerResultsError::NonContiguousFinalBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "scan result",
+            });
         }
         let execution_summary = {
             es_execution_summary.ok_or_else(|| {

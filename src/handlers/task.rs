@@ -4,7 +4,7 @@ use crate::client_ip::{normalize_ip, request_ip};
 use crate::config::SecurityConfig;
 use crate::dns_follow_up::DnsFollowUpConfig;
 use crate::elasticsearch::{ElasticsearchService, ScanQueryIndex};
-use crate::logs::write::{error_logs, error_logs_error, info_logs};
+use crate::logs::write::{error_diagnostics, error_logs, error_logs_error, info_logs};
 use crate::maxmind::MaxMindState;
 use crate::runtime_config::RuntimeConfig;
 use crate::scanner_latency::{ScannerLatencyHistory, ScannerLatencyHistoryEntry};
@@ -27,6 +27,76 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::IpAddr;
 use tracing::error;
 use uuid::Uuid;
+
+fn log_scanner_result_error(
+    req: &HttpRequest,
+    upload: &ScannerResultUpload,
+    error_value: &SaveScannerResultsError,
+) {
+    let diagnostics = error_diagnostics(error_value);
+    let mut port_count = 0usize;
+    let mut service_count = 0usize;
+    let mut dns_count = 0usize;
+    let mut vulnerability_count = 0usize;
+    for observation in &upload.observations {
+        match observation {
+            crate::ScannerObservation::Port { .. } => port_count += 1,
+            crate::ScannerObservation::Service { .. } => service_count += 1,
+            crate::ScannerObservation::Dns { .. } => dns_count += 1,
+            crate::ScannerObservation::Vulnerability { .. } => vulnerability_count += 1,
+        }
+    }
+    let outcome = match error_value {
+        SaveScannerResultsError::Storage(_) | SaveScannerResultsError::BatchBusy { .. } => {
+            "batch_retained_for_retry"
+        }
+        SaveScannerResultsError::Database(_) => "server_error",
+        _ => "request_rejected",
+    };
+    let (conflicting_upload_id, conflicting_upload_count) = error_value
+        .conflicting_upload()
+        .map_or((None, None), |(id, count)| (Some(id), Some(count)));
+    let (expected_checksum, received_checksum) = error_value
+        .batch_conflict_checksums()
+        .map_or((None, None), |(expected, received)| {
+            (expected, Some(received))
+        });
+    error!(
+        event = "SaveScannerResultError",
+        operation = error_value.operation(),
+        error_kind = error_value.kind(),
+        error_code = error_value.code(),
+        error_message = %diagnostics.error_message,
+        error_chain = %diagnostics.error_chain,
+        root_cause = %diagnostics.root_cause,
+        error_truncated = diagnostics.error_truncated,
+        retryable = error_value.retryable(),
+        outcome,
+        http_status = error_value.http_status(),
+        client_ip = crate::get_conn_ip(req),
+        method = %req.method(),
+        user_agent = crate::get_user_agent(req),
+        path = req.path(),
+        scanner_id = %upload.scanner_id,
+        task_id = %upload.task_id,
+        execution_id = error_value.execution_id(),
+        upload_id = ?upload.upload_id,
+        conflicting_upload_id,
+        conflicting_upload_count,
+        expected_checksum,
+        received_checksum,
+        batch_index = upload.batch_index,
+        is_final = upload.is_final,
+        protocol_version = upload.protocol_version,
+        observation_count = upload.observations.len(),
+        legacy_result_count = upload.results.len(),
+        port_observation_count = port_count,
+        service_observation_count = service_count,
+        dns_observation_count = dns_count,
+        vulnerability_observation_count = vulnerability_count,
+        "scanner result upload failed"
+    );
+}
 
 #[derive(Serialize)]
 struct ScannerHeartbeatLease {
@@ -2438,13 +2508,40 @@ async fn upload_scanner_result_handler(
             "saved": saved,
         })),
         Err(e) => {
-            error_logs_error(&req, "SaveScannerResultError", "persist_scan_results", &e);
+            log_scanner_result_error(&req, &upload_data, &e);
             match e {
                 SaveScannerResultsError::InvalidIp { .. } => {
                     HttpResponse::BadRequest().body("invalid ip")
                 }
                 SaveScannerResultsError::InvalidUpload(message) => {
                     HttpResponse::BadRequest().body(message)
+                }
+                SaveScannerResultsError::UnsupportedProtocolVersion { received } => {
+                    HttpResponse::BadRequest()
+                        .body(format!("unsupported protocol_version {received}"))
+                }
+                SaveScannerResultsError::InvalidBatchEnvelope { reason, .. } => {
+                    HttpResponse::BadRequest().body(reason)
+                }
+                SaveScannerResultsError::UploadIdentityConflict { .. } => HttpResponse::BadRequest()
+                    .body("an execution cannot contain batches from multiple upload_id values"),
+                SaveScannerResultsError::BatchPayloadConflict { content_kind, .. } => {
+                    HttpResponse::BadRequest().body(format!(
+                        "batch identity was already used with different {content_kind} content"
+                    ))
+                }
+                SaveScannerResultsError::NonContiguousFinalBatch { content_kind, .. } => {
+                    HttpResponse::BadRequest().body(format!(
+                        "final {content_kind} batch requires one contiguous sequence starting at batch_index 0"
+                    ))
+                }
+                SaveScannerResultsError::CompletedExecutionNewBatch { .. } => {
+                    HttpResponse::BadRequest()
+                        .body("completed execution cannot accept a new batch")
+                }
+                SaveScannerResultsError::ObservationLimitExceeded { actual, limit } => {
+                    HttpResponse::BadRequest()
+                        .body(format!("observation count {actual} exceeds limit {limit}"))
                 }
                 SaveScannerResultsError::ScannerUnauthorized => {
                     HttpResponse::Unauthorized().body("unauthorized")
