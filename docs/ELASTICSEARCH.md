@@ -82,10 +82,12 @@ ES 成功而 PG 确认失败时，相同身份重试收敛；完成后的重复�
 当前端点发布在该事务之后，失败由 outbox 补偿；执行成功不代表所有投影/分析同时可见。
 状态接口统计扫描投影和标签两个队列，不再将旧副本事件计为运行积压。
 
-DNS 新 pending 批次在写入前将实际 backing index 固定到 PG 回执；重试沿用该目标，避免
-Data Stream rollover 后重复写到新索引。旧 pending 批次通过已有证据定位索引；发现跨多个
-backing index 的旧重复批次会要求先对账。回执同时保存实际 RR 索引，不再写占位名称。
-已删除/过期的固定索引不能自动重建后重放，须按保留/恢复流程处理。
+DNS observation 始终通过 Data Stream 名执行 `create`，不直接写 backing index。同一 pending
+批次先获取 PG 事务级 advisory lock，再刷新并按确定性文档 ID 对账整个 Data Stream，只补写
+缺失事实；网络结果未知或 Bulk 部分成功后也先重新对账，不盲目重发整批。因此 ES 写成功而
+PG 尚未确认、并发重试或 Data Stream rollover 都不会产生重复事实。完成回执保存搜索返回的
+实际 backing index 和 DNS RR 索引；升级前已经保存 `.ds-*` 的 pending 回执会在成功时自动
+覆写。若发现同一文档 ID 已跨 backing index 重复，拒绝继续并要求先对账。
 
 ## 查询、备份与验收
 

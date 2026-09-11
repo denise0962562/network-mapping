@@ -542,6 +542,14 @@ fn task_result_pagination(page: Option<i64>, page_size: Option<i64>) -> (i64, i6
     (page, page_size, (page - 1) * page_size)
 }
 
+fn should_load_endpoint_results(task_kind: &str, result_count: i64) -> bool {
+    task_kind == "ip" && result_count > 0
+}
+
+fn should_load_vulnerabilities(task_kind: &str, scan_profile: &str, result_count: i64) -> bool {
+    task_kind == "ip" && scan_profile == "vulnerability_scan" && result_count > 0
+}
+
 async fn load_execution_results_from_elasticsearch(
     elasticsearch: &ElasticsearchService,
     execution_id: &str,
@@ -1493,40 +1501,47 @@ async fn get_task(
     let ip_count = selected_execution.get::<_, i64>("ip_count");
     let port_count = selected_execution.get::<_, i64>("port_count");
     let result_count = selected_execution.get::<_, i64>("result_count");
-    let results = {
-        match load_execution_results_from_elasticsearch(
-            elasticsearch.get_ref(),
-            selected_execution.get::<_, String>("execution_id").as_str(),
-            offset,
-            page_size,
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(error) => {
-                error_logs(&req, "GetTaskResultsElasticsearchError", &error);
-                return HttpResponse::ServiceUnavailable()
-                    .json(json!({"message": "扫描结果索引暂时不可用"}));
-            }
-        }
-    };
-    let (vulnerabilities, vulnerability_count) = {
-        match load_vulnerabilities_from_elasticsearch(
-            elasticsearch.get_ref(),
-            selected_execution.get::<_, String>("execution_id").as_str(),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                error_logs(&req, "GetTaskVulnerabilitiesElasticsearchError", &error);
-                return HttpResponse::ServiceUnavailable()
-                    .json(json!({"message": "漏洞结果索引暂时不可用"}));
-            }
-        }
-    };
+    let task_kind = task.get::<_, String>("task_kind");
     let generation_metadata = task.get::<_, Option<Value>>("generation_metadata");
     let stored_scan_profile = task.get::<_, String>("scan_profile");
+    let (results, endpoint_results_available) =
+        if should_load_endpoint_results(&task_kind, result_count) {
+            match load_execution_results_from_elasticsearch(
+                elasticsearch.get_ref(),
+                selected_execution.get::<_, String>("execution_id").as_str(),
+                offset,
+                page_size,
+            )
+            .await
+            {
+                Ok(results) => (results, true),
+                Err(error) => {
+                    error_logs(&req, "GetTaskResultsElasticsearchError", &error);
+                    (Vec::new(), false)
+                }
+            }
+        } else {
+            (Vec::new(), true)
+        };
+    let (vulnerabilities, vulnerability_count, vulnerabilities_available) =
+        if should_load_vulnerabilities(&task_kind, &stored_scan_profile, result_count) {
+            match load_vulnerabilities_from_elasticsearch(
+                elasticsearch.get_ref(),
+                selected_execution.get::<_, String>("execution_id").as_str(),
+            )
+            .await
+            {
+                Ok((vulnerabilities, vulnerability_count)) => {
+                    (vulnerabilities, Some(vulnerability_count), true)
+                }
+                Err(error) => {
+                    error_logs(&req, "GetTaskVulnerabilitiesElasticsearchError", &error);
+                    (Vec::new(), None, false)
+                }
+            }
+        } else {
+            (Vec::new(), Some(0), true)
+        };
     let display_scan_profile =
         crate::display_scan_profile(&stored_scan_profile, generation_metadata.as_ref());
     HttpResponse::Ok().json(serde_json::json!({
@@ -1534,7 +1549,7 @@ async fn get_task(
         "data": {
             "task_id": task.get::<_, String>("task_id"),
             "task_target": task.get::<_, Vec<String>>("display_targets"),
-            "task_kind": task.get::<_, String>("task_kind"),
+            "task_kind": task_kind,
             "task_port": task.get::<_, String>("task_port"),
             "task_initiator": task.get::<_, String>("task_initiator"),
             "task_level": task.get::<_, i32>("task_level"),
@@ -1569,6 +1584,10 @@ async fn get_task(
             },
             "results": results,
             "vulnerabilities": vulnerabilities,
+            "result_availability": {
+                "endpoints": endpoint_results_available,
+                "vulnerabilities": vulnerabilities_available,
+            },
             "pagination": {
                 "page": page,
                 "page_size": page_size,
@@ -2442,6 +2461,11 @@ async fn upload_scanner_result_handler(
                 SaveScannerResultsError::Storage(_) => {
                     HttpResponse::ServiceUnavailable().body("scan storage unavailable")
                 }
+                SaveScannerResultsError::BatchBusy {
+                    retry_after_seconds,
+                } => HttpResponse::ServiceUnavailable()
+                    .insert_header((header::RETRY_AFTER, retry_after_seconds.to_string()))
+                    .body("scan result batch is already being written"),
             }
         }
     }
@@ -2566,8 +2590,9 @@ mod tests {
     use super::{
         CreateDnsTask, ScannerHeartbeatLease, ScannerHeartbeatResponse, ScannerLatencyReport,
         ScannerScanCapabilities, build_dns_comparison, normalize_task_list_query,
-        resolve_dns_scan_request, resolve_dns_task_port, task_result_pagination,
-        validate_latency_report, validate_public_ip, vulnerability_search_body,
+        resolve_dns_scan_request, resolve_dns_task_port, should_load_endpoint_results,
+        should_load_vulnerabilities, task_result_pagination, validate_latency_report,
+        validate_public_ip, vulnerability_search_body,
     };
     use crate::ReceiveTaskItemQueryInfo;
     use actix_web::web;
@@ -2680,6 +2705,27 @@ mod tests {
     }
 
     #[test]
+    fn task_detail_skips_elasticsearch_when_no_indexed_results_exist() {
+        for task_kind in ["ip", "dns"] {
+            assert!(!should_load_endpoint_results(task_kind, 0));
+            assert!(!should_load_vulnerabilities(
+                task_kind,
+                "vulnerability_scan",
+                0
+            ));
+        }
+    }
+
+    #[test]
+    fn task_detail_only_loads_relevant_elasticsearch_results() {
+        assert!(should_load_endpoint_results("ip", 1));
+        assert!(!should_load_endpoint_results("dns", 1));
+        assert!(should_load_vulnerabilities("ip", "vulnerability_scan", 1));
+        assert!(!should_load_vulnerabilities("ip", "port_only", 1));
+        assert!(!should_load_vulnerabilities("dns", "vulnerability_scan", 1));
+    }
+
+    #[test]
     fn public_probe_addresses_must_match_the_reported_family() {
         assert_eq!(
             validate_public_ip(Some("203.0.113.10"), false).unwrap(),
@@ -2742,6 +2788,23 @@ mod tests {
         let initialization_sql = include_str!("../../source/database/init.sql");
         assert!(initialization_sql.contains("idx_scan_task_execution_running_scanner"));
         assert!(initialization_sql.contains("ON scan_task_execution (assigned_scanner_id)"));
+    }
+
+    #[test]
+    fn database_schema_indexes_bounded_task_claim_paths() {
+        let initialization_sql = include_str!("../../source/database/init.sql");
+        for index in [
+            "idx_scan_task_claim_priority",
+            "idx_scan_task_execution_selected_pending",
+            "idx_scan_task_execution_public_pending",
+            "idx_scan_task_execution_expired_running",
+            "idx_scan_task_execution_cancel_reaper",
+        ] {
+            assert!(initialization_sql.contains(index));
+        }
+        let online_migration =
+            include_str!("../../source/database/migrate_dns_lease_and_dispatch.sql");
+        assert!(online_migration.contains("CREATE INDEX CONCURRENTLY"));
     }
 
     #[test]

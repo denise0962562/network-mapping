@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	id SERIAL PRIMARY KEY,
 	user_id INT NOT NULL,
 	task_id VARCHAR(36) NOT NULL,                                                             -- 任务的 ID ，应该为 UUIDV7
-	task_initiator VARCHAR(10) NOT NULL, 
+	task_initiator VARCHAR(200) NOT NULL,
 	task_target INET[] NOT NULL,                                                              -- 扫描的目标 IP/CIDR 数组
 	task_port TEXT DEFAULT '1-65535',                                                         -- 扫描目标的 PORT
 	task_create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT,   -- 表示扫描任务的创建时间
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 	cancel_requested BOOLEAN NOT NULL DEFAULT false,                                          -- 控制端请求扫描器终止当前任务
 	retry_of_task_id VARCHAR(36),                                                             -- 重试任务所引用的原任务
 	dispatch_mode TEXT NOT NULL DEFAULT 'automatic',                                          -- automatic/selected/all
-	task_source TEXT NOT NULL DEFAULT 'manual',                                               -- manual/automatic
+	task_source TEXT NOT NULL DEFAULT 'manual',                                               -- manual/automatic/search
 	generation_strategy TEXT,
 	generation_key TEXT,
 	generation_metadata JSONB,
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS scan_task(
 );
 
 -- 兼容已有数据库中的任务表。
+ALTER TABLE scan_task ALTER COLUMN task_initiator TYPE VARCHAR(200);
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS task_source TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_strategy TEXT;
 ALTER TABLE scan_task ADD COLUMN IF NOT EXISTS generation_key TEXT;
@@ -240,6 +241,11 @@ CREATE TABLE IF NOT EXISTS scan_result_batch (
 	-- the PostgreSQL transaction. A retry resumes the same receipt after a crash/timeout.
 	storage_backend TEXT NOT NULL DEFAULT 'pending',
 	storage_references JSONB NOT NULL DEFAULT '[]'::JSONB,
+	write_token UUID,
+	write_lease_expires_at TIMESTAMPTZ,
+	write_attempts INT NOT NULL DEFAULT 0,
+	write_started_at TIMESTAMPTZ,
+	last_write_error TEXT,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	UNIQUE(execution_id, upload_id, batch_index)
 );
@@ -266,6 +272,11 @@ ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS payload_checksum VARCHAR(64);
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_references JSONB NOT NULL DEFAULT '[]'::JSONB;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_token UUID;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_lease_expires_at TIMESTAMPTZ;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS write_started_at TIMESTAMPTZ;
+ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS last_write_error TEXT;
 ALTER TABLE scan_result_batch DROP CONSTRAINT IF EXISTS scan_result_batch_protocol_version_check;
 ALTER TABLE scan_result_batch ADD CONSTRAINT scan_result_batch_protocol_version_check
 	CHECK (protocol_version IN (1, 2, 3));
@@ -285,6 +296,10 @@ CREATE TABLE IF NOT EXISTS analytics_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_analytics_outbox_pending
 	ON analytics_outbox(available_at, execution_id) WHERE status <> 'completed';
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_pending_ready
+	ON analytics_outbox(available_at, execution_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_running_locked
+	ON analytics_outbox(locked_at, execution_id) WHERE status = 'running';
 
 -- One compact, additive row per execution/window/dimension/label. It avoids repeatedly
 -- aggregating the raw observation history on interactive requests.
@@ -650,6 +665,22 @@ CREATE INDEX IF NOT EXISTS idx_audit_event_request
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_dispatch
 	ON scan_task_execution (execution_status, requested_scanner_id, lease_expires_at, task_id);
 
+CREATE INDEX IF NOT EXISTS idx_scan_task_claim_priority
+	ON scan_task (task_level DESC, task_create_time, id)
+	WHERE task_status IN ('pending', 'running');
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_selected_pending
+	ON scan_task_execution (requested_scanner_id, task_id, id)
+	WHERE execution_status = 'pending' AND requested_scanner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_public_pending
+	ON scan_task_execution (task_id, id)
+	WHERE execution_status = 'pending' AND requested_scanner_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_expired_running
+	ON scan_task_execution (task_id, lease_expires_at, id)
+	WHERE execution_status = 'running' AND maintenance_hold = FALSE AND cancel_requested = FALSE;
+CREATE INDEX IF NOT EXISTS idx_scan_task_execution_cancel_reaper
+	ON scan_task_execution (lease_expires_at, id)
+	WHERE execution_status = 'running' AND cancel_requested = TRUE;
+
 CREATE INDEX IF NOT EXISTS idx_scan_task_execution_maintenance_hold
 	ON scan_task_execution (maintenance_hold_until)
 	WHERE execution_status = 'running' AND maintenance_hold = TRUE;
@@ -1008,3 +1039,25 @@ CREATE INDEX IF NOT EXISTS idx_search_index_outbox_pending
 
 
 ALTER TABLE scan_result_batch ALTER COLUMN storage_backend SET DEFAULT 'pending';
+
+-- Search-trigger state outlives task deletion so deleting tasks cannot bypass cooldown.
+CREATE TABLE IF NOT EXISTS search_target_state (
+    owner_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('ip', 'domain')),
+    target_key TEXT NOT NULL,
+    last_success_at BIGINT,
+    last_success_plan JSONB,
+    last_search_generated_at BIGINT,
+    last_search_task_id TEXT,
+    PRIMARY KEY (owner_id, target_kind, target_key)
+);
+CREATE INDEX IF NOT EXISTS idx_search_target_recent ON search_target_state(owner_id, last_search_generated_at);
+-- A durable rolling-hour admission log; independent from deletable tasks and targets.
+CREATE TABLE IF NOT EXISTS search_generation_admission (
+    owner_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    generated_at BIGINT NOT NULL,
+    task_id TEXT NOT NULL PRIMARY KEY
+);
+CREATE INDEX IF NOT EXISTS idx_search_generation_admission_owner_time ON search_generation_admission(owner_id, generated_at);
+CREATE INDEX IF NOT EXISTS idx_search_generation_admission_time ON search_generation_admission(generated_at);
+CREATE INDEX IF NOT EXISTS idx_scan_task_search_source ON scan_task(id) WHERE task_source = 'search';

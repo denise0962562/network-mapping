@@ -21,7 +21,7 @@ use crate::handlers::tags::AssetTag;
 use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
 
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
-const SCAN_INDEX_SCHEMA_VERSION: &str = "4";
+const SCAN_INDEX_SCHEMA_VERSION: &str = "5";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const MAX_DOMAIN_RECORDS: usize = 10_000;
 const MAX_DOMAIN_NAMES: usize = 1_000;
@@ -41,6 +41,12 @@ pub(crate) struct ScanBatchContext {
     pub(crate) upload_id: String,
     pub(crate) batch_index: i32,
     pub(crate) is_final: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DnsWriteMode {
+    Fresh,
+    Reconcile,
 }
 
 #[derive(Clone, Debug)]
@@ -151,7 +157,18 @@ struct SearchSource {
     service: Option<String>,
     banner: Option<String>,
     title: Option<String>,
+    tls_mode: Option<String>,
+    tls_version: Option<String>,
+    tls_cipher_suite: Option<String>,
     tls_subject: Option<String>,
+    tls_issuer: Option<String>,
+    #[serde(default)]
+    tls_names: Vec<String>,
+    tls_serial_number: Option<String>,
+    tls_not_before: Option<DateTime<Utc>>,
+    tls_not_after: Option<DateTime<Utc>>,
+    tls_fingerprint_sha256: Option<String>,
+    tls_self_signed: Option<bool>,
     scanner_name: Option<String>,
     last_seen: DateTime<Utc>,
     asn: Option<String>,
@@ -173,7 +190,17 @@ pub(crate) struct ElasticsearchSearchItem {
     pub(crate) service: Option<String>,
     pub(crate) banner: Option<String>,
     pub(crate) title: Option<String>,
+    pub(crate) tls_mode: Option<String>,
+    pub(crate) tls_version: Option<String>,
+    pub(crate) tls_cipher_suite: Option<String>,
     pub(crate) tls_subject: Option<String>,
+    pub(crate) tls_issuer: Option<String>,
+    pub(crate) tls_names: Vec<String>,
+    pub(crate) tls_serial_number: Option<String>,
+    pub(crate) tls_not_before: Option<i64>,
+    pub(crate) tls_not_after: Option<i64>,
+    pub(crate) tls_fingerprint_sha256: Option<String>,
+    pub(crate) tls_self_signed: Option<bool>,
     pub(crate) scanner_name: Option<String>,
     pub(crate) scan_time: i64,
     pub(crate) asn: Option<String>,
@@ -374,6 +401,29 @@ impl ElasticsearchService {
                 ElasticsearchOperation::ScanQuery,
                 Method::POST,
                 &format!("/{index}"),
+                |request| request.json(body),
+            )
+            .await?;
+        validate_scan_search_response(&result)?;
+        self.mark_success();
+        Ok(result)
+    }
+
+    pub(crate) async fn scan_observations(
+        &self,
+        indices: &[String],
+        body: &Value,
+    ) -> Result<Value, String> {
+        if !self.can_read() {
+            return Err("Elasticsearch 扫描事实读路径尚未就绪".to_owned());
+        }
+        let target =
+            observation_search_target(&self.inner.config.observation_index_prefix, indices)?;
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::ScanQuery,
+                Method::POST,
+                &format!("/{target}/_search?allow_no_indices=true&ignore_unavailable=true"),
                 |request| request.json(body),
             )
             .await?;
@@ -638,6 +688,32 @@ impl ElasticsearchService {
         body: &str,
         create_conflict_is_success: bool,
     ) -> Result<Value, String> {
+        self.send_bulk(
+            path,
+            body,
+            create_conflict_is_success,
+            self.inner.config.bulk_max_retries,
+        )
+        .await
+    }
+
+    async fn send_bulk_once(
+        &self,
+        path: &str,
+        body: &str,
+        create_conflict_is_success: bool,
+    ) -> Result<Value, String> {
+        self.send_bulk(path, body, create_conflict_is_success, 0)
+            .await
+    }
+
+    async fn send_bulk(
+        &self,
+        path: &str,
+        body: &str,
+        create_conflict_is_success: bool,
+        max_retries: u32,
+    ) -> Result<Value, String> {
         let (trace_id, traceparent) = new_trace_context();
         let started = Instant::now();
         let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
@@ -648,8 +724,14 @@ impl ElasticsearchService {
                 .acquire()
                 .await
                 .map_err(|_| "Elasticsearch Bulk 并发控制器已关闭".to_owned())?;
-            self.send_bulk_with_retry_inner(path, body, create_conflict_is_success, &traceparent)
-                .await
+            self.send_bulk_with_retry_inner(
+                path,
+                body,
+                create_conflict_is_success,
+                max_retries,
+                &traceparent,
+            )
+            .await
         })
         .await
         {
@@ -682,9 +764,9 @@ impl ElasticsearchService {
         path: &str,
         body: &str,
         create_conflict_is_success: bool,
+        max_retries: u32,
         traceparent: &str,
     ) -> Result<Value, String> {
-        let max_retries = self.inner.config.bulk_max_retries;
         for attempt in 0..=max_retries {
             let response = self
                 .request(
@@ -970,24 +1052,14 @@ impl ElasticsearchService {
             .await
     }
 
-    /// Pin a DNS batch to one backing index so data-stream rollover cannot duplicate a retry.
-    pub(crate) async fn pin_dns_batch_storage(
+    async fn load_dns_batch_observations(
         &self,
-        pool: &Pool,
-        execution_id: i32,
         context: &ScanBatchContext,
-    ) -> Result<Vec<String>, String> {
-        let read = |value: Value| -> Result<Vec<String>, String> {
-            serde_json::from_value(value).map_err(|error| error.to_string())
-        };
-        let client = pool.get().await.map_err(|error| error.to_string())?;
-        let refs = read(client.query_one("SELECT storage_references FROM scan_result_batch WHERE execution_id=$1 AND upload_id=$2 AND batch_index=$3",
-            &[&execution_id, &context.upload_id, &context.batch_index]).await.map_err(|error| error.to_string())?.get(0))?;
-        if !refs.is_empty() {
-            return Ok(refs);
+        expected_ids: &BTreeSet<String>,
+    ) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+        if expected_ids.is_empty() {
+            return Ok((BTreeSet::new(), BTreeSet::new()));
         }
-        drop(client);
-        self.ensure_dns_indices().await?;
         let stream = &self.inner.config.dns_observation_data_stream;
         let refreshed = self
             .send_json_request(
@@ -998,62 +1070,170 @@ impl ElasticsearchService {
             )
             .await?;
         validate_scan_search_response(&refreshed)?;
-        // Recover pre-upgrade pending batches that may already contain DNS evidence.
-        let existing = self
+        let size = expected_ids
+            .len()
+            .checked_add(1)
+            .ok_or("DNS 批次观察数量溢出")?;
+        let result = self
             .send_json_request(
                 ElasticsearchOperation::ScanQuery,
                 Method::POST,
                 &format!("/{stream}/_search"),
                 |request| {
                     request.json(&json!({
-                        "size": 0, "query": {"bool": {"filter": [
+                        "size": size,
+                        "track_total_hits": true,
+                        "_source": false,
+                        "query": {"bool": {"filter": [
                             {"term": {"scan.execution_id": context.execution_id}},
                             {"term": {"scan.upload_id": context.upload_id}},
                             {"term": {"scan.batch_index": context.batch_index}}
-                        ]}}, "aggs": {"indices": {"terms": {"field": "_index", "size": 2}}}
+                        ]}}
                     }))
                 },
             )
             .await?;
-        validate_scan_search_response(&existing)?;
-        let buckets = existing
-            .pointer("/aggregations/indices/buckets")
+        validate_scan_search_response(&result)?;
+        let hits = result
+            .pointer("/hits/hits")
             .and_then(Value::as_array)
-            .ok_or("DNS 索引定位响应不完整")?;
-        if buckets.len() > 1 {
-            return Err("旧 DNS 批次跨多个 backing index，须先对账去重".into());
+            .ok_or("DNS 批次对账响应缺少 hits")?;
+        let total = result
+            .pointer("/hits/total/value")
+            .and_then(Value::as_u64)
+            .ok_or("DNS 批次对账响应缺少总数")?;
+        if result
+            .pointer("/hits/total/relation")
+            .and_then(Value::as_str)
+            != Some("eq")
+            || total != hits.len() as u64
+        {
+            return Err("DNS 批次对账结果被截断".into());
         }
-        let index = if let Some(bucket) = buckets.first() {
-            bucket
-                .get("key")
+        let mut existing_ids = BTreeSet::new();
+        let mut indices = BTreeSet::new();
+        for hit in hits {
+            let id = hit
+                .get("_id")
                 .and_then(Value::as_str)
-                .ok_or("DNS 索引定位缺少 key")?
-                .to_owned()
-        } else {
-            let metadata = self
-                .send_json_request(
-                    ElasticsearchOperation::IndexAdmin,
-                    Method::GET,
-                    &format!("/_data_stream/{stream}"),
-                    |request| request,
+                .ok_or("DNS 批次对账结果缺少 _id")?;
+            let index = hit
+                .get("_index")
+                .and_then(Value::as_str)
+                .ok_or("DNS 批次对账结果缺少 _index")?;
+            if !expected_ids.contains(id) {
+                return Err(format!("DNS 批次包含非预期事实：{id}"));
+            }
+            if !existing_ids.insert(id.to_owned()) {
+                return Err(format!("DNS 事实跨 backing index 重复：{id}"));
+            }
+            indices.insert(index.to_owned());
+        }
+        Ok((existing_ids, indices))
+    }
+
+    async fn persist_dns_observation_documents(
+        &self,
+        context: &ScanBatchContext,
+        documents: &BTreeMap<String, Value>,
+        mode: DnsWriteMode,
+    ) -> Result<Vec<String>, String> {
+        let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
+        match timeout(
+            budget,
+            self.persist_dns_observation_documents_inner(context, documents, mode),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "DNS Elasticsearch Bulk 超过总时间预算 {} 秒",
+                self.inner.config.bulk_total_timeout_seconds
+            )),
+        }
+    }
+
+    async fn persist_dns_observation_documents_inner(
+        &self,
+        context: &ScanBatchContext,
+        documents: &BTreeMap<String, Value>,
+        mode: DnsWriteMode,
+    ) -> Result<Vec<String>, String> {
+        let stream = &self.inner.config.dns_observation_data_stream;
+        if documents.is_empty() {
+            return Ok(vec![stream.clone()]);
+        }
+        let expected_ids = documents.keys().cloned().collect::<BTreeSet<_>>();
+        let max_writes = self.inner.config.bulk_max_retries as usize + 1;
+        let mut write_attempts = 0_usize;
+        let mut last_error = None;
+        let mut reconcile = mode == DnsWriteMode::Reconcile;
+        loop {
+            let (existing_ids, mut indices) = if reconcile {
+                self.load_dns_batch_observations(context, &expected_ids)
+                    .await?
+            } else {
+                (BTreeSet::new(), BTreeSet::new())
+            };
+            if existing_ids.len() == documents.len() {
+                return Ok(indices.into_iter().collect());
+            }
+            if write_attempts >= max_writes {
+                return Err(last_error
+                    .unwrap_or_else(|| "DNS Elasticsearch Bulk 未能持久化全部观察".into()));
+            }
+            let mut body = String::new();
+            let mut submitted_ids = BTreeSet::new();
+            for (id, document) in documents {
+                if existing_ids.contains(id) {
+                    continue;
+                }
+                submitted_ids.insert(id.clone());
+                body.push_str(
+                    &serde_json::to_string(&json!({"create": {"_index": stream, "_id": id}}))
+                        .map_err(|error| error.to_string())?,
+                );
+                body.push('\n');
+                body.push_str(&serde_json::to_string(document).map_err(|error| error.to_string())?);
+                body.push('\n');
+            }
+            let result = self
+                .send_bulk_once(
+                    &format!(
+                        "/_bulk?wait_for_active_shards={}",
+                        self.inner.config.write_wait_for_active_shards
+                    ),
+                    &body,
+                    true,
                 )
-                .await?;
-            metadata
-                .pointer("/data_streams/0/indices")
-                .and_then(Value::as_array)
-                .and_then(|indices| indices.last())
-                .and_then(|index| index.get("index_name"))
-                .and_then(Value::as_str)
-                .ok_or("DNS 数据流缺少 write index")?
-                .to_owned()
-        };
-        let candidate = json!([index, self.inner.config.dns_record_index]);
-        let client = pool.get().await.map_err(|error| error.to_string())?;
-        // Concurrent retries all use the first committed target.
-        let row = client.query_one("UPDATE scan_result_batch SET storage_references = CASE WHEN storage_references = '[]'::jsonb THEN $4 ELSE storage_references END \
-            WHERE execution_id=$1 AND upload_id=$2 AND batch_index=$3 RETURNING storage_references",
-            &[&execution_id, &context.upload_id, &context.batch_index, &candidate]).await.map_err(|error| error.to_string())?;
-        read(row.get(0))
+                .await;
+            write_attempts += 1;
+            let retry_delay = match result {
+                Ok(result) => match parse_dns_observation_bulk_result(&result, &submitted_ids) {
+                    Ok(outcome) => {
+                        indices.extend(outcome.indices);
+                        if !outcome.requires_reconciliation {
+                            return Ok(indices.into_iter().collect());
+                        }
+                        last_error = Some("DNS Elasticsearch Bulk 结果需要对账".into());
+                        true
+                    }
+                    Err(error) => return Err(error),
+                },
+                Err(error) => {
+                    last_error = Some(error);
+                    true
+                }
+            };
+            if retry_delay && write_attempts < max_writes {
+                sleep(bulk_retry_delay(
+                    self.inner.config.bulk_retry_initial_ms,
+                    (write_attempts - 1) as u32,
+                ))
+                .await;
+            }
+            reconcile = true;
+        }
     }
 
     /// Persists immutable DNS query observations and projects successful answer
@@ -1065,8 +1245,8 @@ impl ElasticsearchService {
         context: &ScanBatchContext,
         tenant_id: &str,
         observations: &[DnsObservation],
-        observation_index: &str,
-    ) -> Result<(), String> {
+        mode: DnsWriteMode,
+    ) -> Result<Vec<String>, String> {
         if !self.enabled() {
             return Err("Elasticsearch 未启用，无法保存 DNS 观察".to_owned());
         }
@@ -1075,8 +1255,7 @@ impl ElasticsearchService {
         }
         self.ensure_dns_indices().await?;
 
-        self.require_existing_index(observation_index).await?;
-        let mut observation_bulk = String::new();
+        let mut observation_documents = BTreeMap::new();
         let mut record_bulk = String::new();
         for (position, input) in observations.iter().cloned().enumerate() {
             let observation = input.normalize()?;
@@ -1121,17 +1300,7 @@ impl ElasticsearchService {
                 },
                 "latency_ms": observation.latency_ms
             });
-            observation_bulk.push_str(
-                &serde_json::to_string(&json!({"create": {
-                    "_index": observation_index, "_id": document_id
-                }}))
-                .map_err(|error| error.to_string())?,
-            );
-            observation_bulk.push('\n');
-            observation_bulk.push_str(
-                &serde_json::to_string(&observation_document).map_err(|error| error.to_string())?,
-            );
-            observation_bulk.push('\n');
+            observation_documents.insert(document_id, observation_document);
 
             if observation.response_code != "NOERROR" {
                 continue;
@@ -1170,19 +1339,9 @@ impl ElasticsearchService {
                 )?;
             }
         }
-        if !observation_bulk.is_empty() {
-            let response = self
-                .send_bulk_with_retry(
-                    &format!(
-                        "/_bulk?wait_for_active_shards={}",
-                        self.inner.config.write_wait_for_active_shards
-                    ),
-                    &observation_bulk,
-                    true,
-                )
-                .await?;
-            validate_dns_bulk_result(&response)?;
-        }
+        let mut storage_references = self
+            .persist_dns_observation_documents(context, &observation_documents, mode)
+            .await?;
         if !record_bulk.is_empty() {
             let response = self
                 .send_bulk_with_retry(
@@ -1196,8 +1355,11 @@ impl ElasticsearchService {
                 .await?;
             validate_dns_bulk_result(&response)?;
         }
+        if !storage_references.contains(&self.inner.config.dns_record_index) {
+            storage_references.push(self.inner.config.dns_record_index.clone());
+        }
         self.mark_success();
-        Ok(())
+        Ok(storage_references)
     }
 
     async fn persist_scan_batch_prepared(
@@ -1770,7 +1932,17 @@ impl ElasticsearchService {
                 service: source.service,
                 banner: source.banner,
                 title: source.title,
+                tls_mode: source.tls_mode,
+                tls_version: source.tls_version,
+                tls_cipher_suite: source.tls_cipher_suite,
                 tls_subject: source.tls_subject,
+                tls_issuer: source.tls_issuer,
+                tls_names: source.tls_names,
+                tls_serial_number: source.tls_serial_number,
+                tls_not_before: source.tls_not_before.map(|value| value.timestamp_millis()),
+                tls_not_after: source.tls_not_after.map(|value| value.timestamp_millis()),
+                tls_fingerprint_sha256: source.tls_fingerprint_sha256,
+                tls_self_signed: source.tls_self_signed,
                 scanner_name: source.scanner_name,
                 scan_time: source.last_seen.timestamp_millis(),
                 asn: source.asn,
@@ -2416,6 +2588,12 @@ impl ElasticsearchService {
                     let port: i32 = row.get("port");
                     let endpoint_id =
                         sha256_hex(format!("{execution_id}\0{network}\0{port}").as_bytes());
+                    let data = row.get::<_, Option<Value>>("data");
+                    let extracted = crate::search_content::extract_search_content(data.as_ref());
+                    let title = row.get::<_, Option<String>>("title").or(extracted.title);
+                    let tls_subject = row
+                        .get::<_, Option<String>>("tls_subject")
+                        .or(extracted.tls_subject);
                     json!({
                         "observation_key": row.get::<_, String>("observation_key"),
                         "endpoint_id": endpoint_id,
@@ -2424,12 +2602,22 @@ impl ElasticsearchService {
                         "protocol": row.get::<_, Option<String>>("protocol"),
                         "service": row.get::<_, Option<String>>("service"),
                         "banner": row.get::<_, Option<String>>("banner"),
-                        "title": row.get::<_, Option<String>>("title"),
+                        "title": title,
                         "http_body": row.get::<_, Option<String>>("http_body"),
                         "http_body_truncated": row.get::<_, bool>("http_body_truncated"),
-                        "tls_subject": row.get::<_, Option<String>>("tls_subject"),
+                        "tls_mode": extracted.tls_mode,
+                        "tls_version": extracted.tls_version,
+                        "tls_cipher_suite": extracted.tls_cipher_suite,
+                        "tls_subject": tls_subject,
+                        "tls_issuer": extracted.tls_issuer,
+                        "tls_names": extracted.tls_names,
+                        "tls_serial_number": extracted.tls_serial_number,
+                        "tls_not_before": extracted.tls_not_before,
+                        "tls_not_after": extracted.tls_not_after,
+                        "tls_fingerprint_sha256": extracted.tls_fingerprint_sha256,
+                        "tls_self_signed": extracted.tls_self_signed,
                         "search_content_extracted": row.get::<_, bool>("search_content_extracted"),
-                        "source": row.get::<_, String>("source"), "data": row.get::<_, Option<Value>>("data"),
+                        "source": row.get::<_, String>("source"), "data": data,
                         "observed_at": row.get::<_, i64>("observed_at"),
                         "asn": row.get::<_, Option<String>>("asn"), "isp": row.get::<_, Option<String>>("isp"),
                         "as_org": row.get::<_, Option<String>>("as_org"),
@@ -3261,6 +3449,30 @@ fn scan_observation_index(prefix: &str, observed_at_ms: i64) -> Result<String, S
     Ok(format!("{}-{}", prefix, observed_at.format("%Y.%m")))
 }
 
+fn observation_search_target(prefix: &str, indices: &[String]) -> Result<String, String> {
+    if indices.is_empty() {
+        return Ok(format!("{prefix}-*"));
+    }
+    let expected_prefix = format!("{prefix}-");
+    let indices = indices.iter().collect::<BTreeSet<_>>();
+    for index in &indices {
+        if !index.starts_with(&expected_prefix)
+            || !index.bytes().all(|value| {
+                value.is_ascii_lowercase() || value.is_ascii_digit() || b"-_.".contains(&value)
+            })
+        {
+            return Err(format!(
+                "扫描批次记录了无效的 Elasticsearch 观察索引：{index}"
+            ));
+        }
+    }
+    Ok(indices
+        .into_iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 fn observation_progress(completed: u64, total: Option<u64>) -> String {
     match total {
         Some(total) => format!("观察 {completed}/{total} 条"),
@@ -3304,7 +3516,17 @@ fn scan_observation_template(prefix: &str, replicas: u32) -> Value {
                     "title": {"type": "text", "fields": {"raw": {"type": "keyword", "ignore_above": 512}}},
                     "http_body": {"type": "match_only_text"},
                     "http_body_truncated": {"type": "boolean"},
+                    "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                    "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                    "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                     "tls_subject": {"type": "wildcard"},
+                    "tls_issuer": {"type": "wildcard"},
+                    "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                    "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                    "tls_not_before": {"type": "date"},
+                    "tls_not_after": {"type": "date"},
+                    "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+                    "tls_self_signed": {"type": "boolean"},
                     "search_content_extracted": {"type": "boolean", "index": false},
                     "source": {"type": "keyword"},
                     "data": {"type": "object", "enabled": false},
@@ -3330,6 +3552,16 @@ fn scan_observation_compatibility_mapping() -> Value {
         "ip_network": {"type": "ip_range"},
         "latitude": {"type": "double"},
         "longitude": {"type": "double"},
+        "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+        "tls_issuer": {"type": "wildcard"},
+        "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+        "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+        "tls_not_before": {"type": "date"},
+        "tls_not_after": {"type": "date"},
+        "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+        "tls_self_signed": {"type": "boolean"},
         "tags": {"properties": scan_observation_tag_mapping_properties()}
     }})
 }
@@ -3471,6 +3703,81 @@ fn append_dns_record_update(
     Ok(())
 }
 
+struct DnsObservationBulkOutcome {
+    indices: BTreeSet<String>,
+    requires_reconciliation: bool,
+}
+
+fn parse_dns_observation_bulk_result(
+    result: &Value,
+    expected_ids: &BTreeSet<String>,
+) -> Result<DnsObservationBulkOutcome, String> {
+    let items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("DNS Elasticsearch Bulk 响应缺少 items")?;
+    if items.len() != expected_ids.len() {
+        return Err(format!(
+            "DNS Elasticsearch Bulk 响应条目数量不匹配：预期 {}，实际 {}",
+            expected_ids.len(),
+            items.len()
+        ));
+    }
+
+    let mut seen_ids = BTreeSet::new();
+    let mut indices = BTreeSet::new();
+    let mut requires_reconciliation = false;
+    for item in items {
+        let action = item
+            .get("create")
+            .ok_or("DNS Elasticsearch Bulk 响应缺少 create 条目")?;
+        let id = action
+            .get("_id")
+            .and_then(Value::as_str)
+            .ok_or("DNS Elasticsearch Bulk create 条目缺少 _id")?;
+        if !expected_ids.contains(id) {
+            return Err(format!("DNS Elasticsearch Bulk 返回非预期事实：{id}"));
+        }
+        if !seen_ids.insert(id.to_owned()) {
+            return Err(format!("DNS Elasticsearch Bulk 重复返回事实：{id}"));
+        }
+        let status = action
+            .get("status")
+            .and_then(Value::as_u64)
+            .ok_or("DNS Elasticsearch Bulk create 条目缺少 status")?;
+        if (200..300).contains(&status) {
+            let index = action
+                .get("_index")
+                .and_then(Value::as_str)
+                .ok_or("DNS Elasticsearch Bulk 成功条目缺少 _index")?;
+            indices.insert(index.to_owned());
+            continue;
+        }
+        let retryable = u16::try_from(status)
+            .ok()
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .is_some_and(is_retryable_bulk_status);
+        if status == 409 || retryable {
+            requires_reconciliation = true;
+            continue;
+        }
+        let reason = action
+            .pointer("/error/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Elasticsearch bulk error");
+        return Err(format!(
+            "DNS Elasticsearch bulk create failed with HTTP {status}: {reason}"
+        ));
+    }
+    if seen_ids != *expected_ids {
+        return Err("DNS Elasticsearch Bulk 响应未覆盖所有事实".into());
+    }
+    Ok(DnsObservationBulkOutcome {
+        indices,
+        requires_reconciliation,
+    })
+}
+
 fn validate_dns_bulk_result(result: &Value) -> Result<(), String> {
     if result.get("errors").and_then(Value::as_bool) != Some(true) {
         return Ok(());
@@ -3544,8 +3851,19 @@ fn scan_endpoint_index_definition(replicas: u32) -> Value {
                 "http_body": {"type": "match_only_text", "copy_to": "http_body_contains"},
                 "http_body_contains": {"type": "wildcard"},
                 "http_body_truncated": {"type": "boolean"},
+                "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+                "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "tls_subject": {"type": "wildcard", "copy_to": "tls_subject_text"},
                 "tls_subject_text": {"type": "text"},
+                "tls_issuer": {"type": "wildcard", "copy_to": "tls_issuer_text"},
+                "tls_issuer_text": {"type": "text"},
+                "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+                "tls_not_before": {"type": "date"},
+                "tls_not_after": {"type": "date"},
+                "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+                "tls_self_signed": {"type": "boolean"},
                 "source": {"type": "keyword", "normalizer": "lowercase_normalizer"},
                 "kind": {"type": "keyword"},
                 "first_seen": {"type": "date"},
@@ -3582,7 +3900,24 @@ fn endpoint_projection_document(
         .unwrap_or(Value::Null);
     let port = observation.get("port").cloned().unwrap_or(Value::Null);
     let kind = observation.get("kind").cloned().unwrap_or(Value::Null);
-    let is_service = kind.as_str() == Some("service");
+    // Failed/unidentified probes remain immutable observations, but do not
+    // advance the successful-service clock or erase the last useful evidence.
+    let is_service = kind.as_str() == Some("service")
+        && [
+            "service",
+            "banner",
+            "title",
+            "http_body",
+            "tls_subject",
+            "tls_version",
+        ]
+        .iter()
+        .any(|field| {
+            observation
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
     let observed_at = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
         .expect("observed_at was validated")
         .to_rfc3339();
@@ -3623,7 +3958,17 @@ fn endpoint_projection_document(
         "title": observation.get("title").cloned().unwrap_or(Value::Null),
         "http_body": observation.get("http_body").cloned().unwrap_or(Value::Null),
         "http_body_truncated": observation.get("http_body_truncated").cloned().unwrap_or(json!(false)),
+        "tls_mode": observation.get("tls_mode").cloned().unwrap_or(Value::Null),
+        "tls_version": observation.get("tls_version").cloned().unwrap_or(Value::Null),
+        "tls_cipher_suite": observation.get("tls_cipher_suite").cloned().unwrap_or(Value::Null),
         "tls_subject": observation.get("tls_subject").cloned().unwrap_or(Value::Null),
+        "tls_issuer": observation.get("tls_issuer").cloned().unwrap_or(Value::Null),
+        "tls_names": observation.get("tls_names").cloned().unwrap_or_else(|| json!([])),
+        "tls_serial_number": observation.get("tls_serial_number").cloned().unwrap_or(Value::Null),
+        "tls_not_before": observation.get("tls_not_before").cloned().unwrap_or(Value::Null),
+        "tls_not_after": observation.get("tls_not_after").cloned().unwrap_or(Value::Null),
+        "tls_fingerprint_sha256": observation.get("tls_fingerprint_sha256").cloned().unwrap_or(Value::Null),
+        "tls_self_signed": observation.get("tls_self_signed").cloned().unwrap_or(Value::Null),
         "source": observation.get("source").cloned().unwrap_or(Value::Null),
         "kind": kind,
         "first_seen": observed_at,
@@ -3661,8 +4006,21 @@ fn append_projection_update(
             def title = ctx._source.title;
             def httpBody = ctx._source.http_body;
             def httpBodyTruncated = ctx._source.http_body_truncated;
+            def tlsMode = ctx._source.tls_mode;
+            def tlsVersion = ctx._source.tls_version;
+            def tlsCipherSuite = ctx._source.tls_cipher_suite;
             def tlsSubject = ctx._source.tls_subject;
+            def tlsIssuer = ctx._source.tls_issuer;
+            def tlsNames = ctx._source.tls_names;
+            def tlsSerialNumber = ctx._source.tls_serial_number;
+            def tlsNotBefore = ctx._source.tls_not_before;
+            def tlsNotAfter = ctx._source.tls_not_after;
+            def tlsFingerprintSha256 = ctx._source.tls_fingerprint_sha256;
+            def tlsSelfSigned = ctx._source.tls_self_signed;
             def serviceObserved = ctx._source.service_observed_at_ms;
+            def incomingServiceObserved = params.doc.service_observed_at_ms;
+            boolean replaceService = incomingServiceObserved != null &&
+                (serviceObserved == null || incomingServiceObserved >= serviceObserved);
             if (params.doc.observed_at_ms < ctx._source.observed_at_ms) {
                 if (firstSeenMs == null || params.doc.observed_at_ms < firstSeenMs) {
                     ctx._source.first_seen = params.doc.first_seen;
@@ -3672,25 +4030,44 @@ fn append_projection_update(
                 ctx._source.putAll(params.doc);
                 ctx._source.first_seen = firstSeen;
                 ctx._source.first_seen_ms = firstSeenMs;
-                if (params.doc.kind != 'service') {
+                if (!replaceService) {
                     ctx._source.service = service;
                     ctx._source.banner = banner;
                     ctx._source.title = title;
                     ctx._source.http_body = httpBody;
                     ctx._source.http_body_truncated = httpBodyTruncated;
+                    ctx._source.tls_mode = tlsMode;
+                    ctx._source.tls_version = tlsVersion;
+                    ctx._source.tls_cipher_suite = tlsCipherSuite;
                     ctx._source.tls_subject = tlsSubject;
+                    ctx._source.tls_issuer = tlsIssuer;
+                    ctx._source.tls_names = tlsNames;
+                    ctx._source.tls_serial_number = tlsSerialNumber;
+                    ctx._source.tls_not_before = tlsNotBefore;
+                    ctx._source.tls_not_after = tlsNotAfter;
+                    ctx._source.tls_fingerprint_sha256 = tlsFingerprintSha256;
+                    ctx._source.tls_self_signed = tlsSelfSigned;
                     ctx._source.service_observed_at_ms = serviceObserved;
                 }
             }
-            if (params.doc.kind == 'service' &&
-                (serviceObserved == null || params.doc.observed_at_ms >= serviceObserved)) {
+            if (replaceService) {
                 ctx._source.service = params.doc.service;
                 ctx._source.banner = params.doc.banner;
                 ctx._source.title = params.doc.title;
                 ctx._source.http_body = params.doc.http_body;
                 ctx._source.http_body_truncated = params.doc.http_body_truncated;
+                ctx._source.tls_mode = params.doc.tls_mode;
+                ctx._source.tls_version = params.doc.tls_version;
+                ctx._source.tls_cipher_suite = params.doc.tls_cipher_suite;
                 ctx._source.tls_subject = params.doc.tls_subject;
-                ctx._source.service_observed_at_ms = params.doc.observed_at_ms;
+                ctx._source.tls_issuer = params.doc.tls_issuer;
+                ctx._source.tls_names = params.doc.tls_names;
+                ctx._source.tls_serial_number = params.doc.tls_serial_number;
+                ctx._source.tls_not_before = params.doc.tls_not_before;
+                ctx._source.tls_not_after = params.doc.tls_not_after;
+                ctx._source.tls_fingerprint_sha256 = params.doc.tls_fingerprint_sha256;
+                ctx._source.tls_self_signed = params.doc.tls_self_signed;
+                ctx._source.service_observed_at_ms = incomingServiceObserved;
             }
         }
     "#;
@@ -3727,6 +4104,17 @@ fn tag_mapping_properties() -> Value {
 fn index_mapping_update() -> Value {
     json!({
         "properties": {
+            "tls_mode": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+            "tls_version": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+            "tls_cipher_suite": {"type": "keyword", "normalizer": "lowercase_normalizer"},
+            "tls_issuer": {"type": "wildcard", "copy_to": "tls_issuer_text"},
+            "tls_issuer_text": {"type": "text"},
+            "tls_names": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+            "tls_serial_number": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 512},
+            "tls_not_before": {"type": "date"},
+            "tls_not_after": {"type": "date"},
+            "tls_fingerprint_sha256": {"type": "keyword", "normalizer": "lowercase_normalizer", "ignore_above": 128},
+            "tls_self_signed": {"type": "boolean"},
             "tags": {"properties": tag_mapping_properties()}
         }
     })
@@ -3734,6 +4122,33 @@ fn index_mapping_update() -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_search_uses_recorded_indices_and_validates_them() {
+        let indices = vec![
+            "scan-observations-2026.09".to_owned(),
+            "scan-observations-2026.08".to_owned(),
+            "scan-observations-2026.09".to_owned(),
+        ];
+        assert_eq!(
+            observation_search_target("scan-observations", &indices).unwrap(),
+            "scan-observations-2026.08,scan-observations-2026.09"
+        );
+        assert_eq!(
+            observation_search_target("scan-observations", &[]).unwrap(),
+            "scan-observations-*"
+        );
+        assert!(
+            observation_search_target("scan-observations", &["other-index".to_owned()]).is_err()
+        );
+        assert!(
+            observation_search_target(
+                "scan-observations",
+                &["scan-observations-2026.09/_search".to_owned()]
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn scan_search_rejects_partial_results_even_with_http_success() {
         assert!(
@@ -3758,8 +4173,9 @@ mod tests {
     use super::{
         ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchOperation, ElasticsearchService,
         ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay, collect_domain_addresses,
-        dns_task_observations_search_body, initialization_retry_delay, new_trace_context,
-        parse_asn, parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
+        dns_task_observations_search_body, index_mapping_update, initialization_retry_delay,
+        new_trace_context, observation_search_target, parse_asn, parse_dns_observation_bulk_result,
+        parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
         scan_endpoint_index_definition, scan_observation_compatibility_mapping,
         scan_observation_template,
     };
@@ -3818,7 +4234,7 @@ mod tests {
         let template = scan_observation_template("observations", 0);
         assert_eq!(
             template.pointer("/_meta/schema_version"),
-            Some(&serde_json::json!("4"))
+            Some(&serde_json::json!("5"))
         );
         assert_eq!(
             template.pointer("/template/mappings/properties/ip_address/type"),
@@ -3843,6 +4259,25 @@ mod tests {
                 Some(&serde_json::json!("double"))
             );
         }
+        for field in ["tls_not_before", "tls_not_after"] {
+            assert_eq!(
+                template.pointer(&format!("/template/mappings/properties/{field}/type")),
+                Some(&serde_json::json!("date"))
+            );
+            assert_eq!(
+                scan_observation_compatibility_mapping()
+                    .pointer(&format!("/properties/{field}/type")),
+                Some(&serde_json::json!("date"))
+            );
+        }
+        assert_eq!(
+            scan_endpoint_index_definition(0).pointer("/mappings/properties/tls_names/type"),
+            Some(&serde_json::json!("keyword"))
+        );
+        assert_eq!(
+            index_mapping_update().pointer("/properties/tls_self_signed/type"),
+            Some(&serde_json::json!("boolean"))
+        );
         assert_eq!(
             scan_observation_compatibility_mapping()
                 .pointer("/properties/tags/properties/category_id/type"),
@@ -3987,6 +4422,50 @@ mod tests {
         });
         assert!(!bulk_response_is_retryable(&existing, true));
         assert!(!bulk_response_is_retryable(&existing, false));
+    }
+
+    #[test]
+    fn dns_observation_bulk_collects_indices_without_reconciliation() {
+        let expected = BTreeSet::from(["one".to_owned(), "two".to_owned()]);
+        let response = serde_json::json!({
+            "errors": false,
+            "items": [
+                {"create": {"status": 201, "_id": "one", "_index": ".ds-dns-1"}},
+                {"create": {"status": 201, "_id": "two", "_index": ".ds-dns-1"}}
+            ]
+        });
+        let outcome = parse_dns_observation_bulk_result(&response, &expected).unwrap();
+        assert_eq!(outcome.indices, BTreeSet::from([".ds-dns-1".to_owned()]));
+        assert!(!outcome.requires_reconciliation);
+    }
+
+    #[test]
+    fn dns_observation_bulk_reconciles_conflicts_and_transient_items() {
+        let expected = BTreeSet::from(["one".to_owned(), "two".to_owned()]);
+        let response = serde_json::json!({
+            "errors": true,
+            "items": [
+                {"create": {"status": 409, "_id": "one", "_index": ".ds-dns-1"}},
+                {"create": {"status": 429, "_id": "two", "_index": ".ds-dns-1"}}
+            ]
+        });
+        let outcome = parse_dns_observation_bulk_result(&response, &expected).unwrap();
+        assert!(outcome.indices.is_empty());
+        assert!(outcome.requires_reconciliation);
+    }
+
+    #[test]
+    fn dns_observation_bulk_rejects_incomplete_or_unknown_items() {
+        let expected = BTreeSet::from(["one".to_owned()]);
+        for response in [
+            serde_json::json!({"errors": false, "items": []}),
+            serde_json::json!({
+                "errors": false,
+                "items": [{"create": {"status": 201, "_id": "other", "_index": ".ds-dns-1"}}]
+            }),
+        ] {
+            assert!(parse_dns_observation_bulk_result(&response, &expected).is_err());
+        }
     }
 
     #[test]

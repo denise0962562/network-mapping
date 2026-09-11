@@ -171,6 +171,8 @@ repeat_after_seconds = 604800
 完整的心跳载荷、数据库字段、调度规则、升级兼容和故障排查参见
 [双栈扫描与自动目标文档](docs/DUAL_STACK_SCANNING.md)。
 
+搜索时按需创建更新任务的配置、去重和故障行为见 [搜索触发目标更新](docs/SEARCH_TARGET_GENERATION.md)。
+
 ## 健康监控与告警
 
 服务端内置健康监控，实时检测慢请求、5xx 服务端错误和 Elasticsearch 慢查询/写入，并轮询

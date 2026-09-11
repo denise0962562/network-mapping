@@ -1,4 +1,4 @@
-use actix_web::{HttpResponse, Responder, get, post, web};
+use actix_web::{HttpRequest, HttpResponse, Responder, get, post, web};
 use deadpool_postgres::Pool;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -32,12 +32,16 @@ pub struct PortSearchQuery {
 #[derive(Deserialize)]
 pub struct AdvancedSearchRequest {
     pub query: String,
+    #[serde(default)]
+    pub generate_if_needed: bool,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
 #[derive(Serialize)]
 struct SearchResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_generation: Option<crate::target_generated::search::GenerationResult>,
     query_type: &'static str,
     query: String,
     items: Vec<SearchItem>,
@@ -54,7 +58,17 @@ struct SearchItem {
     service: Option<String>,
     banner: Option<String>,
     title: Option<String>,
+    tls_mode: Option<String>,
+    tls_version: Option<String>,
+    tls_cipher_suite: Option<String>,
     tls_subject: Option<String>,
+    tls_issuer: Option<String>,
+    tls_names: Vec<String>,
+    tls_serial_number: Option<String>,
+    tls_not_before: Option<i64>,
+    tls_not_after: Option<i64>,
+    tls_fingerprint_sha256: Option<String>,
+    tls_self_signed: Option<bool>,
     scanner_name: Option<String>,
     scan_time: Option<i64>,
     asn: Option<String>,
@@ -141,6 +155,9 @@ pub async fn elasticsearch_status(
 
 #[post("/api/search/v2")]
 pub async fn search_v2(
+    req: HttpRequest,
+    pool: web::Data<Pool>,
+    settings: web::Data<crate::runtime_config::RuntimeSettings>,
     elasticsearch: web::Data<ElasticsearchService>,
     payload: web::Json<AdvancedSearchRequest>,
     user: UserBaseI,
@@ -174,6 +191,7 @@ pub async fn search_v2(
             ElasticsearchCompilation::Supported(filter)
             | ElasticsearchCompilation::RequiresElasticsearch(filter) => respond_search_elasticsearch(
                 elasticsearch.get_ref(), &user, "advanced", query.to_owned(), filter, (limit, offset),
+                (payload.generate_if_needed && offset == 0).then_some(GenerationContext { pool: pool.get_ref(), settings: settings.get_ref(), audit: crate::audit::AuditContext::from_request(&req) }),
             ).await,
             ElasticsearchCompilation::Unsupported => HttpResponse::UnprocessableEntity().json(
                 serde_json::json!({"code": "SEARCH_ES_UNSUPPORTED", "message": "该查询暂不支持 Elasticsearch 读路径"}),
@@ -181,6 +199,13 @@ pub async fn search_v2(
         }
 }
 
+struct GenerationContext<'a> {
+    pool: &'a Pool,
+    settings: &'a crate::runtime_config::RuntimeSettings,
+    audit: crate::audit::AuditContext,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn respond_search_elasticsearch(
     elasticsearch: &ElasticsearchService,
     user: &UserBaseI,
@@ -188,42 +213,85 @@ async fn respond_search_elasticsearch(
     query: String,
     filter: serde_json::Value,
     pagination: (i64, i64),
+    generation: Option<GenerationContext<'_>>,
 ) -> HttpResponse {
     let (limit, offset) = pagination;
     match elasticsearch
         .search(user.role, user.id, filter, limit, offset)
         .await
     {
-        Ok(page) => HttpResponse::Ok().json(SearchResponse {
-            query_type,
-            query,
-            items: page
-                .items
-                .into_iter()
-                .map(|item| SearchItem {
-                    ip_address: item.ip_address,
-                    port: Some(item.port),
-                    protocol: item.protocol,
-                    service: item.service,
-                    banner: item.banner,
-                    title: item.title,
-                    tls_subject: item.tls_subject,
-                    scanner_name: item.scanner_name,
-                    scan_time: Some(item.scan_time),
-                    asn: item.asn,
-                    isp: item.isp,
-                    as_org: item.as_org,
-                    country_code: item.country_code,
-                    country_name: item.country_name,
-                    region_name: item.region_name,
-                    city_name: item.city_name,
-                    tags: item.tags,
-                })
-                .collect(),
-            total: page.total,
-            limit,
-            offset,
-        }),
+        Ok(page) => {
+            let auto_generation = if let Some(context) = generation {
+                let policy = context.settings.automatic_target.get().await;
+                let dns_enabled = context.settings.dns_follow_up.get().await.value.enabled;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    crate::target_generated::search::generate(
+                        context.pool,
+                        elasticsearch,
+                        user,
+                        &policy.value,
+                        policy.revision,
+                        &query,
+                        dns_enabled,
+                        &context.audit,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => Some(result),
+                    result => {
+                        tracing::warn!(event = "SearchGenerationUnavailable", error = ?result);
+                        Some(crate::target_generated::search::GenerationResult::status(
+                            "unavailable",
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            HttpResponse::Ok().json(SearchResponse {
+                auto_generation,
+                query_type,
+                query,
+                items: page
+                    .items
+                    .into_iter()
+                    .map(|item| SearchItem {
+                        ip_address: item.ip_address,
+                        port: Some(item.port),
+                        protocol: item.protocol,
+                        service: item.service,
+                        banner: item.banner,
+                        title: item.title,
+                        tls_mode: item.tls_mode,
+                        tls_version: item.tls_version,
+                        tls_cipher_suite: item.tls_cipher_suite,
+                        tls_subject: item.tls_subject,
+                        tls_issuer: item.tls_issuer,
+                        tls_names: item.tls_names,
+                        tls_serial_number: item.tls_serial_number,
+                        tls_not_before: item.tls_not_before,
+                        tls_not_after: item.tls_not_after,
+                        tls_fingerprint_sha256: item.tls_fingerprint_sha256,
+                        tls_self_signed: item.tls_self_signed,
+                        scanner_name: item.scanner_name,
+                        scan_time: Some(item.scan_time),
+                        asn: item.asn,
+                        isp: item.isp,
+                        as_org: item.as_org,
+                        country_code: item.country_code,
+                        country_name: item.country_name,
+                        region_name: item.region_name,
+                        city_name: item.city_name,
+                        tags: item.tags,
+                    })
+                    .collect(),
+                total: page.total,
+                limit,
+                offset,
+            })
+        }
         Err(error_value) if error_value.starts_with("DOMAIN_RESULT_TOO_BROAD:") => {
             domain_result_too_broad(&error_value)
         }
@@ -257,6 +325,7 @@ pub async fn search_ip(
         q.to_owned(),
         serde_json::json!({"term": {"ip": q}}),
         (limit, offset),
+        None,
     )
     .await;
 }
@@ -284,6 +353,7 @@ pub async fn search_network(
         q.to_owned(),
         serde_json::json!({"term": {"ip": normalized_cidr}}),
         (limit, offset),
+        None,
     )
     .await;
 }
@@ -340,6 +410,7 @@ pub async fn search_port(
         port.to_string(),
         serde_json::json!({"term": {"port": port}}),
         (limit, offset),
+        None,
     )
     .await;
 }
@@ -367,6 +438,7 @@ pub async fn search_service(
             elasticsearch.get_ref(), &user, "service", q.to_owned(),
             serde_json::json!({"wildcard": {"service": {"value": format!("*{escaped}*"), "case_insensitive": true}}}),
             (limit, offset),
+            None,
         ).await;
 }
 
@@ -393,5 +465,6 @@ pub async fn search_banner(
             elasticsearch.get_ref(), &user, "banner", q.to_owned(),
             serde_json::json!({"wildcard": {"banner": {"value": format!("*{escaped}*"), "case_insensitive": true}}}),
             (limit, offset),
+            None,
         ).await;
 }

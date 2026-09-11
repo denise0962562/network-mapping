@@ -1,3 +1,5 @@
+pub(crate) mod search;
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use actix_web::{HttpResponse, Responder, get, web};
