@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::admin::UserBaseI;
 use crate::client_ip::request_ip;
+use crate::logs::write::error_diagnostics;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RequestId(pub Uuid);
@@ -168,34 +169,58 @@ pub async fn write_standalone(pool: &Pool, context: &AuditContext, event: &Audit
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error!(event = "AuditPoolError", request_id = %context.request_id, message = %error_value);
+            log_audit_write_error(
+                "AuditPoolError",
+                "acquire_audit_connection",
+                context,
+                event,
+                &error_value,
+            );
             return false;
         }
     };
     if let Err(error_value) = write(&client, context, event).await {
-        if let Some(database_error) = error_value.as_db_error() {
-            error!(
-                event = "AuditWriteError",
-                request_id = %context.request_id,
-                category = %event.category,
-                action = %event.action,
-                sqlstate = database_error.code().code(),
-                constraint = database_error.constraint().unwrap_or(""),
-                detail = database_error.detail().unwrap_or(""),
-                message = database_error.message(),
-            );
-        } else {
-            error!(
-                event = "AuditWriteError",
-                request_id = %context.request_id,
-                category = %event.category,
-                action = %event.action,
-                message = %error_value,
-            );
-        }
+        log_audit_write_error(
+            "AuditWriteError",
+            "insert_audit_event",
+            context,
+            event,
+            &error_value,
+        );
         return false;
     }
     true
+}
+
+fn log_audit_write_error(
+    log_event: &'static str,
+    operation: &'static str,
+    context: &AuditContext,
+    audit_event: &AuditEvent,
+    error_value: &(dyn std::error::Error + 'static),
+) {
+    let diagnostics = error_diagnostics(error_value);
+    let database = diagnostics.database.as_ref();
+    error!(
+        event = log_event,
+        operation,
+        error_kind = "database",
+        error_code = %format!("{operation}_failed"),
+        error_message = %diagnostics.error_message,
+        error_chain = %diagnostics.error_chain,
+        root_cause = %diagnostics.root_cause,
+        error_truncated = diagnostics.error_truncated,
+        retryable = false,
+        outcome = "audit_event_dropped",
+        request_id = %context.request_id,
+        category = %audit_event.category,
+        action = %audit_event.action,
+        audit_outcome = %audit_event.outcome,
+        resource_type = ?audit_event.resource_type,
+        resource_id = ?audit_event.resource_id,
+        sqlstate = ?database.map(|value| value.sqlstate.as_str()),
+        db_constraint = ?database.and_then(|value| value.constraint.as_deref()),
+    );
 }
 
 #[cfg(test)]

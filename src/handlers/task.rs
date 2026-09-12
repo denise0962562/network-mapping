@@ -564,6 +564,13 @@ pub(crate) async fn scanner_public_ip_handler(
     let Some(address) = request_ip(&req) else {
         error!(
             event = "ScannerPublicIpUnavailable",
+            operation = "resolve_scanner_public_ip",
+            error_kind = "request_context",
+            error_code = "scanner_peer_address_unavailable",
+            error_message = "authenticated scanner request has no resolved peer address",
+            retryable = true,
+            outcome = "request_failed",
+            http_status = 503_u16,
             scanner_id = %query.scannerid,
             "authenticated scanner request had no peer address"
         );
@@ -2652,8 +2659,14 @@ async fn get_all_task_handler(
         _ => {
             error!(
                 event = "UserRoleValueInvalid",
-                path = "fn get_all_task_handler",
-                message = format!("用户角色值为：{}", user_role)
+                operation = "authorize_task_list",
+                error_kind = "data_integrity",
+                error_code = "user_role_invalid",
+                error_message = "stored user role is outside the supported set",
+                retryable = false,
+                outcome = "request_failed",
+                user_id,
+                user_role,
             );
             return HttpResponse::InternalServerError().finish();
         }
@@ -2662,10 +2675,23 @@ async fn get_all_task_handler(
     let page = match get_filtered_task_page(p, &filters, permi).await {
         Ok(o) => o,
         Err(e) => {
+            let diagnostics = crate::logs::write::error_diagnostics(e.as_ref());
             error!(
                 event = "GetTaskError",
-                path = "fn get_all_task_handler",
-                message = %e
+                operation = "list_tasks",
+                error_kind = "database",
+                error_code = "task_list_query_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "request_failed",
+                user_id,
+                user_role,
+                cursor = ?filters.cursor,
+                limit = filters.limit,
+                include_system = filters.include_system,
             );
             return HttpResponse::InternalServerError().body("500");
         }

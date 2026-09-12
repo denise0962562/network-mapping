@@ -113,8 +113,17 @@ pub async fn acquire_storage_lease(
         .map_err(|error| format!("无法获取存储运行锁：{error}"))?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
-            tracing::error!(event="StorageLeaseConnectionError", message=%error,
-                "存储运行锁连接中断；迁移前必须确认所有运行实例已停止");
+            tracing::error!(
+                event = "StorageLeaseConnectionError",
+                operation = "hold_storage_advisory_lock",
+                error_kind = "database_connection",
+                error_code = "storage_lease_connection_lost",
+                error_message = %error,
+                retryable = false,
+                outcome = "storage_exclusivity_unknown",
+                migration,
+                "存储运行锁连接中断；迁移前必须确认所有运行实例已停止"
+            );
         }
     });
     let statement = if migration {

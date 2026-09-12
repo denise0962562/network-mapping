@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::MonitorConfig;
-use crate::logs::write::error_chain_diagnostics;
+use crate::logs::write::error_diagnostics;
 use crate::mail_template;
 
 pub const CHANNEL_CAPACITY: usize = 1024;
@@ -483,21 +483,39 @@ async fn run_notifier(
         }
 
         if let Err(error) = record_health_alert(&pool, &event).await {
+            let diagnostics = error_diagnostics(error.as_ref());
             error!(
                 event = "HealthAlertRecordError",
+                operation = "record_health_alert",
+                error_kind = "database",
+                error_code = "health_alert_record_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "alert_history_missing",
                 alert_type = event.alert_type,
                 key = %event.key,
-                message = %error_chain_diagnostics(error.as_ref()),
                 "健康告警历史写入失败"
             );
         }
 
         if let Err(error) = mail_template::send_health_alert(&pool, &encryption_key, &event).await {
+            let diagnostics = error_diagnostics(error.as_ref());
             error!(
                 event = "HealthAlertSendError",
+                operation = "send_health_alert",
+                error_kind = "email_delivery",
+                error_code = "health_alert_delivery_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "alert_not_delivered",
                 alert_type = event.alert_type,
                 key = %event.key,
-                message = %error_chain_diagnostics(error.as_ref()),
                 "健康告警邮件发送失败"
             );
         }

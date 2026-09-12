@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, error, info};
 
-use crate::logs::write::error_chain_diagnostics;
+use crate::logs::write::error_diagnostics;
 
 pub struct SqlFile {
     pub root_path: String,
@@ -57,15 +57,20 @@ pub async fn create_postgresql_pool(
     let pool = db_poll_cfg
         .create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
         .map_err(|error| {
+            let diagnostics = error_diagnostics(&error);
             error!(
                 target: "server::startup",
                 event = "DatabasePoolCreateFailed",
-                database_host = %config.host,
-                database_port = config.port,
-                database_name = %config.db_name,
+                operation = "create_database_pool",
+                error_kind = "database",
+                error_code = "database_pool_create_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "process_stopping",
                 runtime = "tokio1",
-                message = %error_chain_diagnostics(&error),
-                error = ?error,
                 "PostgreSQL 连接池创建失败"
             );
             Box::new(error) as Box<dyn std::error::Error>
@@ -92,17 +97,22 @@ pub async fn create_postgresql_pool(
             );
         }
         Err(e) => {
+            let diagnostics = error_diagnostics(&e);
             error!(
                 target: "server::startup",
                 event = "DatabasePoolConnectionCheckFailed",
-                database_host = %config.host,
-                database_port = config.port,
-                database_name = %config.db_name,
+                operation = "verify_database_pool_connection",
+                error_kind = "database",
+                error_code = "database_pool_connection_check_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "process_stopping",
                 pool_wait_timeout_ms = config.pool_wait_timeout_ms,
                 pool_create_timeout_ms = config.pool_create_timeout_ms,
                 pool_recycle_timeout_ms = config.pool_recycle_timeout_ms,
-                message = %error_chain_diagnostics(&e),
-                error = ?e,
                 "数据库连接池连通性检查失败"
             );
             return Err(Box::new(e));
@@ -164,8 +174,16 @@ pub async fn get_sql_from_file(
     match path {
         Some(s) => Ok(fs::read_to_string(s).await?),
         None => {
-            let message = format!("未能获取到拼接后端路径，用户输入: {}", file_name);
-            error!(message);
+            let message = "SQL file path failed security validation";
+            error!(
+                event = "SqlFilePathRejected",
+                operation = "resolve_sql_file_path",
+                error_kind = "validation",
+                error_code = "sql_file_path_rejected",
+                error_message = message,
+                retryable = false,
+                outcome = "operation_failed",
+            );
             Err(message.into())
         }
     }

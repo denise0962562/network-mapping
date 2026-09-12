@@ -11,6 +11,8 @@ use tokio_postgres::Row;
 use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::logs::write::error_diagnostics;
+
 pub const DEFAULT_RETRY_AFTER_SECONDS: i32 = 600;
 pub const NOTIFICATION_GRACE_SECONDS: i64 = 60;
 pub const RESULT_UPLOAD_GRACE_HOURS: i32 = 24;
@@ -249,9 +251,23 @@ pub async fn run_reconciler(state: web::Data<SystemMaintenanceState>, pool: Pool
     loop {
         ticker.tick().await;
         if let Err(error_value) = state.reconcile(&pool).await {
+            let snapshot = state.snapshot().await;
+            let diagnostics = error_diagnostics(error_value.as_ref());
             error!(
                 event = "SystemMaintenanceReconcileError",
-                message = %error_value,
+                operation = "reconcile_system_maintenance",
+                error_kind = "database",
+                error_code = "system_maintenance_reconcile_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "maintenance_state_unchanged",
+                maintenance_id = ?snapshot.maintenance_id,
+                phase = ?snapshot.phase,
+                revision = snapshot.revision,
+                retry_after_ms = 2_000_u64,
             );
         }
     }

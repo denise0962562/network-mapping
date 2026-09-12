@@ -65,8 +65,15 @@ pub fn get_pool_from_app_data(
         None => {
             error!(
                 event = "GetDatabasePoolErrorFromAppData", // 从 app_data 中获取数据库连接池失败
-                path = "",
-                message = "从 app_data 中获取数据库连接池失败，找到 None 值"
+                operation = "resolve_database_pool",
+                error_kind = "configuration",
+                error_code = "database_pool_app_data_missing",
+                error_message = "database pool is missing from application data",
+                retryable = false,
+                outcome = "request_failed",
+                middleware = "application_data",
+                method = %req.method(),
+                path = req.path(),
             );
             Err("从注入数据中提取失败 ".into())
         }

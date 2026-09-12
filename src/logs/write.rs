@@ -1,9 +1,11 @@
 use actix_web::{HttpMessage, HttpRequest};
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 // use crate::logs::LogEventType;
+use crate::admin::UserBaseI;
 use crate::audit::RequestId;
 use crate::{get_conn_ip, get_user_agent, logs::LoginLog};
 
@@ -132,26 +134,42 @@ pub fn info_logs(req: &HttpRequest, event: &str, message: &str) {
 pub fn warn_logs(req: &HttpRequest, event: &str, message: &str) {
     let req_method = req.method();
     let req_path = req.path();
+    let actor = req.extensions().get::<UserBaseI>().cloned();
     warn!(
         event = event,
         client_ip = get_conn_ip(req),
         method = %req_method,
         user_agent = get_user_agent(req),
         path = req_path,
-        message
+        actor_user_id = ?actor.as_ref().map(|value| value.id),
+        actor_role = ?actor.as_ref().map(|value| value.role),
+        reason = message,
+        outcome = "request_continues",
     );
 }
 
 pub fn error_logs(req: &HttpRequest, event: &str, message: &str) {
     let req_method = req.method();
     let req_path = req.path();
+    let actor = req.extensions().get::<UserBaseI>().cloned();
+    let resource = request_resource_context(req);
     error!(
         event = event,
+        operation = "handle_http_request",
+        error_kind = "application",
+        error_code = event,
+        error_message = message,
+        retryable = false,
+        outcome = "request_failed",
         client_ip = get_conn_ip(req),
         method = %req_method,
         user_agent = get_user_agent(req),
         path = req_path,
-        message
+        route_pattern = ?req.match_pattern(),
+        actor_user_id = ?actor.as_ref().map(|value| value.id),
+        actor_role = ?actor.as_ref().map(|value| value.role),
+        resource_param = ?resource.as_ref().map(|value| value.0),
+        resource_id = ?resource.as_ref().map(|value| value.1.as_str()),
     );
 }
 
@@ -162,12 +180,16 @@ pub fn error_logs_error(
     error_value: &(dyn StdError + 'static),
 ) {
     let diagnostics = error_diagnostics(error_value);
+    let operation = effective_operation(event, operation);
+    let error_code = format!("{operation}_failed");
+    let actor = req.extensions().get::<UserBaseI>().cloned();
+    let resource = request_resource_context(req);
     if let Some(database) = diagnostics.database.as_ref() {
         error!(
             event,
-            operation,
+            operation = %operation,
             error_kind = "database",
-            error_code = "database_operation_failed",
+            error_code = %error_code,
             error_message = %diagnostics.error_message,
             error_chain = %diagnostics.error_chain,
             root_cause = %diagnostics.root_cause,
@@ -187,13 +209,18 @@ pub fn error_logs_error(
             method = %req.method(),
             user_agent = get_user_agent(req),
             path = req.path(),
+            route_pattern = ?req.match_pattern(),
+            actor_user_id = ?actor.as_ref().map(|value| value.id),
+            actor_role = ?actor.as_ref().map(|value| value.role),
+            resource_param = ?resource.as_ref().map(|value| value.0),
+            resource_id = ?resource.as_ref().map(|value| value.1.as_str()),
         );
     } else {
         error!(
             event,
-            operation,
-            error_kind = "application",
-            error_code = "operation_failed",
+            operation = %operation,
+            error_kind = if operation.contains("database") { "database" } else { "application" },
+            error_code = %error_code,
             error_message = %diagnostics.error_message,
             error_chain = %diagnostics.error_chain,
             root_cause = %diagnostics.root_cause,
@@ -204,8 +231,50 @@ pub fn error_logs_error(
             method = %req.method(),
             user_agent = get_user_agent(req),
             path = req.path(),
+            route_pattern = ?req.match_pattern(),
+            actor_user_id = ?actor.as_ref().map(|value| value.id),
+            actor_role = ?actor.as_ref().map(|value| value.role),
+            resource_param = ?resource.as_ref().map(|value| value.0),
+            resource_id = ?resource.as_ref().map(|value| value.1.as_str()),
         );
     }
+}
+
+fn effective_operation<'a>(event: &'a str, operation: &'a str) -> Cow<'a, str> {
+    if !matches!(operation, "database_operation" | "tag_database_operation") {
+        return Cow::Borrowed(operation);
+    }
+    let stem = event
+        .strip_suffix("Error")
+        .or_else(|| event.strip_suffix("Failed"))
+        .unwrap_or(event);
+    let mut normalized = String::with_capacity(stem.len() + 9);
+    for (index, character) in stem.chars().enumerate() {
+        if character.is_ascii_uppercase() && index > 0 {
+            normalized.push('_');
+        }
+        normalized.extend(character.to_lowercase());
+    }
+    normalized.push_str("_database");
+    Cow::Owned(normalized)
+}
+
+fn request_resource_context(req: &HttpRequest) -> Option<(&'static str, String)> {
+    [
+        "task_id",
+        "execution_id",
+        "user_id",
+        "tag_id",
+        "job_id",
+        "scanner_id",
+        "id",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        req.match_info()
+            .get(name)
+            .map(|value| (name, value.to_owned()))
+    })
 }
 
 /// 该函数可以把登录日志数据写入数据库，返回一个 bool ,
@@ -215,22 +284,14 @@ pub async fn login_logs_to_db(pool: &deadpool_postgres::Pool, log: LoginLog) -> 
     let mut client = match pool.get().await {
         Ok(c) => c,
         Err(e) => {
-            error!(
-                event = "GetConnErrorFromPool",
-                path = "fn login_logs_to_db",
-                message = %e
-            );
+            log_login_database_error("LoginLogPoolError", "acquire_connection", &e, &log);
             return false;
         }
     };
     let transaction = match client.transaction().await {
         Ok(t) => t,
         Err(e) => {
-            error!(
-                event = "OpenTransactionError",
-                path = "fn login_logs_to_db",
-                message = %e
-            );
+            log_login_database_error("LoginLogTransactionError", "begin_transaction", &e, &log);
             return false;
         }
     };
@@ -242,11 +303,7 @@ pub async fn login_logs_to_db(pool: &deadpool_postgres::Pool, log: LoginLog) -> 
     ).await {
         Ok(r) => r,
         Err(e) => {
-            error!(
-                event = "ExecuteSQLError",
-                path = "fn login_logs_to_db",
-                message = %e
-            );
+            log_login_database_error("LoginLogInsertError", "insert_login_log", &e, &log);
             return false
         }
     };
@@ -255,28 +312,55 @@ pub async fn login_logs_to_db(pool: &deadpool_postgres::Pool, log: LoginLog) -> 
         match transaction.commit().await {
             Ok(()) => (),
             Err(e) => {
-                error!(
-                    event = "TransactionCommitError",
-                    path = "fn login_logs_to_db",
-                    message = %e
-                );
+                log_login_database_error("LoginLogCommitError", "commit_login_log", &e, &log);
                 return false;
             }
         };
         true
     } else {
         error!(
-            event = "INSERTDataToDatabaseError",
-            path = "fn login_logs_to_db",
-            message = "向数据库中插入日志数据失败"
+            event = "LoginLogInsertError",
+            operation = "insert_login_log",
+            error_kind = "database",
+            error_code = "login_log_no_rows_inserted",
+            error_message = "database reported zero inserted login-log rows",
+            retryable = false,
+            outcome = "login_log_dropped",
+            user_id = log.event_useage_userid,
+            login_successful = log.is_successful,
         );
         false
     }
 }
 
+fn log_login_database_error(
+    event: &'static str,
+    operation: &'static str,
+    error_value: &(dyn StdError + 'static),
+    log: &LoginLog,
+) {
+    let diagnostics = error_diagnostics(error_value);
+    error!(
+        event,
+        operation,
+        error_kind = "database",
+        error_code = %format!("{operation}_failed"),
+        error_message = %diagnostics.error_message,
+        error_chain = %diagnostics.error_chain,
+        root_cause = %diagnostics.root_cause,
+        error_truncated = diagnostics.error_truncated,
+        retryable = false,
+        outcome = "login_log_dropped",
+        user_id = log.event_useage_userid,
+        login_successful = log.is_successful,
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ERROR_DIAGNOSTIC_CHARS, error_chain_diagnostics, error_diagnostics};
+    use super::{
+        MAX_ERROR_DIAGNOSTIC_CHARS, effective_operation, error_chain_diagnostics, error_diagnostics,
+    };
     use std::error::Error;
     use std::fmt;
 
@@ -339,6 +423,18 @@ mod tests {
         assert_eq!(
             diagnostics.root_cause.chars().count(),
             MAX_ERROR_DIAGNOSTIC_CHARS
+        );
+    }
+
+    #[test]
+    fn generic_database_operation_uses_event_specific_name() {
+        assert_eq!(
+            effective_operation("AuditQueryError", "database_operation"),
+            "audit_query_database"
+        );
+        assert_eq!(
+            effective_operation("CreateTaskError", "insert_scan_task"),
+            "insert_scan_task"
         );
     }
 }

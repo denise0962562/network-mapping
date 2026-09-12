@@ -76,7 +76,7 @@ use db::get_sql_from_file;
 use elasticsearch::{
     DnsWriteMode, ElasticsearchService, ScanBatchContext, scan_batch_payload_checksum,
 };
-use logs::write::{database_error_diagnostics, error_chain_diagnostics};
+use logs::write::error_diagnostics;
 use maxmind::MaxMindState;
 
 //常量
@@ -212,7 +212,16 @@ pub fn get_unix_epoch_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as i64,
         Err(e) => {
-            error!(event = "UnixEpochGenerateError", message = e.to_string());
+            error!(
+                event = "UnixEpochGenerateError",
+                operation = "read_system_time",
+                error_kind = "system_clock",
+                error_code = "system_clock_before_unix_epoch",
+                error_message = %e,
+                retryable = false,
+                outcome = "sentinel_timestamp_returned",
+                fallback_timestamp_ms = -1_i64,
+            );
             -1_i64
         }
     }
@@ -420,11 +429,19 @@ impl DbResource {
                 let db_table_size = match db_table_size_sql {
                     Ok(sql) => get_db_table_size_byte(&o, &sql, &[]).await,
                     Err(e) => {
+                        let diagnostics = error_diagnostics(e.as_ref());
                         error!(
                             event = "DatabaseMetricsSqlLoadError",
                             operation = "load_table_size_query",
+                            error_kind = "filesystem",
+                            error_code = "database_metrics_sql_load_failed",
+                            error_message = %diagnostics.error_message,
+                            error_chain = %diagnostics.error_chain,
+                            root_cause = %diagnostics.root_cause,
+                            error_truncated = diagnostics.error_truncated,
+                            retryable = true,
+                            outcome = "table_metrics_unavailable",
                             sql_file = "get_table_size.sql",
-                            message = %error_chain_diagnostics(e.as_ref()),
                         );
                         BTreeMap::from([("error".to_owned(), DbTableSizeInfo::default())])
                     }
@@ -437,10 +454,18 @@ impl DbResource {
                 }
             }
             Err(e) => {
+                let diagnostics = error_diagnostics(&e);
                 error!(
                     event = "DatabaseMetricsPoolError",
                     operation = "acquire_metrics_connection",
-                    message = %error_chain_diagnostics(&e),
+                    error_kind = "database",
+                    error_code = "database_metrics_pool_failed",
+                    error_message = %diagnostics.error_message,
+                    error_chain = %diagnostics.error_chain,
+                    root_cause = %diagnostics.root_cause,
+                    error_truncated = diagnostics.error_truncated,
+                    retryable = true,
+                    outcome = "database_metrics_unavailable",
                 );
                 //返回默认值
                 DbResource::default()
@@ -732,7 +757,15 @@ fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
                 match parse_ip_or_cidr(tmp) {
                     Ok(o) => n_v.push(o),
                     Err(e) => {
-                        error!(event = "PARSING-ERROR", message = e.to_string());
+                        error!(
+                            event = "ScanTargetParseError",
+                            operation = "parse_scan_target",
+                            error_kind = "validation",
+                            error_code = "scan_target_parse_failed",
+                            error_message = %e,
+                            retryable = false,
+                            outcome = "task_validation_failed",
+                        );
                         return Err(e);
                     }
                 }
@@ -753,7 +786,15 @@ fn check_port(port: &str) -> bool {
     match re {
         Ok(o) => o.is_match(port),
         Err(e) => {
-            error!(event = "REGEX-ERROR", message = e.to_string());
+            error!(
+                event = "PortValidationRegexError",
+                operation = "compile_port_validation_regex",
+                error_kind = "configuration",
+                error_code = "port_validation_regex_compile_failed",
+                error_message = %e,
+                retryable = false,
+                outcome = "port_validation_failed_closed",
+            );
             false
         }
     }
@@ -974,10 +1015,21 @@ async fn get_db_table_size_byte(
             // }
         }
         Err(e) => {
+            let diagnostics = error_diagnostics(&e);
+            let database = diagnostics.database.as_ref();
             error!(
                 event = "DatabaseMetricsQueryError",
                 operation = "query_table_sizes",
-                message = %database_error_diagnostics(&e),
+                error_kind = "database",
+                error_code = "database_table_metrics_query_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "table_metrics_unavailable",
+                sqlstate = ?database.map(|value| value.sqlstate.as_str()),
+                db_constraint = ?database.and_then(|value| value.constraint.as_deref()),
             );
             vec![("error".to_string(), DbTableSizeInfo::default())]
                 .into_iter()
@@ -1007,11 +1059,21 @@ async fn get_db_library_size_byte(
             "null".to_string()
         }
         Err(error_value) => {
+            let diagnostics = error_diagnostics(&error_value);
+            let database = diagnostics.database.as_ref();
             error!(
                 event = "DatabaseMetricsQueryError",
                 operation = "query_database_size",
-                database = db_name,
-                message = %database_error_diagnostics(&error_value),
+                error_kind = "database",
+                error_code = "database_size_query_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "database_size_metric_unavailable",
+                sqlstate = ?database.map(|value| value.sqlstate.as_str()),
+                db_constraint = ?database.and_then(|value| value.constraint.as_deref()),
             );
             "null".to_string()
         }
@@ -1038,10 +1100,21 @@ async fn get_db_conn(
             "null".to_string()
         }
         Err(error_value) => {
+            let diagnostics = error_diagnostics(&error_value);
+            let database = diagnostics.database.as_ref();
             error!(
                 event = "DatabaseMetricsQueryError",
                 operation = "query_connection_count",
-                message = %database_error_diagnostics(&error_value),
+                error_kind = "database",
+                error_code = "database_connection_count_query_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "connection_count_metric_unavailable",
+                sqlstate = ?database.map(|value| value.sqlstate.as_str()),
+                db_constraint = ?database.and_then(|value| value.constraint.as_deref()),
             );
             "null".to_string()
         }
@@ -1131,8 +1204,12 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         Err(e) => {
             error!(
                 event = "ParsedHashError",
-                path = "",
-                message = %e
+                operation = "parse_password_hash",
+                error_kind = "credential_storage",
+                error_code = "stored_password_hash_invalid",
+                error_message = %e,
+                retryable = false,
+                outcome = "authentication_failed_closed",
             );
             println!("verify_pwd_e {:>6}", start.elapsed().as_millis());
             false
@@ -1171,8 +1248,16 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
     //在初始化模板时必须用相对路径
     let tera = match Tera::new(&templates.templates_directory) {
         Ok(t) => t,
-        Err(_) => {
-            error!("tera模板系统初始化错误");
+        Err(e) => {
+            error!(
+                event = "FrontendTemplateInitializationError",
+                operation = "initialize_frontend_templates",
+                error_kind = "template",
+                error_code = "frontend_template_initialization_failed",
+                error_message = %e,
+                retryable = false,
+                outcome = "process_panicking",
+            );
             panic!("tera初始化错误");
         }
     };
@@ -1186,7 +1271,16 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
     match tera.render(&templates.templates_name, &context) {
         Ok(body) => body,
         Err(e) => {
-            error!("Render error: {}", e);
+            error!(
+                event = "FrontendErrorPageRenderError",
+                operation = "render_frontend_error_page",
+                error_kind = "template",
+                error_code = "frontend_error_page_render_failed",
+                error_message = %e,
+                retryable = false,
+                outcome = "fallback_error_page_returned",
+                http_status = info.status_code,
+            );
             eprintln!("Render error: {}", e);
             "<h1>系统故障</h1><p>故障组件：模板系统</p>".to_string()
         }
@@ -1393,7 +1487,12 @@ pub fn get_user_agent(req: &HttpRequest) -> String {
             }
         },
         None => {
-            error!(event = "GetHTTPHeadersError", message = "无法获取到请求头");
+            warn!(
+                event = "UserAgentMissing",
+                operation = "read_user_agent_header",
+                reason = "request has no User-Agent header",
+                outcome = "unknown_user_agent_used",
+            );
             "Unknown".to_string()
         }
     }
@@ -4025,9 +4124,16 @@ pub async fn log_out(
         let t_l = tmp_r.len();
         if t_l != 1 {
             error!(
-                event = "Error",
-                path = "fn log_out",
-                message = format!("更新session返回值长度为{}", t_l)
+                event = "LogoutSessionShapeError",
+                operation = "disable_login_session",
+                error_kind = "data_integrity",
+                error_code = "logout_session_return_shape_invalid",
+                error_message = "logout update returned an unexpected column count",
+                retryable = false,
+                outcome = "session_disabled_with_unexpected_response",
+                deleted_by_user_id = ?deleted_by_user_id,
+                deletion_reason = reason,
+                returned_column_count = t_l,
             );
         }
         Ok(true)

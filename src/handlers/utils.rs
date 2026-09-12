@@ -188,7 +188,17 @@ async fn save_runtime_config_h(
                 Ok(revision) => revision,
                 Err(PersistError::Conflict) => return HttpResponse::Conflict().json(json!({"success": false, "message": "配置已被其他管理员更新，请重新加载后再保存"})),
                 Err(error) => {
-                    error!(event = "SaveRuntimeConfigError", namespace = $namespace, message = %error);
+                    error!(
+                        event = "SaveRuntimeConfigError",
+                        operation = "persist_runtime_configuration",
+                        error_kind = "database",
+                        error_code = "runtime_configuration_persist_failed",
+                        error_message = %error,
+                        retryable = false,
+                        outcome = "request_failed",
+                        namespace = $namespace,
+                        expected_revision = body.expected_revision,
+                    );
                     return HttpResponse::InternalServerError().json(json!({"success": false, "message": "保存运行时配置失败"}));
                 }
             };
@@ -273,8 +283,14 @@ async fn get_config_h(
             Err(e) => {
                 error!(
                     event = "GetConfigError",
-                    path = "fn get_config_h",
-                    message = e.to_string()
+                    operation = "load_legacy_configuration",
+                    error_kind = "database",
+                    error_code = "legacy_configuration_load_failed",
+                    error_message = %e,
+                    retryable = false,
+                    outcome = "request_failed",
+                    config_item_type = %conf_q.item_type,
+                    config_key_present = conf_q.key.is_some(),
                 );
                 return HttpResponse::InternalServerError().finish();
             }
@@ -444,8 +460,13 @@ async fn get_mail_settings_h(
         Err(error_value) => {
             error!(
                 event = "GetMailSettingsError",
-                path = "fn get_mail_settings_h",
-                message = %error_value
+                operation = "load_mail_settings",
+                error_kind = "database",
+                error_code = "mail_settings_load_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "request_failed",
+                namespace = "mail",
             );
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
@@ -474,8 +495,13 @@ async fn get_session_settings_h(
         Err(error_value) => {
             error!(
                 event = "GetSessionSettingsError",
-                path = "fn get_session_settings_h",
-                message = %error_value
+                operation = "load_session_settings",
+                error_kind = "database",
+                error_code = "session_settings_load_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "request_failed",
+                namespace = "session",
             );
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
@@ -551,8 +577,13 @@ async fn save_session_settings_h(
         Err(error_value) => {
             error!(
                 event = "SaveSessionSettingsError",
-                path = "fn save_session_settings_h",
-                message = %error_value
+                operation = "save_session_settings",
+                error_kind = "database",
+                error_code = "session_settings_save_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "settings_unchanged",
+                namespace = "session",
             );
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
@@ -626,8 +657,13 @@ async fn save_trusted_proxy_settings_h(
     if let Err(error_value) = write_settings_to_database(pool.get_ref(), &saved_settings).await {
         error!(
             event = "SaveTrustedProxySettingsError",
-            path = "fn save_trusted_proxy_settings_h",
-            message = %error_value
+            operation = "save_trusted_proxy_settings",
+            error_kind = "database",
+            error_code = "trusted_proxy_settings_save_failed",
+            error_message = %error_value,
+            retryable = false,
+            outcome = "settings_unchanged",
+            namespace = "trusted_proxy",
         );
         return HttpResponse::InternalServerError().json(json!({
             "success": false,
@@ -680,8 +716,13 @@ async fn get_scan_settings_h(
         Err(error_value) => {
             error!(
                 event = "GetScanSettingsError",
-                path = "fn get_scan_settings_h",
-                message = %error_value
+                operation = "load_scan_settings",
+                error_kind = "database",
+                error_code = "scan_settings_load_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "request_failed",
+                namespace = "scan",
             );
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
@@ -754,8 +795,13 @@ async fn save_scan_settings_h(
         Err(error_value) => {
             error!(
                 event = "SaveScanSettingsError",
-                path = "fn save_scan_settings_h",
-                message = %error_value
+                operation = "save_scan_settings",
+                error_kind = "database",
+                error_code = "scan_settings_save_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "settings_unchanged",
+                namespace = "scan",
             );
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
@@ -817,8 +863,13 @@ async fn save_mail_settings_h(
             Err(error_value) => {
                 error!(
                     event = "ReadMailSecretError",
-                    path = "fn save_mail_settings_h",
-                    message = %error_value
+                    operation = "read_existing_mail_secret",
+                    error_kind = "secret_storage",
+                    error_code = "mail_secret_read_failed",
+                    error_message = %error_value,
+                    retryable = false,
+                    outcome = "settings_unchanged",
+                    namespace = "mail",
                 );
                 return HttpResponse::InternalServerError().json(json!({
                     "success": false,
@@ -833,8 +884,13 @@ async fn save_mail_settings_h(
     {
         error!(
             event = "SaveMailSettingsError",
-            path = "fn save_mail_settings_h",
-            message = %error_value
+            operation = "save_mail_settings",
+            error_kind = "database",
+            error_code = "mail_settings_save_failed",
+            error_message = %error_value,
+            retryable = false,
+            outcome = "settings_unchanged",
+            namespace = "mail",
         );
         return HttpResponse::InternalServerError().json(json!({
             "success": false,
@@ -847,8 +903,13 @@ async fn save_mail_settings_h(
         Err(error_value) => {
             error!(
                 event = "ReloadMailSettingsError",
-                path = "fn save_mail_settings_h",
-                message = %error_value
+                operation = "reload_mail_settings",
+                error_kind = "database",
+                error_code = "mail_settings_reload_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "settings_saved_runtime_state_stale",
+                namespace = "mail",
             );
             return HttpResponse::InternalServerError().json(json!({
                 "success": false,
@@ -931,8 +992,13 @@ async fn test_mail_server_h(
             Err(error_value) => {
                 error!(
                     event = "ReadMailSecretError",
-                    path = "fn test_mail_server_h",
-                    message = %error_value
+                    operation = "read_mail_secret_for_test",
+                    error_kind = "secret_storage",
+                    error_code = "mail_secret_read_failed",
+                    error_message = %error_value,
+                    retryable = false,
+                    outcome = "test_not_sent",
+                    namespace = "mail",
                 );
                 return HttpResponse::InternalServerError().json(json!({
                     "success": false,
@@ -987,8 +1053,12 @@ async fn test_mail_server_h(
         Err(error_value) => {
             error!(
                 event = "BuildTestMailError",
-                path = "fn test_mail_server_h",
-                message = %error_value
+                operation = "build_test_email",
+                error_kind = "validation",
+                error_code = "test_email_build_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "test_not_sent",
             );
             return HttpResponse::BadRequest().json(json!({
                 "success": false,
@@ -1023,10 +1093,13 @@ async fn test_mail_server_h(
         Err(error_value) => {
             error!(
                 event = "TestMailSendError",
-                path = "fn test_mail_server_h",
+                operation = "send_test_email",
+                error_kind = "email_delivery",
+                error_code = "test_email_delivery_failed",
+                error_message = %error_value,
                 attempts = error_value.attempts(),
                 retryable = error_value.is_retryable(),
-                message = %error_value
+                outcome = "test_not_delivered",
             );
             HttpResponse::BadGateway().json(json!({
                 "success": false,

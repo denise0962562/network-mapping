@@ -1843,11 +1843,46 @@ impl ElasticsearchService {
             Err(error) => {
                 let delay = i64::from(2_i32.saturating_pow(attempts.clamp(1, 8) as u32));
                 let last_error = error.chars().take(2000).collect::<String>();
-                connection.execute(
+                if let Err(mark_error) = connection.execute(
                     "UPDATE scan_projection_outbox SET available_at = NOW() + ($2::BIGINT * INTERVAL '1 second'), \
                         last_error = $3 WHERE execution_id = $1;",
                     &[&execution_db_id, &delay, &last_error],
-                ).await.map_err(|error| error.to_string())?;
+                ).await {
+                    error!(
+                        event = "ScanProjectionRetryScheduleError",
+                        operation = "schedule_scan_projection_retry",
+                        error_kind = "database",
+                        error_code = "scan_projection_retry_schedule_failed",
+                        error_message = %mark_error,
+                        retryable = true,
+                        outcome = "projection_outbox_claim_retained",
+                        execution_database_id = execution_db_id,
+                        execution_id = %context.execution_id,
+                        task_id = %context.task_id,
+                        scanner_id = %context.scanner_id,
+                        upload_id = %context.upload_id,
+                        batch_index = context.batch_index,
+                        attempt = attempts,
+                        retry_after_ms = delay.saturating_mul(1_000),
+                    );
+                    return Err(mark_error.to_string());
+                }
+                warn!(
+                    event = "ScanProjectionOutboxError",
+                    operation = "promote_scan_execution",
+                    reason = %last_error,
+                    error_code = "scan_projection_failed",
+                    retryable = true,
+                    outcome = "projection_retry_scheduled",
+                    execution_database_id = execution_db_id,
+                    execution_id = %context.execution_id,
+                    task_id = %context.task_id,
+                    scanner_id = %context.scanner_id,
+                    upload_id = %context.upload_id,
+                    batch_index = context.batch_index,
+                    attempt = attempts,
+                    retry_after_ms = delay.saturating_mul(1_000),
+                );
                 Err(error)
             }
         }
@@ -2939,9 +2974,14 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
                     if initialization_failures == 1 || initialization_failures.is_power_of_two() {
                         warn!(
                             event = "ElasticsearchInitializeError",
+                            operation = "validate_elasticsearch_cutover",
+                            reason = %message,
+                            error_code = "elasticsearch_initialization_failed",
+                            retryable = true,
+                            outcome = "worker_retry_scheduled",
                             attempt = initialization_failures,
                             retry_after_ms = retry_after.as_millis(),
-                            message = %message,
+                            index_family = %service.inner.config.observation_index_prefix,
                             "Elasticsearch 初始化失败，稍后重试"
                         );
                     }
@@ -2955,7 +2995,6 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
             Ok(false) => {}
             Err(message) => {
                 service.mark_error(&message);
-                warn!(event = "ScanProjectionOutboxError", message = %message);
                 continue;
             }
         }
@@ -2964,7 +3003,16 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
             Ok(value) => value,
             Err(message) => {
                 service.mark_error(&message);
-                error!(event = "ElasticsearchTagOutboxClaimError", message = %message);
+                error!(
+                    event = "ElasticsearchTagOutboxClaimError",
+                    operation = "claim_tag_outbox_event",
+                    error_kind = "database",
+                    error_code = "tag_outbox_claim_failed",
+                    error_message = %message,
+                    retryable = true,
+                    outcome = "worker_retry_scheduled",
+                    retry_after_ms = service.inner.config.poll_interval_ms,
+                );
                 continue;
             }
         };
@@ -2974,14 +3022,51 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
         match process_scan_tag_event(&service, &pool, &event).await {
             Ok(()) => {
                 if let Err(message) = complete_event(&pool, event.id).await {
-                    error!(event = "ElasticsearchTagOutboxCompleteError", outbox_id = event.id, message = %message);
+                    error!(
+                        event = "ElasticsearchTagOutboxCompleteError",
+                        operation = "complete_tag_outbox_event",
+                        error_kind = "database",
+                        error_code = "tag_outbox_complete_failed",
+                        error_message = %message,
+                        retryable = true,
+                        outcome = "outbox_event_pending",
+                        outbox_id = event.id,
+                        aggregate_key = %event.aggregate_key,
+                        attempt = event.attempts,
+                        retry_after_ms = service.inner.config.poll_interval_ms,
+                    );
                 }
             }
             Err(message) => {
                 service.mark_error(&message);
-                warn!(event = "ElasticsearchTagOutboxProcessError", outbox_id = event.id, message = %message);
+                let retry_after_seconds =
+                    i64::from(2_i32.saturating_pow(event.attempts.clamp(1, 8) as u32));
+                warn!(
+                    event = "ElasticsearchTagOutboxProcessError",
+                    operation = "project_asset_tags",
+                    reason = %message,
+                    error_code = "tag_outbox_projection_failed",
+                    retryable = true,
+                    outcome = "outbox_retry_scheduled",
+                    outbox_id = event.id,
+                    aggregate_key = %event.aggregate_key,
+                    attempt = event.attempts,
+                    retry_after_ms = retry_after_seconds.saturating_mul(1_000),
+                );
                 if let Err(mark_error) = retry_event(&pool, &event, &message).await {
-                    error!(event = "ElasticsearchTagOutboxRetryError", outbox_id = event.id, message = %mark_error);
+                    error!(
+                        event = "ElasticsearchTagOutboxRetryError",
+                        operation = "schedule_tag_outbox_retry",
+                        error_kind = "database",
+                        error_code = "tag_outbox_retry_schedule_failed",
+                        error_message = %mark_error,
+                        retryable = true,
+                        outcome = "outbox_event_locked_until_timeout",
+                        outbox_id = event.id,
+                        aggregate_key = %event.aggregate_key,
+                        attempt = event.attempts,
+                        retry_after_ms = OUTBOX_LOCK_TIMEOUT_MINUTES.saturating_mul(60_000),
+                    );
                 }
             }
         }

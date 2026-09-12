@@ -33,6 +33,7 @@ struct ExecutionContext {
     scanner_id: String,
     task_source: String,
     locked_at: DateTime<Utc>,
+    attempts: i32,
     expected_observations: i64,
     observation_indices: Vec<String>,
 }
@@ -110,7 +111,15 @@ pub async fn run_worker(
         }
         if tokio::time::Instant::now() >= reconcile_at {
             if let Err(error) = reconcile(&pool).await {
-                warn!(event = "AnalyticsSnapshotReconcileError", message = %error);
+                warn!(
+                    event = "AnalyticsSnapshotReconcileError",
+                    operation = "reconcile_analytics_outbox",
+                    reason = %error,
+                    error_code = "analytics_snapshot_reconcile_failed",
+                    retryable = true,
+                    outcome = "reconciliation_retry_scheduled",
+                    retry_after_ms = settings.interval_minutes.saturating_mul(60_000),
+                );
             } else {
                 reconcile_at = tokio::time::Instant::now()
                     + Duration::from_secs(settings.interval_minutes * 60);
@@ -127,8 +136,7 @@ pub async fn run_worker(
                     exhausted = false;
                     break;
                 }
-                Err(error) => {
-                    warn!(event = "AnalyticsSnapshotWorkerError", message = %error);
+                Err(_) => {
                     // The failed execution is delayed by fail_execution; continue draining
                     // independent work so one legacy/corrupt execution cannot block upgrades.
                 }
@@ -298,7 +306,19 @@ pub async fn rebuild_all(pool: &Pool, elasticsearch: &ElasticsearchService) -> R
 }
 
 async fn process_one(pool: &Pool, elasticsearch: &ElasticsearchService) -> Result<bool, String> {
-    let Some(context) = claim_execution(pool).await? else {
+    let Some(context) = claim_execution(pool).await.map_err(|error| {
+        warn!(
+            event = "AnalyticsSnapshotClaimError",
+            operation = "claim_analytics_execution",
+            reason = %error,
+            error_code = "analytics_snapshot_claim_failed",
+            retryable = true,
+            outcome = "worker_retry_scheduled",
+            retry_after_ms = 1_000_u64,
+        );
+        error
+    })?
+    else {
         return Ok(false);
     };
     let started = std::time::Instant::now();
@@ -326,10 +346,40 @@ async fn process_one(pool: &Pool, elasticsearch: &ElasticsearchService) -> Resul
             Ok(true)
         }
         Err(error) => {
-            warn!(event = "AnalyticsSnapshotExecutionFailed", execution_id = %context.execution_id,
-                elapsed_ms = started.elapsed().as_millis() as u64, message = %error,
+            let retry_after_seconds =
+                i64::from(2_i32.saturating_pow(context.attempts.clamp(1, 8) as u32));
+            warn!(event = "AnalyticsSnapshotExecutionFailed",
+                operation = "build_analytics_snapshot",
+                reason = %error,
+                error_code = "analytics_snapshot_execution_failed",
+                retryable = true,
+                outcome = "existing_snapshot_preserved",
+                execution_id = %context.execution_id,
+                execution_database_id = context.database_id,
+                scanner_id = %context.scanner_id,
+                task_source = %context.task_source,
+                attempt = context.attempts,
+                expected_observations = context.expected_observations,
+                observation_index_count = context.observation_indices.len(),
+                retry_after_ms = retry_after_seconds.saturating_mul(1_000),
+                elapsed_ms = started.elapsed().as_millis() as u64,
                 "执行统计失败，保留已有统计并安排重试");
-            fail_execution(pool, &context, &error).await?;
+            if let Err(mark_error) = fail_execution(pool, &context, &error).await {
+                warn!(
+                    event = "AnalyticsSnapshotRetryScheduleError",
+                    operation = "schedule_analytics_snapshot_retry",
+                    reason = %mark_error,
+                    error_code = "analytics_snapshot_retry_schedule_failed",
+                    retryable = true,
+                    outcome = "outbox_execution_left_running",
+                    execution_id = %context.execution_id,
+                    execution_database_id = context.database_id,
+                    attempt = context.attempts,
+                    locked_at = %context.locked_at,
+                    retry_after_ms = 60_u64 * 60 * 1_000,
+                );
+                return Err(mark_error);
+            }
             Err(error)
         }
     }
@@ -408,6 +458,7 @@ async fn claim_execution(pool: &Pool) -> Result<Option<ExecutionContext>, String
         scanner_id: row.get("scanner_id"),
         task_source: row.get("task_source"),
         locked_at: row.get("locked_at"),
+        attempts: row.get("attempts"),
         expected_observations: row.get("expected_observations"),
         observation_indices: row.get("observation_indices"),
     }))
@@ -428,11 +479,11 @@ async fn claim_build_execution(
                 UPDATE analytics_outbox o SET status = 'running', attempts = attempts + 1, \
                     locked_at = clock_timestamp(), updated_at = NOW() \
                 FROM candidate WHERE o.execution_id = candidate.execution_id \
-                RETURNING o.execution_id, o.locked_at \
+                RETURNING o.execution_id, o.locked_at, o.attempts \
              ) \
              SELECT e.id, e.execution_id, t.user_id, \
                     COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
-                    t.task_source, claimed.locked_at, \
+                    t.task_source, claimed.locked_at, claimed.attempts, \
                     COALESCE(e.result_observation_count, 0) AS expected_observations, \
                     ARRAY(SELECT DISTINCT ref.index_name \
                           FROM scan_result_batch batch \
@@ -462,11 +513,11 @@ async fn claim_pending_execution(
                 UPDATE analytics_outbox o SET status = 'running', attempts = attempts + 1, \
                     locked_at = clock_timestamp(), updated_at = NOW() \
                 FROM candidate WHERE o.execution_id = candidate.execution_id \
-                RETURNING o.execution_id, o.locked_at \
+                RETURNING o.execution_id, o.locked_at, o.attempts \
              ) \
              SELECT e.id, e.execution_id, t.user_id, \
                     COALESCE(e.assigned_scanner_id, e.requested_scanner_id, 'unknown') AS scanner_id, \
-                    t.task_source, claimed.locked_at, \
+                    t.task_source, claimed.locked_at, claimed.attempts, \
                     COALESCE(e.result_observation_count, 0) AS expected_observations, \
                     ARRAY(SELECT DISTINCT ref.index_name \
                           FROM scan_result_batch batch \

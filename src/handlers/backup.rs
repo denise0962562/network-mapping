@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::backup::{BackupManager, CommandResult};
-use crate::logs::write::error_logs_error;
+use crate::logs::write::{error_diagnostics, error_logs_error};
 
 #[derive(Clone, Copy, Debug)]
 enum BackupOperation {
@@ -454,11 +454,23 @@ async fn update_job_started(pool: &Pool, job_id: Uuid) {
                 )
                 .await
             {
-                error!(event = "BackupJobStartUpdateError", job_id = %job_id, message = %error_value);
+                log_backup_job_database_error(
+                    "BackupJobStartUpdateError",
+                    "mark_backup_job_running",
+                    job_id,
+                    "queued",
+                    &error_value,
+                );
             }
         }
         Err(error_value) => {
-            error!(event = "BackupJobPoolError", job_id = %job_id, message = %error_value)
+            log_backup_job_database_error(
+                "BackupJobPoolError",
+                "acquire_backup_job_connection",
+                job_id,
+                "queued",
+                &error_value,
+            );
         }
     }
 }
@@ -487,13 +499,49 @@ async fn update_job_finished(pool: &Pool, job_id: Uuid, result: Result<CommandRe
                 )
                 .await
             {
-                error!(event = "BackupJobFinishUpdateError", job_id = %job_id, message = %error_value);
+                log_backup_job_database_error(
+                    "BackupJobFinishUpdateError",
+                    "mark_backup_job_finished",
+                    job_id,
+                    status,
+                    &error_value,
+                );
             }
         }
         Err(error_value) => {
-            error!(event = "BackupJobPoolError", job_id = %job_id, message = %error_value)
+            log_backup_job_database_error(
+                "BackupJobPoolError",
+                "acquire_backup_job_connection",
+                job_id,
+                status,
+                &error_value,
+            );
         }
     }
+}
+
+fn log_backup_job_database_error(
+    event: &'static str,
+    operation: &'static str,
+    job_id: Uuid,
+    job_status: &str,
+    error_value: &(dyn std::error::Error + 'static),
+) {
+    let diagnostics = error_diagnostics(error_value);
+    error!(
+        event,
+        operation,
+        error_kind = "database",
+        error_code = %format!("{operation}_failed"),
+        error_message = %diagnostics.error_message,
+        error_chain = %diagnostics.error_chain,
+        root_cause = %diagnostics.root_cause,
+        error_truncated = diagnostics.error_truncated,
+        retryable = false,
+        outcome = "backup_job_state_unknown",
+        job_id = %job_id,
+        job_status,
+    );
 }
 
 #[cfg(test)]

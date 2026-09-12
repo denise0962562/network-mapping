@@ -35,7 +35,15 @@ fn require_admin(user: &UserBaseI) -> Result<(), HttpResponse> {
 }
 
 fn internal_error(event: &'static str, error_value: &dyn std::error::Error) -> HttpResponse {
-    error!(event, message = %error_value);
+    error!(
+        event,
+        operation = "manage_mail_template",
+        error_kind = "application",
+        error_code = event,
+        error_message = %error_value,
+        retryable = false,
+        outcome = "request_failed",
+    );
     HttpResponse::InternalServerError().json(json!({
         "success": false,
         "message": "邮件模板服务暂时不可用"
@@ -283,7 +291,17 @@ pub async fn test_mail_template(
             HttpResponse::Ok().json(json!({"success": true, "message": "模板测试邮件已发送"}))
         }
         Err(error_value) => {
-            error!(event = "TestMailTemplateError", message = %error_value);
+            error!(
+                event = "TestMailTemplateError",
+                operation = "send_mail_template_test",
+                error_kind = "email_delivery",
+                error_code = "mail_template_test_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "request_failed",
+                user_id = user.id,
+                template_key,
+            );
             HttpResponse::BadGateway().json(json!({
                 "success": false,
                 "message": smtp_send_error_message(error_value.as_ref()),

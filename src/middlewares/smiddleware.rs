@@ -152,12 +152,7 @@ where
 
             let g_pool = match get_pool_from_app_data(&req) {
                 Ok(p) => p,
-                Err(e) => {
-                    error!(
-                        event = "GetPoolError",
-                        path = "fn call",
-                        message = %e
-                    );
+                Err(_) => {
                     let resp = HttpResponse::InternalServerError().finish();
                     return Ok(req.into_response(resp).map_into_right_body());
                 }
@@ -214,10 +209,22 @@ where
                     Ok(req.into_response(resp).map_into_right_body())
                 }
                 Err(e) => {
+                    let diagnostics = crate::logs::write::error_diagnostics(e.as_ref());
                     error!(
                         event = "TokenVerifyError",
-                        path = "fn call",
-                        message = %e
+                        operation = "verify_session_token",
+                        error_kind = "database",
+                        error_code = "session_token_verification_failed",
+                        error_message = %diagnostics.error_message,
+                        error_chain = %diagnostics.error_chain,
+                        root_cause = %diagnostics.root_cause,
+                        error_truncated = diagnostics.error_truncated,
+                        retryable = false,
+                        outcome = "request_failed",
+                        middleware = "session_authentication",
+                        http_status = 500_u16,
+                        method = %req.method(),
+                        path = req.path(),
                     );
                     let resp = HttpResponse::InternalServerError().finish();
                     Ok(req.into_response(resp).map_into_right_body())

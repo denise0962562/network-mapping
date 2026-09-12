@@ -783,9 +783,15 @@ pub async fn send_health_alert(
             failure_count += 1;
             tracing::error!(
                 event = "HealthAlertRecipientSendError",
+                operation = "send_health_alert_email",
+                error_kind = "email_delivery",
+                error_code = "health_alert_recipient_delivery_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "remaining_recipients_continued",
                 recipient_index,
                 recipient_count,
-                message = %error_value,
+                failure_count,
                 "单个健康告警收件人发送失败，继续发送其他收件人"
             );
             last_error = Some(error_value.to_string());

@@ -17,7 +17,7 @@ use network_mapping_server::elasticsearch::{
     ElasticsearchService, run_worker as run_elasticsearch_worker,
 };
 use network_mapping_server::frontend::{self, FrontendAssets};
-use network_mapping_server::logs::write::error_chain_diagnostics;
+use network_mapping_server::logs::write::error_diagnostics;
 use network_mapping_server::logs::{self, LogRollingMode};
 use network_mapping_server::maxmind::MaxMindState;
 use network_mapping_server::middlewares::{
@@ -98,19 +98,23 @@ async fn main() -> io::Result<()> {
     let db_pool = db::create_postgresql_pool(&db_config)
         .await
         .unwrap_or_else(|error_value| {
-            let diagnostics = error_chain_diagnostics(error_value.as_ref());
+            let diagnostics = error_diagnostics(error_value.as_ref());
             error!(
                 target: "server::startup",
                 event = "DatabaseStartupFailed",
+                operation = "create_database_pool",
+                error_kind = "database",
+                error_code = "database_pool_initialization_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "process_stopping",
                 startup_stage = "connection_pool",
-                database_host = %db_config.host,
-                database_port = db_config.port,
-                database_name = %db_config.db_name,
-                message = %diagnostics,
-                error = ?error_value,
                 "数据库初始化失败，服务即将终止"
             );
-            panic!("数据库初始化失败：{diagnostics}");
+            panic!("数据库初始化失败：{}", diagnostics.error_chain);
         });
     let pool = db_pool.clone();
     let request_log_pool = db_pool.clone();
@@ -140,20 +144,23 @@ async fn main() -> io::Result<()> {
     match db::init_database_table(&db_pool, &db_config.init_database_file).await {
         Ok(_) => info!(target: "server::startup", "数据库结构初始化完成"),
         Err(error_value) => {
-            let diagnostics = error_chain_diagnostics(error_value.as_ref());
+            let diagnostics = error_diagnostics(error_value.as_ref());
             error!(
                 target: "server::startup",
                 event = "DatabaseStartupFailed",
+                operation = "initialize_database_schema",
+                error_kind = "database",
+                error_code = "database_schema_initialization_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "process_stopping",
                 startup_stage = "schema_initialization",
-                database_host = %db_config.host,
-                database_port = db_config.port,
-                database_name = %db_config.db_name,
-                init_database_file = %db_config.init_database_file,
-                message = %diagnostics,
-                error = ?error_value,
                 "数据库结构初始化失败，服务即将终止"
             );
-            panic!("初始化数据库错误：{diagnostics}");
+            panic!("初始化数据库错误：{}", diagnostics.error_chain);
         }
     };
     let elasticsearch_service = ElasticsearchService::new(elasticsearch_config)
@@ -247,7 +254,19 @@ async fn main() -> io::Result<()> {
             )
             .await
     {
-        error!(event = "BackupJobRecoveryError", message = %error_value);
+        let diagnostics = error_diagnostics(&error_value);
+        error!(
+            event = "BackupJobRecoveryError",
+            operation = "recover_interrupted_backup_jobs",
+            error_kind = "database",
+            error_code = "backup_job_recovery_failed",
+            error_message = %diagnostics.error_message,
+            error_chain = %diagnostics.error_chain,
+            root_cause = %diagnostics.root_cause,
+            error_truncated = diagnostics.error_truncated,
+            retryable = false,
+            outcome = "interrupted_jobs_state_unknown",
+        );
     }
 
     let maxmind_state = MaxMindState::from_directory(&maxmind_directory);
@@ -362,11 +381,19 @@ async fn main() -> io::Result<()> {
             {
                 Ok(_) => (),
                 Err(e) => {
+                    let diagnostics = error_diagnostics(e.as_ref());
                     error!(
                         event = "SystemStatusInsertError",
                         operation = "insert_system_status",
-                        retry_interval_seconds = log.status_duration,
-                        message = %error_chain_diagnostics(e.as_ref()),
+                        error_kind = "database",
+                        error_code = "system_status_insert_failed",
+                        error_message = %diagnostics.error_message,
+                        error_chain = %diagnostics.error_chain,
+                        root_cause = %diagnostics.root_cause,
+                        error_truncated = diagnostics.error_truncated,
+                        retryable = true,
+                        outcome = "sample_dropped",
+                        retry_after_ms = log.status_duration.saturating_mul(1_000),
                     )
                 }
             };

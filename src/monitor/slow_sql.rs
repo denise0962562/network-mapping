@@ -13,7 +13,7 @@ use tracing::{error, warn};
 
 use super::{HealthEvent, SlowSqlObservation};
 use crate::config::MonitorConfig;
-use crate::logs::write::error_chain_diagnostics;
+use crate::logs::write::error_diagnostics;
 
 struct SlowQueryRow {
     queryid: Option<i64>,
@@ -140,17 +140,31 @@ pub async fn run_monitor(
                 }
             }
             Err(error) => {
+                let diagnostics = error_diagnostics(error.as_ref());
                 if !warned_unavailable {
                     warn!(
                         event = "SlowSqlMonitorUnavailable",
-                        message = %error_chain_diagnostics(error.as_ref()),
+                        operation = "query_pg_stat_statements",
+                        reason = %diagnostics.error_message,
+                        error_code = "slow_sql_monitor_unavailable",
+                        outcome = "slow_sql_sampling_skipped",
+                        retry_after_ms = settings.slow_sql_check_interval_seconds.saturating_mul(1_000),
                         "慢 SQL 检测不可用（pg_stat_statements 未启用或无权限），已跳过"
                     );
                     warned_unavailable = true;
                 } else {
                     error!(
                         event = "SlowSqlMonitorError",
-                        message = %error_chain_diagnostics(error.as_ref()),
+                        operation = "query_pg_stat_statements",
+                        error_kind = "database",
+                        error_code = "slow_sql_monitor_query_failed",
+                        error_message = %diagnostics.error_message,
+                        error_chain = %diagnostics.error_chain,
+                        root_cause = %diagnostics.root_cause,
+                        error_truncated = diagnostics.error_truncated,
+                        retryable = true,
+                        outcome = "slow_sql_sampling_skipped",
+                        retry_after_ms = settings.slow_sql_check_interval_seconds.saturating_mul(1_000),
                         "慢 SQL 检测失败"
                     );
                 }

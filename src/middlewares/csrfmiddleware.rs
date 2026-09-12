@@ -1,15 +1,13 @@
-use std::{
-    future::{Ready, ready},
-    sync::Arc,
-};
-use tracing::error;
-
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::logs::write::warn_logs;
 use crate::{
     frontend::is_frontend_resource_path,
     middlewares::{ExpectedCsrfToken, get_pool_from_app_data, is_scanner_api_request},
+};
+use std::{
+    future::{Ready, ready},
+    sync::Arc,
 };
 
 use actix_web::{
@@ -111,8 +109,6 @@ where
                             &audit_event,
                         )
                         .await;
-                    } else {
-                        error!(event = "CsrfAuditError", message = "数据库连接池不可用");
                     }
                     warn_logs(req.request(), "CSRFTokenError", "未获取到 CSRF Token");
                     let resp = HttpResponse::Forbidden().body("403");
@@ -143,8 +139,6 @@ where
                         &audit_event,
                     )
                     .await;
-                } else {
-                    error!(event = "CsrfAuditError", message = "数据库连接池不可用");
                 }
                 let resp = HttpResponse::Forbidden().body("403");
                 Ok(req.into_response(resp).map_into_right_body())

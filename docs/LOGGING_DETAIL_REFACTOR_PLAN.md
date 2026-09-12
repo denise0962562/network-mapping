@@ -1,6 +1,6 @@
 # 日志详细化改造任务
 
-状态：待实施
+状态：代码实施完成；自动化验证完成；依赖真实 PostgreSQL/Elasticsearch 与故障注入的人工演练待运维环境执行
 
 范围：`network-mapping` 服务端与 `Network-Mapping-Scanner` 扫描端
 
@@ -300,3 +300,39 @@
 7. 运行完整故障矩阵，更新运维检索/告警规则，并在本文记录逐事件审查结果。
 
 服务端和扫描端分别提交，使用 Conventional Commits。每个提交必须同时包含对应测试和旧/新事件字段映射；不在日志改造提交中修改协议行为、存储顺序或发布版本。
+
+## 11. 实施记录（2026-09-12）
+
+### 11.1 已完成范围
+
+- 服务端 JSON 文件日志关闭 span 列表，只保留当前 `http_request` span；内存 writer 测试验证 `request_id` 只出现一次。
+- `SaveScannerResultsError` 已拆出稳定分类、机器码、窄操作名和重试属性。upload identity 冲突会同时记录 execution、收到的 upload ID、数据库中冲突的 upload ID 与冲突数量。
+- 扫描结果 handler 在拥有完整载荷上下文的位置输出一次主错误，包含 scanner/task/upload/batch/protocol/数量、HTTP 状态和最终结果，不记录 observation 正文或认证信息。
+- 通用服务端错误帮助函数统一补充 `error_kind`、`error_code`、`error_message`、`retryable`、`outcome`、route pattern、actor/resource 上下文和有界错误链；泛化 `database_operation` 会按 event 生成可检索的窄操作名与机器码。
+- PostgreSQL 错误统一展开 SQLSTATE、severity、detail、hint、schema、table、column、constraint，并对错误链、根因、detail、hint 进行长度限制和截断标记。
+- Elasticsearch outbox、扫描投影、分析快照、审计、请求日志、延迟历史、系统维护、备份、登录/用户管理、中间件、自动目标生成、监控与启动数据库路径的错误已补充业务对象、失败阶段、影响和重试信息；同一失败在深层与外层重复记录的路径已合并。
+- 扫描端保存服务端 `X-Request-ID`，上传错误保留 scanner/task/upload/batch 上下文；retry、永久拒绝、final flush、租约丢失与恢复路径使用稳定事件和结果字段。
+- masscan、zgrab2、nuclei 的外部进程失败统一携带 engine、stage、exit code、耗时、结果数、无效行数、stderr 字节数和截断状态。外部进程只在任务边界输出一次主 `ERROR`；引擎层返回结构化错误。
+- 对会影响恢复或数据完整性的 `WARN` 做了选择性迁移：heartbeat/task fetch/recover/status 重试、维护暂停、运行时配置回退、无效工具输出采样、stderr reader 与临时文件清理均说明原因和后续状态。单次启动提示和纯开发诊断保持简洁。
+- 前端没有集中日志采集链路，仍按第 8 节保持不变。
+
+### 11.2 主要事件映射
+
+| 原事件或旧日志 | 实施后的稳定事件/机器码 | 主要新增上下文 |
+| --- | --- | --- |
+| `SaveScannerResultError` + 文本原因 | `SaveScannerResultError` / `execution_upload_id_conflict` 等具名 code | scanner/task/execution/upload/batch/protocol/count、冲突双方、HTTP status、outcome |
+| 泛化 `database_operation` | 保留业务 event，生成 `<event>_failed` | 窄 operation、actor/resource/route、PostgreSQL 诊断 |
+| 重复的上传 retry 宏和 warning | `ResultBatchUploadRetry` | attempt、retry_after_ms、server request ID、batch identity |
+| 泛化上传终止错误 | `ResultBatchUploadRejected`、`FinalResultUploadFailed` 等 | retryable、retained/discarded 状态、cache batch identity |
+| 引擎内 `masscan/zgrab2/nuclei ... failed` | `ScanTaskFailed` / 引擎专用 code | engine/stage/exit/elapsed/count/stderr metadata |
+| 泛化 heartbeat/fetch/recover warning | `HeartbeatRetry`、`TaskFetchRetry`、`TaskRecoveryRetry` | ServerError 分类、HTTP status、server request ID、attempt、retry_after_ms |
+| 逐行坏 JSON warning | `Zgrab2OutputLineIgnored`、`NucleiOutputLineIgnored` | 首条采样、engine、reason、累计 invalid count |
+
+旧 event 在可行处保持名称以减少检索规则迁移成本；含义过宽或存在重复的事件才拆分。稳定的 `error_code` 用于聚合，展示文本不再作为机器分类依据。
+
+### 11.3 验证结果与限制
+
+- 服务端：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`cargo build --locked --release` 通过；测试结果为 277 passed、23 ignored、0 failed。三个需要本地 HTTP socket 的测试首次在文件系统沙箱内被系统拒绝，获准在沙箱外重跑后通过。
+- 扫描端：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`cargo build --locked --release` 通过；测试结果为 94 passed、0 failed。
+- ignored 测试需要可丢弃 PostgreSQL、真实 Elasticsearch 或已配置的测试账号，本次没有可用外部基础设施，因此未把它们记为通过。
+- 第 9.2 节中依赖真实 PostgreSQL/Elasticsearch 断连、429/503、mapping 错误和生产式队列压力的人工故障矩阵尚未执行。代码已为这些路径补齐字段，但上线前仍应在隔离运维环境核对实际 JSON、告警查询和脱敏结果。

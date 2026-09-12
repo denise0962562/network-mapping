@@ -672,12 +672,14 @@ pub async fn try_send_email(
         Err(failure) => {
             error!(
                 event = "SendEmailFailed",
-                path = "fn try_send_email",
+                operation = "send_email",
                 %delivery_id,
                 attempts = failure.attempts,
                 error_kind = failure.kind.as_str(),
+                error_code = "email_delivery_failed",
+                error_message = %failure.error,
                 retryable = failure.kind.is_retryable(),
-                message = %failure.error,
+                outcome = "email_not_delivered",
                 "邮件发送最终失败"
             );
             Err(MailSendError::new(
@@ -1044,9 +1046,15 @@ pub async fn unbind_2fa(
         Ok(false)
     } else {
         error!(
-            event = "Unbind2FAfaild",
-            path = "fn unbind_2fa",
-            message = "数据库更新条目数不等于 0 和 1"
+            event = "Unbind2FAFailed",
+            operation = "unbind_totp",
+            error_kind = "data_integrity",
+            error_code = "totp_unbind_affected_multiple_rows",
+            error_message = "TOTP unbind affected more than one user row",
+            retryable = false,
+            outcome = "transaction_rolled_back",
+            username,
+            affected_rows = r,
         );
         Err("数据库更新条目数不等于 0 和 1".into())
     }
@@ -1184,11 +1192,17 @@ pub async fn update_user_info(
         }
 
         // 更改了多行，这是不允许的，所以不会提交事务
-        _ => {
+        affected_rows => {
             error!(
-                event = "UpdateUserInfo",
-                path = "fn update_user_info",
-                message = "更改了多行"
+                event = "UpdateUserInfoError",
+                operation = "update_user_info",
+                error_kind = "data_integrity",
+                error_code = "user_update_affected_multiple_rows",
+                error_message = "user update affected more than one row",
+                retryable = false,
+                outcome = "transaction_rolled_back",
+                username,
+                affected_rows,
             );
             Err("更改了多行".into())
         }
