@@ -1,11 +1,15 @@
 use actix_web::HttpRequest;
 use openssl::base64;
+use std::error::Error;
+use std::fmt;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::UserLoginInfo;
 use crate::admin::{UserBaseI, get_session_ttl_seconds_from_database};
+use crate::login_allowlist::login_ip_is_allowed;
 use crate::logs::write::error_diagnostics;
 use crate::{get_password_and_id_from_database, get_unix_epoch_ms, verify_password};
 
@@ -90,6 +94,19 @@ pub struct LoginResult {
     pub session_ttl_seconds: i32,
     pub user_id: i32,
 }
+
+#[derive(Debug)]
+pub struct LoginIpNotAllowlisted {
+    pub user_id: i32,
+}
+
+impl fmt::Display for LoginIpNotAllowlisted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("登录来源 IP 不在白名单中")
+    }
+}
+
+impl Error for LoginIpNotAllowlisted {}
 
 pub(crate) struct SessionAuthentication {
     pub(crate) user: UserBaseI,
@@ -298,6 +315,7 @@ impl LoginToken {
 pub async fn user_login(
     username: &str,
     password: &str,
+    source_ip: Option<IpAddr>,
     pool: &deadpool_postgres::Pool,
 ) -> Result<LoginResult, Box<dyn std::error::Error>> {
     let l_successful: bool;
@@ -334,6 +352,7 @@ pub async fn user_login(
                 role: -1,
                 email_address: None,
                 twofa: None,
+                login_ip_allowlist: Vec::new(),
             };
             // FIXME 当用户不存在时会提供一个默认的校验，但是，如果用户自己调整了密码加密参数，则会导致默认提供的参数实际计算时间与用户其他的密码校验时间不一致
             (-1_i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), t)
@@ -344,6 +363,9 @@ pub async fn user_login(
 
     // 当用户不存在或者是查找用户错误时使用提供的默认密文校验密码
     if verify_password(password, &pwd_hash) && l_successful {
+        if !login_ip_is_allowed(&user_login_info.login_ip_allowlist, source_ip) {
+            return Err(Box::new(LoginIpNotAllowlisted { user_id }));
+        }
         let start = Instant::now();
         let enable_2fa = user_login_info.twofa.map(|_| true).unwrap_or(false);
 

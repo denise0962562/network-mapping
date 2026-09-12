@@ -96,6 +96,7 @@ struct ManagedUser {
     disabled_at: Option<DateTime<Utc>>,
     deleted_at: Option<DateTime<Utc>>,
     is_self: bool,
+    login_ip_allowlist_count: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,6 +264,7 @@ pub async fn list_users(
     let list_sql = format!(
         "SELECT u.id, u.username, u.email, u.role, u.enable_2fa, u.create_time, \
          u.last_login_at, u.last_login_ip, u.disabled_at, u.deleted_at, \
+         cardinality(u.login_ip_allowlist) AS login_ip_allowlist_count, \
          CASE WHEN u.deleted_at IS NOT NULL THEN 'deleted' \
               WHEN u.disabled_at IS NOT NULL THEN 'disabled' \
               WHEN u.limit_login THEN 'locked' ELSE 'active' END AS status, \
@@ -297,6 +299,7 @@ pub async fn list_users(
             disabled_at: row.get("disabled_at"),
             deleted_at: row.get("deleted_at"),
             is_self: row.get::<_, i32>("id") == user.id,
+            login_ip_allowlist_count: row.get("login_ip_allowlist_count"),
         })
         .collect::<Vec<_>>();
     let stats = match conn

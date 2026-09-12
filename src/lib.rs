@@ -15,6 +15,7 @@ pub mod elasticsearch;
 pub mod frontend;
 pub mod handlers;
 pub mod login;
+pub mod login_allowlist;
 pub mod logs;
 pub mod mail_template;
 pub mod maxmind;
@@ -131,6 +132,7 @@ pub struct UserLoginInfo {
     pub role: i32,
     pub email_address: Option<String>,
     pub twofa: Option<TotpInfo>,
+    pub login_ip_allowlist: Vec<cidr::IpCidr>,
 }
 
 pub struct ReadFile {
@@ -1149,7 +1151,7 @@ pub async fn get_password_and_id_from_database(
 ) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
-        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users \
+        "SELECT id, username, password, role, email, enable_2fa, totp_secret, login_ip_allowlist FROM users \
          WHERE limit_login = FALSE AND disabled_at IS NULL AND deleted_at IS NULL AND username = $1",
         &[&username]
     ).await? {
@@ -1173,7 +1175,8 @@ pub async fn get_password_and_id_from_database(
             username: username.to_string(),
             role: row.get::<_, i32>("role"),
             email_address: row.get::<_, Option<String>>("email"),
-            twofa: get_twofa_info(row)
+            login_ip_allowlist: row.get("login_ip_allowlist"),
+            twofa: get_twofa_info(row),
         };
 
         Ok((u_id, u_pwd, userinfo))

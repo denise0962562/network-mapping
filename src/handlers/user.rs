@@ -14,10 +14,12 @@ use crate::admin::{
     totp_verify_status_change, unbind_2fa, update_user_info, web_add_scanner,
 };
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
+use crate::client_ip::request_ip;
 use crate::config::{PasswordHashConfig, SecurityConfig, ServerConfig};
 use crate::handlers::ReceiveLoginInfo;
 use crate::handlers::login_record::{login_failure_event, record_completed_login};
-use crate::login::user_login;
+use crate::login::{LoginIpNotAllowlisted, user_login};
+use crate::login_allowlist::{load_login_allowlist, login_ip_is_allowed};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
@@ -86,36 +88,60 @@ async fn user_login_h(
     let total_start = Instant::now(); // 总的开始时间
     let start = Instant::now(); // 登录函数开始时间
     let p = pool.get_ref();
-    let login_result = match user_login(&receiveinfo.username, &receiveinfo.password, p).await {
-        Ok(value) => value,
-        Err(e) => {
-            let audit_event = login_failure_event(
-                None,
-                &receiveinfo.username,
-                "invalid_credentials",
-                "password",
-            );
-            write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
-            warn!(
-                event = "UserLoginRejected",
-                operation = "authenticate_user",
-                reason = %e,
-                error_code = "user_login_rejected",
-                outcome = "login_denied",
-                username = %receiveinfo.username,
-            );
-            let body = json!({
-                "success": false,
-                "message": "登录失败"
-            });
-            let total_es = total_start.elapsed();
-            let login_function = start.elapsed();
-            println!("Total   : {:>6} ms", total_es.as_millis());
-            println!("Login_f : {:>6} ms", login_function.as_millis());
-            println!("=============================================");
-            return HttpResponse::Unauthorized().json(body);
-        }
-    };
+    let source_ip = request_ip(&req);
+    let login_result =
+        match user_login(&receiveinfo.username, &receiveinfo.password, source_ip, p).await {
+            Ok(value) => value,
+            Err(e) => {
+                let ip_denied = e.downcast_ref::<LoginIpNotAllowlisted>();
+                let mut audit_event = login_failure_event(
+                    None,
+                    &receiveinfo.username,
+                    if ip_denied.is_some() {
+                        "ip_not_allowlisted"
+                    } else {
+                        "invalid_credentials"
+                    },
+                    "password",
+                );
+                if let Some(denied) = ip_denied {
+                    audit_event.resource_type = Some("user".to_owned());
+                    audit_event.resource_id = Some(denied.user_id.to_string());
+                    audit_event.response_status = Some(403);
+                }
+                write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
+                warn!(
+                    event = "UserLoginRejected",
+                    operation = "authenticate_user",
+                    reason = %e,
+                    error_code = "user_login_rejected",
+                    outcome = "login_denied",
+                    username = %receiveinfo.username,
+                );
+                let body = if ip_denied.is_some() {
+                    json!({
+                        "success": false,
+                        "code": "login_ip_not_allowlisted",
+                        "message": "当前 IP 不在该账号的登录白名单中"
+                    })
+                } else {
+                    json!({
+                        "success": false,
+                        "message": "登录失败"
+                    })
+                };
+                let total_es = total_start.elapsed();
+                let login_function = start.elapsed();
+                println!("Total   : {:>6} ms", total_es.as_millis());
+                println!("Login_f : {:>6} ms", login_function.as_millis());
+                println!("=============================================");
+                return if ip_denied.is_some() {
+                    HttpResponse::Forbidden().json(body)
+                } else {
+                    HttpResponse::Unauthorized().json(body)
+                };
+            }
+        };
     let t_session = login_result.session;
     let csrf_token = login_result.csrf_token;
     let enable_twofa = login_result.enable_2fa;
@@ -409,6 +435,60 @@ async fn verify_totp_h(
                 HttpResponse::InternalServerError().finish()
             }
         };
+    }
+
+    let source_ip = request_ip(&req);
+    match load_login_allowlist(database_conn, user_base_i.id).await {
+        Ok(allowlist) if !login_ip_is_allowed(&allowlist, source_ip) => {
+            let mut event = login_failure_event(
+                Some(&user_base_i),
+                &user_base_i.username,
+                "ip_not_allowlisted",
+                "password_totp",
+            );
+            event.response_status = Some(403);
+            write_standalone(database_conn, &AuditContext::from_request(&req), &event).await;
+            if let Err(error_value) = log_out(
+                &session.session,
+                database_conn,
+                "login_ip_denied",
+                Some(user_base_i.id),
+            )
+            .await
+            {
+                error_logs_error(
+                    &req,
+                    "LoginIpDeniedSessionCleanupError",
+                    "cleanup_login_ip_denied_session",
+                    error_value.as_ref(),
+                );
+            }
+            let csrf_token = req
+                .headers()
+                .get("X-CSRF-Token")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            let (session_cookie, csrf_cookie) = expired_auth_cookies(&session.session, csrf_token);
+            return HttpResponse::Forbidden()
+                .cookie(session_cookie)
+                .cookie(csrf_cookie)
+                .json(json!({
+                    "success": false,
+                    "code": "login_ip_not_allowlisted",
+                    "message": "当前 IP 不在该账号的登录白名单中"
+                }));
+        }
+        Ok(_) => {}
+        Err(error_value) => {
+            error_logs_error(
+                &req,
+                "LoadLoginIpAllowlistForTotpError",
+                "load_login_ip_allowlist_for_totp",
+                error_value.as_ref(),
+            );
+            return HttpResponse::InternalServerError()
+                .json(json!({"success": false, "message": "登录白名单校验失败，请重试"}));
+        }
     }
 
     let totp = match totp_struct(username, &s_config.encrypt_key, database_conn).await {
