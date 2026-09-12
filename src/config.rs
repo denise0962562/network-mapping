@@ -1,7 +1,7 @@
 ///web系统配置文件
 use actix_web::web;
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use postgres_from_row::FromRow;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1928,6 +1928,10 @@ pub struct Clis {
     #[arg(short = 'v', long = "verbose")]
     pub terminal_verbose: bool,
 
+    /// 执行用户管理命令后退出；省略时启动服务
+    #[command(subcommand)]
+    pub command: Option<ServerCommand>,
+
     /// 重置指定管理员的密码，并在终端显示新的随机密码后退出
     #[arg(long, value_name = "USERNAME")]
     pub reset_admin_password: Option<String>,
@@ -1943,4 +1947,217 @@ pub struct Clis {
     /// 从所有已成功的 IP 扫描执行重建分析快照后退出；不会修改扫描原始事实
     #[arg(long)]
     pub rebuild_analytics_snapshots: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServerCommand {
+    /// 管理平台用户
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// 修改用户密码
+    Password {
+        #[command(subcommand)]
+        command: PasswordCommand,
+    },
+    /// 管理用户双因素认证
+    #[command(name = "2fa")]
+    TwoFactor {
+        #[command(subcommand)]
+        command: TwoFactorCommand,
+    },
+    /// 管理登录 IP 白名单
+    Allowlist {
+        #[command(subcommand)]
+        command: AllowlistCommand,
+    },
+    /// 管理用户登录限制
+    Login {
+        #[command(subcommand)]
+        command: LoginAccessCommand,
+    },
+    /// 创建用户
+    Create {
+        username: String,
+        #[arg(long, value_enum, default_value_t = UserRole::User)]
+        role: UserRole,
+        #[arg(long)]
+        email: Option<String>,
+        /// 从标准输入读取密码；默认从终端隐藏输入
+        #[arg(long, conflicts_with = "generate")]
+        password_stdin: bool,
+        /// 生成随机密码并只在终端显示一次
+        #[arg(long)]
+        generate: bool,
+    },
+    /// 查看用户信息和会话
+    Show {
+        username: String,
+        #[arg(long, value_enum, default_value_t = SessionSelection::Active)]
+        sessions: SessionSelection,
+    },
+    /// 查看用户登录日志
+    #[command(name = "login-log")]
+    LoginLog {
+        username: String,
+        #[arg(long, value_enum)]
+        outcome: Option<LoginOutcome>,
+        /// 起始时间：RFC3339 或 Nd/Nh/Nm（例如 7d）
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间：RFC3339
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, default_value_t = 100, conflicts_with = "all")]
+        limit: usize,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = PagerMode::Auto)]
+        pager: PagerMode,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PasswordCommand {
+    Set {
+        username: String,
+        #[arg(long, conflicts_with = "generate")]
+        password_stdin: bool,
+        #[arg(long)]
+        generate: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TwoFactorCommand {
+    Clear {
+        username: String,
+        /// 确认执行破坏性操作
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AllowlistCommand {
+    List {
+        username: String,
+    },
+    Add {
+        username: String,
+        #[arg(required = true)]
+        entries: Vec<String>,
+    },
+    Remove {
+        username: String,
+        #[arg(required = true)]
+        entries: Vec<String>,
+        #[arg(long)]
+        ignore_missing: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LoginAccessCommand {
+    Restrict {
+        /// 逗号分隔的用户名，可重复传入
+        #[arg(long, required = true, value_delimiter = ',')]
+        users: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Unrestrict {
+        /// 逗号分隔的用户名，可重复传入
+        #[arg(long, required = true, value_delimiter = ',')]
+        users: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum UserRole {
+    Admin,
+    User,
+}
+
+impl UserRole {
+    pub fn database_value(self) -> i32 {
+        match self {
+            Self::Admin => 1,
+            Self::User => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum SessionSelection {
+    Active,
+    All,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum LoginOutcome {
+    Success,
+    Failure,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Table,
+    Json,
+    Csv,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum PagerMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+
+    use super::{Clis, LoginAccessCommand, ServerCommand, UserCommand};
+
+    #[test]
+    fn no_subcommand_keeps_server_startup_mode() {
+        let cli = Clis::try_parse_from(["networkm"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_comma_delimited_login_restrictions() {
+        let cli = Clis::try_parse_from([
+            "networkm",
+            "user",
+            "login",
+            "restrict",
+            "--users",
+            "alice,bob",
+        ])
+        .unwrap();
+        let Some(ServerCommand::User {
+            command:
+                UserCommand::Login {
+                    command: LoginAccessCommand::Restrict { users, .. },
+                },
+        }) = cli.command
+        else {
+            panic!("unexpected command tree");
+        };
+        assert_eq!(users, ["alice", "bob"]);
+    }
 }

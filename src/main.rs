@@ -11,6 +11,7 @@ use network_mapping_server::admin::{
 use network_mapping_server::audit::RequestId;
 use network_mapping_server::backup::BackupManager;
 use network_mapping_server::cli_progress::CliProgressReporter;
+use network_mapping_server::cli_user;
 use network_mapping_server::client_ip::request_ip;
 use network_mapping_server::config::{Clis, SelfChecking};
 use network_mapping_server::elasticsearch::{
@@ -41,6 +42,18 @@ use network_mapping_server::{Systems, TemplatesInit, config, db, insert_system_s
 #[actix_web::main]
 async fn main() -> io::Result<()> {
     let args = Clis::parse();
+
+    if args.command.is_some()
+        && (args.reset_admin_password.is_some()
+            || args.refresh_ip_intel
+            || args.migrate_scan_data_to_elasticsearch
+            || args.rebuild_analytics_snapshots)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "用户管理子命令不能与旧维护参数同时使用",
+        ));
+    }
 
     let config = config::Config::from_file(&args.config);
 
@@ -163,6 +176,12 @@ async fn main() -> io::Result<()> {
             panic!("初始化数据库错误：{}", diagnostics.error_chain);
         }
     };
+    if let Some(command) = args.command.as_ref() {
+        cli_user::execute(command, &db_pool, config.pwd_hash.clone())
+            .await
+            .map_err(|error| io::Error::other(format!("用户管理命令失败：{error}")))?;
+        return Ok(());
+    }
     let elasticsearch_service = ElasticsearchService::new(elasticsearch_config)
         .map_err(|error| io::Error::other(format!("创建 Elasticsearch 客户端失败：{error}")))?;
     if args.migrate_scan_data_to_elasticsearch {

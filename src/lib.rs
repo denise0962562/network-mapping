@@ -5,6 +5,7 @@ pub mod analytics_snapshot;
 pub mod audit;
 pub mod backup;
 pub mod cli_progress;
+pub mod cli_user;
 pub mod client_ip;
 pub mod config;
 pub mod db;

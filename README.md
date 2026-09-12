@@ -55,6 +55,9 @@ cargo run -- --verbose
 DEBUG 级别日志时，可组合使用 `--verbose --debug-model`，也可以通过 `RUST_LOG` 指定
 过滤规则。
 
+服务端还提供创建用户、修改密码、清除 2FA、登录限制、IP/CIDR 白名单、会话和登录记录
+查询等本地管理命令，详见[用户管理 CLI](docs/USER_MANAGEMENT_CLI.md)。
+
 ## 前端页面托管
 
 服务端直接托管 Vue/Vite 的生产构建产物。先在 `network-mapping-vue/` 中执行
