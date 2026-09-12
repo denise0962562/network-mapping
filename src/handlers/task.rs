@@ -2343,6 +2343,7 @@ async fn current_task_handler(
         pool.get_ref(),
         query.scannerid,
         query.taskid,
+        query.uploadid,
         token,
         &security.scanner_token_pepper,
     )

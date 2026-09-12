@@ -5,6 +5,7 @@ pub mod analytics_snapshot;
 pub mod audit;
 pub mod backup;
 pub mod cli_progress;
+pub mod cli_user;
 pub mod client_ip;
 pub mod config;
 pub mod db;
@@ -15,6 +16,7 @@ pub mod elasticsearch;
 pub mod frontend;
 pub mod handlers;
 pub mod login;
+pub mod login_allowlist;
 pub mod logs;
 pub mod mail_template;
 pub mod maxmind;
@@ -131,6 +133,7 @@ pub struct UserLoginInfo {
     pub role: i32,
     pub email_address: Option<String>,
     pub twofa: Option<TotpInfo>,
+    pub login_ip_allowlist: Vec<cidr::IpCidr>,
 }
 
 pub struct ReadFile {
@@ -1149,7 +1152,7 @@ pub async fn get_password_and_id_from_database(
 ) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
-        "SELECT id, username, password, role, email, enable_2fa, totp_secret FROM users \
+        "SELECT id, username, password, role, email, enable_2fa, totp_secret, login_ip_allowlist FROM users \
          WHERE limit_login = FALSE AND disabled_at IS NULL AND deleted_at IS NULL AND username = $1",
         &[&username]
     ).await? {
@@ -1173,7 +1176,8 @@ pub async fn get_password_and_id_from_database(
             username: username.to_string(),
             role: row.get::<_, i32>("role"),
             email_address: row.get::<_, Option<String>>("email"),
-            twofa: get_twofa_info(row)
+            login_ip_allowlist: row.get("login_ip_allowlist"),
+            twofa: get_twofa_info(row),
         };
 
         Ok((u_id, u_pwd, userinfo))
@@ -3801,6 +3805,7 @@ pub async fn recover_scanner_task(
     pool: &deadpool_postgres::Pool,
     scanner_id: Uuid,
     task_id: Option<Uuid>,
+    upload_id: Option<Uuid>,
     token: &str,
     token_pepper: &str,
 ) -> Result<ApplyTask, ApplyTaskError> {
@@ -3846,6 +3851,83 @@ pub async fn recover_scanner_task(
             .map_err(apply_task_database_error)?;
     }
 
+    // A lease expiry makes the same execution claimable again, but it does not
+    // remove result batches already accepted for that execution. If the
+    // scanner's durable cache belongs to a different upload, retire the old
+    // execution before recovering the task. This preserves the old partial
+    // attempt for audit while giving the durable upload a clean execution.
+    if let (Some(requested_task_id), Some(upload_id)) = (&requested_task_id, upload_id) {
+        let recovery_candidate = transaction
+            .query_opt(
+                "SELECT e.id, e.task_id, e.requested_scanner_id \
+                 FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+                 JOIN scanner_info s ON s.scanner_id = $2 \
+                 WHERE t.task_id = $1 AND ( \
+                    (e.execution_status = 'running' AND e.assigned_scanner_id = $2) OR \
+                    (e.execution_status = 'pending' AND e.assigned_scanner_id IS NULL \
+                     AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
+                     AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
+                       OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
+                     AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
+                     AND (jsonb_array_length(t.dns_resolvers) = 0 \
+                       OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)))) \
+                 ORDER BY CASE WHEN e.execution_status = 'running' THEN 0 ELSE 1 END, e.id \
+                 FOR UPDATE OF e LIMIT 1;",
+                &[requested_task_id, &scanner_id],
+            )
+            .await
+            .map_err(apply_task_database_error)?;
+        if let Some(candidate) = recovery_candidate {
+            let execution_id: i32 = candidate.get("id");
+            let allowed_upload_ids = vec![
+                upload_id.to_string(),
+                dns_sidecar_upload_id(upload_id).to_string(),
+            ];
+            let conflicting_upload = transaction
+                .query_opt(
+                    "SELECT upload_id FROM scan_result_batch \
+                     WHERE execution_id = $1 AND NOT (upload_id = ANY($2::TEXT[])) \
+                     ORDER BY upload_id LIMIT 1;",
+                    &[&execution_id, &allowed_upload_ids],
+                )
+                .await
+                .map_err(apply_task_database_error)?;
+            if let Some(conflict) = conflicting_upload {
+                let conflicting_upload_id: String = conflict.get("upload_id");
+                let requested_scanner_id: Option<String> = candidate.get("requested_scanner_id");
+                let task_db_id: i32 = candidate.get("task_id");
+                transaction
+                    .execute(
+                        "UPDATE scan_task_execution SET execution_status = 'superseded', \
+                         requested_scanner_id = NULL, lease_expires_at = NULL, task_end_time = $2, \
+                         cancel_requested = false, maintenance_hold = FALSE, maintenance_hold_until = NULL, \
+                         failure_reason = 'superseded after durable upload identity changed' \
+                         WHERE id = $1;",
+                        &[&execution_id, &now],
+                    )
+                    .await
+                    .map_err(apply_task_database_error)?;
+                transaction
+                    .execute(
+                        "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) \
+                         VALUES ($1, $2, $3);",
+                        &[&Uuid::now_v7().to_string(), &task_db_id, &requested_scanner_id],
+                    )
+                    .await
+                    .map_err(apply_task_database_error)?;
+                info!(
+                    event = "ROTATE-UPLOAD-EXECUTION",
+                    scanner_id,
+                    task_id = requested_task_id,
+                    upload_id = %upload_id,
+                    conflicting_upload_id,
+                    retired_execution_id = execution_id,
+                    "retired an execution whose result upload identity no longer matches the scanner cache"
+                );
+            }
+        }
+    }
+
     let row = transaction
         .query_opt(
             "SELECT t.id AS task_pk, e.id AS execution_pk, e.execution_status, t.user_id, t.task_id, \
@@ -3886,6 +3968,7 @@ pub async fn recover_scanner_task(
             "UPDATE scan_task_execution SET execution_status = 'running', assigned_scanner_id = $1, \
              task_start_time = COALESCE(task_start_time, $2::BIGINT), task_end_time = NULL, \
              lease_expires_at = CASE WHEN maintenance_hold THEN NULL ELSE $3::BIGINT END, \
+             attempt_count = attempt_count + CASE WHEN execution_status = 'pending' THEN 1 ELSE 0 END, \
              failure_reason = NULL WHERE id = $4;",
             &[
                 &scanner_id,
@@ -4095,6 +4178,7 @@ pub struct ApplyTaskQuery {
 pub struct CurrentTaskQuery {
     pub scannerid: Uuid,
     pub taskid: Option<Uuid>,
+    pub uploadid: Option<Uuid>,
 }
 
 /// 该函数用于退出登录

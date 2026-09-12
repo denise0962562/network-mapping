@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
 	last_login_ip INET,                                                                   -- 最后一次登录的 IP 地址
 	login_error_count INT,                                                                -- 登录错误的次数
 	last_error_at BIGINT,                                                                 -- 最后一次登录出错的时间，以该时间为起点，判断是否将登录错误次数清零
+	login_ip_allowlist CIDR[] NOT NULL DEFAULT ARRAY[]::CIDR[],                            -- 用户登录来源白名单；空数组表示不限制
 	disabled_at TIMESTAMPTZ,                                                              -- 管理员主动禁用时间，与密码错误锁定分离
 	deleted_at TIMESTAMPTZ,                                                               -- 软删除时间，保留任务与审计历史
 	update_at TIMESTAMPTZ
@@ -25,6 +26,16 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS update_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS login_ip_allowlist CIDR[] NOT NULL DEFAULT ARRAY[]::CIDR[];
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'users_login_ip_allowlist_size_check'
+    ) THEN
+        ALTER TABLE users ADD CONSTRAINT users_login_ip_allowlist_size_check
+            CHECK (cardinality(login_ip_allowlist) <= 64);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_users_management_status
 ON users (role, disabled_at, deleted_at) WHERE role IN (1, 2);
 

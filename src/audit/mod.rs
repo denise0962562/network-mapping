@@ -54,6 +54,17 @@ impl AuditContext {
             request_path: req.path().to_owned(),
         }
     }
+
+    /// Build an audit context for a local administrative CLI invocation.
+    pub fn cli(command: impl Into<String>) -> Self {
+        Self {
+            request_id: Uuid::new_v4(),
+            source_ip: None,
+            user_agent: None,
+            http_method: "CLI".to_owned(),
+            request_path: command.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +117,29 @@ impl AuditEvent {
             actor_type: "anonymous".to_owned(),
             actor_id: None,
             actor_name: None,
+            resource_type: None,
+            resource_id: None,
+            response_status: None,
+            reason_code: None,
+            changes: None,
+            metadata: json!({}),
+        }
+    }
+
+    pub fn system(category: &str, action: &str, outcome: &str) -> Self {
+        Self {
+            category: category.to_owned(),
+            action: action.to_owned(),
+            outcome: outcome.to_owned(),
+            severity: if outcome == "success" {
+                "info"
+            } else {
+                "warning"
+            }
+            .to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            actor_name: Some("cli".to_owned()),
             resource_type: None,
             resource_id: None,
             response_status: None,
