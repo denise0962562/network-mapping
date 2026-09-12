@@ -896,6 +896,74 @@ async fn task_claim_keeps_selected_priority_then_uses_public_queue() {
 
 #[tokio::test]
 #[ignore = "requires disposable STORAGE_TEST_DATABASE_URL"]
+async fn durable_upload_recovery_rotates_an_execution_with_a_different_upload_identity() {
+    let (pool, schema) = isolated_pool().await;
+    let scanner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let cached_upload_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+    let token_hash = crate::hash_scanner_token("fixture-token", "fixture-pepper").unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .batch_execute("INSERT INTO users(id,username,password) VALUES(1,'fixture','unused')")
+        .await
+        .unwrap();
+    client.execute("INSERT INTO scanner_info(scanner_id,create_user,runtime_token_hash,is_enable) VALUES($1,1,$2,true)", &[&scanner.to_string(), &token_hash]).await.unwrap();
+    client.execute("INSERT INTO scan_task(id,user_id,task_id,task_initiator,task_target,task_status) VALUES(1,1,$1,'fixture',ARRAY['192.0.2.1'::inet],'running')", &[&task_id.to_string()]).await.unwrap();
+    client.execute("INSERT INTO scan_task_execution(id,execution_id,task_id,requested_scanner_id,assigned_scanner_id,execution_status,attempt_count,task_start_time,lease_expires_at) VALUES(1,'old-execution',1,$1,$1,'running',1,1,1)", &[&scanner.to_string()]).await.unwrap();
+    client.execute("INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,protocol_version,storage_backend) VALUES(1,'old-upload',0,false,500,3,'elasticsearch')", &[]).await.unwrap();
+    drop(client);
+
+    let recovered = crate::recover_scanner_task(
+        &pool,
+        scanner,
+        Some(task_id),
+        Some(cached_upload_id),
+        "fixture-token",
+        "fixture-pepper",
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.task_id, task_id);
+
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT id, execution_status, requested_scanner_id, assigned_scanner_id, attempt_count FROM scan_task_execution ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>("execution_status"), "superseded");
+    assert_eq!(
+        rows[0].get::<_, Option<String>>("requested_scanner_id"),
+        None
+    );
+    assert_eq!(rows[1].get::<_, String>("execution_status"), "running");
+    assert_eq!(
+        rows[1]
+            .get::<_, Option<String>>("assigned_scanner_id")
+            .as_deref(),
+        Some(scanner.to_string().as_str())
+    );
+    assert_eq!(rows[1].get::<_, i32>("attempt_count"), 1);
+    assert_eq!(
+        client
+            .query_one("SELECT execution_id FROM scan_result_batch", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        rows[0].get::<_, i32>("id")
+    );
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL"]
 async fn concurrent_task_claims_do_not_assign_one_execution_twice() {
     let (pool, schema) = isolated_pool().await;
     let first_scanner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
