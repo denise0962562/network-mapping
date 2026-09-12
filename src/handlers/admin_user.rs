@@ -158,12 +158,32 @@ fn error_response(event: &'static str, value: ManagementError) -> HttpResponse {
             HttpResponse::Conflict().json(json!({"success": false, "message": message}))
         }
         ManagementError::Database(error_value) => {
-            error!(event, message = %error_value);
+            let diagnostics = crate::logs::write::error_diagnostics(&error_value);
+            error!(
+                event,
+                operation = "manage_user",
+                error_kind = "database",
+                error_code = event,
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "request_failed",
+            );
             HttpResponse::InternalServerError()
                 .json(json!({"success": false, "message": "用户管理服务暂时不可用"}))
         }
         ManagementError::Other(message) => {
-            error!(event, message);
+            error!(
+                event,
+                operation = "manage_user",
+                error_kind = "application",
+                error_code = event,
+                error_message = message,
+                retryable = false,
+                outcome = "request_failed",
+            );
             HttpResponse::InternalServerError()
                 .json(json!({"success": false, "message": "用户管理服务暂时不可用"}))
         }

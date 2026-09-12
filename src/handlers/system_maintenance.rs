@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit};
 use crate::config::SecurityConfig;
+use crate::logs::write::error_diagnostics;
 use crate::system_maintenance::{
     DEFAULT_RETRY_AFTER_SECONDS, MaintenanceSnapshot, RESULT_UPLOAD_GRACE_HOURS,
     SystemMaintenanceState, active_task_count, held_task_count,
@@ -17,6 +18,31 @@ use crate::{ApplyTaskError, validate_scanner_credentials};
 
 const DEFAULT_HISTORY_LIMIT: i64 = 20;
 const MAX_HISTORY_LIMIT: i64 = 100;
+
+fn log_maintenance_failure(
+    event: &'static str,
+    operation: &'static str,
+    error_value: &(dyn std::error::Error + 'static),
+    maintenance_id: Option<Uuid>,
+    revision: Option<i64>,
+    outcome: &'static str,
+) {
+    let diagnostics = error_diagnostics(error_value);
+    error!(
+        event,
+        operation,
+        error_kind = "database",
+        error_code = %format!("{operation}_failed"),
+        error_message = %diagnostics.error_message,
+        error_chain = %diagnostics.error_chain,
+        root_cause = %diagnostics.root_cause,
+        error_truncated = diagnostics.error_truncated,
+        retryable = false,
+        outcome,
+        maintenance_id = ?maintenance_id,
+        revision = ?revision,
+    );
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,7 +129,14 @@ async fn status_response(pool: &Pool, snapshot: MaintenanceSnapshot) -> HttpResp
             "held_tasks": held_tasks,
         })),
         (Err(error_value), _) | (_, Err(error_value)) => {
-            error!(event = "SystemMaintenanceCountError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceCountError",
+                "load_maintenance_task_counts",
+                error_value.as_ref(),
+                snapshot.maintenance_id,
+                Some(snapshot.revision),
+                "request_failed",
+            );
             HttpResponse::InternalServerError().json(json!({
                 "success": false,
                 "message": "读取运行任务数量失败"
@@ -141,7 +174,14 @@ pub async fn get_maintenance_history(
     let client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error!(event = "SystemMaintenanceHistoryPoolError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceHistoryPoolError",
+                "acquire_maintenance_history_connection",
+                &error_value,
+                None,
+                None,
+                "request_failed",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -157,7 +197,14 @@ pub async fn get_maintenance_history(
     {
         Ok(rows) => rows,
         Err(error_value) => {
-            error!(event = "SystemMaintenanceHistoryQueryError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceHistoryQueryError",
+                "load_maintenance_history",
+                &error_value,
+                None,
+                None,
+                "request_failed",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -170,7 +217,14 @@ pub async fn get_maintenance_history(
     {
         Ok(row) => row.get::<_, i64>("count"),
         Err(error_value) => {
-            error!(event = "SystemMaintenanceHistoryCountError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceHistoryCountError",
+                "count_maintenance_history",
+                &error_value,
+                None,
+                None,
+                "request_failed",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -222,14 +276,28 @@ pub async fn enter_maintenance(
     let mut client = match pool.get().await {
         Ok(client) => client,
         Err(error_value) => {
-            error!(event = "SystemMaintenancePoolError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenancePoolError",
+                "acquire_maintenance_connection",
+                &error_value,
+                Some(maintenance_id),
+                None,
+                "request_failed",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
     let transaction = match client.transaction().await {
         Ok(transaction) => transaction,
         Err(error_value) => {
-            error!(event = "SystemMaintenanceTransactionError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceTransactionError",
+                "begin_maintenance_transaction",
+                &error_value,
+                Some(maintenance_id),
+                None,
+                "request_failed",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -253,7 +321,14 @@ pub async fn enter_maintenance(
     {
         Ok(row) => row,
         Err(error_value) => {
-            error!(event = "SystemMaintenanceEnterError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceEnterError",
+                "enable_system_maintenance",
+                &error_value,
+                Some(maintenance_id),
+                None,
+                "transaction_rolled_back",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -281,11 +356,27 @@ pub async fn enter_maintenance(
     {
         Ok(1) => {}
         Ok(_) => {
-            error!(event = "SystemMaintenanceHistoryInsertMissing", maintenance_id = %maintenance_id);
+            error!(
+                event = "SystemMaintenanceHistoryInsertMissing",
+                operation = "insert_maintenance_history",
+                error_kind = "data_integrity",
+                error_code = "maintenance_history_row_missing",
+                error_message = "maintenance history insert affected no row",
+                retryable = false,
+                outcome = "transaction_rolled_back",
+                maintenance_id = %maintenance_id,
+            );
             return HttpResponse::InternalServerError().finish();
         }
         Err(error_value) => {
-            error!(event = "SystemMaintenanceHistoryInsertError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceHistoryInsertError",
+                "insert_maintenance_history",
+                &error_value,
+                Some(maintenance_id),
+                None,
+                "transaction_rolled_back",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     }
@@ -298,7 +389,14 @@ pub async fn enter_maintenance(
         )
         .await
     {
-        error!(event = "SystemMaintenanceHoldTasksError", message = %error_value);
+        log_maintenance_failure(
+            "SystemMaintenanceHoldTasksError",
+            "hold_running_tasks",
+            &error_value,
+            Some(maintenance_id),
+            None,
+            "transaction_rolled_back",
+        );
         return HttpResponse::InternalServerError().finish();
     }
     let snapshot = MaintenanceSnapshot::from_row(&row);
@@ -320,11 +418,25 @@ pub async fn enter_maintenance(
     if let Err(error_value) =
         write_audit(&transaction, &AuditContext::from_request(&req), &audit).await
     {
-        error!(event = "SystemMaintenanceAuditError", message = %error_value);
+        log_maintenance_failure(
+            "SystemMaintenanceAuditError",
+            "write_maintenance_audit",
+            &error_value,
+            Some(maintenance_id),
+            Some(snapshot.revision),
+            "transaction_rolled_back",
+        );
         return HttpResponse::InternalServerError().finish();
     }
     if let Err(error_value) = transaction.commit().await {
-        error!(event = "SystemMaintenanceCommitError", message = %error_value);
+        log_maintenance_failure(
+            "SystemMaintenanceCommitError",
+            "commit_maintenance_entry",
+            &error_value,
+            Some(maintenance_id),
+            Some(snapshot.revision),
+            "database_state_unknown",
+        );
         return HttpResponse::InternalServerError().finish();
     }
     state.replace(snapshot.clone()).await;
@@ -355,13 +467,34 @@ pub async fn update_maintenance(
             "message": "预计结束时间必须晚于当前时间"
         }));
     }
+    let current_snapshot = state.snapshot().await;
     let mut client = match pool.get().await {
         Ok(client) => client,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error_value) => {
+            log_maintenance_failure(
+                "SystemMaintenancePoolError",
+                "acquire_maintenance_update_connection",
+                &error_value,
+                current_snapshot.maintenance_id,
+                Some(body.revision),
+                "request_failed",
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let transaction = match client.transaction().await {
         Ok(transaction) => transaction,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error_value) => {
+            log_maintenance_failure(
+                "SystemMaintenanceTransactionError",
+                "begin_maintenance_update_transaction",
+                &error_value,
+                current_snapshot.maintenance_id,
+                Some(body.revision),
+                "request_failed",
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let row = match transaction
         .query_opt(
@@ -375,7 +508,14 @@ pub async fn update_maintenance(
     {
         Ok(row) => row,
         Err(error_value) => {
-            error!(event = "SystemMaintenanceUpdateError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceUpdateError",
+                "update_maintenance_state",
+                &error_value,
+                current_snapshot.maintenance_id,
+                Some(body.revision),
+                "transaction_rolled_back",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -389,6 +529,13 @@ pub async fn update_maintenance(
     let Some(maintenance_id) = snapshot.maintenance_id else {
         error!(
             event = "SystemMaintenanceMissingId",
+            operation = "validate_maintenance_state",
+            error_kind = "data_integrity",
+            error_code = "enabled_maintenance_id_missing",
+            error_message = "enabled system maintenance has no identity",
+            retryable = false,
+            outcome = "transaction_rolled_back",
+            revision = snapshot.revision,
             "enabled system maintenance has no id"
         );
         return HttpResponse::InternalServerError().finish();
@@ -403,11 +550,28 @@ pub async fn update_maintenance(
     {
         Ok(1) => {}
         Ok(_) => {
-            error!(event = "SystemMaintenanceHistoryMissing", maintenance_id = %maintenance_id);
+            error!(
+                event = "SystemMaintenanceHistoryMissing",
+                operation = "update_maintenance_history",
+                error_kind = "data_integrity",
+                error_code = "maintenance_history_row_missing",
+                error_message = "active maintenance history row was not found",
+                retryable = false,
+                outcome = "transaction_rolled_back",
+                maintenance_id = %maintenance_id,
+                revision = snapshot.revision,
+            );
             return HttpResponse::InternalServerError().finish();
         }
         Err(error_value) => {
-            error!(event = "SystemMaintenanceHistoryUpdateError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceHistoryUpdateError",
+                "update_maintenance_history",
+                &error_value,
+                Some(maintenance_id),
+                Some(snapshot.revision),
+                "transaction_rolled_back",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     }
@@ -424,11 +588,28 @@ pub async fn update_maintenance(
         "message": message,
         "expected_end_at": body.expected_end_at,
     }));
-    if write_audit(&transaction, &AuditContext::from_request(&req), &audit)
-        .await
-        .is_err()
-        || transaction.commit().await.is_err()
+    if let Err(error_value) =
+        write_audit(&transaction, &AuditContext::from_request(&req), &audit).await
     {
+        log_maintenance_failure(
+            "SystemMaintenanceAuditError",
+            "write_maintenance_update_audit",
+            &error_value,
+            Some(maintenance_id),
+            Some(snapshot.revision),
+            "transaction_rolled_back",
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error_value) = transaction.commit().await {
+        log_maintenance_failure(
+            "SystemMaintenanceCommitError",
+            "commit_maintenance_update",
+            &error_value,
+            Some(maintenance_id),
+            Some(snapshot.revision),
+            "database_state_unknown",
+        );
         return HttpResponse::InternalServerError().finish();
     }
     state.replace(snapshot.clone()).await;
@@ -446,13 +627,34 @@ pub async fn exit_maintenance(
     if let Err(response) = require_admin(&user) {
         return response;
     }
+    let current_snapshot = state.snapshot().await;
     let mut client = match pool.get().await {
         Ok(client) => client,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error_value) => {
+            log_maintenance_failure(
+                "SystemMaintenancePoolError",
+                "acquire_maintenance_exit_connection",
+                &error_value,
+                current_snapshot.maintenance_id,
+                Some(body.revision),
+                "request_failed",
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let transaction = match client.transaction().await {
         Ok(transaction) => transaction,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error_value) => {
+            log_maintenance_failure(
+                "SystemMaintenanceTransactionError",
+                "begin_maintenance_exit_transaction",
+                &error_value,
+                current_snapshot.maintenance_id,
+                Some(body.revision),
+                "request_failed",
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let row = match transaction
         .query_opt(
@@ -471,7 +673,14 @@ pub async fn exit_maintenance(
     {
         Ok(row) => row,
         Err(error_value) => {
-            error!(event = "SystemMaintenanceExitError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceExitError",
+                "disable_system_maintenance",
+                &error_value,
+                current_snapshot.maintenance_id,
+                Some(body.revision),
+                "transaction_rolled_back",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
@@ -485,6 +694,13 @@ pub async fn exit_maintenance(
     let Some(previous_maintenance_id) = previous_maintenance_id else {
         error!(
             event = "SystemMaintenanceMissingId",
+            operation = "validate_maintenance_exit_state",
+            error_kind = "data_integrity",
+            error_code = "exiting_maintenance_id_missing",
+            error_message = "maintenance exit did not return the previous identity",
+            retryable = false,
+            outcome = "transaction_rolled_back",
+            revision = body.revision,
             "exiting system maintenance has no id"
         );
         return HttpResponse::InternalServerError().finish();
@@ -500,11 +716,28 @@ pub async fn exit_maintenance(
     {
         Ok(1) => {}
         Ok(_) => {
-            error!(event = "SystemMaintenanceHistoryMissing", maintenance_id = %previous_maintenance_id);
+            error!(
+                event = "SystemMaintenanceHistoryMissing",
+                operation = "close_maintenance_history",
+                error_kind = "data_integrity",
+                error_code = "maintenance_history_row_missing",
+                error_message = "active maintenance history row was not found during exit",
+                retryable = false,
+                outcome = "transaction_rolled_back",
+                maintenance_id = %previous_maintenance_id,
+                revision = body.revision,
+            );
             return HttpResponse::InternalServerError().finish();
         }
         Err(error_value) => {
-            error!(event = "SystemMaintenanceHistoryExitError", message = %error_value);
+            log_maintenance_failure(
+                "SystemMaintenanceHistoryExitError",
+                "close_maintenance_history",
+                &error_value,
+                Some(previous_maintenance_id),
+                Some(body.revision),
+                "transaction_rolled_back",
+            );
             return HttpResponse::InternalServerError().finish();
         }
     }
@@ -517,7 +750,14 @@ pub async fn exit_maintenance(
         )
         .await
     {
-        error!(event = "SystemMaintenanceReleaseTasksError", message = %error_value);
+        log_maintenance_failure(
+            "SystemMaintenanceReleaseTasksError",
+            "release_maintenance_tasks",
+            &error_value,
+            Some(previous_maintenance_id),
+            Some(body.revision),
+            "transaction_rolled_back",
+        );
         return HttpResponse::InternalServerError().finish();
     }
     let snapshot = MaintenanceSnapshot::from_row(&row);
@@ -529,11 +769,28 @@ pub async fn exit_maintenance(
         "phase": "off",
         "result_upload_grace_hours": RESULT_UPLOAD_GRACE_HOURS,
     }));
-    if write_audit(&transaction, &AuditContext::from_request(&req), &audit)
-        .await
-        .is_err()
-        || transaction.commit().await.is_err()
+    if let Err(error_value) =
+        write_audit(&transaction, &AuditContext::from_request(&req), &audit).await
     {
+        log_maintenance_failure(
+            "SystemMaintenanceAuditError",
+            "write_maintenance_exit_audit",
+            &error_value,
+            Some(previous_maintenance_id),
+            Some(snapshot.revision),
+            "transaction_rolled_back",
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error_value) = transaction.commit().await {
+        log_maintenance_failure(
+            "SystemMaintenanceCommitError",
+            "commit_maintenance_exit",
+            &error_value,
+            Some(previous_maintenance_id),
+            Some(snapshot.revision),
+            "database_state_unknown",
+        );
         return HttpResponse::InternalServerError().finish();
     }
     state.replace(snapshot.clone()).await;
@@ -573,7 +830,24 @@ pub async fn scanner_system_maintenance_probe(
             HttpResponse::Unauthorized().body("unauthorized")
         }
         Err(error_value) => {
-            error!(event = "SystemMaintenanceProbeError", message = %error_value);
+            let snapshot = state.snapshot().await;
+            let diagnostics = error_diagnostics(&error_value);
+            error!(
+                event = "SystemMaintenanceProbeError",
+                operation = "validate_scanner_for_maintenance_probe",
+                error_kind = "database",
+                error_code = "maintenance_probe_validation_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "request_failed",
+                scanner_id = %query.scannerid,
+                maintenance_id = ?snapshot.maintenance_id,
+                phase = ?snapshot.phase,
+                revision = snapshot.revision,
+            );
             HttpResponse::InternalServerError().finish()
         }
     }

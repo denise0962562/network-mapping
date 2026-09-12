@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use maxminddb::{Reader, geoip2};
 use serde::Serialize;
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::cli_progress::{NoopProgressReporter, ProgressReporter, ProgressUpdate};
 
@@ -239,7 +239,14 @@ fn lookup_asn(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<geoip2::Asn<'_>> {
     match result.decode::<geoip2::Asn>() {
         Ok(record) => record,
         Err(e) => {
-            error!(event = "MaxMindDecodeAsnError", ip = %ip, message = %e);
+            warn!(
+                event = "MaxMindDecodeAsnError",
+                operation = "decode_maxmind_asn",
+                reason = %e,
+                error_code = "maxmind_asn_decode_failed",
+                outcome = "asn_enrichment_omitted",
+                ip = %ip,
+            );
             None
         }
     }
@@ -250,7 +257,14 @@ fn lookup_city(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<geoip2::City<'_>>
     match result.decode::<geoip2::City>() {
         Ok(record) => record,
         Err(e) => {
-            error!(event = "MaxMindDecodeCityError", ip = %ip, message = %e);
+            warn!(
+                event = "MaxMindDecodeCityError",
+                operation = "decode_maxmind_city",
+                reason = %e,
+                error_code = "maxmind_city_decode_failed",
+                outcome = "city_enrichment_omitted",
+                ip = %ip,
+            );
             None
         }
     }
@@ -261,7 +275,14 @@ fn lookup_country(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<geoip2::Countr
     match result.decode::<geoip2::Country>() {
         Ok(record) => record,
         Err(e) => {
-            error!(event = "MaxMindDecodeCountryError", ip = %ip, message = %e);
+            warn!(
+                event = "MaxMindDecodeCountryError",
+                operation = "decode_maxmind_country",
+                reason = %e,
+                error_code = "maxmind_country_decode_failed",
+                outcome = "country_enrichment_omitted",
+                ip = %ip,
+            );
             None
         }
     }

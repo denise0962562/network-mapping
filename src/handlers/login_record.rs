@@ -13,9 +13,36 @@ use crate::admin::UserBaseI;
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
 use crate::client_ip::display_ip;
 use crate::get_unix_epoch_ms;
+use crate::logs::write::error_diagnostics;
 
 const DEFAULT_PAGE_SIZE: u32 = 10;
 const MAX_PAGE_SIZE: u32 = 50;
+
+fn log_login_record_error(
+    event: &'static str,
+    operation: &'static str,
+    error_value: &(dyn std::error::Error + 'static),
+    actor_id: i32,
+    target_user_id: i32,
+    page: Option<u32>,
+) {
+    let diagnostics = error_diagnostics(error_value);
+    error!(
+        event,
+        operation,
+        error_kind = "database",
+        error_code = %format!("{operation}_failed"),
+        error_message = %diagnostics.error_message,
+        error_chain = %diagnostics.error_chain,
+        root_cause = %diagnostics.root_cause,
+        error_truncated = diagnostics.error_truncated,
+        retryable = false,
+        outcome = "request_failed",
+        actor_id,
+        target_user_id,
+        page = ?page,
+    );
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -149,7 +176,14 @@ async fn list_login_records(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error_value) => {
-            error!(event = "LoginRecordPoolError", message = %error_value);
+            log_login_record_error(
+                "LoginRecordPoolError",
+                "acquire_login_record_connection",
+                &error_value,
+                actor.id,
+                target_id,
+                Some(page),
+            );
             return HttpResponse::InternalServerError()
                 .json(json!({"success": false, "message": "登录记录服务暂时不可用"}));
         }
@@ -166,7 +200,14 @@ async fn list_login_records(
     {
         Ok(row) => row.get::<_, i64>("total"),
         Err(error_value) => {
-            error!(event = "LoginRecordCountError", message = %error_value);
+            log_login_record_error(
+                "LoginRecordCountError",
+                "count_login_records",
+                &error_value,
+                actor.id,
+                target_id,
+                Some(page),
+            );
             return HttpResponse::InternalServerError()
                 .json(json!({"success": false, "message": "登录记录服务暂时不可用"}));
         }
@@ -187,7 +228,14 @@ async fn list_login_records(
     let rows = match client.query(&list_sql, &list_params).await {
         Ok(value) => value,
         Err(error_value) => {
-            error!(event = "LoginRecordQueryError", message = %error_value);
+            log_login_record_error(
+                "LoginRecordQueryError",
+                "list_login_records",
+                &error_value,
+                actor.id,
+                target_id,
+                Some(page),
+            );
             return HttpResponse::InternalServerError()
                 .json(json!({"success": false, "message": "登录记录服务暂时不可用"}));
         }
@@ -249,7 +297,14 @@ pub async fn admin_login_records(
     let client = match pool.get().await {
         Ok(value) => value,
         Err(error_value) => {
-            error!(event = "AdminLoginRecordPoolError", message = %error_value);
+            log_login_record_error(
+                "AdminLoginRecordPoolError",
+                "acquire_admin_login_record_connection",
+                &error_value,
+                user.id,
+                target_id,
+                None,
+            );
             return HttpResponse::InternalServerError()
                 .json(json!({"success": false, "message": "登录记录服务暂时不可用"}));
         }
@@ -267,7 +322,14 @@ pub async fn admin_login_records(
                 .json(json!({"success": false, "message": "用户不存在"}));
         }
         Err(error_value) => {
-            error!(event = "AdminLoginRecordTargetError", message = %error_value);
+            log_login_record_error(
+                "AdminLoginRecordTargetError",
+                "resolve_login_record_user",
+                &error_value,
+                user.id,
+                target_id,
+                None,
+            );
             return HttpResponse::InternalServerError()
                 .json(json!({"success": false, "message": "登录记录服务暂时不可用"}));
         }

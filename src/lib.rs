@@ -76,7 +76,7 @@ use db::get_sql_from_file;
 use elasticsearch::{
     DnsWriteMode, ElasticsearchService, ScanBatchContext, scan_batch_payload_checksum,
 };
-use logs::write::{database_error_diagnostics, error_chain_diagnostics};
+use logs::write::error_diagnostics;
 use maxmind::MaxMindState;
 
 //常量
@@ -212,7 +212,16 @@ pub fn get_unix_epoch_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as i64,
         Err(e) => {
-            error!(event = "UnixEpochGenerateError", message = e.to_string());
+            error!(
+                event = "UnixEpochGenerateError",
+                operation = "read_system_time",
+                error_kind = "system_clock",
+                error_code = "system_clock_before_unix_epoch",
+                error_message = %e,
+                retryable = false,
+                outcome = "sentinel_timestamp_returned",
+                fallback_timestamp_ms = -1_i64,
+            );
             -1_i64
         }
     }
@@ -420,11 +429,19 @@ impl DbResource {
                 let db_table_size = match db_table_size_sql {
                     Ok(sql) => get_db_table_size_byte(&o, &sql, &[]).await,
                     Err(e) => {
+                        let diagnostics = error_diagnostics(e.as_ref());
                         error!(
                             event = "DatabaseMetricsSqlLoadError",
                             operation = "load_table_size_query",
+                            error_kind = "filesystem",
+                            error_code = "database_metrics_sql_load_failed",
+                            error_message = %diagnostics.error_message,
+                            error_chain = %diagnostics.error_chain,
+                            root_cause = %diagnostics.root_cause,
+                            error_truncated = diagnostics.error_truncated,
+                            retryable = true,
+                            outcome = "table_metrics_unavailable",
                             sql_file = "get_table_size.sql",
-                            message = %error_chain_diagnostics(e.as_ref()),
                         );
                         BTreeMap::from([("error".to_owned(), DbTableSizeInfo::default())])
                     }
@@ -437,10 +454,18 @@ impl DbResource {
                 }
             }
             Err(e) => {
+                let diagnostics = error_diagnostics(&e);
                 error!(
                     event = "DatabaseMetricsPoolError",
                     operation = "acquire_metrics_connection",
-                    message = %error_chain_diagnostics(&e),
+                    error_kind = "database",
+                    error_code = "database_metrics_pool_failed",
+                    error_message = %diagnostics.error_message,
+                    error_chain = %diagnostics.error_chain,
+                    root_cause = %diagnostics.root_cause,
+                    error_truncated = diagnostics.error_truncated,
+                    retryable = true,
+                    outcome = "database_metrics_unavailable",
                 );
                 //返回默认值
                 DbResource::default()
@@ -732,7 +757,15 @@ fn parsing_target(ip: TargetIP) -> Result<Vec<IpNet>, AddrParseError> {
                 match parse_ip_or_cidr(tmp) {
                     Ok(o) => n_v.push(o),
                     Err(e) => {
-                        error!(event = "PARSING-ERROR", message = e.to_string());
+                        error!(
+                            event = "ScanTargetParseError",
+                            operation = "parse_scan_target",
+                            error_kind = "validation",
+                            error_code = "scan_target_parse_failed",
+                            error_message = %e,
+                            retryable = false,
+                            outcome = "task_validation_failed",
+                        );
                         return Err(e);
                     }
                 }
@@ -753,7 +786,15 @@ fn check_port(port: &str) -> bool {
     match re {
         Ok(o) => o.is_match(port),
         Err(e) => {
-            error!(event = "REGEX-ERROR", message = e.to_string());
+            error!(
+                event = "PortValidationRegexError",
+                operation = "compile_port_validation_regex",
+                error_kind = "configuration",
+                error_code = "port_validation_regex_compile_failed",
+                error_message = %e,
+                retryable = false,
+                outcome = "port_validation_failed_closed",
+            );
             false
         }
     }
@@ -974,10 +1015,21 @@ async fn get_db_table_size_byte(
             // }
         }
         Err(e) => {
+            let diagnostics = error_diagnostics(&e);
+            let database = diagnostics.database.as_ref();
             error!(
                 event = "DatabaseMetricsQueryError",
                 operation = "query_table_sizes",
-                message = %database_error_diagnostics(&e),
+                error_kind = "database",
+                error_code = "database_table_metrics_query_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "table_metrics_unavailable",
+                sqlstate = ?database.map(|value| value.sqlstate.as_str()),
+                db_constraint = ?database.and_then(|value| value.constraint.as_deref()),
             );
             vec![("error".to_string(), DbTableSizeInfo::default())]
                 .into_iter()
@@ -1007,11 +1059,21 @@ async fn get_db_library_size_byte(
             "null".to_string()
         }
         Err(error_value) => {
+            let diagnostics = error_diagnostics(&error_value);
+            let database = diagnostics.database.as_ref();
             error!(
                 event = "DatabaseMetricsQueryError",
                 operation = "query_database_size",
-                database = db_name,
-                message = %database_error_diagnostics(&error_value),
+                error_kind = "database",
+                error_code = "database_size_query_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "database_size_metric_unavailable",
+                sqlstate = ?database.map(|value| value.sqlstate.as_str()),
+                db_constraint = ?database.and_then(|value| value.constraint.as_deref()),
             );
             "null".to_string()
         }
@@ -1038,10 +1100,21 @@ async fn get_db_conn(
             "null".to_string()
         }
         Err(error_value) => {
+            let diagnostics = error_diagnostics(&error_value);
+            let database = diagnostics.database.as_ref();
             error!(
                 event = "DatabaseMetricsQueryError",
                 operation = "query_connection_count",
-                message = %database_error_diagnostics(&error_value),
+                error_kind = "database",
+                error_code = "database_connection_count_query_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = true,
+                outcome = "connection_count_metric_unavailable",
+                sqlstate = ?database.map(|value| value.sqlstate.as_str()),
+                db_constraint = ?database.and_then(|value| value.constraint.as_deref()),
             );
             "null".to_string()
         }
@@ -1131,8 +1204,12 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         Err(e) => {
             error!(
                 event = "ParsedHashError",
-                path = "",
-                message = %e
+                operation = "parse_password_hash",
+                error_kind = "credential_storage",
+                error_code = "stored_password_hash_invalid",
+                error_message = %e,
+                retryable = false,
+                outcome = "authentication_failed_closed",
             );
             println!("verify_pwd_e {:>6}", start.elapsed().as_millis());
             false
@@ -1171,8 +1248,16 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
     //在初始化模板时必须用相对路径
     let tera = match Tera::new(&templates.templates_directory) {
         Ok(t) => t,
-        Err(_) => {
-            error!("tera模板系统初始化错误");
+        Err(e) => {
+            error!(
+                event = "FrontendTemplateInitializationError",
+                operation = "initialize_frontend_templates",
+                error_kind = "template",
+                error_code = "frontend_template_initialization_failed",
+                error_message = %e,
+                retryable = false,
+                outcome = "process_panicking",
+            );
             panic!("tera初始化错误");
         }
     };
@@ -1186,7 +1271,16 @@ fn front_end_error_page(info: &FrontEndErrorInfo, templates: &TemplatesInit) -> 
     match tera.render(&templates.templates_name, &context) {
         Ok(body) => body,
         Err(e) => {
-            error!("Render error: {}", e);
+            error!(
+                event = "FrontendErrorPageRenderError",
+                operation = "render_frontend_error_page",
+                error_kind = "template",
+                error_code = "frontend_error_page_render_failed",
+                error_message = %e,
+                retryable = false,
+                outcome = "fallback_error_page_returned",
+                http_status = info.status_code,
+            );
             eprintln!("Render error: {}", e);
             "<h1>系统故障</h1><p>故障组件：模板系统</p>".to_string()
         }
@@ -1393,7 +1487,12 @@ pub fn get_user_agent(req: &HttpRequest) -> String {
             }
         },
         None => {
-            error!(event = "GetHTTPHeadersError", message = "无法获取到请求头");
+            warn!(
+                event = "UserAgentMissing",
+                operation = "read_user_agent_header",
+                reason = "request has no User-Agent header",
+                outcome = "unknown_user_agent_used",
+            );
             "Unknown".to_string()
         }
     }
@@ -1509,11 +1608,52 @@ struct NormalizedObservation {
 pub enum SaveScannerResultsError {
     Database(Box<dyn std::error::Error + Send + Sync>),
     Storage(String),
-    BatchBusy { retry_after_seconds: u64 },
-    InvalidIp { ip: String, source: AddrParseError },
+    BatchBusy {
+        retry_after_seconds: u64,
+    },
+    InvalidIp {
+        ip: String,
+        source: AddrParseError,
+    },
     ScannerUnauthorized,
     TaskNotFound,
     TaskNotOwned,
+    UnsupportedProtocolVersion {
+        received: u16,
+    },
+    InvalidBatchEnvelope {
+        protocol_version: u16,
+        reason: &'static str,
+    },
+    UploadIdentityConflict {
+        execution_id: i32,
+        received_upload_id: String,
+        conflicting_upload_id: String,
+        conflicting_upload_count: i64,
+    },
+    BatchPayloadConflict {
+        execution_id: i32,
+        upload_id: String,
+        batch_index: i32,
+        content_kind: &'static str,
+        expected_checksum: Option<String>,
+        received_checksum: String,
+    },
+    NonContiguousFinalBatch {
+        execution_id: i32,
+        upload_id: String,
+        batch_index: i32,
+        content_kind: &'static str,
+    },
+    CompletedExecutionNewBatch {
+        execution_id: i32,
+        upload_id: String,
+        batch_index: i32,
+    },
+    ObservationLimitExceeded {
+        actual: usize,
+        limit: usize,
+    },
     InvalidUpload(String),
 }
 
@@ -1595,7 +1735,153 @@ impl fmt::Display for SaveScannerResultsError {
             Self::ScannerUnauthorized => write!(f, "扫描器认证失败"),
             Self::TaskNotFound => write!(f, "任务不存在"),
             Self::TaskNotOwned => write!(f, "任务不属于当前扫描器或租约已失效"),
+            Self::UnsupportedProtocolVersion { received } => {
+                write!(
+                    f,
+                    "无效扫描结果上传: unsupported protocol_version {received}"
+                )
+            }
+            Self::InvalidBatchEnvelope { reason, .. } => {
+                write!(f, "无效扫描结果上传: {reason}")
+            }
+            Self::UploadIdentityConflict { .. } => write!(
+                f,
+                "无效扫描结果上传: an execution cannot contain batches from multiple upload_id values"
+            ),
+            Self::BatchPayloadConflict { content_kind, .. } => write!(
+                f,
+                "无效扫描结果上传: batch identity was already used with different {content_kind} content"
+            ),
+            Self::NonContiguousFinalBatch { content_kind, .. } => write!(
+                f,
+                "无效扫描结果上传: final {content_kind} batch requires one contiguous sequence starting at batch_index 0"
+            ),
+            Self::CompletedExecutionNewBatch { .. } => write!(
+                f,
+                "无效扫描结果上传: completed execution cannot accept a new batch"
+            ),
+            Self::ObservationLimitExceeded { actual, limit } => write!(
+                f,
+                "无效扫描结果上传: observation count {actual} exceeds limit {limit}"
+            ),
             Self::InvalidUpload(message) => write!(f, "无效扫描结果上传: {message}"),
+        }
+    }
+}
+
+impl SaveScannerResultsError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "database",
+            Self::Storage(_) => "storage",
+            Self::BatchBusy { .. } => "concurrency",
+            Self::ScannerUnauthorized => "authentication",
+            Self::TaskNotFound | Self::TaskNotOwned => "task_state",
+            Self::InvalidIp { .. }
+            | Self::UnsupportedProtocolVersion { .. }
+            | Self::InvalidBatchEnvelope { .. }
+            | Self::UploadIdentityConflict { .. }
+            | Self::BatchPayloadConflict { .. }
+            | Self::NonContiguousFinalBatch { .. }
+            | Self::CompletedExecutionNewBatch { .. }
+            | Self::ObservationLimitExceeded { .. }
+            | Self::InvalidUpload(_) => "validation",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "scan_result_database_operation_failed",
+            Self::Storage(_) => "scan_result_storage_operation_failed",
+            Self::BatchBusy { .. } => "scan_result_batch_busy",
+            Self::InvalidIp { .. } => "invalid_observation_ip",
+            Self::ScannerUnauthorized => "scanner_unauthorized",
+            Self::TaskNotFound => "scan_task_not_found",
+            Self::TaskNotOwned => "scan_task_not_owned",
+            Self::UnsupportedProtocolVersion { .. } => "unsupported_protocol_version",
+            Self::InvalidBatchEnvelope { .. } => "invalid_batch_envelope",
+            Self::UploadIdentityConflict { .. } => "execution_upload_id_conflict",
+            Self::BatchPayloadConflict { .. } => "batch_payload_conflict",
+            Self::NonContiguousFinalBatch { .. } => "non_contiguous_final_batch",
+            Self::CompletedExecutionNewBatch { .. } => "completed_execution_new_batch",
+            Self::ObservationLimitExceeded { .. } => "observation_limit_exceeded",
+            Self::InvalidUpload(_) => "invalid_scan_result_upload",
+        }
+    }
+
+    pub fn operation(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "persist_scan_result_database_state",
+            Self::Storage(_) => "persist_scan_result_elasticsearch_data",
+            Self::BatchBusy { .. } => "claim_scan_result_batch",
+            Self::InvalidIp { .. } => "normalize_scan_observation",
+            Self::ScannerUnauthorized => "authenticate_scanner",
+            Self::TaskNotFound | Self::TaskNotOwned => "validate_scan_task_lease",
+            Self::UnsupportedProtocolVersion { .. } | Self::InvalidBatchEnvelope { .. } => {
+                "validate_scan_result_envelope"
+            }
+            Self::UploadIdentityConflict { .. } => "validate_execution_upload_identity",
+            Self::BatchPayloadConflict { .. } => "validate_scan_result_batch_identity",
+            Self::NonContiguousFinalBatch { .. } => "validate_scan_result_batch_sequence",
+            Self::CompletedExecutionNewBatch { .. } => "validate_execution_state",
+            Self::ObservationLimitExceeded { .. } | Self::InvalidUpload(_) => {
+                "validate_scan_result_payload"
+            }
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::Storage(_) | Self::BatchBusy { .. })
+    }
+
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::InvalidIp { .. }
+            | Self::UnsupportedProtocolVersion { .. }
+            | Self::InvalidBatchEnvelope { .. }
+            | Self::UploadIdentityConflict { .. }
+            | Self::BatchPayloadConflict { .. }
+            | Self::NonContiguousFinalBatch { .. }
+            | Self::CompletedExecutionNewBatch { .. }
+            | Self::ObservationLimitExceeded { .. }
+            | Self::InvalidUpload(_) => 400,
+            Self::ScannerUnauthorized => 401,
+            Self::TaskNotFound => 404,
+            Self::TaskNotOwned => 409,
+            Self::Database(_) => 500,
+            Self::Storage(_) | Self::BatchBusy { .. } => 503,
+        }
+    }
+
+    pub fn execution_id(&self) -> Option<i32> {
+        match self {
+            Self::UploadIdentityConflict { execution_id, .. }
+            | Self::BatchPayloadConflict { execution_id, .. }
+            | Self::NonContiguousFinalBatch { execution_id, .. }
+            | Self::CompletedExecutionNewBatch { execution_id, .. } => Some(*execution_id),
+            _ => None,
+        }
+    }
+
+    pub fn conflicting_upload(&self) -> Option<(&str, i64)> {
+        match self {
+            Self::UploadIdentityConflict {
+                conflicting_upload_id,
+                conflicting_upload_count,
+                ..
+            } => Some((conflicting_upload_id, *conflicting_upload_count)),
+            _ => None,
+        }
+    }
+
+    pub fn batch_conflict_checksums(&self) -> Option<(Option<&str>, &str)> {
+        match self {
+            Self::BatchPayloadConflict {
+                expected_checksum,
+                received_checksum,
+                ..
+            } => Some((expected_checksum.as_deref(), received_checksum)),
+            _ => None,
         }
     }
 }
@@ -1609,8 +1895,50 @@ impl std::error::Error for SaveScannerResultsError {
             Self::ScannerUnauthorized
             | Self::TaskNotFound
             | Self::TaskNotOwned
+            | Self::UnsupportedProtocolVersion { .. }
+            | Self::InvalidBatchEnvelope { .. }
+            | Self::UploadIdentityConflict { .. }
+            | Self::BatchPayloadConflict { .. }
+            | Self::NonContiguousFinalBatch { .. }
+            | Self::CompletedExecutionNewBatch { .. }
+            | Self::ObservationLimitExceeded { .. }
             | Self::InvalidUpload(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod save_scanner_results_error_tests {
+    use super::SaveScannerResultsError;
+
+    #[test]
+    fn upload_identity_conflict_has_stable_diagnostics() {
+        let error = SaveScannerResultsError::UploadIdentityConflict {
+            execution_id: 17,
+            received_upload_id: "received".into(),
+            conflicting_upload_id: "existing".into(),
+            conflicting_upload_count: 2,
+        };
+        assert_eq!(error.kind(), "validation");
+        assert_eq!(error.code(), "execution_upload_id_conflict");
+        assert_eq!(error.operation(), "validate_execution_upload_identity");
+        assert_eq!(error.http_status(), 400);
+        assert!(!error.retryable());
+        assert_eq!(error.execution_id(), Some(17));
+        assert_eq!(error.conflicting_upload(), Some(("existing", 2)));
+        assert!(error.to_string().contains("multiple upload_id values"));
+    }
+
+    #[test]
+    fn busy_and_storage_errors_are_retryable() {
+        let busy = SaveScannerResultsError::BatchBusy {
+            retry_after_seconds: 3,
+        };
+        let storage = SaveScannerResultsError::Storage("temporarily unavailable".into());
+        assert!(busy.retryable());
+        assert!(storage.retryable());
+        assert_eq!(busy.http_status(), 503);
+        assert_eq!(storage.http_status(), 503);
     }
 }
 
@@ -1941,6 +2269,61 @@ fn valid_vulnerability_data(data: Option<&Value>) -> bool {
         && string_array("extracted_results", 64, 2_048)
 }
 
+// DNS storage uses a deterministic child identity, while the scanner's original
+// identity owns the contiguous batch sequence and execution completion.
+fn dns_sidecar_upload_id(upload_id: Uuid) -> Uuid {
+    let digest = openssl::sha::sha256(format!("dns-observations:{upload_id}").as_bytes());
+    Uuid::from_slice(&digest[..16]).expect("SHA-256 prefix has UUID length")
+}
+
+async fn validate_execution_upload_ids(
+    transaction: &tokio_postgres::Transaction<'_>,
+    execution_id: i32,
+    upload_ids: &[String],
+) -> Result<(), SaveScannerResultsError> {
+    let conflict = transaction
+        .query_one(
+            "SELECT COUNT(DISTINCT upload_id)::BIGINT AS conflicting_count, \
+                    MIN(upload_id) AS conflicting_upload_id \
+             FROM scan_result_batch \
+             WHERE execution_id = $1 AND NOT (upload_id = ANY($2::TEXT[]));",
+            &[&execution_id, &upload_ids],
+        )
+        .await
+        .map_err(scanner_result_database_error)?;
+    let conflicting_upload_count: i64 = conflict.get("conflicting_count");
+    if let Some(conflicting_upload_id) = conflict.get("conflicting_upload_id") {
+        return Err(SaveScannerResultsError::UploadIdentityConflict {
+            execution_id,
+            received_upload_id: upload_ids.first().cloned().unwrap_or_default(),
+            conflicting_upload_id,
+            conflicting_upload_count,
+        });
+    }
+    Ok(())
+}
+
+fn dns_batch_payload_checksum(
+    execution_id: &str,
+    upload_id: &str,
+    batch_index: i32,
+    is_final: bool,
+    observations: &[&dns::DnsObservation],
+) -> Result<String, SaveScannerResultsError> {
+    let content = serde_json::to_vec(&serde_json::json!({
+        "execution_id": execution_id,
+        "upload_id": upload_id,
+        "batch_index": batch_index,
+        "is_final": is_final,
+        "observations": observations,
+    }))
+    .map_err(scanner_result_database_error)?;
+    Ok(openssl::sha::sha256(&content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 async fn save_dns_scanner_results(
     pool: &deadpool_postgres::Pool,
     elasticsearch: &ElasticsearchService,
@@ -1948,20 +2331,28 @@ async fn save_dns_scanner_results(
     upload: &ScannerResultUpload,
     token: &str,
     token_pepper: &str,
-    observations: Vec<dns::DnsObservation>,
+    parent_upload_id: Option<Uuid>,
 ) -> Result<usize, SaveScannerResultsError> {
     if !elasticsearch.enabled() {
         return Err(SaveScannerResultsError::Storage(
             "DNS observations require elasticsearch.enabled=true".into(),
         ));
     }
-    let observations = observations
-        .into_iter()
-        .map(dns::DnsObservation::normalize)
+    let observations = upload
+        .observations
+        .iter()
+        .map(|item| match item {
+            ScannerObservation::Dns { observation } => observation.clone().normalize(),
+            _ => Err("a DNS upload batch may contain only DNS observations".to_owned()),
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(SaveScannerResultsError::InvalidUpload)?;
-    let observation_count = i32::try_from(observations.len())
-        .map_err(|_| SaveScannerResultsError::InvalidUpload("too many DNS observations".into()))?;
+    let observation_count = i32::try_from(observations.len()).map_err(|_| {
+        SaveScannerResultsError::ObservationLimitExceeded {
+            actual: observations.len(),
+            limit: i32::MAX as usize,
+        }
+    })?;
     let upload_id = upload
         .upload_id
         .expect("protocol v2 upload ID was validated")
@@ -2015,6 +2406,13 @@ async fn save_dns_scanner_results(
 
     let task_db_id: i32 = task.get("task_id");
     let execution_db_id: i32 = task.get("execution_id");
+    let mut allowed_upload_ids = vec![upload_id.clone()];
+    if let Some(parent) = parent_upload_id {
+        debug_assert_eq!(upload.upload_id, Some(dns_sidecar_upload_id(parent)));
+        debug_assert!(!is_final);
+        allowed_upload_ids.push(parent.to_string());
+    }
+    validate_execution_upload_ids(&transaction, execution_db_id, &allowed_upload_ids).await?;
     let context = ScanBatchContext {
         task_id: upload.task_id.to_string(),
         execution_id: task.get("public_execution_id"),
@@ -2032,19 +2430,13 @@ async fn save_dns_scanner_results(
         .and_then(|metadata| metadata.pointer("/dns_follow_up/enabled"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let payload_checksum = openssl::sha::sha256(
-        &serde_json::to_vec(&serde_json::json!({
-            "execution_id": context.execution_id,
-            "upload_id": upload_id,
-            "batch_index": batch_index,
-            "is_final": is_final,
-            "observations": observations,
-        }))
-        .map_err(scanner_result_database_error)?,
-    )
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect::<String>();
+    let payload_checksum = dns_batch_payload_checksum(
+        &context.execution_id,
+        &upload_id,
+        batch_index,
+        is_final,
+        &observations.iter().collect::<Vec<_>>(),
+    )?;
     if is_final {
         let sequence = transaction
             .query_one(
@@ -2080,9 +2472,12 @@ async fn save_dns_scanner_results(
             || sequence.get::<_, i64>("later_count") != 0
             || !existing_final_valid
         {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "final DNS batch requires one contiguous sequence starting at batch_index 0".into(),
-            ));
+            return Err(SaveScannerResultsError::NonContiguousFinalBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "DNS",
+            });
         }
     }
     let write_token = Uuid::new_v4();
@@ -2095,16 +2490,19 @@ async fn save_dns_scanner_results(
         .await
         .map_err(scanner_result_database_error)?
     {
+        let existing_checksum: Option<String> = existing.get("payload_checksum");
         let matches = existing.get::<_, bool>("is_final") == is_final
             && existing.get::<_, i32>("observation_count") == observation_count
-            && existing
-                .get::<_, Option<String>>("payload_checksum")
-                .as_deref()
-                == Some(payload_checksum.as_str());
+            && existing_checksum.as_deref() == Some(payload_checksum.as_str());
         if !matches {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "batch identity was already used with different content".into(),
-            ));
+            return Err(SaveScannerResultsError::BatchPayloadConflict {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "DNS",
+                expected_checksum: existing_checksum,
+                received_checksum: payload_checksum.clone(),
+            });
         }
         if existing.get::<_, String>("storage_backend") != "pending" {
             transaction
@@ -2156,7 +2554,11 @@ async fn save_dns_scanner_results(
         )
     } else {
         if already_succeeded {
-            return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+            return Err(SaveScannerResultsError::CompletedExecutionNewBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+            });
         }
         let write_attempts = transaction
             .query_one(
@@ -2659,26 +3061,32 @@ pub async fn save_scanner_results(
 ) -> Result<usize, SaveScannerResultsError> {
     let is_typed = matches!(upload.protocol_version, 2 | 3);
     if upload.protocol_version != 1 && !is_typed {
-        return Err(SaveScannerResultsError::InvalidUpload(format!(
-            "unsupported protocol_version {}",
-            upload.protocol_version
-        )));
+        return Err(SaveScannerResultsError::UnsupportedProtocolVersion {
+            received: upload.protocol_version,
+        });
     }
     if is_typed
         && (upload.upload_id.is_none()
             || upload.batch_index.is_none()
             || upload.is_final.is_none()
-            || !upload.results.is_empty()
-            || upload.observations.len() > 500)
+            || !upload.results.is_empty())
     {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "typed result protocols require upload_id, batch_index and is_final, accept only observations, and limit each batch to 500 observations".into(),
-        ));
+        return Err(SaveScannerResultsError::InvalidBatchEnvelope {
+            protocol_version: upload.protocol_version,
+            reason: "typed result protocols require upload_id, batch_index and is_final, accept only observations, and limit each batch to 500 observations",
+        });
+    }
+    if is_typed && upload.observations.len() > 500 {
+        return Err(SaveScannerResultsError::ObservationLimitExceeded {
+            actual: upload.observations.len(),
+            limit: 500,
+        });
     }
     if !is_typed && !upload.observations.is_empty() {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "typed observations require protocol_version 2 or 3".into(),
-        ));
+        return Err(SaveScannerResultsError::InvalidBatchEnvelope {
+            protocol_version: upload.protocol_version,
+            reason: "typed observations require protocol_version 2 or 3",
+        });
     }
     if upload.protocol_version == 2
         && upload
@@ -2686,113 +3094,62 @@ pub async fn save_scanner_results(
             .iter()
             .any(|item| matches!(item, ScannerObservation::Vulnerability { .. }))
     {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "vulnerability observations require protocol_version 3".into(),
+        return Err(SaveScannerResultsError::InvalidBatchEnvelope {
+            protocol_version: upload.protocol_version,
+            reason: "vulnerability observations require protocol_version 3",
+        });
+    }
+
+    let mut regular_upload = upload.clone();
+    regular_upload
+        .observations
+        .retain(|item| !matches!(item, ScannerObservation::Dns { .. }));
+    let mut dns_upload = upload.clone();
+    dns_upload
+        .observations
+        .retain(|item| matches!(item, ScannerObservation::Dns { .. }));
+    // Route DNS-only tasks by their persisted profile, not by this batch's
+    // contents: a dns_full upload can start or end with a DNS-only batch.
+    if is_typed && regular_upload.observations.is_empty() {
+        let client = pool.get().await.map_err(scanner_result_database_error)?;
+        let dns_only = client
+            .query_opt(
+                "SELECT scan_profile FROM scan_task WHERE task_id = $1;",
+                &[&upload.task_id.to_string()],
+            )
+            .await
+            .map_err(scanner_result_database_error)?
+            .is_some_and(|row| row.get::<_, String>("scan_profile") == "dns_records");
+        drop(client);
+        if dns_only {
+            return save_dns_scanner_results(
+                pool,
+                elasticsearch,
+                dns_follow_up,
+                upload,
+                token,
+                token_pepper,
+                None,
+            )
+            .await;
+        }
+    }
+    let normalized_observations = normalize_upload_observations(&regular_upload)?;
+    // Normalize before reserving a primary receipt, so invalid DNS cannot leave
+    // a permanently pending batch behind.
+    for item in &mut dns_upload.observations {
+        if let ScannerObservation::Dns { observation } = item {
+            *observation = observation
+                .clone()
+                .normalize()
+                .map_err(SaveScannerResultsError::InvalidUpload)?;
+        }
+    }
+    if !dns_upload.observations.is_empty() && !elasticsearch.enabled() {
+        return Err(SaveScannerResultsError::Storage(
+            "DNS observations require elasticsearch.enabled=true".into(),
         ));
     }
-
-    if is_typed
-        && upload
-            .observations
-            .iter()
-            .any(|item| matches!(item, ScannerObservation::Dns { .. }))
-    {
-        let contains_non_dns = upload
-            .observations
-            .iter()
-            .any(|item| !matches!(item, ScannerObservation::Dns { .. }));
-        if contains_non_dns {
-            let mut dns_upload = upload.clone();
-            let upload_id = upload
-                .upload_id
-                .expect("protocol v2 upload ID was validated");
-            let dns_upload_id =
-                openssl::sha::sha256(format!("dns-observations:{upload_id}").as_bytes());
-            dns_upload.upload_id = Some(
-                Uuid::from_slice(&dns_upload_id[..16])
-                    .expect("a SHA-256 prefix always has a UUID-compatible length"),
-            );
-            dns_upload.batch_index = upload.batch_index;
-            dns_upload.is_final = Some(false);
-            dns_upload.observations = upload
-                .observations
-                .iter()
-                .filter(|item| matches!(item, ScannerObservation::Dns { .. }))
-                .cloned()
-                .collect();
-            let dns_observations = dns_upload
-                .observations
-                .iter()
-                .map(|item| match item {
-                    ScannerObservation::Dns { observation } => Ok(observation.clone()),
-                    _ => Err(SaveScannerResultsError::InvalidUpload(
-                        "a DNS upload batch may contain only DNS observations".into(),
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let dns_count = save_dns_scanner_results(
-                pool,
-                elasticsearch,
-                dns_follow_up,
-                &dns_upload,
-                token,
-                token_pepper,
-                dns_observations,
-            )
-            .await?;
-
-            let mut regular_upload = upload.clone();
-            regular_upload.observations = upload
-                .observations
-                .iter()
-                .filter(|item| !matches!(item, ScannerObservation::Dns { .. }))
-                .cloned()
-                .collect();
-            let regular_count = Box::pin(save_scanner_results(
-                pool,
-                maxmind,
-                elasticsearch,
-                dns_follow_up,
-                &regular_upload,
-                token,
-                token_pepper,
-            ))
-            .await?;
-            return Ok(dns_count.saturating_add(regular_count));
-        }
-        if !upload.results.is_empty()
-            || upload
-                .observations
-                .iter()
-                .any(|item| !matches!(item, ScannerObservation::Dns { .. }))
-        {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "a DNS upload batch may contain only DNS observations".into(),
-            ));
-        }
-        let dns_observations = upload
-            .observations
-            .iter()
-            .map(|item| match item {
-                ScannerObservation::Dns { observation } => Ok(observation.clone()),
-                _ => Err(SaveScannerResultsError::InvalidUpload(
-                    "a DNS upload batch may contain only DNS observations".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        return save_dns_scanner_results(
-            pool,
-            elasticsearch,
-            dns_follow_up,
-            upload,
-            token,
-            token_pepper,
-            dns_observations,
-        )
-        .await;
-    }
-
-    let normalized_observations = normalize_upload_observations(upload)?;
 
     let mut client = pool.get().await.map_err(scanner_result_database_error)?;
     let transaction = client
@@ -2876,19 +3233,58 @@ pub async fn save_scanner_results(
         batch_index,
         is_final,
     };
-    let conflicting_uploads: i64 = transaction
-        .query_one(
-            "SELECT COUNT(*)::BIGINT AS count FROM scan_result_batch \
-             WHERE execution_id = $1 AND upload_id <> $2;",
-            &[&execution_db_id, &upload_id],
-        )
-        .await
-        .map_err(scanner_result_database_error)?
-        .get("count");
-    if conflicting_uploads > 0 {
-        return Err(SaveScannerResultsError::InvalidUpload(
-            "an execution cannot contain batches from multiple upload_id values".into(),
-        ));
+    let sidecar_upload_id = if is_typed {
+        upload.upload_id.map(dns_sidecar_upload_id)
+    } else {
+        None
+    };
+    let sidecar_identity = sidecar_upload_id.map(|id| id.to_string());
+    let mut allowed_upload_ids = vec![upload_id.clone()];
+    allowed_upload_ids.extend(sidecar_identity.iter().cloned());
+    validate_execution_upload_ids(&transaction, execution_db_id, &allowed_upload_ids).await?;
+    // Older servers may have committed the DNS child before creating the primary
+    // receipt. Validate that child first so a changed retry cannot reserve (and
+    // poison) the primary identity or silently drop already persisted DNS data.
+    if let Some(sidecar) = &sidecar_identity
+        && let Some(existing) = transaction
+            .query_opt(
+                "SELECT is_final, observation_count, payload_checksum FROM scan_result_batch \
+             WHERE execution_id = $1 AND upload_id = $2 AND batch_index = $3;",
+                &[&execution_db_id, sidecar, &batch_index],
+            )
+            .await
+            .map_err(scanner_result_database_error)?
+    {
+        let observations = dns_upload
+            .observations
+            .iter()
+            .filter_map(|item| match item {
+                ScannerObservation::Dns { observation } => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected = dns_batch_payload_checksum(
+            &public_execution_id,
+            sidecar,
+            batch_index,
+            false,
+            &observations,
+        )?;
+        let existing_checksum: Option<String> = existing.get("payload_checksum");
+        if observations.is_empty()
+            || existing.get::<_, bool>("is_final")
+            || existing.get::<_, i32>("observation_count") as usize != observations.len()
+            || existing_checksum.as_deref() != Some(expected.as_str())
+        {
+            return Err(SaveScannerResultsError::BatchPayloadConflict {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "DNS",
+                expected_checksum: existing_checksum,
+                received_checksum: expected,
+            });
+        }
     }
     if is_final {
         let sequence = transaction
@@ -2923,13 +3319,19 @@ pub async fn save_scanner_results(
             None => final_count == 0,
         };
         if !prior_sequence_valid || later_count != 0 || !existing_final_valid {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "final batch requires one contiguous sequence starting at batch_index 0".into(),
-            ));
+            return Err(SaveScannerResultsError::NonContiguousFinalBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "scan result",
+            });
         }
     }
     let observation_count = i32::try_from(normalized_observations.len()).map_err(|_| {
-        SaveScannerResultsError::InvalidUpload("too many observations in one upload".into())
+        SaveScannerResultsError::ObservationLimitExceeded {
+            actual: normalized_observations.len(),
+            limit: i32::MAX as usize,
+        }
     })?;
     let protocol_version = i16::try_from(upload.protocol_version).expect("validated above");
     let mut observation_rows = Vec::with_capacity(normalized_observations.len());
@@ -3069,8 +3471,24 @@ pub async fn save_scanner_results(
     }
     let storage_backend = "elasticsearch";
     let (transaction, es_execution_summary) = {
-        let expected_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
+        let es_checksum = scan_batch_payload_checksum(&batch_context, &observation_rows)
             .map_err(SaveScannerResultsError::Storage)?;
+        let expected_checksum = if dns_upload.observations.is_empty() {
+            es_checksum.clone()
+        } else {
+            let content = serde_json::to_vec(&serde_json::json!({
+                "endpoint_checksum": es_checksum,
+                "dns_observations": dns_upload.observations.iter().filter_map(|item| match item {
+                    ScannerObservation::Dns { observation } => Some(observation),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+            }))
+            .map_err(scanner_result_database_error)?;
+            openssl::sha::sha256(&content)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
         if let Some(existing) = transaction
             .query_opt(
                 "SELECT is_final, observation_count, payload_checksum, storage_backend FROM scan_result_batch \
@@ -3087,9 +3505,14 @@ pub async fn save_scanner_results(
                     .as_deref()
                     .is_none_or(|checksum| checksum != expected_checksum)
             {
-                return Err(SaveScannerResultsError::InvalidUpload(
-                    "batch identity was already used with different content".into(),
-                ));
+                return Err(SaveScannerResultsError::BatchPayloadConflict {
+                    execution_id: execution_db_id,
+                    upload_id: upload_id.clone(),
+                    batch_index,
+                    content_kind: "scan result",
+                    expected_checksum: existing_checksum,
+                    received_checksum: expected_checksum.clone(),
+                });
             }
             if existing.get::<_, String>("storage_backend") != "pending" {
                 transaction
@@ -3105,7 +3528,11 @@ pub async fn save_scanner_results(
             }
         } else {
             if already_succeeded {
-                return Err(SaveScannerResultsError::InvalidUpload("completed execution cannot accept a new batch".into()));
+                return Err(SaveScannerResultsError::CompletedExecutionNewBatch {
+                    execution_id: execution_db_id,
+                    upload_id: upload_id.clone(),
+                    batch_index,
+                });
             }
             transaction
                 .execute(
@@ -3131,11 +3558,25 @@ pub async fn save_scanner_results(
             .await
             .map_err(scanner_result_database_error)?;
         drop(client);
+        if !dns_upload.observations.is_empty() {
+            dns_upload.upload_id = sidecar_upload_id;
+            dns_upload.is_final = Some(false);
+            save_dns_scanner_results(
+                pool,
+                elasticsearch,
+                dns_follow_up,
+                &dns_upload,
+                token,
+                token_pepper,
+                upload.upload_id,
+            )
+            .await?;
+        }
         let result = elasticsearch
             .persist_scan_batch(&batch_context, &observation_rows)
             .await
             .map_err(SaveScannerResultsError::Storage)?;
-        debug_assert_eq!(result.payload_checksum, expected_checksum);
+        debug_assert_eq!(result.payload_checksum, es_checksum);
         let storage_references =
             Value::Array(result.indices.into_iter().map(Value::String).collect());
         client = pool.get().await.map_err(scanner_result_database_error)?;
@@ -3188,7 +3629,7 @@ pub async fn save_scanner_results(
         };
         (transaction, result.execution_summary)
     };
-    let saved = normalized_observations.len();
+    let saved = normalized_observations.len() + dns_upload.observations.len();
 
     if !is_typed || upload.is_final == Some(true) {
         let batch_sequence = transaction
@@ -3210,9 +3651,12 @@ pub async fn save_scanner_results(
             || count != i64::from(batch_index) + 1
             || final_count != 1
         {
-            return Err(SaveScannerResultsError::InvalidUpload(
-                "final batch requires one contiguous sequence starting at batch_index 0".into(),
-            ));
+            return Err(SaveScannerResultsError::NonContiguousFinalBatch {
+                execution_id: execution_db_id,
+                upload_id: upload_id.clone(),
+                batch_index,
+                content_kind: "scan result",
+            });
         }
         let execution_summary = {
             es_execution_summary.ok_or_else(|| {
@@ -3221,6 +3665,22 @@ pub async fn save_scanner_results(
                 )
             })?
         };
+        let dns_summary = transaction.query_one(
+            "SELECT COALESCE(SUM(d.observation_count), 0)::BIGINT AS count, \
+             COUNT(*) FILTER (WHERE d.storage_backend = 'pending' OR d.is_final \
+                 OR p.id IS NULL OR p.storage_backend = 'pending')::BIGINT AS incomplete \
+             FROM scan_result_batch d LEFT JOIN scan_result_batch p \
+                 ON p.execution_id = d.execution_id AND p.upload_id = $3 AND p.batch_index = d.batch_index \
+             WHERE d.execution_id = $1 AND d.upload_id = $2;",
+            &[&execution_db_id, &sidecar_identity, &upload_id],
+        ).await.map_err(scanner_result_database_error)?;
+        if dns_summary.get::<_, i64>("incomplete") != 0 {
+            return Err(SaveScannerResultsError::InvalidUpload(
+                "final batch requires completed DNS children with matching primary batches".into(),
+            ));
+        }
+        let total_observation_count =
+            execution_summary.observation_count + dns_summary.get::<_, i64>("count");
         transaction
             .execute(
                 "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
@@ -3232,7 +3692,7 @@ pub async fn save_scanner_results(
                     &execution_db_id,
                     &execution_summary.ip_count,
                     &execution_summary.port_count,
-                    &execution_summary.observation_count,
+                    &total_observation_count,
                 ],
             )
             .await
@@ -3664,9 +4124,16 @@ pub async fn log_out(
         let t_l = tmp_r.len();
         if t_l != 1 {
             error!(
-                event = "Error",
-                path = "fn log_out",
-                message = format!("更新session返回值长度为{}", t_l)
+                event = "LogoutSessionShapeError",
+                operation = "disable_login_session",
+                error_kind = "data_integrity",
+                error_code = "logout_session_return_shape_invalid",
+                error_message = "logout update returned an unexpected column count",
+                retryable = false,
+                outcome = "session_disabled_with_unexpected_response",
+                deleted_by_user_id = ?deleted_by_user_id,
+                deletion_reason = reason,
+                returned_column_count = t_l,
             );
         }
         Ok(true)

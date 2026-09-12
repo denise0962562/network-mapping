@@ -146,7 +146,16 @@ pub async fn elasticsearch_status(
     match elasticsearch.status(pool.get_ref()).await {
         Ok(status) => HttpResponse::Ok().json(status),
         Err(error_value) => {
-            error!(event = "ElasticsearchStatusError", message = %error_value);
+            error!(
+                event = "ElasticsearchStatusError",
+                operation = "load_elasticsearch_status",
+                error_kind = "search_storage",
+                error_code = "elasticsearch_status_load_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "request_failed",
+                user_id = user.id,
+            );
             HttpResponse::InternalServerError()
                 .json(serde_json::json!({"message": "无法读取搜索索引状态"}))
         }
@@ -296,7 +305,20 @@ async fn respond_search_elasticsearch(
             domain_result_too_broad(&error_value)
         }
         Err(error_value) => {
-            error!(event = "SearchElasticsearchError", query_type, message = %error_value);
+            error!(
+                event = "SearchElasticsearchError",
+                operation = "execute_elasticsearch_search",
+                error_kind = "search_storage",
+                error_code = "elasticsearch_search_failed",
+                error_message = %error_value,
+                retryable = true,
+                outcome = "request_failed",
+                query_type,
+                user_id = user.id,
+                user_role = user.role,
+                limit,
+                offset,
+            );
             HttpResponse::ServiceUnavailable()
                 .json(serde_json::json!({"message": "搜索索引暂时不可用"}))
         }

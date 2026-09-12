@@ -15,7 +15,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::config::RequestsConfig;
-use crate::logs::write::error_chain_diagnostics;
+use crate::logs::write::error_diagnostics;
 use crate::runtime_config::RuntimeConfig;
 
 /// 操作者槽位：由最外层 `wrap_fn` 预置，内层 `AuthMiddleware` 鉴权成功后写入，
@@ -110,11 +110,21 @@ async fn flush_batch(pool: &Pool, batch: &mut Vec<RequestLogEntry>, dropped: &mu
             Err(error_value) => {
                 if attempt > RETRY_DELAYS_MS.len() {
                     *dropped += entries.len() as u64;
+                    let diagnostics = error_diagnostics(error_value.as_ref());
                     error!(
                         event = "RequestLogWriteError",
+                        operation = "insert_request_log_batch",
+                        error_kind = "database",
+                        error_code = "request_log_batch_write_failed",
+                        error_message = %diagnostics.error_message,
+                        error_chain = %diagnostics.error_chain,
+                        root_cause = %diagnostics.root_cause,
+                        error_truncated = diagnostics.error_truncated,
+                        retryable = false,
+                        outcome = "request_log_batch_dropped",
+                        attempt,
                         dropped_this_batch = entries.len(),
                         total_dropped = dropped,
-                        message = %error_chain_diagnostics(error_value.as_ref()),
                         "请求日志批量写入失败，已丢弃该批次",
                     );
                     return;
@@ -231,10 +241,19 @@ pub async fn run_retention(pool: Pool, config: RuntimeConfig<RequestsConfig>) {
                 }
             }
             Err(error_value) => {
+                let diagnostics = error_diagnostics(error_value.as_ref());
                 error!(
                     event = "RequestLogRetentionError",
+                    operation = "delete_expired_request_logs",
+                    error_kind = "database",
+                    error_code = "request_log_retention_failed",
+                    error_message = %diagnostics.error_message,
+                    error_chain = %diagnostics.error_chain,
+                    root_cause = %diagnostics.root_cause,
+                    error_truncated = diagnostics.error_truncated,
+                    retryable = true,
+                    outcome = "retention_deferred",
                     retention_days,
-                    message = %error_chain_diagnostics(error_value.as_ref()),
                     "清理过期请求日志失败"
                 );
             }

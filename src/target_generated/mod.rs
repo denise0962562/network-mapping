@@ -444,7 +444,17 @@ pub async fn run_generator(config: RuntimeConfig<AutomaticTargetConfig>, pool: P
             Ok(service) => service,
             Err(error) => {
                 let error = error.to_string();
-                error!(target: "server::automatic_target", event = "AutomaticTargetConfigurationError", message = %error);
+                error!(
+                    target: "server::automatic_target",
+                    event = "AutomaticTargetConfigurationError",
+                    operation = "build_automatic_target_service",
+                    error_kind = "configuration",
+                    error_code = "automatic_target_configuration_invalid",
+                    error_message = %error,
+                    retryable = true,
+                    outcome = "generator_retry_scheduled",
+                    retry_after_ms = 5_000_u64,
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                     changed = changes.changed() => if changed.is_err() { return; }
@@ -492,7 +502,17 @@ pub async fn run_generator(config: RuntimeConfig<AutomaticTargetConfig>, pool: P
             Err(error_value) => {
                 let error_value = error_value.to_string();
                 service.record_error(&pool, &error_value).await;
-                error!(target: "server::automatic_target", event = "AutomaticTargetRefillError", message = %error_value);
+                error!(
+                    target: "server::automatic_target",
+                    event = "AutomaticTargetRefillError",
+                    operation = "refill_automatic_target_queue",
+                    error_kind = "database",
+                    error_code = "automatic_target_refill_failed",
+                    error_message = %error_value,
+                    retryable = true,
+                    outcome = "generator_retry_scheduled",
+                    retry_after_ms = service.interval_seconds().saturating_mul(1_000),
+                );
             }
         }
         tokio::select! {
@@ -514,14 +534,32 @@ pub async fn automatic_target_status(
     let service = match AutomaticTargetService::new(config.get().await.value) {
         Ok(service) => service,
         Err(error_value) => {
-            error!(event = "AutomaticTargetStatusConfigurationError", message = %error_value);
+            error!(
+                event = "AutomaticTargetStatusConfigurationError",
+                operation = "build_automatic_target_status_service",
+                error_kind = "configuration",
+                error_code = "automatic_target_status_configuration_invalid",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "request_failed",
+                user_id = user.id,
+            );
             return HttpResponse::InternalServerError().finish();
         }
     };
     match service.status(pool.get_ref()).await {
         Ok(status) => HttpResponse::Ok().json(json!({"success": true, "data": status})),
         Err(error_value) => {
-            error!(event = "AutomaticTargetStatusError", message = %error_value);
+            error!(
+                event = "AutomaticTargetStatusError",
+                operation = "load_automatic_target_status",
+                error_kind = "database",
+                error_code = "automatic_target_status_load_failed",
+                error_message = %error_value,
+                retryable = false,
+                outcome = "request_failed",
+                user_id = user.id,
+            );
             HttpResponse::InternalServerError().finish()
         }
     }

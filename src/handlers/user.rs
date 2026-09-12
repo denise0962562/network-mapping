@@ -4,7 +4,7 @@ use deadpool_postgres::Pool;
 use serde_json::json;
 use std::ops::Deref;
 use std::time::Instant;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::TemplatesInit;
 use crate::admin::{
@@ -57,10 +57,14 @@ fn queue_login_notification(
         if let Err(error_value) =
             send_login_notification(&pool, &encryption_key, user_id, &username, &source_ip).await
         {
-            error!(
+            warn!(
                 event = "SendLoginNotificationError",
+                operation = "send_login_notification",
+                reason = %error_value,
+                error_code = "login_notification_delivery_failed",
+                outcome = "login_completed_without_notification",
+                user_id,
                 username,
-                message = %error_value
             );
         }
     });
@@ -92,13 +96,13 @@ async fn user_login_h(
                 "password",
             );
             write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
-            let log_event = "LoginFaild";
-            let log_message = &receiveinfo.username;
-            error_logs(&req, log_event, log_message.as_str());
-            error!(
-                event = "UserLoginError",
-                path = "fn user_login_h",
-                message = %e
+            warn!(
+                event = "UserLoginRejected",
+                operation = "authenticate_user",
+                reason = %e,
+                error_code = "user_login_rejected",
+                outcome = "login_denied",
+                username = %receiveinfo.username,
             );
             let body = json!({
                 "success": false,
@@ -137,11 +141,37 @@ async fn user_login_h(
     )
     .await
     {
-        error!(event = "RecordCompletedLoginError", message = %error_value);
+        let diagnostics = crate::logs::write::error_diagnostics(error_value.as_ref());
+        error!(
+            event = "RecordCompletedLoginError",
+            operation = "record_completed_login",
+            error_kind = "database",
+            error_code = "completed_login_record_failed",
+            error_message = %diagnostics.error_message,
+            error_chain = %diagnostics.error_chain,
+            root_cause = %diagnostics.root_cause,
+            error_truncated = diagnostics.error_truncated,
+            retryable = false,
+            outcome = "login_session_rollback_started",
+            user_id = login_result.user_id,
+        );
         if let Err(logout_error) =
             log_out(&t_session, p, "login_rollback", Some(login_result.user_id)).await
         {
-            error!(event = "RollbackLoginSessionError", message = %logout_error);
+            let diagnostics = crate::logs::write::error_diagnostics(logout_error.as_ref());
+            error!(
+                event = "RollbackLoginSessionError",
+                operation = "rollback_login_session",
+                error_kind = "database",
+                error_code = "login_session_rollback_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "login_session_may_remain_active",
+                user_id = login_result.user_id,
+            );
         }
         return HttpResponse::InternalServerError()
             .json(json!({"success": false, "message": "登录状态保存失败，请重试"}));
@@ -736,8 +766,13 @@ async fn change_password_h(
             Err(error_value) => {
                 error!(
                     event = "ChangePasswordHashError",
-                    path = "fn change_password_h",
-                    message = ?error_value
+                    operation = "hash_new_password",
+                    error_kind = "cryptography",
+                    error_code = "password_hash_generation_failed",
+                    error_message = %error_value,
+                    retryable = false,
+                    outcome = "password_unchanged",
+                    user_id = user_base_i.id,
                 );
                 return HttpResponse::InternalServerError().json(json!({
                     "success": false,

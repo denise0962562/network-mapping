@@ -6,6 +6,8 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use crate::logs::write::error_diagnostics;
+
 pub const CHANNEL_CAPACITY: usize = 4096;
 pub const RETENTION_DAYS: i32 = 30;
 const BATCH_SIZE: usize = 250;
@@ -88,24 +90,14 @@ async fn flush_batch(pool: &Pool, batch: &mut Vec<ScannerLatencyHistoryEntry>) {
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
         Err(error_value) => {
-            error!(
-                event = "ScannerLatencyHistoryWriteError",
-                dropped = entries.len(),
-                message = %error_value,
-                "failed to acquire a database connection for scanner latency history"
-            );
+            log_history_write_error("acquire_connection", &entries, &error_value);
             return;
         }
     };
     let transaction = match connection.transaction().await {
         Ok(transaction) => transaction,
         Err(error_value) => {
-            error!(
-                event = "ScannerLatencyHistoryWriteError",
-                dropped = entries.len(),
-                message = %error_value,
-                "failed to begin scanner latency history transaction"
-            );
+            log_history_write_error("begin_transaction", &entries, &error_value);
             return;
         }
     };
@@ -128,23 +120,38 @@ async fn flush_batch(pool: &Pool, batch: &mut Vec<ScannerLatencyHistoryEntry>) {
             )
             .await
         {
-            error!(
-                event = "ScannerLatencyHistoryWriteError",
-                dropped = entries.len(),
-                message = %error_value,
-                "failed to insert scanner latency history batch"
-            );
+            log_history_write_error("insert_latency_batch", &entries, &error_value);
             return;
         }
     }
     if let Err(error_value) = transaction.commit().await {
-        error!(
-            event = "ScannerLatencyHistoryWriteError",
-            dropped = entries.len(),
-            message = %error_value,
-            "failed to commit scanner latency history batch"
-        );
+        log_history_write_error("commit_latency_batch", &entries, &error_value);
     }
+}
+
+fn log_history_write_error(
+    operation: &'static str,
+    entries: &[ScannerLatencyHistoryEntry],
+    error_value: &(dyn std::error::Error + 'static),
+) {
+    let diagnostics = error_diagnostics(error_value);
+    error!(
+        event = "ScannerLatencyHistoryWriteError",
+        operation,
+        error_kind = "database",
+        error_code = %format!("scanner_latency_{operation}_failed"),
+        error_message = %diagnostics.error_message,
+        error_chain = %diagnostics.error_chain,
+        root_cause = %diagnostics.root_cause,
+        error_truncated = diagnostics.error_truncated,
+        retryable = false,
+        outcome = "latency_samples_dropped",
+        batch_size = entries.len(),
+        dropped_this_batch = entries.len(),
+        first_probe_at = ?entries.first().map(|entry| entry.measured_at),
+        last_probe_at = ?entries.last().map(|entry| entry.measured_at),
+        "failed to persist scanner latency history batch"
+    );
 }
 
 pub async fn run_retention(pool: Pool, retention_days: i32) {
@@ -157,7 +164,22 @@ pub async fn run_retention(pool: Pool, retention_days: i32) {
             let connection = match pool.get().await {
                 Ok(connection) => connection,
                 Err(error_value) => {
-                    error!(event = "ScannerLatencyRetentionError", message = %error_value);
+                    let diagnostics = error_diagnostics(&error_value);
+                    error!(
+                        event = "ScannerLatencyRetentionError",
+                        operation = "acquire_retention_connection",
+                        error_kind = "database",
+                        error_code = "scanner_latency_retention_pool_failed",
+                        error_message = %diagnostics.error_message,
+                        error_chain = %diagnostics.error_chain,
+                        root_cause = %diagnostics.root_cause,
+                        error_truncated = diagnostics.error_truncated,
+                        retryable = true,
+                        outcome = "retention_deferred",
+                        retention_days,
+                        cutoff = %cutoff,
+                        retry_after_ms = 86_400_000_u64,
+                    );
                     break;
                 }
             };
@@ -173,7 +195,23 @@ pub async fn run_retention(pool: Pool, retention_days: i32) {
                 Ok(affected) if affected == PURGE_BATCH_SIZE as u64 => {}
                 Ok(_) => break,
                 Err(error_value) => {
-                    error!(event = "ScannerLatencyRetentionError", message = %error_value);
+                    let diagnostics = error_diagnostics(&error_value);
+                    error!(
+                        event = "ScannerLatencyRetentionError",
+                        operation = "delete_expired_latency_samples",
+                        error_kind = "database",
+                        error_code = "scanner_latency_retention_delete_failed",
+                        error_message = %diagnostics.error_message,
+                        error_chain = %diagnostics.error_chain,
+                        root_cause = %diagnostics.root_cause,
+                        error_truncated = diagnostics.error_truncated,
+                        retryable = true,
+                        outcome = "retention_deferred",
+                        retention_days,
+                        cutoff = %cutoff,
+                        purge_batch_size = PURGE_BATCH_SIZE,
+                        retry_after_ms = 86_400_000_u64,
+                    );
                     break;
                 }
             }

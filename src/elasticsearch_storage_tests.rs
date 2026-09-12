@@ -582,7 +582,7 @@ async fn seed_dns_upload(pool: &Pool) -> crate::ScannerResultUpload {
     client.execute("INSERT INTO scanner_info(scanner_id,create_user,runtime_token_hash,is_enable) VALUES($1,1,$2,true)", &[&scanner,&token_hash]).await.unwrap();
     client
         .execute(
-            "UPDATE scan_task SET task_id=$1, task_kind='dns' WHERE id=1",
+            "UPDATE scan_task SET task_id=$1, task_kind='dns', scan_profile='dns_records' WHERE id=1",
             &[&task],
         )
         .await
@@ -1409,4 +1409,384 @@ async fn live_elasticsearch_preserves_successful_web_evidence_after_failed_probe
         .await;
     test.unwrap();
     cleanup.unwrap();
+}
+
+async fn save_upload_fixture(
+    pool: &Pool,
+    service: &ElasticsearchService,
+    upload: &crate::ScannerResultUpload,
+) -> Result<usize, crate::SaveScannerResultsError> {
+    crate::save_scanner_results(
+        pool,
+        &crate::maxmind::MaxMindState::from_directory("/tmp/nm-es-no-maxmind"),
+        service,
+        &crate::dns_follow_up::DnsFollowUpConfig::default(),
+        upload,
+        "fixture-token",
+        "fixture-pepper",
+    )
+    .await
+}
+
+fn port_observation() -> crate::ScannerObservation {
+    serde_json::from_value(json!({
+        "kind": "port", "ip": "192.0.2.1", "port": 443,
+        "protocol": "tcp", "state": "open", "source": "masscan",
+        "observed_at": 1_788_883_200_000_i64
+    }))
+    .unwrap()
+}
+
+async fn seed_mixed_upload(pool: &Pool) -> crate::ScannerResultUpload {
+    let mut upload = seed_dns_upload(pool).await;
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute("UPDATE scan_task SET scan_profile='dns_full' WHERE id=1")
+        .await
+        .unwrap();
+    upload.protocol_version = 3;
+    upload.observations.push(port_observation());
+    upload
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn mixed_upload_completes_and_retries_without_duplicate_observations() {
+    let (pool, schema) = isolated_pool().await;
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let mut upload = seed_mixed_upload(&pool).await;
+    upload.is_final = Some(true);
+    assert_eq!(
+        save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+        2
+    );
+    let documents = fixture.state.lock().unwrap().documents.len();
+    assert_eq!(
+        save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+        0
+    );
+    assert_eq!(fixture.state.lock().unwrap().documents.len(), documents);
+    let client = pool.get().await.unwrap();
+    let execution = client.query_one(
+        "SELECT execution_status,result_ip_count,result_port_count,result_observation_count FROM scan_task_execution WHERE id=1", &[]
+    ).await.unwrap();
+    assert_eq!(execution.get::<_, String>(0), "succeeded");
+    assert_eq!(execution.get::<_, i64>(1), 1);
+    assert_eq!(execution.get::<_, i64>(2), 1);
+    assert_eq!(execution.get::<_, i64>(3), 2);
+    let receipt = client.query_one(
+        "SELECT COUNT(*)::BIGINT, COUNT(*) FILTER (WHERE is_final)::BIGINT, COUNT(*) FILTER (WHERE storage_backend='pending')::BIGINT FROM scan_result_batch", &[]
+    ).await.unwrap();
+    assert_eq!(receipt.get::<_, i64>(0), 2);
+    assert_eq!(receipt.get::<_, i64>(1), 1);
+    assert_eq!(receipt.get::<_, i64>(2), 0);
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn mixed_upload_keeps_dns_only_and_endpoint_only_batches_in_one_sequence() {
+    for dns_last in [false, true] {
+        let (pool, schema) = isolated_pool().await;
+        let fixture = EsFixture::start();
+        let service = fixture.service();
+        let mut upload = seed_mixed_upload(&pool).await;
+        let dns = upload.observations[0].clone();
+        upload.observations = if dns_last {
+            vec![port_observation()]
+        } else {
+            vec![dns.clone()]
+        };
+        assert_eq!(
+            save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+            1
+        );
+        let status: String = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT execution_status FROM scan_task_execution WHERE id=1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(status, "running");
+        upload.batch_index = Some(2);
+        upload.is_final = Some(true);
+        upload.observations = if dns_last {
+            vec![dns]
+        } else {
+            vec![port_observation()]
+        };
+        assert!(matches!(
+            save_upload_fixture(&pool, &service, &upload).await,
+            Err(crate::SaveScannerResultsError::NonContiguousFinalBatch { .. })
+        ));
+        upload.batch_index = Some(1);
+        assert_eq!(
+            save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+            1
+        );
+        let client = pool.get().await.unwrap();
+        let row = client.query_one(
+            "SELECT execution_status,result_observation_count FROM scan_task_execution WHERE id=1", &[]
+        ).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "succeeded");
+        assert_eq!(row.get::<_, i64>(1), 2);
+        client
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn mixed_upload_recovers_after_dns_commit_and_rejects_changed_payload_or_identity() {
+    let (pool, schema) = isolated_pool().await;
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let mut upload = seed_mixed_upload(&pool).await;
+    upload.is_final = Some(true);
+    fixture.state.lock().unwrap().fail_path = Some("network-mapping-execution-endpoints".into());
+    assert!(matches!(
+        save_upload_fixture(&pool, &service, &upload).await,
+        Err(crate::SaveScannerResultsError::Storage(_))
+    ));
+    let client = pool.get().await.unwrap();
+    let receipts = client.query_one(
+        "SELECT COUNT(*) FILTER (WHERE storage_backend='pending')::BIGINT, COUNT(*) FILTER (WHERE storage_backend='elasticsearch')::BIGINT FROM scan_result_batch", &[]
+    ).await.unwrap();
+    assert_eq!(receipts.get::<_, i64>(0), 1);
+    assert_eq!(receipts.get::<_, i64>(1), 1);
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT execution_status FROM scan_task_execution WHERE id=1",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "running"
+    );
+    let documents = fixture.state.lock().unwrap().documents.len();
+    let mut changed = upload.clone();
+    changed.observations.remove(0);
+    assert!(matches!(
+        save_upload_fixture(&pool, &service, &changed).await,
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
+    ));
+    changed = upload.clone();
+    if let crate::ScannerObservation::Dns { observation } = &mut changed.observations[0] {
+        observation.question.name = "changed.example.com".into();
+    }
+    assert!(matches!(
+        save_upload_fixture(&pool, &service, &changed).await,
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
+    ));
+    changed = upload.clone();
+    changed.upload_id = Some(Uuid::new_v4());
+    assert!(matches!(
+        save_upload_fixture(&pool, &service, &changed).await,
+        Err(crate::SaveScannerResultsError::UploadIdentityConflict { .. })
+    ));
+    assert_eq!(fixture.state.lock().unwrap().documents.len(), documents);
+    fixture.state.lock().unwrap().fail_path = None;
+    assert_eq!(
+        save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .documents
+            .keys()
+            .filter(|(index, _)| index.starts_with(".ds-dns-"))
+            .count(),
+        1
+    );
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn mixed_upload_resumes_dns_sidecar_left_by_previous_server() {
+    let (pool, schema) = isolated_pool().await;
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let mut upload = seed_mixed_upload(&pool).await;
+    let mut sidecar = upload.clone();
+    sidecar.upload_id = upload.upload_id.map(crate::dns_sidecar_upload_id);
+    sidecar.observations.truncate(1);
+    crate::save_dns_scanner_results(
+        &pool,
+        &service,
+        &crate::dns_follow_up::DnsFollowUpConfig::default(),
+        &sidecar,
+        "fixture-token",
+        "fixture-pepper",
+        upload.upload_id,
+    )
+    .await
+    .unwrap();
+    let mut changed = upload.clone();
+    changed.observations.remove(0);
+    assert!(matches!(
+        save_upload_fixture(&pool, &service, &changed).await,
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
+    ));
+    changed = upload.clone();
+    if let crate::ScannerObservation::Dns { observation } = &mut changed.observations[0] {
+        observation.question.name = "changed.example.com".into();
+    }
+    assert!(matches!(
+        save_upload_fixture(&pool, &service, &changed).await,
+        Err(crate::SaveScannerResultsError::BatchPayloadConflict { .. })
+    ));
+    assert_eq!(
+        pool.get()
+            .await
+            .unwrap()
+            .query_one("SELECT COUNT(*)::BIGINT FROM scan_result_batch", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    upload.is_final = Some(true);
+    assert_eq!(
+        save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .documents
+            .keys()
+            .filter(|(index, _)| index.starts_with(".ds-dns-"))
+            .count(),
+        1
+    );
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn mixed_upload_dns_only_results_and_empty_final_preserve_task_completion() {
+    for profile in ["dns_records", "dns_full"] {
+        let (pool, schema) = isolated_pool().await;
+        let fixture = EsFixture::start();
+        let service = fixture.service();
+        let mut upload = seed_dns_upload(&pool).await;
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "UPDATE scan_task SET scan_profile=$1 WHERE id=1",
+                &[&profile],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+            1
+        );
+        let mut unrelated = upload.clone();
+        unrelated.upload_id = Some(Uuid::new_v4());
+        assert!(matches!(
+            save_upload_fixture(&pool, &service, &unrelated).await,
+            Err(crate::SaveScannerResultsError::UploadIdentityConflict { .. })
+        ));
+        upload.batch_index = Some(1);
+        upload.is_final = Some(true);
+        upload.observations.clear();
+        assert_eq!(
+            save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+            0
+        );
+        let row = client.query_one(
+            "SELECT execution_status,result_ip_count,result_port_count,result_observation_count FROM scan_task_execution WHERE id=1", &[]
+        ).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "succeeded", "{profile}");
+        assert_eq!(row.get::<_, i64>(1), 0, "{profile}");
+        assert_eq!(row.get::<_, i64>(2), 0, "{profile}");
+        assert_eq!(row.get::<_, i64>(3), 1, "{profile}");
+        client
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn mixed_upload_cannot_finish_with_an_unmatched_dns_child() {
+    let (pool, schema) = isolated_pool().await;
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let mut upload = seed_mixed_upload(&pool).await;
+    let mut child = upload.clone();
+    child.upload_id = upload.upload_id.map(crate::dns_sidecar_upload_id);
+    child.batch_index = Some(1);
+    child.observations.truncate(1);
+    crate::save_dns_scanner_results(
+        &pool,
+        &service,
+        &crate::dns_follow_up::DnsFollowUpConfig::default(),
+        &child,
+        "fixture-token",
+        "fixture-pepper",
+        upload.upload_id,
+    )
+    .await
+    .unwrap();
+    upload.observations.remove(0);
+    upload.is_final = Some(true);
+    assert!(matches!(
+        save_upload_fixture(&pool, &service, &upload).await,
+        Err(crate::SaveScannerResultsError::InvalidUpload(_))
+    ));
+    let client = pool.get().await.unwrap();
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT execution_status FROM scan_task_execution WHERE id=1",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "running"
+    );
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
 }

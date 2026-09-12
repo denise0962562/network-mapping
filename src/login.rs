@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::UserLoginInfo;
 use crate::admin::{UserBaseI, get_session_ttl_seconds_from_database};
+use crate::logs::write::error_diagnostics;
 use crate::{get_password_and_id_from_database, get_unix_epoch_ms, verify_password};
 
 const SESSION_EXPIRATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -28,9 +29,20 @@ pub async fn run_session_expiration(pool: deadpool_postgres::Pool) {
             }
             Ok(_) => {}
             Err(error_value) => {
+                let diagnostics = error_diagnostics(error_value.as_ref());
                 error!(
                     event = "SessionExpirationError",
-                    message = %error_value,
+                    operation = "expire_sessions",
+                    error_kind = "database",
+                    error_code = "session_expiration_failed",
+                    error_message = %diagnostics.error_message,
+                    error_chain = %diagnostics.error_chain,
+                    root_cause = %diagnostics.root_cause,
+                    error_truncated = diagnostics.error_truncated,
+                    retryable = true,
+                    outcome = "expired_sessions_retained",
+                    batch_size = SESSION_EXPIRATION_BATCH_SIZE,
+                    retry_after_ms = SESSION_EXPIRATION_INTERVAL.as_millis() as u64,
                     "标记过期会话失败"
                 );
             }
@@ -112,8 +124,13 @@ impl LoginToken {
             Err(e) => {
                 error!(
                     event = "GenerateCSRFTokenError",
-                    path = "LoginToken => fn create_session",
-                    message = %e
+                    operation = "generate_csrf_token",
+                    error_kind = "cryptography",
+                    error_code = "csrf_random_generation_failed",
+                    error_message = %e,
+                    retryable = false,
+                    outcome = "login_failed",
+                    username = u_name,
                 );
                 return Err(e.into());
             }
@@ -127,10 +144,19 @@ impl LoginToken {
                 Ok((session, csrf_token_base64))
             }
             Err(e) => {
+                let diagnostics = error_diagnostics(e.as_ref());
                 error!(
                     event = "SaveSessionFailed",
-                    path = "LoginToken => fn create_session => self.save",
-                    message = %e
+                    operation = "create_login_session",
+                    error_kind = "database",
+                    error_code = "login_session_create_failed",
+                    error_message = %diagnostics.error_message,
+                    error_chain = %diagnostics.error_chain,
+                    root_cause = %diagnostics.root_cause,
+                    error_truncated = diagnostics.error_truncated,
+                    retryable = false,
+                    outcome = "login_failed",
+                    username = u_name,
                 );
                 Err(e)
             }
@@ -202,8 +228,14 @@ impl LoginToken {
         }
         else {
             error!(
-                event = "INSERTDataError",
-                message = "插入session错误，返回值不为一"
+                event = "SaveSessionFailed",
+                operation = "insert_login_session",
+                error_kind = "data_integrity",
+                error_code = "login_session_insert_returned_no_row",
+                error_message = "session insert returned no row",
+                retryable = false,
+                outcome = "login_failed",
+                user_id = userid,
             );
             Err("插入数据不正确".into())
         }
@@ -283,10 +315,19 @@ pub async fn user_login(
         }
         Err(e) => {
             l_successful = false;
+            let diagnostics = error_diagnostics(e.as_ref());
             error!(
                 event = "GetUserPasswordHashError",
-                path = "fn user_login",
-                message = %e
+                operation = "load_login_identity",
+                error_kind = "database",
+                error_code = "login_identity_lookup_failed",
+                error_message = %diagnostics.error_message,
+                error_chain = %diagnostics.error_chain,
+                root_cause = %diagnostics.root_cause,
+                error_truncated = diagnostics.error_truncated,
+                retryable = false,
+                outcome = "login_denied",
+                username,
             );
             let t = UserLoginInfo {
                 username: String::new(),
