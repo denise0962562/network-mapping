@@ -8,6 +8,7 @@ use tracing::{Instrument, error, info};
 use network_mapping_server::admin::{
     check_default_admin_user, check_system_user, reset_admin_password,
 };
+use network_mapping_server::api_response::ApiErrorMiddleware;
 use network_mapping_server::audit::RequestId;
 use network_mapping_server::backup::BackupManager;
 use network_mapping_server::cli_progress::CliProgressReporter;
@@ -475,6 +476,7 @@ async fn main() -> io::Result<()> {
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
             .wrap(rate_limiter.clone())
+            .wrap(ApiErrorMiddleware)
             .wrap_fn(move |req, service| {
                 let request_id = req
                     .headers()

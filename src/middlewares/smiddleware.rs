@@ -14,6 +14,7 @@ use crate::login::LoginToken;
 use crate::login::get_session_from_req;
 use tracing::{debug, error, info};
 
+use crate::api_response::error_response;
 use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
 use crate::get_conn_ip;
@@ -53,13 +54,18 @@ pub struct AuthMiddlewareService<S> {
     service: Arc<S>,
 }
 
-fn unauthorized_response(frontend_page: bool) -> HttpResponse {
+fn unauthorized_response(req: &actix_web::HttpRequest, frontend_page: bool) -> HttpResponse {
     if frontend_page {
         HttpResponse::Found()
             .insert_header((header::LOCATION, "/login"))
             .finish()
     } else {
-        HttpResponse::Unauthorized().body("401")
+        error_response(
+            req,
+            actix_web::http::StatusCode::UNAUTHORIZED,
+            "authentication_required",
+            "身份验证失败或登录已过期",
+        )
     }
 }
 
@@ -145,7 +151,7 @@ where
                         request_id = %request_id,
                         "request rejected because no session cookie was provided",
                     );
-                    let resp = unauthorized_response(frontend_page);
+                    let resp = unauthorized_response(req.request(), frontend_page);
                     return Ok(req.into_response(resp).map_into_right_body());
                 }
             };
@@ -205,7 +211,7 @@ where
                         request_id = %request_id,
                         "request rejected because the session is invalid or expired",
                     );
-                    let resp = unauthorized_response(frontend_page);
+                    let resp = unauthorized_response(req.request(), frontend_page);
                     Ok(req.into_response(resp).map_into_right_body())
                 }
                 Err(e) => {

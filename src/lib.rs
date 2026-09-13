@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod analytics_snapshot;
+pub mod api_response;
 pub mod audit;
 pub mod backup;
 pub mod cli_progress;

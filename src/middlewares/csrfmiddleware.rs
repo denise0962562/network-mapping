@@ -1,4 +1,5 @@
 use crate::admin::UserBaseI;
+use crate::api_response::error_response;
 use crate::audit::{AuditContext, AuditEvent, write_standalone};
 use crate::logs::write::warn_logs;
 use crate::{
@@ -11,7 +12,7 @@ use std::{
 };
 
 use actix_web::{
-    Error, HttpMessage, HttpResponse,
+    Error, HttpMessage,
     body::EitherBody,
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
 };
@@ -111,7 +112,12 @@ where
                         .await;
                     }
                     warn_logs(req.request(), "CSRFTokenError", "未获取到 CSRF Token");
-                    let resp = HttpResponse::Forbidden().body("403");
+                    let resp = error_response(
+                        req.request(),
+                        actix_web::http::StatusCode::FORBIDDEN,
+                        "csrf_token_missing",
+                        "请求验证失败，请刷新页面后重试",
+                    );
                     return Ok(req.into_response(resp).map_into_right_body());
                 }
             };
@@ -140,7 +146,12 @@ where
                     )
                     .await;
                 }
-                let resp = HttpResponse::Forbidden().body("403");
+                let resp = error_response(
+                    req.request(),
+                    actix_web::http::StatusCode::FORBIDDEN,
+                    "csrf_token_invalid",
+                    "请求验证失败，请刷新页面后重试",
+                );
                 Ok(req.into_response(resp).map_into_right_body())
             }
         })
