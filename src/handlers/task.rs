@@ -2531,8 +2531,19 @@ async fn upload_scanner_result_handler(
                 SaveScannerResultsError::InvalidBatchEnvelope { reason, .. } => {
                     HttpResponse::BadRequest().body(reason)
                 }
-                SaveScannerResultsError::UploadIdentityConflict { .. } => HttpResponse::BadRequest()
-                    .body("an execution cannot contain batches from multiple upload_id values"),
+                SaveScannerResultsError::UploadIdentityConflict {
+                    execution_id,
+                    ref conflicting_upload_id,
+                    ..
+                } => HttpResponse::BadRequest().json(serde_json::json!({
+                    "success": false,
+                    "code": "execution_upload_id_conflict",
+                    "message": "an execution cannot contain batches from multiple upload_id values",
+                    "retryable": false,
+                    "action": "recover_execution",
+                    "execution_id": execution_id,
+                    "conflicting_upload_id": conflicting_upload_id,
+                })),
                 SaveScannerResultsError::BatchPayloadConflict { content_kind, .. } => {
                     HttpResponse::BadRequest().body(format!(
                         "batch identity was already used with different {content_kind} content"
