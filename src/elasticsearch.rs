@@ -87,6 +87,7 @@ struct ElasticsearchInner {
     runtime: RwLock<ElasticsearchRuntime>,
     monitor: RwLock<Option<MonitorHandle>>,
     bulk_semaphore: Semaphore,
+    scan_indices_ready: AtomicBool,
     observation_compatibility_ready: AtomicBool,
 }
 
@@ -296,6 +297,7 @@ impl ElasticsearchService {
                 runtime: RwLock::new(ElasticsearchRuntime::default()),
                 monitor: RwLock::new(None),
                 bulk_semaphore: Semaphore::new(bulk_max_concurrency),
+                scan_indices_ready: AtomicBool::new(false),
                 observation_compatibility_ready: AtomicBool::new(false),
             }),
         })
@@ -869,6 +871,9 @@ impl ElasticsearchService {
     }
 
     async fn ensure_scan_indices(&self) -> Result<(), String> {
+        if self.inner.scan_indices_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let template_name = format!("{}-template", self.inner.config.observation_index_prefix);
         self.send_json_request(
             ElasticsearchOperation::IndexAdmin,
@@ -940,7 +945,9 @@ impl ElasticsearchService {
             &self.inner.config.current_endpoint_index,
             &index_mapping_update(),
         )
-        .await
+        .await?;
+        self.inner.scan_indices_ready.store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn ensure_dns_indices(&self) -> Result<(), String> {
@@ -1048,8 +1055,17 @@ impl ElasticsearchService {
     ) -> Result<ScanBatchWriteResult, String> {
         self.ensure_scan_indices().await?;
 
-        self.persist_scan_batch_prepared(context, observations)
-            .await
+        let result = self
+            .persist_scan_batch_prepared(context, observations)
+            .await;
+        if result.is_err() {
+            // The failure may be caused by an index being removed or replaced
+            // after startup. Revalidate mappings on the next upload attempt.
+            self.inner
+                .scan_indices_ready
+                .store(false, Ordering::Release);
+        }
+        result
     }
 
     async fn load_dns_batch_observations(
@@ -1426,15 +1442,10 @@ impl ElasticsearchService {
         }
 
         if !body.is_empty() {
-            let refresh = if context.is_final {
-                "&refresh=wait_for"
-            } else {
-                ""
-            };
             let result = self
                 .send_bulk_with_retry(
                     &format!(
-                        "/_bulk?wait_for_active_shards={}{refresh}",
+                        "/_bulk?wait_for_active_shards={}",
                         self.inner.config.write_wait_for_active_shards
                     ),
                     &body,
@@ -1644,15 +1655,10 @@ impl ElasticsearchService {
                 &event,
             )?;
         }
-        let refresh = if context.is_final {
-            "&refresh=wait_for"
-        } else {
-            ""
-        };
         let result = self
             .send_bulk_with_retry(
                 &format!(
-                    "/_bulk?wait_for_active_shards={}{refresh}",
+                    "/_bulk?wait_for_active_shards={}",
                     self.inner.config.write_wait_for_active_shards
                 ),
                 &body,
@@ -1716,6 +1722,7 @@ impl ElasticsearchService {
 
     async fn promote_execution(&self, context: &ScanBatchContext) -> Result<(), String> {
         let mut search_after = None;
+        let mut wrote_current_projection = false;
         loop {
             let mut query = json!({
                 "size": 1000,
@@ -1776,7 +1783,7 @@ impl ElasticsearchService {
             let bulk = self
                 .send_bulk_with_retry(
                     &format!(
-                        "/_bulk?wait_for_active_shards={}&refresh=wait_for",
+                        "/_bulk?wait_for_active_shards={}",
                         self.inner.config.write_wait_for_active_shards
                     ),
                     &body,
@@ -1799,10 +1806,26 @@ impl ElasticsearchService {
                     return Err(format!("发布当前端点投影失败：{failure}"));
                 }
             }
+            wrote_current_projection = true;
             search_after = hits.last().and_then(|hit| hit.get("sort")).cloned();
             if hits.len() < 1000 || search_after.is_none() {
                 break;
             }
+        }
+        // A large execution is promoted in many bulk pages. Waiting for a refresh
+        // on every page serializes one refresh interval per 1,000 endpoints. One
+        // refresh after all pages preserves read-after-finalize visibility without
+        // making upload latency grow in refresh-sized steps.
+        if wrote_current_projection {
+            let refreshed = self
+                .send_json_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::POST,
+                    &format!("/{}/_refresh", self.inner.config.current_endpoint_index),
+                    |request| request,
+                )
+                .await?;
+            validate_scan_search_response(&refreshed)?;
         }
         Ok(())
     }
@@ -2209,6 +2232,9 @@ impl ElasticsearchService {
     }
 
     fn mark_error(&self, message: &str) {
+        self.inner
+            .scan_indices_ready
+            .store(false, Ordering::Release);
         self.update_runtime(|runtime| {
             runtime.connected = false;
             runtime.read_ready = false;
