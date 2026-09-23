@@ -30,6 +30,89 @@ const SCAN_MIGRATION_STATE_KEY: &str = "elasticsearch_scan_migration";
 const ENSURE_SCAN_MIGRATION_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_scan_observation_batch_id_id \
      ON scan_observation(batch_id, id);";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SearchSort {
+    field: SearchSortField,
+    descending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchSortField {
+    LastSeen,
+    FirstSeen,
+    Ip,
+    Port,
+}
+
+impl Default for SearchSort {
+    fn default() -> Self {
+        Self {
+            field: SearchSortField::LastSeen,
+            descending: true,
+        }
+    }
+}
+
+impl SearchSort {
+    pub(crate) fn parse(field: Option<&str>, order: Option<&str>) -> Result<Self, &'static str> {
+        let field = match field.unwrap_or("last_seen") {
+            "last_seen" => SearchSortField::LastSeen,
+            "first_seen" => SearchSortField::FirstSeen,
+            "ip" => SearchSortField::Ip,
+            "port" => SearchSortField::Port,
+            _ => return Err("sort_field 不支持该字段"),
+        };
+        let descending = match order {
+            Some("asc") => false,
+            Some("desc") => true,
+            None => matches!(
+                field,
+                SearchSortField::LastSeen | SearchSortField::FirstSeen
+            ),
+            _ => return Err("sort_order 必须是 asc 或 desc"),
+        };
+        Ok(Self { field, descending })
+    }
+
+    pub(crate) fn field_name(self) -> &'static str {
+        match self.field {
+            SearchSortField::LastSeen => "last_seen",
+            SearchSortField::FirstSeen => "first_seen",
+            SearchSortField::Ip => "ip",
+            SearchSortField::Port => "port",
+        }
+    }
+
+    pub(crate) fn order_name(self) -> &'static str {
+        if self.descending { "desc" } else { "asc" }
+    }
+
+    fn clauses(self) -> Vec<Value> {
+        let primary = match self.field {
+            SearchSortField::LastSeen => {
+                json!({"last_seen": {"order": self.order_name(), "missing": "_last"}})
+            }
+            SearchSortField::FirstSeen => {
+                json!({"first_seen": {"order": self.order_name(), "missing": "_last"}})
+            }
+            SearchSortField::Ip => json!({"ip": {"order": self.order_name()}}),
+            SearchSortField::Port => json!({"port": {"order": self.order_name()}}),
+        };
+        let mut clauses = vec![primary];
+        if self.field != SearchSortField::LastSeen {
+            clauses.push(json!({"last_seen": {"order": "desc", "missing": "_last"}}));
+        }
+        if self.field != SearchSortField::Ip {
+            clauses.push(json!({"ip": {"order": "asc"}}));
+        }
+        if self.field != SearchSortField::Port {
+            clauses.push(json!({"port": {"order": "asc"}}));
+        }
+        clauses.push(json!({"endpoint_key": {"order": "asc"}}));
+        clauses
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ScanBatchContext {
     pub(crate) task_id: String,
@@ -1918,6 +2001,7 @@ impl ElasticsearchService {
         filter: Value,
         limit: i64,
         offset: i64,
+        sort: SearchSort,
     ) -> Result<ElasticsearchSearchPage, String> {
         if !self.can_read() {
             return Err("Elasticsearch 搜索读路径尚未就绪".to_owned());
@@ -1945,11 +2029,7 @@ impl ElasticsearchService {
                     ]
                 }
             },
-            "sort": [
-                {"last_seen": {"order": "desc"}},
-                {"ip": {"order": "asc"}},
-                {"port": {"order": "asc"}}
-            ]
+            "sort": sort.clauses()
         });
         let search_index = { &self.inner.config.current_endpoint_index };
         let result = match self
@@ -4283,16 +4363,45 @@ mod tests {
     }
     use super::{
         ENSURE_SCAN_MIGRATION_INDEX_SQL, ElasticsearchOperation, ElasticsearchService,
-        ScanBatchContext, bulk_response_is_retryable, bulk_retry_delay, collect_domain_addresses,
-        dns_task_observations_search_body, index_mapping_update, initialization_retry_delay,
-        new_trace_context, observation_search_target, parse_asn, parse_dns_observation_bulk_result,
-        parse_storage_metrics, replace_domain_filters, scan_batch_payload_checksum,
-        scan_endpoint_index_definition, scan_observation_compatibility_mapping,
-        scan_observation_template,
+        ScanBatchContext, SearchSort, bulk_response_is_retryable, bulk_retry_delay,
+        collect_domain_addresses, dns_task_observations_search_body, index_mapping_update,
+        initialization_retry_delay, new_trace_context, observation_search_target, parse_asn,
+        parse_dns_observation_bulk_result, parse_storage_metrics, replace_domain_filters,
+        scan_batch_payload_checksum, scan_endpoint_index_definition,
+        scan_observation_compatibility_mapping, scan_observation_template,
     };
     use crate::config::ElasticsearchConfig;
     use std::collections::BTreeSet;
     use std::time::Duration;
+
+    #[test]
+    fn search_sort_uses_a_stable_tie_breaker_and_rejects_unknown_fields() {
+        let default = SearchSort::default();
+        assert_eq!(default.field_name(), "last_seen");
+        assert_eq!(default.order_name(), "desc");
+        assert_eq!(
+            default.clauses(),
+            vec![
+                serde_json::json!({"last_seen": {"order": "desc", "missing": "_last"}}),
+                serde_json::json!({"ip": {"order": "asc"}}),
+                serde_json::json!({"port": {"order": "asc"}}),
+                serde_json::json!({"endpoint_key": {"order": "asc"}}),
+            ]
+        );
+
+        let first_seen = SearchSort::parse(Some("first_seen"), Some("asc")).unwrap();
+        assert_eq!(
+            first_seen.clauses()[0],
+            serde_json::json!({"first_seen": {"order": "asc", "missing": "_last"}})
+        );
+        assert_eq!(first_seen.clauses().last(), default.clauses().last());
+        assert_eq!(
+            SearchSort::parse(Some("port"), None).unwrap().order_name(),
+            "asc"
+        );
+        assert!(SearchSort::parse(Some("banner"), None).is_err());
+        assert!(SearchSort::parse(None, Some("random")).is_err());
+    }
 
     #[tokio::test]
     async fn bulk_requires_complete_items_even_when_errors_flag_is_false() {

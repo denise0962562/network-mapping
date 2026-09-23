@@ -7,19 +7,21 @@ use std::str::FromStr;
 use tracing::error;
 
 use crate::admin::UserBaseI;
-use crate::elasticsearch::ElasticsearchService;
+use crate::elasticsearch::{ElasticsearchService, SearchSort};
 use crate::handlers::search_dsl::{ElasticsearchCompilation, parse_and_compile_elasticsearch};
 use crate::handlers::tags::AssetTag;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 100;
-const MAX_OFFSET: i64 = 10_000;
+const MAX_RESULT_WINDOW: i64 = 10_000;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
     pub q: String,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub sort_field: Option<String>,
+    pub sort_order: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +29,8 @@ pub struct PortSearchQuery {
     pub port: String,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub sort_field: Option<String>,
+    pub sort_order: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +40,8 @@ pub struct AdvancedSearchRequest {
     pub generate_if_needed: bool,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub sort_field: Option<String>,
+    pub sort_order: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -48,6 +54,8 @@ struct SearchResponse {
     total: i64,
     limit: i64,
     offset: i64,
+    sort_field: &'static str,
+    sort_order: &'static str,
 }
 
 #[derive(Serialize)]
@@ -87,8 +95,8 @@ fn pagination(limit: Option<i64>, offset: Option<i64>) -> Result<(i64, i64), &'s
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err("limit 必须在 1 到 100 之间");
     }
-    if !(0..=MAX_OFFSET).contains(&offset) {
-        return Err("offset 超出允许范围");
+    if !(0..MAX_RESULT_WINDOW).contains(&offset) || offset + limit > MAX_RESULT_WINDOW {
+        return Err("offset 与 limit 超出前 10000 条结果窗口");
     }
     Ok((limit, offset))
 }
@@ -176,6 +184,11 @@ pub async fn search_v2(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    let sort = match SearchSort::parse(payload.sort_field.as_deref(), payload.sort_order.as_deref())
+    {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
     let elasticsearch_compilation = match parse_and_compile_elasticsearch(query) {
         Ok(value) => value,
         Err(error_value) => {
@@ -199,7 +212,7 @@ pub async fn search_v2(
     match elasticsearch_compilation {
             ElasticsearchCompilation::Supported(filter)
             | ElasticsearchCompilation::RequiresElasticsearch(filter) => respond_search_elasticsearch(
-                elasticsearch.get_ref(), &user, "advanced", query.to_owned(), filter, (limit, offset),
+                elasticsearch.get_ref(), &user, "advanced", query.to_owned(), filter, (limit, offset), sort,
                 (payload.generate_if_needed && offset == 0).then_some(GenerationContext { pool: pool.get_ref(), settings: settings.get_ref(), audit: crate::audit::AuditContext::from_request(&req) }),
             ).await,
             ElasticsearchCompilation::Unsupported => HttpResponse::UnprocessableEntity().json(
@@ -222,11 +235,12 @@ async fn respond_search_elasticsearch(
     query: String,
     filter: serde_json::Value,
     pagination: (i64, i64),
+    sort: SearchSort,
     generation: Option<GenerationContext<'_>>,
 ) -> HttpResponse {
     let (limit, offset) = pagination;
     match elasticsearch
-        .search(user.role, user.id, filter, limit, offset)
+        .search(user.role, user.id, filter, limit, offset, sort)
         .await
     {
         Ok(page) => {
@@ -299,6 +313,8 @@ async fn respond_search_elasticsearch(
                 total: page.total,
                 limit,
                 offset,
+                sort_field: sort.field_name(),
+                sort_order: sort.order_name(),
             })
         }
         Err(error_value) if error_value.starts_with("DOMAIN_RESULT_TOO_BROAD:") => {
@@ -339,6 +355,10 @@ pub async fn search_ip(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    let sort = match SearchSort::parse(query.sort_field.as_deref(), query.sort_order.as_deref()) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
 
     return respond_search_elasticsearch(
         elasticsearch.get_ref(),
@@ -347,6 +367,7 @@ pub async fn search_ip(
         q.to_owned(),
         serde_json::json!({"term": {"ip": q}}),
         (limit, offset),
+        sort,
         None,
     )
     .await;
@@ -367,6 +388,10 @@ pub async fn search_network(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    let sort = match SearchSort::parse(query.sort_field.as_deref(), query.sort_order.as_deref()) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
 
     return respond_search_elasticsearch(
         elasticsearch.get_ref(),
@@ -375,6 +400,7 @@ pub async fn search_network(
         q.to_owned(),
         serde_json::json!({"term": {"ip": normalized_cidr}}),
         (limit, offset),
+        sort,
         None,
     )
     .await;
@@ -382,7 +408,14 @@ pub async fn search_network(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_cidr;
+    use super::{normalize_cidr, pagination};
+
+    #[test]
+    fn search_pagination_stays_within_elasticsearch_result_window() {
+        assert_eq!(pagination(Some(50), Some(9950)), Ok((50, 9950)));
+        assert!(pagination(Some(50), Some(10000)).is_err());
+        assert!(pagination(Some(100), Some(9950)).is_err());
+    }
 
     #[test]
     fn normalizes_ipv4_cidr_with_host_bits() {
@@ -424,6 +457,10 @@ pub async fn search_port(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    let sort = match SearchSort::parse(query.sort_field.as_deref(), query.sort_order.as_deref()) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
 
     return respond_search_elasticsearch(
         elasticsearch.get_ref(),
@@ -432,6 +469,7 @@ pub async fn search_port(
         port.to_string(),
         serde_json::json!({"term": {"port": port}}),
         (limit, offset),
+        sort,
         None,
     )
     .await;
@@ -451,6 +489,10 @@ pub async fn search_service(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    let sort = match SearchSort::parse(query.sort_field.as_deref(), query.sort_order.as_deref()) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
 
     let escaped = q
         .replace('\\', "\\\\")
@@ -459,7 +501,7 @@ pub async fn search_service(
     return respond_search_elasticsearch(
             elasticsearch.get_ref(), &user, "service", q.to_owned(),
             serde_json::json!({"wildcard": {"service": {"value": format!("*{escaped}*"), "case_insensitive": true}}}),
-            (limit, offset),
+            (limit, offset), sort,
             None,
         ).await;
 }
@@ -478,6 +520,10 @@ pub async fn search_banner(
         Ok(value) => value,
         Err(message) => return bad_request(message),
     };
+    let sort = match SearchSort::parse(query.sort_field.as_deref(), query.sort_order.as_deref()) {
+        Ok(value) => value,
+        Err(message) => return bad_request(message),
+    };
 
     let escaped = q
         .replace('\\', "\\\\")
@@ -486,7 +532,7 @@ pub async fn search_banner(
     return respond_search_elasticsearch(
             elasticsearch.get_ref(), &user, "banner", q.to_owned(),
             serde_json::json!({"wildcard": {"banner": {"value": format!("*{escaped}*"), "case_insensitive": true}}}),
-            (limit, offset),
+            (limit, offset), sort,
             None,
         ).await;
 }

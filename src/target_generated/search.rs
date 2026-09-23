@@ -116,7 +116,14 @@ pub(crate) async fn generate(
         }
     };
     let observation = elasticsearch
-        .search(user.role, user.id, filter, 1, 0)
+        .search(
+            user.role,
+            user.id,
+            filter,
+            1,
+            0,
+            crate::elasticsearch::SearchSort::default(),
+        )
         .await?
         .items
         .first()
