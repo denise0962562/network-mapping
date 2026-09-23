@@ -259,6 +259,7 @@ async fn user_login_h(
                 .cookie(cookie_csrf_token)
                 .json(json!({
                     "success": true,
+                    "code": "totp_required",
                     "message": "请验证 2FA 验证码"
                 }))
         }

@@ -60,8 +60,8 @@ where
         Box::pin(async move {
             let response = future.await?;
             let status = response.status();
-            let path = response.request().path();
-            if !is_api_path(path) || !(status.is_client_error() || status.is_server_error()) {
+            let path = response.request().path().to_owned();
+            if !is_api_path(&path) || !(status.is_client_error() || status.is_server_error()) {
                 return Ok(response.map_into_boxed_body());
             }
 
@@ -86,7 +86,7 @@ where
                 Ok(Ok(bytes)) => bytes,
                 Ok(Err(_)) | Err(_) => Bytes::new(),
             };
-            let body = normalize_error_body(status, &original, request_id);
+            let body = normalize_error_body(status, &path, &original, request_id);
 
             response.headers_mut().remove(header::CONTENT_LENGTH);
             response.headers_mut().insert(
@@ -131,8 +131,22 @@ fn is_api_path(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/") || path == "/logout"
 }
 
-fn normalize_error_body(status: StatusCode, original: &[u8], request_id: Uuid) -> Bytes {
+fn normalize_error_body(
+    status: StatusCode,
+    path: &str,
+    original: &[u8],
+    request_id: Uuid,
+) -> Bytes {
     let parsed = serde_json::from_slice::<Value>(original).ok();
+    let totp_required = status == StatusCode::UNAUTHORIZED
+        && path == "/api/login"
+        && parsed
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|body| {
+                body.get("code").and_then(Value::as_str) == Some("totp_required")
+                    && body.get("success").and_then(Value::as_bool) == Some(true)
+            });
     let maintenance = status == StatusCode::SERVICE_UNAVAILABLE
         && parsed
             .as_ref()
@@ -155,7 +169,7 @@ fn normalize_error_body(status: StatusCode, original: &[u8], request_id: Uuid) -
         body.remove(key);
     }
 
-    body.insert("success".to_owned(), Value::Bool(false));
+    body.insert("success".to_owned(), Value::Bool(totp_required));
     body.insert(
         "code".to_owned(),
         Value::String(
@@ -167,7 +181,9 @@ fn normalize_error_body(status: StatusCode, original: &[u8], request_id: Uuid) -
         ),
     );
 
-    let message = if maintenance {
+    let message = if totp_required {
+        "请验证 2FA 验证码".to_owned()
+    } else if maintenance {
         "系统维护中，请稍后重试".to_owned()
     } else if status.is_server_error()
         || matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
@@ -247,6 +263,7 @@ mod tests {
     fn normalize(status: StatusCode, value: Value) -> Value {
         serde_json::from_slice(&normalize_error_body(
             status,
+            "/api/other",
             &serde_json::to_vec(&value).unwrap(),
             Uuid::nil(),
         ))
@@ -257,6 +274,7 @@ mod tests {
     fn legacy_plain_forbidden_becomes_public_contract() {
         let value: Value = serde_json::from_slice(&normalize_error_body(
             StatusCode::FORBIDDEN,
+            "/api/legacy",
             b"403",
             Uuid::nil(),
         ))
@@ -310,6 +328,77 @@ mod tests {
         assert_eq!(value["code"], "system_maintenance");
         assert_eq!(value["maintenance"]["retry_after_seconds"], 600);
         assert_eq!(value["message"], "系统维护中，请稍后重试");
+    }
+
+    #[test]
+    fn login_totp_challenge_preserves_pending_state_without_diagnostics() {
+        let value: Value = serde_json::from_slice(&normalize_error_body(
+            StatusCode::UNAUTHORIZED,
+            "/api/login",
+            &serde_json::to_vec(&json!({
+                "success": true,
+                "code": "totp_required",
+                "message": "请验证 2FA 验证码",
+                "detail": "internal secret"
+            }))
+            .unwrap(),
+            Uuid::nil(),
+        ))
+        .unwrap();
+        assert_eq!(value["success"], true);
+        assert_eq!(value["code"], "totp_required");
+        assert_eq!(value["message"], "请验证 2FA 验证码");
+        assert_eq!(value["request_id"], Uuid::nil().to_string());
+        assert!(value.get("detail").is_none());
+    }
+
+    #[test]
+    fn only_login_totp_challenge_can_succeed_with_unauthorized_status() {
+        let challenge = json!({"success": true, "code": "totp_required"});
+        for (path, body) in [
+            ("/api/other", challenge.clone()),
+            (
+                "/api/login",
+                json!({"success": false, "code": "totp_required"}),
+            ),
+            ("/api/login", json!({"success": true, "code": "other"})),
+        ] {
+            let value: Value = serde_json::from_slice(&normalize_error_body(
+                StatusCode::UNAUTHORIZED,
+                path,
+                &serde_json::to_vec(&body).unwrap(),
+                Uuid::nil(),
+            ))
+            .unwrap();
+            assert_eq!(value["success"], false);
+            assert_eq!(value["message"], "身份验证失败或登录已过期");
+        }
+    }
+
+    #[actix_web::test]
+    async fn login_totp_challenge_reaches_client_with_pending_state_and_cookies() {
+        let app = actix_web::test::init_service(App::new().wrap(ApiErrorMiddleware).route(
+            "/api/login",
+            web::post().to(|| async {
+                HttpResponse::Unauthorized()
+                    .insert_header(("set-cookie", "session=pending; HttpOnly; Secure"))
+                    .json(json!({
+                        "success": true,
+                        "code": "totp_required",
+                        "message": "请验证 2FA 验证码"
+                    }))
+            }),
+        ))
+        .await;
+        let response =
+            actix_web::test::call_service(&app, TestRequest::post().uri("/api/login").to_request())
+                .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("set-cookie"));
+        let body = actix_web::test::read_body(response).await;
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["success"], true);
+        assert_eq!(value["code"], "totp_required");
     }
 
     #[actix_web::test]
