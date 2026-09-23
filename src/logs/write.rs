@@ -7,6 +7,7 @@ use uuid::Uuid;
 // use crate::logs::LogEventType;
 use crate::admin::UserBaseI;
 use crate::audit::RequestId;
+use crate::request_log::set_reason_if_absent;
 use crate::{get_conn_ip, get_user_agent, logs::LoginLog};
 
 const MAX_ERROR_DIAGNOSTIC_CHARS: usize = 4096;
@@ -149,6 +150,7 @@ pub fn warn_logs(req: &HttpRequest, event: &str, message: &str) {
 }
 
 pub fn error_logs(req: &HttpRequest, event: &str, message: &str) {
+    set_reason_if_absent(req, event);
     let req_method = req.method();
     let req_path = req.path();
     let actor = req.extensions().get::<UserBaseI>().cloned();
@@ -182,6 +184,7 @@ pub fn error_logs_error(
     let diagnostics = error_diagnostics(error_value);
     let operation = effective_operation(event, operation);
     let error_code = format!("{operation}_failed");
+    set_reason_if_absent(req, error_code.clone());
     let actor = req.extensions().get::<UserBaseI>().cloned();
     let resource = request_resource_context(req);
     if let Some(database) = diagnostics.database.as_ref() {

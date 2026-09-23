@@ -66,6 +66,37 @@ pub struct VerifyTotp {
     pub token: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TotpBindingRejection {
+    SessionIneligible,
+    PendingSecretMissing,
+    PendingBindingExpired,
+    CodeMismatch,
+}
+
+impl TotpBindingRejection {
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::SessionIneligible => "totp_bind_session_ineligible",
+            Self::PendingSecretMissing => "totp_bind_pending_secret_missing",
+            Self::PendingBindingExpired => "totp_bind_expired",
+            Self::CodeMismatch => "totp_bind_code_mismatch",
+        }
+    }
+}
+
+pub struct TotpBindingAttempt {
+    pub url: String,
+    pub attempt_id: Uuid,
+    pub expires_at_ms: i64,
+}
+
+pub struct TotpBindingConfirmation {
+    pub attempt_id: Option<Uuid>,
+    pub expires_in_ms: Option<i64>,
+    pub rejection: Option<TotpBindingRejection>,
+}
+
 /// 接受解绑 2FA 信息
 #[derive(Deserialize)]
 pub struct Unbind2FAH {
@@ -99,6 +130,17 @@ pub struct ScannerRegisterSecret {
 pub struct ScannerRuntimeSecret {
     pub runtime_token: String,
 }
+
+#[derive(Debug)]
+pub struct ScannerRegistrationUnauthorized;
+
+impl fmt::Display for ScannerRegistrationUnauthorized {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("scanner unauthorized")
+    }
+}
+
+impl Error for ScannerRegistrationUnauthorized {}
 
 #[derive(Serialize)]
 pub struct ScannerInfo {
@@ -804,7 +846,7 @@ pub async fn bind_twofa(
     session: &str,
     pool: &deadpool_postgres::Pool,
     e_key: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<TotpBindingAttempt, Box<dyn std::error::Error>> {
     let secret32 = Secret::generate_secret();
     let totp = TOTP::new(
         Algorithm::SHA1,
@@ -827,20 +869,25 @@ pub async fn bind_twofa(
     let encrypted_secret = openssl::base64::encode_block(&encrypted);
     let expires_at =
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64 + 10 * 60 * 1000;
+    let attempt_id = Uuid::new_v4();
     let updated = transaction
         .execute(
-            "UPDATE session SET pending_totp_secret = $1, pending_totp_expires_at = $2 \
+            "UPDATE session SET pending_totp_secret = $1, pending_totp_expires_at = $2, pending_totp_attempt_id = $5 \
          WHERE token = $3 AND is_enable = true AND deleted_at IS NULL \
          AND totp_verify_successful = true \
          AND user_id = (SELECT id FROM users WHERE username = $4 AND enable_2fa = false);",
-            &[&encrypted_secret, &expires_at, &session, &username],
+            &[&encrypted_secret, &expires_at, &session, &username, &attempt_id],
         )
         .await?;
     if updated != 1 {
         return Err("当前会话不可用于绑定 2FA，或 2FA 已启用".into());
     }
     transaction.commit().await?;
-    Ok(url)
+    Ok(TotpBindingAttempt {
+        url,
+        attempt_id,
+        expires_at_ms: expires_at,
+    })
 }
 
 /// 验证当前会话中的临时 TOTP 密钥，并在成功后正式启用 2FA。
@@ -850,12 +897,12 @@ pub async fn confirm_twofa_binding(
     token: &str,
     pool: &deadpool_postgres::Pool,
     d_key: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<TotpBindingConfirmation, Box<dyn std::error::Error>> {
     let mut conn = pool.get().await?;
     let transaction = conn.transaction().await?;
     let row = transaction
         .query_opt(
-            "SELECT u.id, s.pending_totp_secret, s.pending_totp_expires_at \
+            "SELECT u.id, s.pending_totp_secret, s.pending_totp_expires_at, s.pending_totp_attempt_id \
          FROM session s JOIN users u ON u.id = s.user_id \
          WHERE s.token = $1 AND s.is_enable = true AND s.deleted_at IS NULL \
          AND s.totp_verify_successful = true \
@@ -864,17 +911,35 @@ pub async fn confirm_twofa_binding(
         )
         .await?;
     let Some(row) = row else {
-        return Ok(false);
+        return Ok(TotpBindingConfirmation {
+            attempt_id: None,
+            expires_in_ms: None,
+            rejection: Some(TotpBindingRejection::SessionIneligible),
+        });
     };
+    let attempt_id = row.get::<_, Option<Uuid>>("pending_totp_attempt_id");
     let Some(pending_secret) = row.get::<_, Option<String>>("pending_totp_secret") else {
-        return Ok(false);
+        return Ok(TotpBindingConfirmation {
+            attempt_id,
+            expires_in_ms: None,
+            rejection: Some(TotpBindingRejection::PendingSecretMissing),
+        });
     };
     let Some(expires_at) = row.get::<_, Option<i64>>("pending_totp_expires_at") else {
-        return Ok(false);
+        return Ok(TotpBindingConfirmation {
+            attempt_id,
+            expires_in_ms: None,
+            rejection: Some(TotpBindingRejection::PendingSecretMissing),
+        });
     };
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let expires_in_ms = expires_at - now;
     if now > expires_at {
-        return Ok(false);
+        return Ok(TotpBindingConfirmation {
+            attempt_id,
+            expires_in_ms: Some(expires_in_ms),
+            rejection: Some(TotpBindingRejection::PendingBindingExpired),
+        });
     }
 
     let encrypted_secret = openssl::base64::decode_block(&pending_secret)?;
@@ -890,7 +955,11 @@ pub async fn confirm_twofa_binding(
         username.to_string(),
     )?;
     if !totp_token_verify(totp, token).await? {
-        return Ok(false);
+        return Ok(TotpBindingConfirmation {
+            attempt_id,
+            expires_in_ms: Some(expires_in_ms),
+            rejection: Some(TotpBindingRejection::CodeMismatch),
+        });
     }
 
     let user_id: i32 = row.get("id");
@@ -909,7 +978,11 @@ pub async fn confirm_twofa_binding(
     )
     .await?;
     transaction.commit().await?;
-    Ok(true)
+    Ok(TotpBindingConfirmation {
+        attempt_id,
+        expires_in_ms: Some(expires_in_ms),
+        rejection: None,
+    })
 }
 
 async fn invalidate_user_sessions_in_transaction(
@@ -971,7 +1044,6 @@ pub async fn totp_token_verify(
     if totp.check(token, seconds) {
         Ok(true)
     } else {
-        println!("验证失败");
         Ok(false)
     }
 }
@@ -1804,7 +1876,7 @@ pub async fn scanner_register(
         .await?;
 
     let Some(row) = row else {
-        return Err("scanner unauthorized".into());
+        return Err(Box::new(ScannerRegistrationUnauthorized));
     };
 
     let scanner_pk: i32 = row.get("id");
@@ -1837,7 +1909,7 @@ pub async fn scanner_register(
             db_transaction.commit().await?;
             Ok(ScannerRuntimeSecret { runtime_token })
         }
-        0 => Err("scanner unauthorized".into()),
+        0 => Err(Box::new(ScannerRegistrationUnauthorized)),
         _ => Err("更新影响多行".into()),
     }
 }

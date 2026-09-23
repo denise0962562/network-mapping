@@ -554,7 +554,7 @@ pub(crate) async fn update_scanner(
             return HttpResponse::InternalServerError().finish();
         }
     }
-    if audit(
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -564,9 +564,12 @@ pub(crate) async fn update_scanner(
         json!({"name": name}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "UpdateScannerAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "UpdateScannerCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true}))
@@ -615,7 +618,10 @@ pub(crate) async fn set_scanner_enabled(
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            log_database_error(&req, "SetScannerEnabledTransactionError", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let id = scanner_id.into_inner().to_string();
     let changed = transaction.execute("UPDATE scanner_info SET is_enable = $1, runtime_state = CASE WHEN $1 THEN runtime_state ELSE 'offline' END, is_run = CASE WHEN $1 THEN is_run ELSE false END, update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&body.enabled, &id]).await;
@@ -632,10 +638,13 @@ pub(crate) async fn set_scanner_enabled(
     } else {
         match release_scanner_tasks(&transaction, &id, "scanner disabled by administrator").await {
             Ok(count) => count,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(error) => {
+                log_database_error(&req, "SetScannerEnabledReleaseError", &error);
+                return HttpResponse::InternalServerError().finish();
+            }
         }
     };
-    if audit(
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -649,9 +658,12 @@ pub(crate) async fn set_scanner_enabled(
         json!({"released_tasks": released}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "SetScannerEnabledAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "SetScannerEnabledCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true, "released_tasks": released}))
@@ -670,11 +682,27 @@ pub(crate) async fn reissue_scanner_token(
     }
     let token = match generate_scanner_token("nm_reg") {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ReissueScannerTokenGenerationError",
+                "generate_scanner_token",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let token_hash = match hash_scanner_token(&token, &security.scanner_token_pepper) {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ReissueScannerTokenHashError",
+                "hash_scanner_token",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let mut connection = match pool.get().await {
         Ok(value) => value,
@@ -685,7 +713,10 @@ pub(crate) async fn reissue_scanner_token(
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            log_database_error(&req, "ReissueScannerTokenTransactionError", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let id = scanner_id.into_inner().to_string();
     let changed = transaction.execute(
@@ -701,9 +732,12 @@ pub(crate) async fn reissue_scanner_token(
     let released =
         match release_scanner_tasks(&transaction, &id, "scanner credentials revoked").await {
             Ok(value) => value,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(error) => {
+                log_database_error(&req, "ReissueScannerTokenReleaseError", &error);
+                return HttpResponse::InternalServerError().finish();
+            }
         };
-    if audit(
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -713,9 +747,12 @@ pub(crate) async fn reissue_scanner_token(
         json!({"released_tasks": released}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "ReissueScannerTokenAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "ReissueScannerTokenCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok()
@@ -741,13 +778,19 @@ pub(crate) async fn delete_scanner(
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            log_database_error(&req, "DeleteScannerTransactionError", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let id = scanner_id.into_inner().to_string();
     let released =
         match release_scanner_tasks(&transaction, &id, "scanner deleted by administrator").await {
             Ok(value) => value,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(error) => {
+                log_database_error(&req, "DeleteScannerReleaseError", &error);
+                return HttpResponse::InternalServerError().finish();
+            }
         };
     let changed = transaction.execute("UPDATE scanner_info SET deleted_at = NOW(), is_enable = false, is_run = false, runtime_state = 'offline', registration_token_hash = NULL, runtime_token_hash = NULL, update_time = NOW() WHERE scanner_id = $1 AND deleted_at IS NULL;", &[&id]).await;
     match changed {
@@ -758,7 +801,7 @@ pub(crate) async fn delete_scanner(
             return HttpResponse::InternalServerError().finish();
         }
     }
-    if audit(
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -768,9 +811,12 @@ pub(crate) async fn delete_scanner(
         json!({"released_tasks": released}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "DeleteScannerAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "DeleteScannerCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true}))

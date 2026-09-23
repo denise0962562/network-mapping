@@ -445,11 +445,22 @@ pub async fn update_scanner_configuration(
         .resource("scanner", &scanner_id);
     event.changes = Some(json!({"revision": revision, "change_reason": body.change_reason.trim()}));
     event.response_status = Some(200);
-    if write_audit(&transaction, &AuditContext::from_request(&req), &event)
-        .await
-        .is_err()
-        || transaction.commit().await.is_err()
-    {
+    if let Err(error) = write_audit(&transaction, &AuditContext::from_request(&req), &event).await {
+        error_logs_error(
+            &req,
+            "ScannerConfigurationAuditError",
+            "write_configuration_audit",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        error_logs_error(
+            &req,
+            "ScannerConfigurationCommitError",
+            "commit_configuration_update",
+            &error,
+        );
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true, "data": {
@@ -487,11 +498,27 @@ pub async fn get_runtime_scanner_configuration(
         Err(ApplyTaskError::ScannerUnauthorized) => {
             return HttpResponse::Unauthorized().body("unauthorized");
         }
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerRuntimeCredentialError",
+                "validate_scanner_credentials",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     }
     let client = match pool.get().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerRuntimePoolError",
+                "acquire_scanner_configuration_connection",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     match load_configuration(&client, &query.scannerid.to_string()).await {
         Ok(Some(configuration)) => {

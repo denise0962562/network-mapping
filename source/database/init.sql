@@ -368,6 +368,7 @@ CREATE TABLE IF NOT EXISTS session (
 	totp_verify_successful boolean DEFAULT false,
 	pending_totp_secret TEXT,
 	pending_totp_expires_at BIGINT,
+	pending_totp_attempt_id UUID,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
 	is_enable boolean DEFAULT true,
 	deleted_at TIMESTAMPTZ,
@@ -378,6 +379,7 @@ CREATE TABLE IF NOT EXISTS session (
 -- Session 使用软删除保留认证历史，便于安全事件回溯。旧库升级时只补充审计字段，
 -- 不物理删除既有失效记录；历史记录的精确失效时间未知，因此明确标记为迁移时间。
 ALTER TABLE session ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE session ADD COLUMN IF NOT EXISTS pending_totp_attempt_id UUID;
 ALTER TABLE session ADD COLUMN IF NOT EXISTS deletion_reason TEXT;
 ALTER TABLE session ADD COLUMN IF NOT EXISTS deleted_by_user_id INT;
 DO $$
@@ -977,12 +979,14 @@ CREATE TABLE IF NOT EXISTS request_log (
 	actor_name TEXT,                     -- 已认证用户名；匿名/扫描器请求为 NULL
 	error_level TEXT NOT NULL DEFAULT 'ok'
 		CHECK (error_level IN ('ok', 'client_error', 'server_error')),
-	error_type TEXT                      -- bad_request / unauthorized / not_found / ...
+	error_type TEXT,                     -- bad_request / unauthorized / not_found / ...
+	reason_code TEXT                     -- 服务端判定的稳定原因代码，不存储请求体或凭据
 );
 
 -- 兼容已经创建 request_log 的部署：保留 duration_ms，新增微秒精度和标准化路由。
 ALTER TABLE request_log ADD COLUMN IF NOT EXISTS duration_us BIGINT;
 ALTER TABLE request_log ADD COLUMN IF NOT EXISTS route_pattern TEXT;
+ALTER TABLE request_log ADD COLUMN IF NOT EXISTS reason_code TEXT;
 
 -- 只保留 2 个索引：分页/趋势/保留清理走 time 索引，错误查询与错误率趋势走 error 索引。
 CREATE INDEX IF NOT EXISTS idx_request_log_time

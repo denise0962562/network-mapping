@@ -4,9 +4,11 @@
 //! 覆盖每一个业务请求，用于请求级别的分析与错误自动识别。
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use actix_web::{HttpMessage, HttpRequest};
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use tokio::sync::mpsc;
@@ -24,6 +26,31 @@ use crate::runtime_config::RuntimeConfig;
 /// 匿名请求、被 401/403 拒绝的请求、扫描器请求（直通、不注入 `UserBaseI`）保持为 `None`。
 pub struct RequestActor(pub Arc<Mutex<Option<(i32, String)>>>); // (user_id, username)
 
+/// 业务处理器写入的稳定原因代码，供请求结束时的访问记录读取。
+#[derive(Clone)]
+pub struct RequestReason(pub Arc<Mutex<Option<String>>>);
+
+pub fn set_reason(req: &HttpRequest, reason: impl Into<String>) {
+    if let Some(slot) = req.extensions().get::<RequestReason>() {
+        *slot
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.into());
+    }
+}
+
+pub fn set_reason_if_absent(req: &HttpRequest, reason: impl Into<String>) {
+    if let Some(slot) = req.extensions().get::<RequestReason>() {
+        let mut value = slot
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if value.is_none() {
+            *value = Some(reason.into());
+        }
+    }
+}
+
 /// 一条待写入 `request_log` 的请求记录。
 pub struct RequestLogEntry {
     pub request_id: Uuid,
@@ -40,6 +67,7 @@ pub struct RequestLogEntry {
     pub actor_name: Option<String>,
     pub error_level: String,
     pub error_type: Option<String>,
+    pub reason_code: Option<String>,
 }
 
 /// 按 HTTP 状态码派生 `error_level` 与 `error_type`。
@@ -60,6 +88,11 @@ pub fn classify_status(status: u16) -> (&'static str, Option<&'static str>) {
 }
 
 pub const CHANNEL_CAPACITY: usize = 8192;
+static DROPPED_ENQUEUE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_enqueue_drop() -> u64 {
+    DROPPED_ENQUEUE_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+}
 const BATCH_SIZE: usize = 500;
 const FLUSH_INTERVAL_MS: u64 = 500;
 const RETRY_DELAYS_MS: [u64; 2] = [50, 200];
@@ -135,7 +168,7 @@ async fn flush_batch(pool: &Pool, batch: &mut Vec<RequestLogEntry>, dropped: &mu
     }
 }
 
-const COLUMN_COUNT: usize = 14;
+const COLUMN_COUNT: usize = 15;
 
 async fn insert_batch(
     pool: &Pool,
@@ -150,7 +183,7 @@ async fn insert_batch(
     let mut sql = String::from(
         "INSERT INTO request_log (request_id, occurred_at, http_method, request_path, \
          route_pattern, status_code, duration_ms, duration_us, client_ip, user_agent, actor_id, actor_name, \
-         error_level, error_type) VALUES ",
+         error_level, error_type, reason_code) VALUES ",
     );
     let mut params: Vec<Box<dyn ToSql + Send + Sync>> =
         Vec::with_capacity(entries.len() * COLUMN_COUNT);
@@ -160,7 +193,7 @@ async fn insert_batch(
         }
         let base = index * COLUMN_COUNT;
         sql.push_str(&format!(
-            "(${},${},${},${},${},${},${},${},${},${},${},${},${},${})",
+            "(${},${},${},${},${},${},${},${},${},${},${},${},${},${},${})",
             base + 1,
             base + 2,
             base + 3,
@@ -175,6 +208,7 @@ async fn insert_batch(
             base + 12,
             base + 13,
             base + 14,
+            base + 15,
         ));
         params.push(Box::new(entry.request_id));
         params.push(Box::new(entry.occurred_at));
@@ -190,6 +224,7 @@ async fn insert_batch(
         params.push(Box::new(entry.actor_name.clone()));
         params.push(Box::new(entry.error_level.clone()));
         params.push(Box::new(entry.error_type.clone()));
+        params.push(Box::new(entry.reason_code.clone()));
     }
 
     let param_refs: Vec<&(dyn ToSql + Sync)> = params

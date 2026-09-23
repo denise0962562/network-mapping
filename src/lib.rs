@@ -1150,7 +1150,7 @@ pub fn generate_hash_password(
 pub async fn get_password_and_id_from_database(
     pool: &deadpool_postgres::Pool,
     username: &str,
-) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
+) -> Result<Option<(i32, String, UserLoginInfo)>, Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
         "SELECT id, username, password, role, email, enable_2fa, totp_secret, login_ip_allowlist FROM users \
@@ -1181,15 +1181,10 @@ pub async fn get_password_and_id_from_database(
             twofa: get_twofa_info(row),
         };
 
-        Ok((u_id, u_pwd, userinfo))
+        Ok(Some((u_id, u_pwd, userinfo)))
     }
     else {
-        info!(
-                event = "UserPasswordHASHNotFound",
-                path = "fn get_password_from_database",
-                message = "用户密码哈希值未找到"
-            );
-        Err("未找到密码".into())
+        Ok(None)
     }
 }
 
@@ -1203,7 +1198,10 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
             let result = argon2
                 .verify_password(password.as_bytes(), &parsed_hash)
                 .is_ok();
-            println!("verify_pwd {:>6} ms", start.elapsed().as_millis());
+            tracing::debug!(
+                event = "PasswordHashVerified",
+                duration_ms = start.elapsed().as_millis() as u64
+            );
             result
         }
         Err(e) => {
@@ -1216,7 +1214,10 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
                 retryable = false,
                 outcome = "authentication_failed_closed",
             );
-            println!("verify_pwd_e {:>6}", start.elapsed().as_millis());
+            tracing::debug!(
+                event = "PasswordHashVerificationFailed",
+                duration_ms = start.elapsed().as_millis() as u64
+            );
             false
         }
     }

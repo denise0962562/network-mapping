@@ -506,7 +506,10 @@ async fn maintenance_gate_for_runtime_scanner(
         Err(ApplyTaskError::ScannerUnauthorized) => {
             Some(HttpResponse::Unauthorized().body("unauthorized"))
         }
-        Err(_) => Some(HttpResponse::InternalServerError().finish()),
+        Err(error) => {
+            tracing::error!(event = "ScannerMaintenanceCredentialError", operation = "validate_scanner_credentials", error = ?error, scanner_id = %scanner_id);
+            Some(HttpResponse::InternalServerError().finish())
+        }
     }
 }
 
@@ -1823,7 +1826,15 @@ async fn get_dns_comparison(
     let task_id = task_id.into_inner().to_string();
     let connection = match pool.get().await {
         Ok(connection) => connection,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "DnsComparisonPoolError",
+                "acquire_dns_comparison_connection",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let task_kind = match connection.query_opt(
         "SELECT task_kind FROM scan_task WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) LIMIT 1;",
@@ -1943,7 +1954,10 @@ async fn create_task(
             let ids: HashSet<String> = create_data.scanner_ids.iter().map(Uuid::to_string).collect();
             let connection = match database_conn.get().await {
                 Ok(value) => value,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
+                Err(error) => {
+                    error_logs_error(&req, "ResolveSelectedScannersPoolError", "acquire_scanner_connection", &error);
+                    return HttpResponse::InternalServerError().finish();
+                }
             };
             let values: Vec<String> = ids.into_iter().collect();
             let query = format!(
@@ -1963,7 +1977,10 @@ async fn create_task(
         "all" if create_data.scanner_ids.is_empty() => {
             let connection = match database_conn.get().await {
                 Ok(value) => value,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
+                Err(error) => {
+                    error_logs_error(&req, "ResolveAllScannersPoolError", "acquire_scanner_connection", &error);
+                    return HttpResponse::InternalServerError().finish();
+                }
             };
             let query = format!(
                 "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
@@ -2092,7 +2109,15 @@ async fn create_dns_task(
     domains.dedup();
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "CreateDnsTaskPoolError",
+                "acquire_dns_task_connection",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let dispatch_mode = input.dispatch_mode.trim().to_ascii_lowercase();
     let requires_explicit_resolvers = !dns_resolvers.is_empty();

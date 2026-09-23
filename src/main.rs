@@ -510,6 +510,9 @@ async fn main() -> io::Result<()> {
                 let actor = std::sync::Arc::new(std::sync::Mutex::new(None));
                 req.extensions_mut()
                     .insert(request_log::RequestActor(actor.clone()));
+                let reason = std::sync::Arc::new(std::sync::Mutex::new(None));
+                req.extensions_mut()
+                    .insert(request_log::RequestReason(reason.clone()));
                 let method = req.method().to_string();
                 let client_ip = request_ip(req.request());
                 let user_agent = req
@@ -561,6 +564,10 @@ async fn main() -> io::Result<()> {
                     {
                         let status = response.status().as_u16();
                         let (error_level, error_type) = request_log::classify_status(status);
+                        let reason_code = reason
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
                         let elapsed = started.elapsed();
                         let duration_ms = i32::try_from(elapsed.as_millis()).ok();
                         let duration_us = i64::try_from(elapsed.as_micros()).ok();
@@ -573,6 +580,24 @@ async fn main() -> io::Result<()> {
                             Some((id, name)) => (Some(id), Some(name)),
                             None => (None, None),
                         };
+
+                        if status >= 500
+                            || (status >= 400
+                                && (path.starts_with("/api/totp/")
+                                    || path == "/api/login"
+                                    || path == "/api/scanner/register"))
+                        {
+                            tracing::warn!(
+                                event = "request_completed",
+                                request_id = %request_id,
+                                method,
+                                path,
+                                status,
+                                duration_us = ?duration_us,
+                                reason_code = ?reason_code,
+                                actor_user_id = ?actor_id,
+                            );
+                        }
 
                         // 健康告警：慢请求与 5xx 错误实时判定，仅在命中阈值时才分配/克隆字符串。
                         {
@@ -629,8 +654,20 @@ async fn main() -> io::Result<()> {
                                 actor_name,
                                 error_level: error_level.to_owned(),
                                 error_type: error_type.map(str::to_owned),
+                                reason_code,
                             };
-                            let _ = request_log_tx.try_send(entry);
+                            if request_log_tx.try_send(entry).is_err() {
+                                let dropped = request_log::record_enqueue_drop();
+                                if dropped.is_power_of_two() {
+                                    tracing::warn!(
+                                        event = "RequestLogEnqueueDropped",
+                                        operation = "enqueue_request_log",
+                                        reason_code = "request_log_queue_unavailable",
+                                        dropped_total = dropped,
+                                        request_id = %request_id,
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(response)

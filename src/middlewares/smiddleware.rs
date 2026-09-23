@@ -10,8 +10,8 @@ use std::sync::Arc;
 use futures::future::LocalBoxFuture;
 
 use crate::admin::UserSession;
-use crate::login::LoginToken;
 use crate::login::get_session_from_req;
+use crate::login::{LoginToken, SessionCheck};
 use tracing::{debug, error, info};
 
 use crate::api_response::error_response;
@@ -19,7 +19,7 @@ use crate::audit::{AuditContext, AuditEvent, RequestId, write_standalone};
 use crate::frontend::{FrontendAssets, is_protected_frontend_path};
 use crate::get_conn_ip;
 use crate::middlewares::{ExpectedCsrfToken, get_pool_from_app_data, is_scanner_api_request};
-use crate::request_log::RequestActor;
+use crate::request_log::{RequestActor, set_reason};
 use uuid::Uuid;
 
 /// 用于 session 检查的中间件的 Transform
@@ -128,6 +128,7 @@ where
             let session = match get_session_from_req(req.request(), "session") {
                 Some(se) => se,
                 None => {
+                    set_reason(req.request(), "missing_session");
                     if let Ok(pool) = get_pool_from_app_data(&req) {
                         let mut audit_event = AuditEvent::anonymous(
                             "authentication",
@@ -159,6 +160,7 @@ where
             let g_pool = match get_pool_from_app_data(&req) {
                 Ok(p) => p,
                 Err(_) => {
+                    set_reason(req.request(), "database_pool_app_data_missing");
                     let resp = HttpResponse::InternalServerError().finish();
                     return Ok(req.into_response(resp).map_into_right_body());
                 }
@@ -170,7 +172,7 @@ where
             let require_totp = path != "/api/totp/verify" && !scanner_api_request;
 
             match login_t.check_token(&session, require_totp).await {
-                Ok(Some(authentication)) => {
+                Ok(SessionCheck::Valid(authentication)) => {
                     let user = authentication.user;
                     // 将操作者写入最外层 wrap_fn 预置的槽位，供请求日志采集（request_log）。
                     // 槽位仅在采集开启且未被跳过的请求上存在；匿名/被拒绝请求保持 NULL。
@@ -192,11 +194,12 @@ where
 
                     Ok(svc.call(req).await?.map_into_left_body())
                 }
-                Ok(None) => {
+                Ok(SessionCheck::Rejected(reason)) => {
+                    set_reason(req.request(), reason);
                     let mut audit_event =
                         AuditEvent::anonymous("authentication", "auth.session_rejected", "denied");
                     audit_event.response_status = Some(401);
-                    audit_event.reason_code = Some("invalid_or_expired_session".to_owned());
+                    audit_event.reason_code = Some(reason.to_owned());
                     write_standalone(
                         g_pool,
                         &AuditContext::from_request(req.request()),
@@ -205,7 +208,7 @@ where
                     .await;
                     debug!(
                         event = "InvalidSession",
-                        reason = "invalid_or_expired_session",
+                        reason,
                         method = %req.method(),
                         path = req.path(),
                         request_id = %request_id,
@@ -215,6 +218,7 @@ where
                     Ok(req.into_response(resp).map_into_right_body())
                 }
                 Err(e) => {
+                    set_reason(req.request(), "session_token_verification_failed");
                     let diagnostics = crate::logs::write::error_diagnostics(e.as_ref());
                     error!(
                         event = "TokenVerifyError",
