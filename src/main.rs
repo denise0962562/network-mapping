@@ -310,6 +310,13 @@ async fn main() -> io::Result<()> {
         elasticsearch_service.clone(),
     ));
 
+    tokio::spawn(network_mapping_server::reports::run_worker(
+        db_pool.clone(),
+        ser_con.encrypt_key.clone(),
+        runtime_settings.analytics_snapshot.clone(),
+        system_maintenance_state.clone(),
+    ));
+
     info!(target: "server::startup", "正在检查系统账户");
 
     check_system_user(&db_pool).await;

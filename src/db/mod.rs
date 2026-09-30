@@ -157,6 +157,9 @@ pub async fn init_database_table(
     let transaction = client.transaction().await?;
     debug!(init_database_file = file_path, "开始执行数据库初始化事务");
     transaction.batch_execute(&sql).await?;
+    transaction
+        .batch_execute(include_str!("../../source/database/migrate_reports.sql"))
+        .await?;
     transaction.commit().await?;
 
     Ok(())

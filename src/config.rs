@@ -1707,7 +1707,16 @@ mod tests {
 }
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(user::user_login_h)
+    cfg.service(handlers::reports::generate)
+        .service(handlers::reports::list)
+        .service(handlers::reports::detail)
+        .service(handlers::reports::revise)
+        .service(handlers::reports::retry)
+        .service(handlers::reports::deliveries)
+        .service(handlers::reports::send)
+        .service(handlers::reports::schedules)
+        .service(handlers::reports::save_schedule)
+        .service(user::user_login_h)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::data_saa::get_analysis_distribution)
         .service(handlers::data_saa::get_analysis_discovery_heatmap)

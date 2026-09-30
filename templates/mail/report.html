@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><style>
+body{font-family:Arial,sans-serif;color:#263238;background:#f4f6f8;margin:0;padding:24px}
+main{max-width:640px;margin:auto;background:white;padding:28px;border-radius:12px}
+h1{font-size:24px}table{width:100%;border-collapse:collapse}td{padding:10px;border-bottom:1px solid #e5e7eb}.note{color:#64748b;font-size:13px}
+</style></head><body><main>
+<h1>{{ system_name }} {{ report_label }}</h1><p>{{ period_label }}</p>
+<table><tbody>
+<tr><td>新建任务</td><td>{{ tasks.created }}</td></tr>
+<tr><td>成功 / 失败 / 部分完成 / 取消</td><td>{{ tasks.succeeded }} / {{ tasks.failed }} / {{ tasks.partial }} / {{ tasks.cancelled }}</td></tr>
+<tr><td>任务成功率</td><td>{% if tasks.success_rate is number %}{{ tasks.success_rate }}%{% else %}无完成任务{% endif %}</td></tr>
+<tr><td>成功执行发现的去重 IP</td><td>{{ scan_output.unique_ips }}</td></tr>
+<tr><td>端口 / 服务观测次数</td><td>{{ scan_output.port_observations }} / {{ scan_output.service_observations }}</td></tr>
+</tbody></table>
+<h2>处理建议</h2>{% for item in recommendations %}<p>{{ item }}</p>{% else %}<p>本期未发现需要提示的任务异常。</p>{% endfor %}
+<p class="note">统计数据已完整归档。任务按完成时间归属；端口和服务按扫描执行累加，不代表资产存量。数据范围为生成时保留的历史。</p>
+<p>登录平台后查看完整报告：{{ detail_path }}</p>
+</main></body></html>
