@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+<body style="font-family:Arial,sans-serif;color:#1f2937;line-height:1.6">
+  <h2>扫描器{{ event_label }}：{{ scanner_name }}</h2>
+  <p>扫描器 {{ scanner_name }} 已{{ event_label }}。</p>
+  <ul>
+    <li>扫描器 ID：{{ scanner_id }}</li>
+    <li>位置：{{ location }}</li>
+    <li>最后心跳：{{ last_seen_at }}</li>
+    <li>发现或恢复时间：{{ event_at }}</li>
+  </ul>
+  <p>登录 Network Mapping 后访问扫描器详情：{{ detail_path }}</p>
+</body>
+</html>

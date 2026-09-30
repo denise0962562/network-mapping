@@ -960,7 +960,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         .query_opt(
             "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
              cpus = $4, ram = $5, uptime = $6, runtime_state = $7, last_seen_at = NOW(), \
-             update_time = NOW(), is_run = ($7 <> 'stopping'), \
+             update_time = NOW(), outage_monitored_at = NOW(), is_run = ($7 <> 'stopping'), \
              ip_address = COALESCE($8::text::inet, ip_address), supports_ipv4 = $9, \
              supports_ipv6 = $10, ipv4_ready = $11, ipv6_ready = $12, \
              public_ipv4 = $13::text::inet, public_ipv6 = $14::text::inet, \
@@ -1069,6 +1069,17 @@ pub(crate) async fn scanner_heartbeat_handler(
             revision: value.revision,
             schema_version: value.schema_version,
         });
+    if let Err(error) =
+        crate::scanner_outage::record_recovery(&scanner_transaction, &scanner_id).await
+    {
+        error_logs_error(
+            &req,
+            "ScannerRecoveryError",
+            "record_scanner_recovery",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
     // 扫描器状态行与任务执行行使用两个短事务。过去这里会在等待任务租约锁时一直
     // 持有 scanner_info 行锁，导致同一扫描器后续心跳形成分钟级锁队列。
     if let Err(error) = scanner_transaction.commit().await {

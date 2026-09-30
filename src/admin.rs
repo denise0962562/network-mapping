@@ -1522,6 +1522,14 @@ pub async fn get_mail_settings_from_database(
                 "health_alert_enabled",
                 defaults.health_alert_enabled,
             ),
+            scanner_offline_enabled: notification_value(
+                "scanner_offline_enabled",
+                defaults.scanner_offline_enabled,
+            ),
+            scanner_recovery_enabled: notification_value(
+                "scanner_recovery_enabled",
+                defaults.scanner_recovery_enabled,
+            ),
         },
     })
 }
@@ -1616,6 +1624,20 @@ pub async fn write_mail_settings_to_database(
         (
             "health_alert_enabled",
             settings.notification_prefs.health_alert_enabled.to_string(),
+        ),
+        (
+            "scanner_offline_enabled",
+            settings
+                .notification_prefs
+                .scanner_offline_enabled
+                .to_string(),
+        ),
+        (
+            "scanner_recovery_enabled",
+            settings
+                .notification_prefs
+                .scanner_recovery_enabled
+                .to_string(),
         ),
     ];
     const UPSERT_SETTING: &str = "INSERT INTO setting (item_type, key, value) VALUES ($1, $2, $3) \

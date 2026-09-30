@@ -1190,6 +1190,14 @@ pub struct NotificationPreferences {
     /// 字段级默认值为 `true`，保证旧前端保存邮件设置时不带该字段也能正常反序列化。
     #[serde(default = "default_health_alert_enabled")]
     pub health_alert_enabled: bool,
+    #[serde(default)]
+    pub scanner_offline_enabled: bool,
+    #[serde(default = "default_scanner_recovery_enabled")]
+    pub scanner_recovery_enabled: bool,
+}
+
+fn default_scanner_recovery_enabled() -> bool {
+    true
 }
 
 fn default_health_alert_enabled() -> bool {
@@ -1206,6 +1214,8 @@ impl Default for NotificationPreferences {
             report_weekly: true,
             report_monthly: false,
             health_alert_enabled: true,
+            scanner_offline_enabled: false,
+            scanner_recovery_enabled: true,
         }
     }
 }
@@ -1334,6 +1344,8 @@ mod tests {
         }))
         .expect("旧前端缺少 healthAlertEnabled 时应能正常反序列化");
         assert!(prefs.health_alert_enabled);
+        assert!(!prefs.scanner_offline_enabled);
+        assert!(prefs.scanner_recovery_enabled);
     }
 
     #[test]

@@ -464,6 +464,42 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	deleted_at TIMESTAMPTZ                                                          -- 软删除时间
 );
 
+-- 仅新版本服务成功处理过的心跳会启用掉线监控，避免升级时补发历史离线告警。
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS outage_monitored_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS scanner_outage (
+	id BIGSERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL REFERENCES scanner_info(scanner_id) ON DELETE CASCADE,
+	last_seen_at TIMESTAMPTZ NOT NULL,
+	detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	recovered_at TIMESTAMPTZ,
+	recovery_requested BOOLEAN NOT NULL DEFAULT FALSE,
+	recovery_delivery_prepared BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_outage_active
+	ON scanner_outage(scanner_id) WHERE recovered_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_scanner_outage_recovery_queue
+	ON scanner_outage(id)
+	WHERE recovered_at IS NOT NULL AND recovery_requested AND NOT recovery_delivery_prepared;
+
+CREATE TABLE IF NOT EXISTS scanner_outage_delivery (
+	id BIGSERIAL PRIMARY KEY,
+	outage_id BIGINT NOT NULL REFERENCES scanner_outage(id) ON DELETE CASCADE,
+	kind TEXT NOT NULL CHECK (kind IN ('offline', 'recovered')),
+	recipient TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'pending'
+		CHECK (status IN ('pending', 'sending', 'sent', 'cancelled', 'failed')),
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	claimed_until TIMESTAMPTZ,
+	sent_at TIMESTAMPTZ,
+	last_error TEXT,
+	UNIQUE (outage_id, kind, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_scanner_outage_delivery_ready
+	ON scanner_outage_delivery(available_at, id)
+	WHERE status IN ('pending', 'sending');
+
 -- 旧版扫描器没有网络能力心跳，安全地按仅支持 IPv4 处理。
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS supports_ipv4 BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS supports_ipv6 BOOLEAN NOT NULL DEFAULT false;

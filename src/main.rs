@@ -31,6 +31,7 @@ use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
 use network_mapping_server::runtime_config::{RuntimeSettings, RuntimeSettingsBootstrap};
 use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
+use network_mapping_server::scanner_outage;
 use network_mapping_server::system_maintenance::{
     SystemMaintenanceState, run_reconciler as run_system_maintenance_reconciler,
 };
@@ -263,6 +264,11 @@ async fn main() -> io::Result<()> {
     tokio::spawn(run_system_maintenance_reconciler(
         system_maintenance_state.clone(),
         db_pool.clone(),
+    ));
+    tokio::spawn(scanner_outage::run_worker(
+        db_pool.clone(),
+        ser_con.encrypt_key.clone(),
+        system_maintenance_state.clone(),
     ));
     if let Ok(client) = db_pool.get().await
         && let Err(error_value) = client

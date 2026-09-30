@@ -624,7 +624,7 @@ pub(crate) async fn set_scanner_enabled(
         }
     };
     let id = scanner_id.into_inner().to_string();
-    let changed = transaction.execute("UPDATE scanner_info SET is_enable = $1, runtime_state = CASE WHEN $1 THEN runtime_state ELSE 'offline' END, is_run = CASE WHEN $1 THEN is_run ELSE false END, update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&body.enabled, &id]).await;
+    let changed = transaction.execute("UPDATE scanner_info SET is_enable = $1, runtime_state = CASE WHEN $1 THEN runtime_state ELSE 'offline' END, is_run = CASE WHEN $1 THEN is_run ELSE false END, outage_monitored_at = NULL, update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&body.enabled, &id]).await;
     match changed {
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
@@ -632,6 +632,12 @@ pub(crate) async fn set_scanner_enabled(
             log_database_error(&req, "SetScannerEnabledError", &error);
             return HttpResponse::InternalServerError().finish();
         }
+    }
+    if !body.enabled
+        && let Err(error) = crate::scanner_outage::close_without_recovery(&transaction, &id).await
+    {
+        log_database_error(&req, "SetScannerEnabledOutageError", &error);
+        return HttpResponse::InternalServerError().finish();
     }
     let released = if body.enabled {
         0
@@ -720,7 +726,7 @@ pub(crate) async fn reissue_scanner_token(
     };
     let id = scanner_id.into_inner().to_string();
     let changed = transaction.execute(
-        "UPDATE scanner_info SET registration_token_hash = $1, registration_token_expires_at = NOW() + INTERVAL '24 hours', registration_consumed_at = NULL, runtime_token_hash = NULL, is_enable = false, is_run = false, runtime_state = 'offline', update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&token_hash, &id]).await;
+        "UPDATE scanner_info SET registration_token_hash = $1, registration_token_expires_at = NOW() + INTERVAL '24 hours', registration_consumed_at = NULL, runtime_token_hash = NULL, is_enable = false, is_run = false, runtime_state = 'offline', outage_monitored_at = NULL, update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&token_hash, &id]).await;
     match changed {
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
@@ -728,6 +734,10 @@ pub(crate) async fn reissue_scanner_token(
             log_database_error(&req, "ReissueScannerTokenError", &error);
             return HttpResponse::InternalServerError().finish();
         }
+    }
+    if let Err(error) = crate::scanner_outage::close_without_recovery(&transaction, &id).await {
+        log_database_error(&req, "ReissueScannerTokenOutageError", &error);
+        return HttpResponse::InternalServerError().finish();
     }
     let released =
         match release_scanner_tasks(&transaction, &id, "scanner credentials revoked").await {
@@ -792,7 +802,7 @@ pub(crate) async fn delete_scanner(
                 return HttpResponse::InternalServerError().finish();
             }
         };
-    let changed = transaction.execute("UPDATE scanner_info SET deleted_at = NOW(), is_enable = false, is_run = false, runtime_state = 'offline', registration_token_hash = NULL, runtime_token_hash = NULL, update_time = NOW() WHERE scanner_id = $1 AND deleted_at IS NULL;", &[&id]).await;
+    let changed = transaction.execute("UPDATE scanner_info SET deleted_at = NOW(), is_enable = false, is_run = false, runtime_state = 'offline', outage_monitored_at = NULL, registration_token_hash = NULL, runtime_token_hash = NULL, update_time = NOW() WHERE scanner_id = $1 AND deleted_at IS NULL;", &[&id]).await;
     match changed {
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
@@ -800,6 +810,10 @@ pub(crate) async fn delete_scanner(
             log_database_error(&req, "DeleteScannerError", &error);
             return HttpResponse::InternalServerError().finish();
         }
+    }
+    if let Err(error) = crate::scanner_outage::close_without_recovery(&transaction, &id).await {
+        log_database_error(&req, "DeleteScannerOutageError", &error);
+        return HttpResponse::InternalServerError().finish();
     }
     if let Err(error) = audit(
         &transaction,
