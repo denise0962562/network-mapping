@@ -7,7 +7,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::{
-    period::{Period, PeriodType, local_date},
+    period::{Period, PeriodType},
     statistics, storage,
 };
 use crate::{
@@ -53,6 +53,11 @@ pub(crate) async fn schedule(pool: &Pool) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     drop(client);
+    let calendar = crate::system_time::refresh(pool).await?;
+    let timezone = calendar.document.timezone;
+    let tz = timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|e| e.to_string())?;
     let now = Utc::now();
     for row in rows {
         let kind = PeriodType::parse(&row.get::<_, String>("period_type"))?;
@@ -71,16 +76,32 @@ pub(crate) async fn schedule(pool: &Pool) -> Result<(), String> {
         let minute = row.get::<_, i16>("send_minute") as u32;
         // Bounded catch-up: at most eight periods per plan and tick, never send pre-activation history.
         let mut period = if start < now - ChronoDuration::days(366) {
-            Period::last_closed(kind, now)?
+            Period::containing_in(
+                kind,
+                now.with_timezone(&tz).date_naive(),
+                &timezone,
+                calendar.revision,
+            )?
+            .previous()?
         } else {
-            Period::containing(kind, local_date(start)?)?
+            Period::containing_in(
+                kind,
+                start.with_timezone(&tz).date_naive(),
+                &timezone,
+                calendar.revision,
+            )?
         };
         for _ in 0..8 {
             if period.due_at(hour, minute)? > now {
                 break;
             }
             storage::create(pool, &period, None, "automatic", None).await?;
-            period = Period::containing(kind, local_date(period.end)?)?;
+            period = Period::containing_in(
+                kind,
+                period.date(period.end)?,
+                &timezone,
+                calendar.revision,
+            )?;
         }
     }
     Ok(())
@@ -182,6 +203,8 @@ async fn generate(pool: &Pool, id: Uuid, token: Uuid, mode_ready: bool) -> Resul
         return Ok(());
     }
     let period = Period {
+        timezone: row.get("timezone"),
+        settings_revision: row.get("settings_revision"),
         kind: PeriodType::parse(&row.get::<_, String>("period_type"))?,
         start: row.get("period_start"),
         end: row.get("period_end"),

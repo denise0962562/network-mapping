@@ -459,13 +459,16 @@ pub(crate) async fn dashboard_overview(
         Ok(row) => row.get("count"),
         Err(error) => { log_database_error(&req, "DashboardDatabaseError", &error); return HttpResponse::InternalServerError().finish(); }
     };
-    let mut trend_conditions =
-        vec!["to_timestamp(t.task_create_time / 1000.0)::date = days.day::date".to_owned()];
-    let mut trend_params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    let mut trend_conditions = vec![
+        "(to_timestamp(t.task_create_time / 1000.0) AT TIME ZONE $1)::date = days.day::date"
+            .to_owned(),
+    ];
+    let timezone = crate::system_time::snapshot().document.timezone;
+    let mut trend_params: Vec<&(dyn ToSql + Sync)> = vec![&timezone];
     push_task_owner_scope(&mut trend_conditions, &mut trend_params, &user, "t.user_id");
     let trend_sql = format!(
         "SELECT to_char(days.day, 'YYYY-MM-DD') AS day, COALESCE(s.name, t.assigned_scanner_id, '未分配') AS scanner, COUNT(t.id)::BIGINT AS count \
-         FROM generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day') days(day) \
+         FROM generate_series((NOW() AT TIME ZONE $1)::DATE - INTERVAL '6 days', (NOW() AT TIME ZONE $1)::DATE::TIMESTAMP, INTERVAL '1 day') days(day) \
          LEFT JOIN scan_task t ON {} \
          LEFT JOIN scanner_info s ON s.scanner_id = t.assigned_scanner_id GROUP BY days.day, scanner ORDER BY days.day, scanner;",
         trend_conditions.join(" AND ")

@@ -2,7 +2,7 @@ use deadpool_postgres::GenericClient;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::period::{Period, TIMEZONE, growth};
+use super::period::{Period, growth};
 
 pub async fn tasks<C: GenericClient + Sync>(client: &C, period: &Period) -> Result<Value, String> {
     let row = client.query_one(
@@ -59,11 +59,11 @@ pub async fn capture<C: GenericClient + Sync>(
          COUNT(t.id) FILTER (WHERE t.task_status = 'failed')::BIGINT AS failed, \
          COUNT(t.id) FILTER (WHERE t.task_status = 'partial')::BIGINT AS partial, \
          COUNT(t.id) FILTER (WHERE t.task_status = 'cancelled')::BIGINT AS cancelled \
-         FROM generate_series(($1::TIMESTAMPTZ AT TIME ZONE 'Asia/Shanghai')::DATE::TIMESTAMP, \
-              ($2::TIMESTAMPTZ AT TIME ZONE 'Asia/Shanghai')::DATE::TIMESTAMP - INTERVAL '1 day', INTERVAL '1 day') d(day) \
+         FROM generate_series(($1::TIMESTAMPTZ AT TIME ZONE $5)::DATE::TIMESTAMP, \
+              ($2::TIMESTAMPTZ AT TIME ZONE $5)::DATE::TIMESTAMP - INTERVAL '1 day', INTERVAL '1 day') d(day) \
          LEFT JOIN scan_task t ON t.task_end_time >= $3 AND t.task_end_time < $4 \
-              AND (to_timestamp(t.task_end_time / 1000.0) AT TIME ZONE 'Asia/Shanghai')::DATE = d.day::DATE \
-         GROUP BY d.day ORDER BY d.day;", &[&period.start, &period.end, &start, &end]).await.map_err(|e| e.to_string())?;
+              AND (to_timestamp(t.task_end_time / 1000.0) AT TIME ZONE $5)::DATE = d.day::DATE \
+         GROUP BY d.day ORDER BY d.day;", &[&period.start, &period.end, &start, &end, &period.timezone]).await.map_err(|e| e.to_string())?;
     let trend: Vec<Value> = rows.iter().map(|r| json!({"day": r.get::<_, String>("day"), "succeeded": r.get::<_, i64>("succeeded"),
         "failed": r.get::<_, i64>("failed"), "partial": r.get::<_, i64>("partial"), "cancelled": r.get::<_, i64>("cancelled")})).collect();
     let prior_history: bool = client
@@ -148,8 +148,8 @@ pub async fn build<C: GenericClient + Sync>(
     } else {
         Value::Null
     };
-    let days = (period.end - period.start).num_days() as f64;
-    let previous_days = (period.previous()?.end - period.previous()?.start).num_days() as f64;
+    let days = period.days()? as f64;
+    let previous_days = period.previous()?.days()? as f64;
     let rate = snapshot["current"]["success_rate"].as_f64();
     let previous_rate = snapshot["previous"]["success_rate"].as_f64();
     let mut recommendations = Vec::new();
@@ -181,7 +181,7 @@ pub async fn build<C: GenericClient + Sync>(
         Value::Null
     };
     Ok(
-        json!({"schema_version": 1, "metric_version": 1, "period": {"type": period.kind, "start_at": period.start, "end_at": period.end, "timezone": TIMEZONE},
+        json!({"schema_version": 1, "metric_version": 1, "period": {"type": period.kind, "start_at": period.start, "end_at": period.end, "timezone": period.timezone},
         "tasks": snapshot["current"], "previous_tasks": if previous_available { snapshot["previous"].clone() } else { Value::Null },
         "scan_output": current, "previous_scan_output": previous, "previous_available": previous_available, "comparison": comparison,
         "trend": snapshot["trend"], "scanners": snapshot["scanners"], "recommendations": recommendations,

@@ -1823,6 +1823,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
         .service(utils::get_server_config_h)
+        .service(utils::get_system_preferences)
+        .service(utils::get_system_timezones)
         .service(utils::get_runtime_config_h)
         .service(utils::save_runtime_config_h)
         .service(utils::get_mail_settings_h)

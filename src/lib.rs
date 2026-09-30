@@ -43,6 +43,7 @@ mod search_content;
 pub mod search_projection;
 pub mod system_maintenance;
 pub mod system_resource_cache;
+pub mod system_time;
 
 #[cfg(test)]
 pub mod test; // 测试模块
@@ -91,7 +92,7 @@ pub const APPLICATION_JAVASCRIPT_UTF_8: &str = "application/javascript; charset=
 pub const IMAGE_PNG: &str = "image/png";
 pub const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 pub const APPLICATION_JSON: &str = "application/json";
-pub const _SYSTEM_TIME_ZONE: &str = "Asia/Shanghai";
+
 pub const TASK_LEASE_MS: i64 = 90_000;
 const DNS_BATCH_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DNS_BATCH_WRITE_LEASE_SECONDS: i64 = 45;

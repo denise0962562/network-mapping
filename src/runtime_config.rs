@@ -17,6 +17,8 @@ use crate::config::{
 use crate::dns_follow_up::DnsFollowUpConfig;
 use crate::dns_resolvers::DnsResolverSettings;
 
+pub const GENERAL_NAMESPACE: &str = "general";
+
 pub const REQUESTS_NAMESPACE: &str = "requests";
 pub const MONITOR_NAMESPACE: &str = "monitor";
 pub const AUTOMATIC_TARGET_NAMESPACE: &str = "automatic_target";
@@ -61,6 +63,7 @@ impl<T: Clone> RuntimeConfig<T> {
 
 #[derive(Clone)]
 pub struct RuntimeSettings {
+    pub general: RuntimeConfig<crate::system_time::GeneralSettings>,
     pub requests: RuntimeConfig<RequestsConfig>,
     pub monitor: RuntimeConfig<MonitorConfig>,
     pub automatic_target: RuntimeConfig<AutomaticTargetConfig>,
@@ -101,7 +104,18 @@ impl RuntimeSettings {
         pool: &Pool,
         bootstrap: RuntimeSettingsBootstrap,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let general = load_namespace(
+            pool,
+            GENERAL_NAMESPACE,
+            crate::system_time::GeneralSettings::default(),
+            crate::system_time::GeneralSettings::default(),
+            crate::system_time::GeneralSettings::validate,
+        )
+        .await?;
+        let loaded = general.get().await;
+        crate::system_time::apply(loaded.value, loaded.revision);
         Ok(Self {
+            general,
             requests: load_namespace(
                 pool,
                 REQUESTS_NAMESPACE,
@@ -187,6 +201,9 @@ where
     let persisted = row.get::<_, Value>("document");
     match serde_json::from_value::<T>(persisted) {
         Ok(value) if validate(&value).is_ok() => Ok(RuntimeConfig::new(value, revision)),
+        Ok(_) | Err(_) if namespace == GENERAL_NAMESPACE => {
+            Err("数据库常规设置无效，无法确定系统业务时区".into())
+        }
         Ok(_) | Err(_) => {
             warn!(namespace, "数据库运行时配置无效，已使用安全默认值");
             Ok(RuntimeConfig::new(invalid_fallback, revision))
@@ -215,6 +232,18 @@ where
         .transaction()
         .await
         .map_err(|error| PersistError::Other(error.to_string()))?;
+    let previous = if namespace == GENERAL_NAMESPACE {
+        transaction
+            .query_opt(
+                "SELECT document FROM runtime_configuration WHERE namespace = $1 FOR UPDATE;",
+                &[&namespace],
+            )
+            .await
+            .map_err(|e| PersistError::Other(e.to_string()))?
+            .map(|r| r.get::<_, Value>("document"))
+    } else {
+        None
+    };
     let row = transaction.query_opt(
         "UPDATE runtime_configuration SET document = $1, revision = revision + 1, updated_at = NOW(), updated_by_user_id = $2 \
          WHERE namespace = $3 AND revision = $4 RETURNING revision, schema_version;",
@@ -230,6 +259,13 @@ where
          VALUES ($1, $2, $3, $4, $5, $6);",
         &[&namespace, &revision, &schema_version, &document, &user_id, &change_reason],
     ).await.map_err(|error| PersistError::Other(error.to_string()))?;
+    if previous
+        .as_ref()
+        .is_some_and(|old| old["timezone"] != document["timezone"])
+    {
+        // New calendar rules start from this publication; do not re-send old periods.
+        transaction.execute("UPDATE report_schedule SET enabled_at = CASE WHEN enabled THEN NOW() ELSE enabled_at END, last_period_end = NULL, revision = revision + 1, updated_at = NOW();", &[]).await.map_err(|e| PersistError::Other(e.to_string()))?;
+    }
     transaction
         .commit()
         .await
@@ -280,6 +316,10 @@ fn validate_analytics_snapshot(value: &AnalyticsSnapshotConfig) -> Result<(), St
         .try_check()
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+pub fn parse_general(value: Value) -> Result<crate::system_time::GeneralSettings, String> {
+    parse(value, crate::system_time::GeneralSettings::validate)
 }
 
 pub fn parse_requests(value: Value) -> Result<RequestsConfig, String> {

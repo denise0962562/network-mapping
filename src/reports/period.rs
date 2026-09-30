@@ -1,7 +1,7 @@
-use chrono::{DateTime, Datelike, Days, FixedOffset, Months, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Days, Months, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const TIMEZONE: &str = "Asia/Shanghai";
+pub const TIMEZONE: &str = crate::system_time::DEFAULT_TIMEZONE;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -34,30 +34,40 @@ impl PeriodType {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Period {
+    pub timezone: String,
+    pub settings_revision: i64,
     pub kind: PeriodType,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
 }
 
-fn offset() -> Result<FixedOffset, String> {
-    FixedOffset::east_opt(8 * 3600).ok_or_else(|| "无效报告时区".into())
-}
-
 pub fn local_date(value: DateTime<Utc>) -> Result<NaiveDate, String> {
-    Ok(value.with_timezone(&offset()?).date_naive())
+    Ok(value
+        .with_timezone(&crate::system_time::timezone())
+        .date_naive())
 }
 
 pub fn local_time(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>, String> {
-    let naive = date.and_hms_opt(hour, minute, 0).ok_or("无效发送时间")?;
-    offset()?
-        .from_local_datetime(&naive)
-        .single()
-        .map(|d| d.with_timezone(&Utc))
-        .ok_or_else(|| "无效报告时间".into())
+    crate::system_time::scheduled_time(
+        crate::system_time::timezone(),
+        date.and_hms_opt(hour, minute, 0).ok_or("无效发送时间")?,
+    )
 }
 
 impl Period {
     pub fn containing(kind: PeriodType, date: NaiveDate) -> Result<Self, String> {
+        let settings = crate::system_time::snapshot();
+        Self::containing_in(kind, date, &settings.document.timezone, settings.revision)
+    }
+    pub fn containing_in(
+        kind: PeriodType,
+        date: NaiveDate,
+        timezone: &str,
+        settings_revision: i64,
+    ) -> Result<Self, String> {
+        let tz = timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| "无效报告时区")?;
         let start = match kind {
             PeriodType::Weekly => {
                 date.checked_sub_days(Days::new(u64::from(date.weekday().num_days_from_monday())))
@@ -72,18 +82,49 @@ impl Period {
         .ok_or("日期超出支持范围")?;
         Ok(Self {
             kind,
-            start: local_time(start, 0, 0)?,
-            end: local_time(end, 0, 0)?,
+            timezone: timezone.to_owned(),
+            settings_revision,
+            start: crate::system_time::scheduled_time(
+                tz,
+                start.and_hms_opt(0, 0, 0).ok_or("无效日期")?,
+            )?,
+            end: crate::system_time::scheduled_time(
+                tz,
+                end.and_hms_opt(0, 0, 0).ok_or("无效日期")?,
+            )?,
         })
     }
+    pub fn date(&self, instant: DateTime<Utc>) -> Result<NaiveDate, String> {
+        let tz = self
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| "无效报告时区")?;
+        Ok(instant.with_timezone(&tz).date_naive())
+    }
+    pub fn days(&self) -> Result<i64, String> {
+        Ok((self.date(self.end)? - self.date(self.start)?).num_days())
+    }
     pub fn previous(&self) -> Result<Self, String> {
-        let day = local_date(self.start)?
+        let day = self
+            .date(self.start)?
             .checked_sub_days(Days::new(1))
             .ok_or("日期超出支持范围")?;
-        Self::containing(self.kind, day)
+        Self::containing_in(self.kind, day, &self.timezone, self.settings_revision)
     }
     pub fn last_closed(kind: PeriodType, now: DateTime<Utc>) -> Result<Self, String> {
-        Self::containing(kind, local_date(now)?)?.previous()
+        let settings = crate::system_time::snapshot();
+        let tz = settings
+            .document
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| "无效报告时区")?;
+        Self::containing_in(
+            kind,
+            now.with_timezone(&tz).date_naive(),
+            &settings.document.timezone,
+            settings.revision,
+        )?
+        .previous()
     }
     pub fn validate_closed(&self, now: DateTime<Utc>) -> Result<(), String> {
         if self.end > now {
@@ -95,7 +136,16 @@ impl Period {
         Ok(())
     }
     pub fn due_at(&self, hour: u32, minute: u32) -> Result<DateTime<Utc>, String> {
-        local_time(local_date(self.end)?, hour, minute)
+        let tz = self
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| "无效报告时区")?;
+        crate::system_time::scheduled_time(
+            tz,
+            self.date(self.end)?
+                .and_hms_opt(hour, minute, 0)
+                .ok_or("无效发送时间")?,
+        )
     }
 }
 
@@ -139,6 +189,33 @@ mod tests {
                 .validate_closed(now)
                 .is_err()
         );
+    }
+    #[test]
+    fn new_york_calendar_week_is_seven_days_across_dst() {
+        let p = Period::containing_in(
+            PeriodType::Weekly,
+            date("2026-03-08"),
+            "America/New_York",
+            7,
+        )
+        .expect("period");
+        assert_eq!(p.days().expect("days"), 7);
+        assert_eq!((p.end - p.start).num_hours(), 167);
+        assert_eq!(p.timezone, "America/New_York");
+        assert_eq!(p.previous().expect("previous").timezone, p.timezone);
+        assert_eq!(p.settings_revision, 7);
+    }
+    #[test]
+    fn china_calendar_boundaries_do_not_change_with_season() {
+        for day in ["2026-01-15", "2026-07-15"] {
+            let p = Period::containing_in(PeriodType::Weekly, date(day), "Asia/Shanghai", 1)
+                .expect("period");
+            assert_eq!((p.end - p.start).num_hours(), 168);
+            assert_eq!(
+                p.due_at(9, 0).expect("due").format("%H:%M").to_string(),
+                "01:00"
+            );
+        }
     }
     #[test]
     fn zero_baseline_is_not_an_infinite_growth_rate() {

@@ -251,6 +251,17 @@ async fn main() -> io::Result<()> {
     )
     .await
     .map_err(|error| io::Error::other(format!("加载运行时配置失败：{error}")))?;
+    let general_pool = db_pool.clone();
+    let general_config = runtime_settings.general.clone();
+    tokio::spawn(async move {
+        loop {
+            match network_mapping_server::system_time::refresh(&general_pool).await {
+                Ok(value) => general_config.replace(value.document, value.revision).await,
+                Err(error) => tracing::warn!(event = "GeneralSettingsRefreshFailed", %error),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
     let trusted_proxy_state = web::Data::new(
         TrustedProxyState::from_database(&db_pool)
             .await

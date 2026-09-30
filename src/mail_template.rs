@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use lettre::{Message, message::Mailbox, message::MultiPart};
 use serde::{Deserialize, Serialize};
@@ -357,7 +357,7 @@ pub fn login_context(username: &str, source_ip: &str) -> Result<Context, tera::E
     Context::from_serialize(json!({
         "system_name": "Network Mapping",
         "username": username,
-        "login_time": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "login_time": crate::system_time::format_now(),
         "source_ip": source_ip
     }))
 }
@@ -1036,7 +1036,7 @@ fn health_alert_context(event: &HealthEvent) -> Result<Context, tera::Error> {
         "system_name": "Network Mapping",
         "alert_type": event.alert_type,
         "severity": event.severity,
-        "occurred_at": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "occurred_at": crate::system_time::format_now(),
         "summary": event.summary,
         "details": details,
     }))
@@ -1118,15 +1118,21 @@ pub(crate) async fn render_report<C: deadpool_postgres::GenericClient + Sync>(
     let end = payload["period"]["end_at"]
         .as_str()
         .ok_or("缺少周期结束时间")?;
+    let timezone = payload["period"]["timezone"]
+        .as_str()
+        .unwrap_or(crate::system_time::DEFAULT_TIMEZONE);
+    let tz = timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| "无效报告时区")?;
     let format = |text: &str| -> Result<String, String> {
         let t = DateTime::parse_from_rfc3339(text)
             .map_err(|e| e.to_string())?
             .with_timezone(&Utc);
-        Ok(crate::reports::period::local_date(t)?.to_string())
+        Ok(t.with_timezone(&tz).date_naive().to_string())
     };
     let context = Context::from_serialize(json!({
         "system_name": "Network Mapping", "report_label": if key == REPORT_WEEKLY_TEMPLATE_KEY { "周报" } else { "月报" },
-        "period_label": format!("{} 至 {}（不含），Asia/Shanghai", format(start)?, format(end)?),
+        "period_label": format!("{} 至 {}（不含），{}", format(start)?, format(end)?, timezone),
         "tasks": payload["tasks"], "scan_output": payload["scan_output"], "recommendations": payload["recommendations"],
         "detail_path": format!("/reports/{id}")
     })).map_err(|e| e.to_string())?;

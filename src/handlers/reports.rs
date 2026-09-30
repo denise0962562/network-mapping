@@ -80,7 +80,7 @@ pub(crate) async fn list(
     let result = async {
         let client = pool.get().await.map_err(|e| e.to_string())?;
         let total: i64 = client.query_one("SELECT COUNT(*)::BIGINT AS count FROM report_run WHERE ($1::TEXT IS NULL OR period_type = $1);", &[&kind]).await.map_err(|e| e.to_string())?.get("count");
-        let rows = client.query("SELECT id, period_type, period_start, period_end, revision, source, status, cutoff_at, created_at, generated_at, supersedes_report_id, quality, last_error, content_checksum \
+        let rows = client.query("SELECT id, period_type, period_start, period_end, revision, source, status, cutoff_at, created_at, generated_at, timezone, settings_revision, supersedes_report_id, quality, last_error, content_checksum \
             FROM report_run WHERE ($1::TEXT IS NULL OR period_type = $1) ORDER BY period_start DESC, created_at DESC LIMIT $2 OFFSET $3;", &[&kind, &limit, &((page - 1) * limit)]).await.map_err(|e| e.to_string())?;
         Ok::<_, String>(json!({"items": rows.into_iter().map(|r| Report::from_row(r, false)).collect::<Vec<_>>(), "total": total, "page": page, "page_size": limit}))
     }.await;
@@ -132,9 +132,32 @@ pub(crate) async fn generate(
     if !admin(&req, &pool, &user, "report.generate") {
         return denied();
     }
+    let calendar = match crate::system_time::refresh(&pool).await {
+        Ok(value) => value,
+        Err(e) => return internal(e),
+    };
+    let tz = match calendar.document.timezone.parse::<chrono_tz::Tz>() {
+        Ok(tz) => tz,
+        Err(e) => return internal(e),
+    };
     let period = match body.date.map_or_else(
-        || Period::last_closed(body.period_type, Utc::now()),
-        |date| Period::containing(body.period_type, date),
+        || {
+            Period::containing_in(
+                body.period_type,
+                Utc::now().with_timezone(&tz).date_naive(),
+                &calendar.document.timezone,
+                calendar.revision,
+            )
+            .and_then(|p| p.previous())
+        },
+        |date| {
+            Period::containing_in(
+                body.period_type,
+                date,
+                &calendar.document.timezone,
+                calendar.revision,
+            )
+        },
     ) {
         Ok(p) => p,
         Err(e) => return bad(&e),
@@ -165,7 +188,7 @@ pub(crate) async fn revise(
         let client = pool.get().await.map_err(|e| e.to_string())?;
         let row = client
             .query_opt(
-                "SELECT period_type, period_start, period_end FROM report_run WHERE id = $1;",
+                "SELECT period_type, period_start, period_end, timezone, settings_revision FROM report_run WHERE id = $1;",
                 &[&*id],
             )
             .await
@@ -174,6 +197,8 @@ pub(crate) async fn revise(
             return Ok(None);
         };
         Ok::<_, String>(Some(Period {
+            timezone: row.get("timezone"),
+            settings_revision: row.get("settings_revision"),
             kind: PeriodType::parse(&row.get::<_, String>("period_type"))?,
             start: row.get("period_start"),
             end: row.get("period_end"),

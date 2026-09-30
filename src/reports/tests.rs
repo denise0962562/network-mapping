@@ -44,7 +44,7 @@ async fn isolated_pool() -> (Pool, String) {
         .parse()
         .expect("config");
     let schema = format!("report_{}", Uuid::new_v4().simple());
-    config.options(format!("-c search_path={schema}"));
+    config.options(format!("-c search_path={schema} -c timezone=UTC"));
     let pool = Pool::builder(Manager::new(config, NoTls))
         .max_size(8)
         .build()
@@ -74,6 +74,79 @@ async fn cleanup(pool: &Pool, schema: String) {
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable REPORT_TEST_DATABASE_URL"]
+async fn timezone_publication_resets_future_schedules_and_preserves_archives() {
+    let (pool, schema) = isolated_pool().await;
+    let client = pool.get().await.expect("client");
+    client
+        .batch_execute(include_str!(
+            "../../source/database/migrate_system_time.sql"
+        ))
+        .await
+        .expect("idempotent migration");
+    client.batch_execute("UPDATE report_schedule SET enabled = TRUE, enabled_at = NOW() - INTERVAL '1 year', last_period_end = NOW() - INTERVAL '1 week' WHERE period_type = 'weekly';").await.expect("plan");
+    drop(client);
+    let settings = crate::system_time::GeneralSettings {
+        timezone: "America/New_York".into(),
+        ..Default::default()
+    };
+    let revision =
+        crate::runtime_config::persist(&pool, "general", 1, &settings, "test calendar", 1)
+            .await
+            .expect("publish");
+    assert_eq!(revision, 2);
+    assert!(matches!(
+        crate::runtime_config::persist(&pool, "general", 1, &settings, "stale", 1).await,
+        Err(crate::runtime_config::PersistError::Conflict)
+    ));
+    let client = pool.get().await.expect("client");
+    let plan = client.query_one("SELECT revision, last_period_end, enabled_at > NOW() - INTERVAL '1 minute' AS recent FROM report_schedule WHERE period_type='weekly';", &[]).await.expect("plan");
+    assert_eq!(plan.get::<_, i64>("revision"), 1);
+    assert!(
+        plan.get::<_, Option<chrono::DateTime<Utc>>>("last_period_end")
+            .is_none()
+    );
+    assert!(plan.get::<_, bool>("recent"));
+    drop(client);
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 8).expect("date");
+    let period =
+        Period::containing_in(PeriodType::Weekly, date, "America/New_York", 2).expect("period");
+    let id = storage::create(&pool, &period, Some(1), "manual", None)
+        .await
+        .expect("report");
+    assert!(
+        worker::process_one(&pool, &config())
+            .await
+            .expect("generate")
+    );
+    let row = report(&pool, id).await;
+    assert_eq!(row.get::<_, String>("timezone"), "America/New_York");
+    let payload: Value = row.get("payload");
+    assert_eq!(payload["period"]["timezone"], "America/New_York");
+    assert_eq!(payload["trend"].as_array().expect("trend").len(), 7);
+    // Equivalent offsets still identify distinct named calendars.
+    let tokyo = Period::containing_in(PeriodType::Weekly, date, "Asia/Tokyo", 2).expect("Tokyo");
+    let seoul = Period::containing_in(PeriodType::Weekly, date, "Asia/Seoul", 2).expect("Seoul");
+    assert_eq!(tokyo.start, seoul.start);
+    let a = storage::create(&pool, &tokyo, Some(1), "manual", None)
+        .await
+        .expect("Tokyo archive");
+    let b = storage::create(&pool, &seoul, Some(1), "manual", None)
+        .await
+        .expect("Seoul archive");
+    assert_ne!(a, b);
+    // Old schedule snapshots cannot publish after a timezone update.
+    let stale =
+        Period::containing_in(PeriodType::Weekly, date, "Asia/Shanghai", 1).expect("old rules");
+    assert!(
+        storage::create(&pool, &stale, None, "automatic", None)
+            .await
+            .is_err()
+    );
+    cleanup(&pool, schema).await;
 }
 fn config() -> RuntimeConfig<AnalyticsSnapshotConfig> {
     RuntimeConfig::new(

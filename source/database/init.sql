@@ -333,6 +333,7 @@ CREATE INDEX IF NOT EXISTS idx_analytics_distribution_query
 CREATE TABLE IF NOT EXISTS analytics_discovery_fact (
 	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
 	day_start DATE NOT NULL,
+	first_observed_at TIMESTAMPTZ,
 	owner_id INT NOT NULL,
 	scanner_id TEXT NOT NULL,
 	task_source TEXT NOT NULL,
@@ -1201,3 +1202,13 @@ CREATE INDEX IF NOT EXISTS idx_scan_execution_report_end ON scan_task_execution(
     WHERE execution_status = 'succeeded';
 INSERT INTO mail_template(template_key, display_name) VALUES
     ('report_weekly', '平台周报'), ('report_monthly', '平台月报') ON CONFLICT DO NOTHING;
+
+-- Preserve absolute observation instants and immutable report calendar rules.
+ALTER TABLE analytics_discovery_fact ADD COLUMN IF NOT EXISTS first_observed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_analytics_discovery_instant ON analytics_discovery_fact(first_observed_at, owner_id, scanner_id, task_source);
+ALTER TABLE report_run ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai';
+ALTER TABLE report_run ADD COLUMN IF NOT EXISTS settings_revision BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE report_run DROP CONSTRAINT IF EXISTS report_run_period_type_period_start_period_end_revision_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_report_run_calendar_revision ON report_run(period_type, period_start, period_end, timezone, revision);
+INSERT INTO runtime_configuration(namespace, document) VALUES ('general', '{"timezone":"Asia/Shanghai","hourCycle":"24","dateFormat":"YYYY-MM-DD"}'::JSONB) ON CONFLICT(namespace) DO NOTHING;

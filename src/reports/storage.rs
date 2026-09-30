@@ -12,6 +12,8 @@ use super::{
 
 #[derive(Serialize)]
 pub struct Report {
+    pub timezone: String,
+    pub settings_revision: i64,
     pub id: Uuid,
     pub period_type: String,
     pub period_start: DateTime<Utc>,
@@ -31,6 +33,8 @@ pub struct Report {
 impl Report {
     pub fn from_row(r: Row, detail: bool) -> Self {
         Self {
+            timezone: r.get("timezone"),
+            settings_revision: r.get("settings_revision"),
             id: r.get("id"),
             period_type: r.get("period_type"),
             period_start: r.get("period_start"),
@@ -138,6 +142,18 @@ async fn create_once(
         .await
         .map_err(database_error)?;
     let kind = period.kind.as_str();
+    if source == "automatic" {
+        let current = tx
+            .query_one(
+                "SELECT revision FROM runtime_configuration WHERE namespace = 'general' FOR SHARE;",
+                &[],
+            )
+            .await
+            .map_err(database_error)?;
+        if current.get::<_, i64>("revision") != period.settings_revision {
+            return Err("系统时区配置已更新，等待重新计算报告计划".into());
+        }
+    }
     let plan = tx
         .query_one(
             "SELECT * FROM report_schedule WHERE period_type = $1 FOR UPDATE;",
@@ -154,7 +170,7 @@ async fn create_once(
         }
     }
     let existing = if supersedes.is_none() {
-        tx.query_opt("SELECT id, status FROM report_run WHERE period_type = $1 AND period_start = $2 AND period_end = $3 AND revision = 1;", &[&kind, &period.start, &period.end]).await.map_err(database_error)?
+        tx.query_opt("SELECT id, status FROM report_run WHERE period_type = $1 AND period_start = $2 AND period_end = $3 AND revision = 1 AND timezone = $4;", &[&kind, &period.start, &period.end, &period.timezone]).await.map_err(database_error)?
     } else {
         None
     };
@@ -174,10 +190,10 @@ async fn create_once(
         id
     } else {
         let id = Uuid::new_v4();
-        let revision: i32 = tx.query_one("SELECT COALESCE(MAX(revision), 0) + 1 AS revision FROM report_run WHERE period_type = $1 AND period_start = $2 AND period_end = $3;", &[&kind, &period.start, &period.end]).await.map_err(database_error)?.get("revision");
+        let revision: i32 = tx.query_one("SELECT COALESCE(MAX(revision), 0) + 1 AS revision FROM report_run WHERE period_type = $1 AND period_start = $2 AND period_end = $3 AND timezone = $4;", &[&kind, &period.start, &period.end, &period.timezone]).await.map_err(database_error)?.get("revision");
         let snapshot = statistics::capture(&tx, period).await?;
-        tx.execute("INSERT INTO report_run(id, period_type, period_start, period_end, revision, source, requested_by, send_email, recipient_ids, task_snapshot, supersedes_report_id) \
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11);", &[&id, &kind, &period.start, &period.end, &revision, &source, &requested_by, &automatic, &recipient_ids, &snapshot, &supersedes]).await.map_err(database_error)?;
+        tx.execute("INSERT INTO report_run(id, period_type, period_start, period_end, revision, source, requested_by, send_email, recipient_ids, task_snapshot, supersedes_report_id, timezone, settings_revision) \
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13);", &[&id, &kind, &period.start, &period.end, &revision, &source, &requested_by, &automatic, &recipient_ids, &snapshot, &supersedes, &period.timezone, &period.settings_revision]).await.map_err(database_error)?;
         let previous = period.previous()?;
         tx.execute("INSERT INTO report_input_execution(report_id, execution_id, period_slot, expected_observations) \
             SELECT $1, e.id, CASE WHEN e.task_end_time >= $2 THEN 'current' ELSE 'previous' END, COALESCE(e.result_observation_count, (SELECT SUM(b.observation_count) FROM scan_result_batch b WHERE b.execution_id = e.id), 0) \
@@ -197,6 +213,7 @@ async fn create_once(
 }
 
 pub async fn schedules(pool: &Pool) -> Result<Value, String> {
+    let settings = crate::system_time::refresh(pool).await?;
     let client = pool.get().await.map_err(|e| e.to_string())?;
     let rows = client
         .query(
@@ -206,6 +223,10 @@ pub async fn schedules(pool: &Pool) -> Result<Value, String> {
         .await
         .map_err(|e| e.to_string())?;
     let now = Utc::now();
+    let timezone = settings.document.timezone;
+    let tz = timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|e| e.to_string())?;
     let mut plans = Vec::new();
     for row in rows {
         let kind: String = row.get("period_type");
@@ -218,15 +239,20 @@ pub async fn schedules(pool: &Pool) -> Result<Value, String> {
         let next = if enabled {
             let base = last.or(enabled_at).unwrap_or(now);
             Some(
-                Period::containing(parsed, super::period::local_date(base)?)?
-                    .due_at(hour as u32, minute as u32)?,
+                Period::containing_in(
+                    parsed,
+                    base.with_timezone(&tz).date_naive(),
+                    &timezone,
+                    settings.revision,
+                )?
+                .due_at(hour as u32, minute as u32)?,
             )
         } else {
             None
         };
         plans.push(json!({"period_type": kind, "enabled": enabled, "send_hour": hour, "send_minute": minute,
             "recipient_ids": row.get::<_, Vec<i32>>("recipient_ids"), "revision": row.get::<_, i64>("revision"),
-            "enabled_at": enabled_at, "next_run_at": next, "timezone": super::period::TIMEZONE}));
+            "enabled_at": enabled_at, "next_run_at": next, "timezone": timezone}));
     }
     let users = client.query("SELECT id, username, email FROM users WHERE role = 1 AND disabled_at IS NULL AND deleted_at IS NULL AND NOT limit_login ORDER BY username;", &[]).await.map_err(|e| e.to_string())?;
     let users: Vec<Value> = users.iter().map(|r| json!({"id": r.get::<_, i32>("id"), "username": r.get::<_, String>("username"), "email": r.get::<_, Option<String>>("email")})).collect();
