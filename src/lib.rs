@@ -3845,13 +3845,14 @@ async fn execution_for_upload_attempt(
     let conflicting_upload_id: String = conflict.get("upload_id");
     let execution = transaction
         .query_one(
-            "SELECT task_id, requested_scanner_id FROM scan_task_execution WHERE id = $1;",
+            "SELECT task_id, requested_scanner_id, recovery_failure_count FROM scan_task_execution WHERE id = $1;",
             &[&execution_id],
         )
         .await
         .map_err(apply_task_database_error)?;
     let task_db_id: i32 = execution.get("task_id");
     let requested_scanner_id: Option<String> = execution.get("requested_scanner_id");
+    let recovery_failure_count: i32 = execution.get("recovery_failure_count");
     let reason = if expected_upload_id.is_some() {
         "superseded after durable upload identity changed"
     } else {
@@ -3870,9 +3871,9 @@ async fn execution_for_upload_attempt(
     let replacement_public_id = Uuid::now_v7().to_string();
     let replacement = transaction
         .query_one(
-            "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) \
-             VALUES ($1, $2, $3) RETURNING id;",
-            &[&replacement_public_id, &task_db_id, &requested_scanner_id],
+            "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id, recovery_failure_count) \
+             VALUES ($1, $2, $3, $4) RETURNING id;",
+            &[&replacement_public_id, &task_db_id, &requested_scanner_id, &recovery_failure_count],
         )
         .await
         .map_err(apply_task_database_error)?;
@@ -3904,6 +3905,33 @@ pub async fn recover_scanner_task(
     token: &str,
     token_pepper: &str,
 ) -> Result<ApplyTask, ApplyTaskError> {
+    recover_scanner_task_with_failure(
+        pool,
+        scanner_id,
+        task_id,
+        upload_id,
+        None,
+        token,
+        token_pepper,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryFailureReport {
+    pub task_id: Uuid,
+    pub count: u32,
+}
+
+pub async fn recover_scanner_task_with_failure(
+    pool: &deadpool_postgres::Pool,
+    scanner_id: Uuid,
+    task_id: Option<Uuid>,
+    upload_id: Option<Uuid>,
+    failure: Option<RecoveryFailureReport>,
+    token: &str,
+    token_pepper: &str,
+) -> Result<ApplyTask, ApplyTaskError> {
     let mut connection = pool.get().await.map_err(apply_task_database_error)?;
     let transaction = connection
         .transaction()
@@ -3922,6 +3950,29 @@ pub async fn recover_scanner_task(
         )
         .await
         .map_err(apply_task_database_error)?;
+
+    if let Some(failure) = failure {
+        // The client reports a durable cumulative count; repeated recovery requests
+        // (including a lost HTTP response) must never count the same failure twice.
+        let now = get_unix_epoch_ms();
+        let count = i32::try_from(failure.count.min(3)).unwrap_or(3);
+        let changed = transaction.query(
+            "UPDATE scan_task_execution SET recovery_failure_count=GREATEST(recovery_failure_count,$1), \
+             execution_status=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN 'failed' ELSE execution_status END, \
+             task_end_time=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN $2 ELSE task_end_time END, \
+             lease_expires_at=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN NULL ELSE lease_expires_at END, \
+             failure_reason=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN 'scanner recovery limit exceeded' ELSE failure_reason END \
+             WHERE task_id=(SELECT id FROM scan_task WHERE task_id=$3) AND assigned_scanner_id=$4 \
+             AND execution_status='running' RETURNING task_id;",
+            &[&count,&now,&failure.task_id.to_string(),&scanner_id]).await.map_err(apply_task_database_error)?;
+        for row in changed {
+            refresh_task_aggregate(&transaction, row.get("task_id"))
+                .await
+                .map_err(apply_task_database_error)?;
+        }
+        info!(event="RECOVERY-FAILURE-REPORTED",scanner_id,task_id=%failure.task_id,count,
+            "recorded cumulative scanner recovery failures");
+    }
 
     let requested_task_id = task_id.map(|value| value.to_string());
     let now = get_unix_epoch_ms();
@@ -4214,6 +4265,8 @@ pub struct CurrentTaskQuery {
     pub scannerid: Uuid,
     pub taskid: Option<Uuid>,
     pub uploadid: Option<Uuid>,
+    pub failure_taskid: Option<Uuid>,
+    pub failure_count: Option<u32>,
 }
 
 /// 该函数用于退出登录

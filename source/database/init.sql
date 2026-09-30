@@ -1112,3 +1112,6 @@ CREATE TABLE IF NOT EXISTS search_generation_admission (
 CREATE INDEX IF NOT EXISTS idx_search_generation_admission_owner_time ON search_generation_admission(owner_id, generated_at);
 CREATE INDEX IF NOT EXISTS idx_search_generation_admission_time ON search_generation_admission(generated_at);
 CREATE INDEX IF NOT EXISTS idx_scan_task_search_source ON scan_task(id) WHERE task_source = 'search';
+
+-- Persistent recovery count; safe to reapply on existing databases.
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS recovery_failure_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_failure_count >= 0);

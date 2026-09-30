@@ -14,7 +14,7 @@ use crate::system_maintenance::{
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, CurrentTaskQuery, ReceiveTaskItemQueryInfo, STask,
     TargetIP, TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
-    recover_scanner_task, validate_scanner_credentials,
+    validate_scanner_credentials,
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
@@ -1091,6 +1091,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         );
         return HttpResponse::InternalServerError().finish();
     }
+    let lease_started = std::time::Instant::now();
     let mut lease = None;
     let mut cancel_task_id = None;
     if let Some(task_id) = heartbeat.active_task_id {
@@ -1183,6 +1184,8 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::ServiceUnavailable().finish();
         }
     }
+    tracing::debug!(event="ScannerLeaseRenewCompleted", scanner_id, task_id=?heartbeat.active_task_id,
+        elapsed_ms=lease_started.elapsed().as_millis() as u64, "scanner lease transaction completed");
     if let Some(latency) = latency {
         latency_history.record(ScannerLatencyHistoryEntry {
             scanner_id,
@@ -2375,11 +2378,22 @@ async fn current_task_handler(
         return response;
     }
 
-    match recover_scanner_task(
+    let recovery_failure = match (query.failure_taskid, query.failure_count) {
+        (None, None) => None,
+        (Some(task_id), Some(count)) if (1..=3).contains(&count) => {
+            Some(crate::RecoveryFailureReport { task_id, count })
+        }
+        _ => {
+            return HttpResponse::BadRequest()
+                .body("failure_taskid and failure_count (1..=3) must be supplied together");
+        }
+    };
+    match crate::recover_scanner_task_with_failure(
         pool.get_ref(),
         query.scannerid,
         query.taskid,
         query.uploadid,
+        recovery_failure,
         token,
         &security.scanner_token_pepper,
     )
