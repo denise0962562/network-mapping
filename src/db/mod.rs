@@ -159,6 +159,11 @@ pub async fn init_database_table(
     debug!(init_database_file = file_path, "开始执行数据库初始化事务");
     transaction.batch_execute(&sql).await?;
     transaction
+        .batch_execute(include_str!(
+            "../../source/database/migrate_scanner_diagnostics.sql"
+        ))
+        .await?;
+    transaction
         .batch_execute(include_str!("../../source/database/migrate_reports.sql"))
         .await?;
     transaction

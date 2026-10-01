@@ -124,6 +124,16 @@ where
 
 fn policy_for_path(path: &str) -> Option<RateLimitPolicy> {
     match path {
+        "/api/scanner/diagnostics/chunk"
+        | "/api/scanner/diagnostics/upload-status"
+        | "/api/scanner/diagnostics/ack"
+        | "/api/scanner/diagnostics/manifest"
+        | "/api/scanner/diagnostics/complete"
+        | "/api/scanner/diagnostics/events" => Some(RateLimitPolicy {
+            max_requests: 120,
+            window: Duration::from_secs(60),
+            message: "扫描器诊断请求过于频繁",
+        }),
         "/api/login" => Some(RateLimitPolicy {
             max_requests: 10,
             window: Duration::from_secs(60),
@@ -205,6 +215,12 @@ fn check_rate_limit(
 }
 
 fn rate_limit_key(req: &ServiceRequest, path: &str, client: &str) -> String {
+    if crate::middlewares::is_scanner_api_request(req.method(), path)
+        && path.starts_with("/api/scanner/diagnostics/")
+        && let Some(fingerprint) = bearer_fingerprint(req)
+    {
+        return format!("scanner-diagnostics:{fingerprint}");
+    }
     if matches!(
         path,
         "/api/scanner/result"

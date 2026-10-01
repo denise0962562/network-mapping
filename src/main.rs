@@ -87,6 +87,7 @@ async fn main() -> io::Result<()> {
     let automatic_target_config = config.automatic_target.clone();
     let dns_follow_up_config = config.dns_follow_up.clone();
     let frontend_directory = config.frontend.directory.clone();
+    let scanner_diagnostics_config = config.scanner_diagnostics.clone();
     let maxmind_directory = config.maxmind.directory.clone();
     let ser_con = config.server.clone();
     let server = config.server;
@@ -467,6 +468,16 @@ async fn main() -> io::Result<()> {
         scanner_latency::RETENTION_DAYS,
     ));
 
+    let scanner_diagnostics =
+        network_mapping_server::scanner_diagnostics::Diagnostics::new(scanner_diagnostics_config)
+            .await?;
+    tokio::spawn(network_mapping_server::scanner_diagnostics::run_worker(
+        pool.clone(),
+        scanner_diagnostics.clone(),
+        system_maintenance_state.clone(),
+    ));
+    let scanner_diagnostics_data = web::Data::new(scanner_diagnostics);
+
     HttpServer::new(move || {
         let request_log_tx = request_log_tx.clone();
         let runtime_settings = runtime_settings.clone();
@@ -495,6 +506,7 @@ async fn main() -> io::Result<()> {
             .app_data(runtime_settings.clone())
             .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())
+            .app_data(scanner_diagnostics_data.clone())
             .app_data(web::JsonConfig::default().limit(server_max_body))
             .wrap(CsrfMiddleware)
             .wrap(SHeaderM)

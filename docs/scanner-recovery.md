@@ -22,3 +22,7 @@
 集成测试在独立 PostgreSQL 数据库内创建并删除临时 schema。设置 `STORAGE_TEST_DATABASE_URL` 后，执行 `cargo test --locked recovery_ -- --ignored`，验证上传冲突执行替换、累计失败报告幂等和三次失败上限。现有 storage 测试覆盖批次重传、混合结果、执行接管和并发领取；不要将测试变量指向生产数据库。
 
 心跳增加 `ScannerLeaseRenewCompleted` 耗时事件，可与请求日志、数据库连接池及代理日志联合定位请求延迟。
+
+## 诊断与领取任务
+
+新心跳同时报告诊断能力、健康状态和 accepting_tasks。启动引擎检查失败时仍维持心跳/诊断采集，但服务端阻止新任务分配；已经运行的任务恢复仍按原租约协议处理。诊断事件和日志任务使用独立队列，规则见[扫描器错误诊断与日志采集](SCANNER_DIAGNOSTICS.md)。

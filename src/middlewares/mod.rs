@@ -44,11 +44,17 @@ pub(crate) fn is_scanner_api_request(method: &Method, path: &str) -> bool {
         | "/api/scanner/network/public-ip"
         | "/api/scanner/maintenance"
         | "/api/scanner/runtime-config" => method == Method::GET,
+        "/api/scanner/diagnostics/upload-status" => method == Method::GET,
+        "/api/scanner/diagnostics/chunk" => method == Method::PUT,
         "/api/scanner/register"
         | "/api/scanner/heartbeat"
         | "/api/scanner/result"
         | "/api/scanner/task/fail"
         | "/api/scanner/task/cancelled" => method == Method::POST,
+        "/api/scanner/diagnostics/ack"
+        | "/api/scanner/diagnostics/manifest"
+        | "/api/scanner/diagnostics/complete"
+        | "/api/scanner/diagnostics/events" => method == Method::POST,
         _ => false,
     }
 }
@@ -270,6 +276,35 @@ mod tests {
             "/api/task/apply/anything"
         ));
         assert!(!is_scanner_api_request(&Method::GET, "/api/task"));
+        for path in [
+            "/api/scanner/diagnostics/ack",
+            "/api/scanner/diagnostics/manifest",
+            "/api/scanner/diagnostics/complete",
+            "/api/scanner/diagnostics/events",
+        ] {
+            assert!(is_scanner_api_request(&Method::POST, path));
+            assert!(!is_scanner_api_request(&Method::GET, path));
+            assert!(!is_scanner_api_request(
+                &Method::POST,
+                &format!("{path}/extra")
+            ));
+        }
+        assert!(is_scanner_api_request(
+            &Method::PUT,
+            "/api/scanner/diagnostics/chunk"
+        ));
+        assert!(is_scanner_api_request(
+            &Method::GET,
+            "/api/scanner/diagnostics/upload-status"
+        ));
+        assert!(!is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/diagnostics/chunk"
+        ));
+        assert!(!is_scanner_api_request(
+            &Method::POST,
+            "/api/scanner/01952f0c-0000-7000-8000-000000000001/diagnostic-jobs"
+        ));
     }
 
     #[actix_web::test]

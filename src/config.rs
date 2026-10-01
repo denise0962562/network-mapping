@@ -25,6 +25,8 @@ pub trait SelfChecking {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub scanner_diagnostics: crate::scanner_diagnostics::DiagnosticsConfig,
     pub server: ServerConfig,
     pub tls: TlsConfig,
     pub log: LogConfig,
@@ -74,6 +76,9 @@ impl TlsConfig {
 
 impl SelfChecking for Config {
     fn check(&self) {
+        self.scanner_diagnostics
+            .validate()
+            .expect("invalid scanner diagnostics configuration");
         let _ = &self.server.check();
         let _ = &self.database.check();
         let _ = &self.security.check();
@@ -91,6 +96,9 @@ impl SelfChecking for Config {
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        self.scanner_diagnostics
+            .validate()
+            .map_err(|e| e.to_string())?;
         match self.server.try_check() {
             Ok(true) => (),
             Ok(false) => return Ok(false),
@@ -1313,6 +1321,12 @@ impl Config {
         let path = path.as_ref();
         let content = fs::read_to_string(path).expect("无法读取配置文件");
         let mut config: Self = toml::from_str(&content).expect("配置文件格式错误");
+        if config.scanner_diagnostics.directory.is_relative() {
+            config.scanner_diagnostics.directory = path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(&config.scanner_diagnostics.directory);
+        }
         config.tls.resolve_relative_to(path);
         config.frontend.resolve_relative_to(path);
         config.maxmind.resolve_relative_to(path);
@@ -1707,6 +1721,7 @@ mod tests {
 }
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
+    cfg.configure(handlers::scanner_diagnostics::configure);
     cfg.service(handlers::reports::generate)
         .service(handlers::reports::list)
         .service(handlers::reports::detail)

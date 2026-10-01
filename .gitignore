@@ -1,6 +1,7 @@
 /target
 scanner/
 /logs/
+/diagnostics/
 .vscode/
 ssl/
 .codegraph/

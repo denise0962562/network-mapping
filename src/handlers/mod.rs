@@ -11,6 +11,7 @@ pub mod open_source;
 pub mod operations;
 pub mod reports;
 pub mod requests;
+pub mod scanner_diagnostics;
 pub mod scanner_latency;
 pub mod search;
 pub(crate) mod search_dsl;

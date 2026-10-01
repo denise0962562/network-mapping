@@ -37,6 +37,7 @@ pub mod request_log;
 pub mod runtime_config;
 pub mod scan_migration;
 pub mod scanner_config;
+pub mod scanner_diagnostics;
 pub mod scanner_latency;
 pub mod scanner_outage;
 mod search_content;
@@ -4010,7 +4011,7 @@ pub async fn recover_scanner_task_with_failure(
                  (e.execution_status = 'running' AND e.assigned_scanner_id = $1 \
                   AND ($2::TEXT IS NULL OR t.task_id = $2)) \
                  OR ($2::TEXT IS NOT NULL AND t.task_id = $2 AND e.execution_status = 'pending' \
-                     AND e.assigned_scanner_id IS NULL \
+                     AND e.assigned_scanner_id IS NULL AND s.accepting_tasks \
                      AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $1) \
                      AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
                        OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
@@ -4148,7 +4149,7 @@ pub async fn apply_task(
          FROM scan_task_execution e \
          JOIN scan_task t ON t.id = e.task_id \
          JOIN scanner_info s ON s.scanner_id = $1 \
-         WHERE e.execution_status = 'pending' AND e.requested_scanner_id = $1 \
+         WHERE s.accepting_tasks AND e.execution_status = 'pending' AND e.requested_scanner_id = $1 \
            AND t.task_status IN ('pending', 'running') \
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
              OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
@@ -4185,7 +4186,7 @@ pub async fn apply_task(
                      ) \
                      ORDER BY candidate.id FOR UPDATE SKIP LOCKED LIMIT 1 \
                  ) e ON TRUE \
-                 WHERE t.task_status IN ('pending', 'running') \
+                 WHERE s.accepting_tasks AND t.task_status IN ('pending', 'running') \
                    AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
                      OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
                    AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \

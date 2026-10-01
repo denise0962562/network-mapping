@@ -274,6 +274,8 @@ struct ScannerHeartbeatCommand {
 
 #[derive(Serialize)]
 struct ScannerHeartbeatResponse {
+    diagnostics_enabled: bool,
+    diagnostic_requests: Vec<crate::scanner_diagnostics::protocol::Job>,
     success: bool,
     lease: Option<ScannerHeartbeatLease>,
     command: Option<ScannerHeartbeatCommand>,
@@ -304,6 +306,10 @@ pub struct ScannerSystemInfo {
 
 #[derive(Deserialize)]
 pub struct ScannerHeartbeat {
+    #[serde(default)]
+    diagnostics: crate::scanner_diagnostics::protocol::Capabilities,
+    #[serde(default)]
+    diagnostic_health: Option<crate::scanner_diagnostics::Health>,
     scanner_id: Uuid,
     state: String,
     active_task_id: Option<Uuid>,
@@ -810,6 +816,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     latency_history: web::Data<ScannerLatencyHistory>,
     maintenance: web::Data<SystemMaintenanceState>,
     heartbeat: web::Json<ScannerHeartbeat>,
+    diagnostics: Option<web::Data<std::sync::Arc<crate::scanner_diagnostics::Diagnostics>>>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
@@ -856,6 +863,14 @@ pub(crate) async fn scanner_heartbeat_handler(
             .is_some_and(|value| !matches!(value, "local" | "staged" | "applied" | "rejected"))
     {
         return HttpResponse::BadRequest().body("invalid scanner configuration state");
+    }
+    if heartbeat.diagnostics.supported_versions.len() > 8
+        || heartbeat
+            .diagnostic_health
+            .as_ref()
+            .is_some_and(|h| !matches!(h.status.as_str(), "healthy" | "error" | "degraded"))
+    {
+        return HttpResponse::BadRequest().body("invalid diagnostics capabilities");
     }
     let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
         Ok(value) => value,
@@ -1022,6 +1037,23 @@ pub(crate) async fn scanner_heartbeat_handler(
             );
             return HttpResponse::InternalServerError().finish();
         }
+    }
+    let diagnostic_health = heartbeat
+        .diagnostic_health
+        .as_ref()
+        .map(|h| h.status.as_str())
+        .unwrap_or("unknown");
+    let accepting_tasks = heartbeat
+        .diagnostic_health
+        .as_ref()
+        .map(|h| h.accepting_tasks)
+        .unwrap_or(true);
+    if let Err(error) = scanner_transaction.execute(
+        "UPDATE scanner_info SET diagnostics_capabilities=$2, accepting_tasks=$3, diagnostic_health=$4, diagnostic_dropped_events=$5 WHERE scanner_id=$1",
+        &[&scanner_id, &serde_json::json!(heartbeat.diagnostics), &accepting_tasks, &diagnostic_health, &(heartbeat.diagnostic_health.as_ref().map(|h| h.dropped_events).unwrap_or(0).min(i64::MAX as u64) as i64)],
+    ).await {
+        error_logs_error(&req, "ScannerDiagnosticHealthError", "update_diagnostic_health", &error);
+        return HttpResponse::InternalServerError().finish();
     }
     let configuration =
         match crate::scanner_config::load_configuration(&scanner_transaction, &scanner_id).await {
@@ -1196,7 +1228,26 @@ pub(crate) async fn scanner_heartbeat_handler(
             network_rtt_us: latency.network_rtt_us,
         });
     }
+    let diagnostic_requests = if diagnostics.as_ref().is_some_and(|d| d.config.enabled)
+        && !maintenance_snapshot.blocks_new_work()
+        && heartbeat
+            .diagnostics
+            .supported_versions
+            .contains(&crate::scanner_diagnostics::protocol::VERSION)
+    {
+        match crate::scanner_diagnostics::pending_jobs(pool.get_ref(), heartbeat.scanner_id).await {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::warn!(event="ScannerDiagnosticDispatchFailed", %error);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     HttpResponse::Ok().json(ScannerHeartbeatResponse {
+        diagnostics_enabled: diagnostics.as_ref().is_some_and(|d| d.config.enabled),
+        diagnostic_requests,
         success: true,
         lease,
         command: cancel_task_id.map(|task_id| ScannerHeartbeatCommand {
@@ -3072,6 +3123,8 @@ mod tests {
     fn heartbeat_reports_lost_task_lease_explicitly() {
         let task_id = uuid::Uuid::now_v7();
         let body = serde_json::to_value(ScannerHeartbeatResponse {
+            diagnostics_enabled: false,
+            diagnostic_requests: Vec::new(),
             success: true,
             lease: Some(ScannerHeartbeatLease {
                 task_id,

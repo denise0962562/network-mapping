@@ -144,6 +144,10 @@ impl Error for ScannerRegistrationUnauthorized {}
 
 #[derive(Serialize)]
 pub struct ScannerInfo {
+    pub diagnostics_capabilities: serde_json::Value,
+    pub accepting_tasks: bool,
+    pub diagnostic_health: String,
+    pub diagnostic_dropped_events: i64,
     pub scanner_id: String,
     pub name: Option<String>,
     pub creator: Option<String>,
@@ -1937,7 +1941,7 @@ pub async fn scanner_register(
 }
 
 const SCANNER_INFO_SELECT: &str = "\
-    SELECT s.scanner_id, s.name, u.username AS creator, s.location, \
+    SELECT s.diagnostic_dropped_events, s.diagnostics_capabilities, s.accepting_tasks, s.diagnostic_health, s.scanner_id, s.name, u.username AS creator, s.location, \
            s.ip_address, s.system_version, s.scanner_version, \
            s.cpu_model, s.cpus, s.ram, s.uptime, s.create_time, s.register_time, s.update_time, \
            s.last_seen_at, s.runtime_state, \
@@ -1976,6 +1980,10 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
         _ => None,
     };
     ScannerInfo {
+        diagnostics_capabilities: row.get("diagnostics_capabilities"),
+        accepting_tasks: row.get("accepting_tasks"),
+        diagnostic_health: row.get("diagnostic_health"),
+        diagnostic_dropped_events: row.get("diagnostic_dropped_events"),
         scanner_id: row.get("scanner_id"),
         name: row.get("name"),
         creator: row.get("creator"),
