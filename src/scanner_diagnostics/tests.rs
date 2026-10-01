@@ -126,6 +126,39 @@ async fn authenticated_transfer_deduplicates_errors_and_checks_ownership() {
         .unwrap()
         .get(0);
     assert_eq!(count, 1);
+    let mut oversized_event = event.clone();
+    oversized_event["fields"]["message"] = json!("x".repeat(parser::MAX_LINE_BYTES));
+    for invalid_events in [vec![event.clone(); 101], vec![oversized_event]] {
+        let request = test::TestRequest::post()
+            .uri(events_path)
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .set_json(json!({"scanner_id":scanner,"events":invalid_events}))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["code"], "invalid_diagnostic_events");
+    }
+    // Check the actual POST route's wire-size limit as well as the isolated extractor tests.
+    for (size, status) in [
+        (8 * 1024 * 1024, StatusCode::OK),
+        (8 * 1024 * 1024 + 1, StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+        let mut body = serde_json::to_vec(&json!({"scanner_id":scanner,"events":[]})).unwrap();
+        body.resize(size, b' ');
+        let request = test::TestRequest::post()
+            .uri(events_path)
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .insert_header(("Content-Type", "application/json"))
+            .set_payload(body)
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), status);
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            let response: Value = test::read_body_json(response).await;
+            assert_eq!(response["code"], "payload_too_large");
+        }
+    }
     let source = SourceFile {
         source_file_id: parser::digest(b"test-source-generation"),
         name: "scanner.log.2026-10-01".into(),
@@ -277,6 +310,29 @@ async fn authenticated_transfer_deduplicates_errors_and_checks_ownership() {
         test::call_service(&app, changed).await.status(),
         StatusCode::CONFLICT
     );
+    let tail = &log[CHUNK_BYTES..];
+    for (size, status, code) in [
+        (
+            tail.len() + 1,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "log_part_too_large",
+        ),
+        (
+            tail.len() - 1,
+            StatusCode::BAD_REQUEST,
+            "log_part_incomplete",
+        ),
+    ] {
+        let request = test::TestRequest::put()
+            .uri(&transfer.replace("part_index=0", "part_index=1"))
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .set_payload(vec![b'x'; size])
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), status);
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["code"], code);
+    }
     let second = test::TestRequest::put()
         .uri(&transfer.replace("part_index=0", "part_index=1"))
         .insert_header(("Authorization", format!("Bearer {token}")))

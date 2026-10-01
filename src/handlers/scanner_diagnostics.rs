@@ -16,6 +16,8 @@ use crate::system_maintenance::SystemMaintenanceState;
 
 type ApiResult = actix_web::Result<HttpResponse>;
 
+const EVENTS_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
 fn internal(error: impl std::fmt::Debug) -> actix_web::Error {
     tracing::error!(event="ScannerDiagnosticsRequestFailed",error=?error);
     error::ErrorInternalServerError("诊断操作失败")
@@ -800,7 +802,6 @@ pub async fn complete(
     Ok(HttpResponse::Ok().json(json!({"success":true})))
 }
 
-#[post("/api/scanner/diagnostics/events")]
 pub async fn events(
     req: HttpRequest,
     pool: web::Data<Pool>,
@@ -842,6 +843,13 @@ pub async fn events(
     Ok(HttpResponse::Ok().json(json!({"success":true,"confirmed":confirmed})))
 }
 
+fn events_resource() -> actix_web::Resource {
+    // Limit only this endpoint; an empty-prefix scope would shadow later app routes.
+    web::resource("/api/scanner/diagnostics/events")
+        .app_data(web::JsonConfig::default().limit(EVENTS_BODY_LIMIT))
+        .route(web::post().to(events))
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(create_job)
         .service(list_jobs)
@@ -856,9 +864,164 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .service(upload_status)
         .service(chunk)
         .service(complete)
-        .service(
-            web::scope("")
-                .app_data(web::JsonConfig::default().limit(8 * 1024 * 1024))
-                .service(events),
+        .service(events_resource());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENTS_BODY_LIMIT, Events, events_resource};
+    use crate::{config, frontend};
+    use actix_web::{App, HttpResponse, http::StatusCode, test, web};
+    use serde_json::{Value, json};
+
+    fn server_config() -> config::ServerConfig {
+        serde_json::from_value(json!({
+            "host": "127.0.0.1",
+            "port": 9443,
+            "encrypt_key": "test-only"
+        }))
+        .unwrap()
+    }
+
+    fn padded_events(size: usize) -> Vec<u8> {
+        let mut body = serde_json::to_vec(&json!({
+            "scanner_id": uuid::Uuid::nil(),
+            "events": []
+        }))
+        .unwrap();
+        assert!(size >= body.len());
+        // Whitespace exercises the wire-size limit without violating event business rules.
+        body.resize(size, b' ');
+        body
+    }
+
+    async fn json_probe(_: web::Json<Events>) -> HttpResponse {
+        HttpResponse::Ok().finish()
+    }
+
+    #[actix_web::test]
+    async fn diagnostics_do_not_shadow_application_routes() {
+        let directory = std::env::temp_dir().join(format!(
+            "network-mapping-diagnostic-routes-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(directory.join("assets")).unwrap();
+        std::fs::create_dir_all(directory.join("maps")).unwrap();
+        for file in ["index.html", "login.html", "search.html", "asset.html"] {
+            std::fs::write(directory.join(file), "<html>route fixture</html>").unwrap();
+        }
+        let mut pool_config = deadpool_postgres::Config::new();
+        pool_config.dbname = Some("unused_route_test".to_owned());
+        let pool = pool_config
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .unwrap();
+        let server = server_config();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool))
+                .app_data(web::JsonConfig::default().limit(server.max_body_size))
+                .app_data(web::Data::new(server))
+                .app_data(web::Data::new(frontend::FrontendAssets::new(&directory)))
+                .configure(config::init_routes)
+                .configure(frontend::configure),
+        )
+        .await;
+
+        for (path, status) in [
+            ("/api/version", StatusCode::OK),
+            ("/login", StatusCode::OK),
+            ("/", StatusCode::OK),
+            (
+                "/api/scanner/diagnostics/events",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            ("/api/nonexistent", StatusCode::NOT_FOUND),
+        ] {
+            let request = test::TestRequest::get().uri(path).to_request();
+            assert_eq!(
+                test::call_service(&app, request).await.status(),
+                status,
+                "{path}"
+            );
+        }
+        // Invalid login JSON must reach the real extractor, without opening a DB connection.
+        let request = test::TestRequest::post()
+            .uri("/api/login")
+            .set_json(json!({}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::BAD_REQUEST
         );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[actix_web::test]
+    async fn events_limit_is_local_and_preserves_global_json_limit() {
+        let default_limit = server_config().max_body_size;
+        assert_eq!(default_limit, 64 * 1024 * 1024);
+        for global_limit in [1024, default_limit] {
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::JsonConfig::default().limit(global_limit))
+                    .wrap(crate::api_response::ApiErrorMiddleware)
+                    // A test-only GET extractor on the production resource isolates JSON
+                    // limits from the POST handler's database and authentication dependencies.
+                    .service(events_resource().route(web::get().to(json_probe)))
+                    .route("/api/body-limit-probe", web::post().to(json_probe)),
+            )
+            .await;
+
+            for (size, status) in [
+                (EVENTS_BODY_LIMIT - 1, StatusCode::OK),
+                (EVENTS_BODY_LIMIT, StatusCode::OK),
+                (EVENTS_BODY_LIMIT + 1, StatusCode::PAYLOAD_TOO_LARGE),
+            ] {
+                let request = test::TestRequest::get()
+                    .uri("/api/scanner/diagnostics/events")
+                    .insert_header(("Content-Type", "application/json"))
+                    .set_payload(padded_events(size))
+                    .to_request();
+                let response = test::call_service(&app, request).await;
+                assert_eq!(
+                    response.status(),
+                    status,
+                    "global={global_limit}, size={size}"
+                );
+                if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    let body: Value = test::read_body_json(response).await;
+                    assert_eq!(body["code"], "payload_too_large");
+                    assert_eq!(body["success"], false);
+                    assert!(body["request_id"].as_str().is_some());
+                }
+            }
+            for (size, status) in [
+                (global_limit, StatusCode::OK),
+                (global_limit + 1, StatusCode::PAYLOAD_TOO_LARGE),
+                (
+                    EVENTS_BODY_LIMIT + 1,
+                    if global_limit > EVENTS_BODY_LIMIT {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::PAYLOAD_TOO_LARGE
+                    },
+                ),
+            ] {
+                let request = test::TestRequest::post()
+                    .uri("/api/body-limit-probe")
+                    .insert_header(("Content-Type", "application/json"))
+                    .set_payload(padded_events(size))
+                    .to_request();
+                assert_eq!(
+                    test::call_service(&app, request).await.status(),
+                    status,
+                    "global={global_limit}, size={size}"
+                );
+            }
+        }
+    }
 }

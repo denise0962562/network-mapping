@@ -75,8 +75,25 @@ auto_collect = false
 | 每台扫描器有效待处理任务 | 最多 4 个；每次心跳最多通知 2 个 |
 | 任务期限 | 创建后 30 分钟，重试不延长 |
 | 目录清单有效期 | 服务端接收后 1 天 |
-| 实时事件请求 | 最多 100 条，每条最多 64 KiB，时间不得超过服务端当前时间 5 分钟 |
+| 实时事件请求体 | 最多 8 MiB，仅作用于 `POST /api/scanner/diagnostics/events` |
+| 实时事件请求 | 最多 100 条，每条序列化为 JSON 后最多 64 KiB，时间不得超过服务端当前时间 5 分钟 |
 | 日志解析 | 单行最多 64 KiB，超大行跳过并统计；按 100 条事件分批入库 |
+
+普通 JSON 接口（包括扫描结果上传）继续使用 `server.max_body_size`，默认值为
+`67108864` 字节（64 MiB）。实时事件接口在精确路径的 resource 上独立配置 8 MiB，
+覆盖该接口的 App 级 JSON 配置；即使全局值小于 8 MiB，该接口仍采用 8 MiB。
+ACK、manifest、complete 等其他诊断 JSON 接口继承全局值。请求体超过生效的 JSON
+限制返回 HTTP 413，统一错误码为 `payload_too_large`；事件数量或单条大小不合法返回
+HTTP 400，错误码为 `invalid_diagnostic_events`。
+
+分块上传使用 `web::Payload` 流式读取，不受 `JsonConfig` 限制，也不会自动执行
+`PayloadConfig` 的限制。服务端按 manifest 中该块的预期大小累计校验：超过预期返回
+HTTP 413（`log_part_too_large`），不足预期返回 HTTP 400（`log_part_incomplete`）。
+4 MiB 分块、尾块实际大小、60 秒期限以及单文件/任务上限均独立保留。
+
+路由配置必须把事件接口的 JSON 限制放在该 resource 上，不能用 `web::scope("")`
+包裹单个接口；空前缀 scope 会优先匹配后续路径，内部未匹配时走默认服务返回 404，
+遮挡登录、其他 API 和前端页面。
 
 分块大小和 SHA-256 以持久化 manifest 为准。同一分块重试且摘要相同则返回成功，摘要不同返回 409；manifest 一旦创建，文件 ID 和内容不允许变更。`complete` 要求所有分块齐全，流式组装并检查整个文件大小和 SHA-256，校验成功后才开放下载。缺块返回 409，校验不匹配将任务标记 `failed/log_checksum_mismatch` 并返回 400。
 
@@ -152,6 +169,16 @@ cargo clippy --all-targets
 cargo test
 ```
 
+登录/API/前端路由以及 JSON 大小限制的回归测试不需要数据库：
+
+```sh
+cargo test handlers::scanner_diagnostics::tests
+```
+
+这组测试使用实际应用路由检查登录请求能进入 JSON 提取器、版本接口和前端页面可访问、
+事件接口只接受 POST，并在生产事件 resource 上附加测试专用提取器检查 8 MiB 边界、
+全局 64 MiB 边界和自定义小限额互不干扰，以及 413 的统一错误格式。
+
 数据库专项测试默认 ignored，需要独立、可丢弃的 PostgreSQL 数据库，库名必须包含 `nm_diagnostics_test`。它执行实际迁移两次，使用测试 scanner/token，测试结束后可销毁该数据库；不可指向部署数据库。
 
 ```sh
@@ -159,7 +186,7 @@ NM_DIAGNOSTICS_TEST_DATABASE_URL='host=<test-host> dbname=nm_diagnostics_test us
   cargo test authenticated_transfer_deduplicates_errors_and_checks_ownership -- --ignored --nocapture
 ```
 
-专项测试覆盖实时重复 ACK、跨 4 MiB 分块及续传状态、缺块、重复/冲突分块、大小/SHA 校验、错误解析/证据去重、损坏/超大行、脱敏、CSRF、非管理员拒绝、扫描器归属隔离、下载和恢复事件乱序。真实多台扫描器长期运行的压力测试、跨实例共享存储和外部错误通知需另行验证或实现。
+专项测试覆盖实时重复 ACK、真实事件 POST 的 8 MiB 请求体边界、超过 100 条或单条超过 64 KiB 的事件拒绝、跨 4 MiB 分块及续传状态、超大分块、过长/不足的尾块、缺块、重复/冲突分块、大小/SHA 校验、错误解析/证据去重、损坏/超大行、脱敏、CSRF、非管理员拒绝、扫描器归属隔离、下载和恢复事件乱序。真实多台扫描器长期运行的压力测试、跨实例共享存储和外部错误通知需另行验证或实现。
 
 ### 本次验证记录（2026-10-01）
 
@@ -168,3 +195,10 @@ NM_DIAGNOSTICS_TEST_DATABASE_URL='host=<test-host> dbname=nm_diagnostics_test us
 - 扫描端 121 项测试通过，含诊断任务/manifest 重启恢复和到期清理。
 - 前端 `pnpm build` 通过；本地 Chrome 使用模拟 API 验证桌面、390px 手机、目录刷新、选择采集、证据下载、告警确认、离线、启动异常、旧能力、空状态、服务错误及 403，无页面异常和整体横向溢出。
 - 未执行真实生产部署、长期多节点压力测试或断电持久化测试。
+
+### 登录路由修复验证（2026-10-01）
+
+- 将事件接口的 8 MiB JSON 限制移至精确路径 resource，移除遮挡后续路由的空前缀 scope；全局 JSON 配置、事件业务限制和流式分块限制保持原值。
+- 服务端 `cargo fmt --check`、`cargo clippy --all-targets` 通过，无警告；`cargo test` 共 316 项通过、40 项按原设置忽略。
+- 诊断专项测试在独立 PostgreSQL 18 测试库中另行执行并通过，包含新增的真实 POST 请求体边界、事件业务限制和尾块大小检查；其余 39 项默认忽略测试未在本次修复中另行执行。
+- 登录路由通过无数据库的非法 JSON 请求验证可达性；未运行需要配置数据库和预置管理员的真实账号登录测试，也未执行生产部署。

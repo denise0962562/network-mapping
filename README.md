@@ -58,6 +58,11 @@ DEBUG 级别日志时，可组合使用 `--verbose --debug-model`，也可以通
 服务端还提供创建用户、修改密码、清除 2FA、登录限制、IP/CIDR 白名单、会话和登录记录
 查询等本地管理命令，详见[用户管理 CLI](docs/USER_MANAGEMENT_CLI.md)。
 
+JSON 请求体使用 `[server]` 下的 `max_body_size`，单位为字节，省略时默认为
+`67108864`（64 MiB），用于容纳扫描结果批量上传。诊断实时事件接口单独使用 8 MiB
+上限，日志分块上传按每块最多 4 MiB 流式校验；具体限制和错误码见
+[扫描器诊断与日志采集](docs/SCANNER_DIAGNOSTICS.md#固定目录与文件语义)。
+
 ## 前端页面托管
 
 服务端直接托管 Vue/Vite 的生产构建产物。先在 `network-mapping-vue/` 中执行
