@@ -19,10 +19,10 @@ use crate::config::{
 use crate::monitor::MonitorHandle;
 use crate::runtime_config::{
     ANALYTICS_SNAPSHOT_NAMESPACE, AUTOMATIC_TARGET_NAMESPACE, DNS_FOLLOW_UP_NAMESPACE,
-    DNS_RESOLVERS_NAMESPACE, MONITOR_NAMESPACE, PersistError, REQUESTS_NAMESPACE,
-    RuntimeConfigResponse, RuntimeSettings, UpdateRuntimeConfigRequest, parse_analytics_snapshot,
-    parse_automatic_target, parse_dns_follow_up, parse_dns_resolvers, parse_monitor,
-    parse_requests, persist,
+    DNS_RESOLVERS_NAMESPACE, GENERAL_NAMESPACE, MONITOR_NAMESPACE, PersistError,
+    REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings, UpdateRuntimeConfigRequest,
+    parse_analytics_snapshot, parse_automatic_target, parse_dns_follow_up, parse_dns_resolvers,
+    parse_general, parse_monitor, parse_requests, persist,
 };
 use crate::trusted_proxy::{
     MAX_CLIENT_IP_HEADER_LENGTH, MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState,
@@ -116,6 +116,12 @@ async fn get_runtime_config_h(
             .json(json!({"success": false, "message": "仅管理员可以读取运行时配置"}));
     }
     match namespace.as_str() {
+        GENERAL_NAMESPACE => {
+            match crate::system_time::refresh(pool.get_ref()).await {
+                Ok(value) => HttpResponse::Ok().json(json!({"success": true, "data": {"namespace": "general", "revision": value.revision, "document": value.document}})),
+                Err(_) => HttpResponse::ServiceUnavailable().json(json!({"success": false, "message": "常规设置读取失败"})),
+            }
+        }
         REQUESTS_NAMESPACE => {
             let value = settings.requests.get().await;
             HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: REQUESTS_NAMESPACE, revision: value.revision, document: value.value }}))
@@ -214,6 +220,15 @@ async fn save_runtime_config_h(
     }
 
     match namespace.as_str() {
+        GENERAL_NAMESPACE => publish!(
+            GENERAL_NAMESPACE,
+            parse_general,
+            general,
+            |value: &crate::system_time::GeneralSettings| {
+                // The runtime snapshot already contains the published revision.
+                crate::system_time::apply(value.clone(), body.expected_revision + 1);
+            }
+        ),
         REQUESTS_NAMESPACE => publish!(REQUESTS_NAMESPACE, parse_requests, requests, |_| {}),
         MONITOR_NAMESPACE => publish!(
             MONITOR_NAMESPACE,
@@ -1108,4 +1123,20 @@ async fn test_mail_server_h(
             }))
         }
     }
+}
+
+#[get("/api/system/preferences")]
+pub async fn get_system_preferences(
+    pool: web::Data<deadpool_postgres::Pool>,
+    _user: UserBaseI,
+) -> impl Responder {
+    match crate::system_time::refresh(pool.get_ref()).await {
+        Ok(value) => HttpResponse::Ok().json(json!({"success": true, "data": {"revision": value.revision, "document": value.document}})),
+        Err(_) => HttpResponse::ServiceUnavailable().json(json!({"success": false, "message": "系统时间设置暂不可用"})),
+    }
+}
+#[get("/api/system/timezones")]
+pub async fn get_system_timezones(_user: UserBaseI) -> impl Responder {
+    HttpResponse::Ok()
+        .json(json!({"success": true, "data": crate::system_time::timezone_options()}))
 }

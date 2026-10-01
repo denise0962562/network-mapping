@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use lettre::{Message, message::Mailbox, message::MultiPart};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,9 @@ use crate::monitor::HealthEvent;
 
 pub const LOGIN_SUCCESS_TEMPLATE_KEY: &str = "login_success";
 pub const HEALTH_ALERT_TEMPLATE_KEY: &str = "health_alert";
+pub const SCANNER_OUTAGE_TEMPLATE_KEY: &str = "scanner_outage";
+pub const REPORT_WEEKLY_TEMPLATE_KEY: &str = "report_weekly";
+pub const REPORT_MONTHLY_TEMPLATE_KEY: &str = "report_monthly";
 const MAX_SUBJECT_TEMPLATE_CHARS: usize = 500;
 const MAX_BODY_TEMPLATE_BYTES: usize = 256 * 1024;
 const DEFAULT_LOGIN_SUBJECT: &str = "{{ system_name }} 登录成功提醒";
@@ -24,6 +27,10 @@ const DEFAULT_LOGIN_TEXT: &str = include_str!("../templates/mail/login_success.t
 const DEFAULT_HEALTH_ALERT_SUBJECT: &str = "{{ system_name }} 健康告警：{{ alert_type }}";
 const DEFAULT_HEALTH_ALERT_HTML: &str = include_str!("../templates/mail/health_alert.html");
 const DEFAULT_HEALTH_ALERT_TEXT: &str = include_str!("../templates/mail/health_alert.txt");
+const DEFAULT_SCANNER_OUTAGE_SUBJECT: &str =
+    "{{ system_name }} 扫描器{{ event_label }}：{{ scanner_name }}";
+const DEFAULT_SCANNER_OUTAGE_HTML: &str = include_str!("../templates/mail/scanner_outage.html");
+const DEFAULT_SCANNER_OUTAGE_TEXT: &str = include_str!("../templates/mail/scanner_outage.txt");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,7 +83,7 @@ pub struct MailTemplateVersion {
     pub published_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderedMailTemplate {
     pub subject: String,
@@ -109,13 +116,42 @@ const HEALTH_ALERT_DEFINITION: MailTemplateDefinition = MailTemplateDefinition {
     default_text: DEFAULT_HEALTH_ALERT_TEXT,
 };
 
-const ALL_TEMPLATE_DEFINITIONS: &[MailTemplateDefinition] =
-    &[LOGIN_SUCCESS_DEFINITION, HEALTH_ALERT_DEFINITION];
+const SCANNER_OUTAGE_DEFINITION: MailTemplateDefinition = MailTemplateDefinition {
+    template_key: SCANNER_OUTAGE_TEMPLATE_KEY,
+    display_name: "扫描器掉线与恢复",
+    default_subject: DEFAULT_SCANNER_OUTAGE_SUBJECT,
+    default_html: DEFAULT_SCANNER_OUTAGE_HTML,
+    default_text: DEFAULT_SCANNER_OUTAGE_TEXT,
+};
+
+const REPORT_WEEKLY_DEFINITION: MailTemplateDefinition = MailTemplateDefinition {
+    template_key: REPORT_WEEKLY_TEMPLATE_KEY,
+    display_name: "平台周报",
+    default_subject: "{{ system_name }} {{ report_label }}：{{ period_label }}",
+    default_html: include_str!("../templates/mail/report.html"),
+    default_text: include_str!("../templates/mail/report.txt"),
+};
+const REPORT_MONTHLY_DEFINITION: MailTemplateDefinition = MailTemplateDefinition {
+    template_key: REPORT_MONTHLY_TEMPLATE_KEY,
+    display_name: "平台月报",
+    ..REPORT_WEEKLY_DEFINITION
+};
+
+const ALL_TEMPLATE_DEFINITIONS: &[MailTemplateDefinition] = &[
+    LOGIN_SUCCESS_DEFINITION,
+    HEALTH_ALERT_DEFINITION,
+    SCANNER_OUTAGE_DEFINITION,
+    REPORT_WEEKLY_DEFINITION,
+    REPORT_MONTHLY_DEFINITION,
+];
 
 fn template_definition(template_key: &str) -> Option<MailTemplateDefinition> {
     match template_key {
         LOGIN_SUCCESS_TEMPLATE_KEY => Some(LOGIN_SUCCESS_DEFINITION),
         HEALTH_ALERT_TEMPLATE_KEY => Some(HEALTH_ALERT_DEFINITION),
+        SCANNER_OUTAGE_TEMPLATE_KEY => Some(SCANNER_OUTAGE_DEFINITION),
+        REPORT_WEEKLY_TEMPLATE_KEY => Some(REPORT_WEEKLY_DEFINITION),
+        REPORT_MONTHLY_TEMPLATE_KEY => Some(REPORT_MONTHLY_DEFINITION),
         _ => None,
     }
 }
@@ -184,6 +220,85 @@ fn template_variables(template_key: &str) -> Vec<MailTemplateVariable> {
                 example: "[{\"label\":\"请求路径\",\"value\":\"/api/task/create\"}]",
             },
         ],
+        SCANNER_OUTAGE_TEMPLATE_KEY => vec![
+            MailTemplateVariable {
+                key: "system_name",
+                label: "系统名称",
+                example: "Network Mapping",
+            },
+            MailTemplateVariable {
+                key: "event_label",
+                label: "事件类型",
+                example: "掉线 / 恢复",
+            },
+            MailTemplateVariable {
+                key: "scanner_name",
+                label: "扫描器名称",
+                example: "华东扫描器",
+            },
+            MailTemplateVariable {
+                key: "scanner_id",
+                label: "扫描器 ID",
+                example: "01952f0c-0000-7000-8000-000000000001",
+            },
+            MailTemplateVariable {
+                key: "location",
+                label: "位置",
+                example: "上海",
+            },
+            MailTemplateVariable {
+                key: "last_seen_at",
+                label: "最后心跳",
+                example: "2026-09-30 10:00:00 UTC",
+            },
+            MailTemplateVariable {
+                key: "event_at",
+                label: "发现或恢复时间",
+                example: "2026-09-30 10:02:00 UTC",
+            },
+            MailTemplateVariable {
+                key: "detail_path",
+                label: "扫描器详情路径",
+                example: "/scanner/01952f0c-0000-7000-8000-000000000001",
+            },
+        ],
+        REPORT_WEEKLY_TEMPLATE_KEY | REPORT_MONTHLY_TEMPLATE_KEY => vec![
+            MailTemplateVariable {
+                key: "system_name",
+                label: "系统名称",
+                example: "Network Mapping",
+            },
+            MailTemplateVariable {
+                key: "report_label",
+                label: "报告类型",
+                example: "周报 / 月报",
+            },
+            MailTemplateVariable {
+                key: "period_label",
+                label: "报告周期（上海时间）",
+                example: "2026-09-21 至 2026-09-28（不含）",
+            },
+            MailTemplateVariable {
+                key: "tasks",
+                label: "任务统计",
+                example: "created / succeeded / failed / partial / cancelled / success_rate",
+            },
+            MailTemplateVariable {
+                key: "scan_output",
+                label: "扫描产出",
+                example: "unique_ips / port_observations / service_observations",
+            },
+            MailTemplateVariable {
+                key: "recommendations",
+                label: "建议列表",
+                example: "[处理失败任务]",
+            },
+            MailTemplateVariable {
+                key: "detail_path",
+                label: "报告详情路径",
+                example: "/reports/报告ID",
+            },
+        ],
         _ => Vec::new(),
     }
 }
@@ -191,6 +306,19 @@ fn template_variables(template_key: &str) -> Vec<MailTemplateVariable> {
 pub fn sample_context(template_key: &str) -> Result<Context, Box<dyn std::error::Error>> {
     if template_definition(template_key).is_none() {
         return Err("未知邮件模板".into());
+    }
+    if matches!(
+        template_key,
+        REPORT_WEEKLY_TEMPLATE_KEY | REPORT_MONTHLY_TEMPLATE_KEY
+    ) {
+        return Ok(Context::from_serialize(json!({
+            "system_name": "Network Mapping", "report_label": if template_key == REPORT_WEEKLY_TEMPLATE_KEY { "周报" } else { "月报" },
+            "period_label": "2026-09-21 至 2026-09-28（不含）",
+            "tasks": {"created": 12, "succeeded": 10, "failed": 1, "partial": 1, "cancelled": 0, "success_rate": 83.3},
+            "scan_output": {"unique_ips": 100, "port_observations": 240, "service_observations": 180},
+            "recommendations": ["存在失败任务，请检查失败原因。"],
+            "detail_path": "/reports/01952f0c-0000-7000-8000-000000000001"
+        }))?);
     }
     if template_key == HEALTH_ALERT_TEMPLATE_KEY {
         return Ok(Context::from_serialize(json!({
@@ -205,6 +333,18 @@ pub fn sample_context(template_key: &str) -> Result<Context, Box<dyn std::error:
             ]
         }))?);
     }
+    if template_key == SCANNER_OUTAGE_TEMPLATE_KEY {
+        return Ok(Context::from_serialize(json!({
+            "system_name": "Network Mapping",
+            "event_label": "掉线",
+            "scanner_name": "华东扫描器",
+            "scanner_id": "01952f0c-0000-7000-8000-000000000001",
+            "location": "上海",
+            "last_seen_at": "2026-09-30 10:00:00 UTC",
+            "event_at": "2026-09-30 10:02:00 UTC",
+            "detail_path": "/scanner/01952f0c-0000-7000-8000-000000000001"
+        }))?);
+    }
     Ok(Context::from_serialize(json!({
         "system_name": "Network Mapping",
         "username": "admin",
@@ -217,7 +357,7 @@ pub fn login_context(username: &str, source_ip: &str) -> Result<Context, tera::E
     Context::from_serialize(json!({
         "system_name": "Network Mapping",
         "username": username,
-        "login_time": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "login_time": crate::system_time::format_now(),
         "source_ip": source_ip
     }))
 }
@@ -664,6 +804,25 @@ async fn send_rendered_mail(
     rendered: RenderedMailTemplate,
     retry_policy: MailRetryPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    send_rendered_mail_with_id(
+        pool,
+        encryption_key,
+        recipient,
+        rendered,
+        retry_policy,
+        None,
+    )
+    .await
+}
+
+async fn send_rendered_mail_with_id(
+    pool: &Pool,
+    encryption_key: &str,
+    recipient: &str,
+    rendered: RenderedMailTemplate,
+    retry_policy: MailRetryPolicy,
+    message_id: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let settings = get_mail_settings_from_database(pool).await?;
     if settings.smtp_host.trim().is_empty() || settings.sender.trim().is_empty() {
         return Err("尚未配置 SMTP 邮件服务器".into());
@@ -683,7 +842,7 @@ async fn send_rendered_mail(
         ))
         .to(recipient.parse()?)
         .subject(rendered.subject)
-        .message_id(None)
+        .message_id(message_id)
         .multipart(MultiPart::alternative_plain_html(
             rendered.text_body,
             rendered.html_body,
@@ -807,6 +966,46 @@ pub async fn send_health_alert(
     Ok(())
 }
 
+pub struct ScannerOutageMail<'a> {
+    pub kind: &'a str,
+    pub scanner_id: &'a str,
+    pub scanner_name: &'a str,
+    pub location: &'a str,
+    pub last_seen_at: DateTime<Utc>,
+    pub event_at: DateTime<Utc>,
+}
+
+pub async fn send_scanner_outage_email(
+    pool: &Pool,
+    encryption_key: &str,
+    recipient: &str,
+    mail: &ScannerOutageMail<'_>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(source) = get_published_source(pool, SCANNER_OUTAGE_TEMPLATE_KEY).await? else {
+        return Ok(false);
+    };
+    let context = Context::from_serialize(json!({
+        "system_name": "Network Mapping",
+        "event_label": if mail.kind == "offline" { "掉线" } else { "恢复" },
+        "scanner_name": mail.scanner_name,
+        "scanner_id": mail.scanner_id,
+        "location": mail.location,
+        "last_seen_at": mail.last_seen_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        "event_at": mail.event_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        "detail_path": format!("/scanner/{}", mail.scanner_id),
+    }))?;
+    let rendered = render_template(SCANNER_OUTAGE_TEMPLATE_KEY, &source, &context)?;
+    send_rendered_mail(
+        pool,
+        encryption_key,
+        recipient,
+        rendered,
+        MailRetryPolicy::Background,
+    )
+    .await?;
+    Ok(true)
+}
+
 /// 枚举所有启用中的管理员（`role = 1`）邮箱，过滤掉无效或缺失的地址。
 pub async fn get_admin_recipients(pool: &Pool) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let conn = pool.get().await?;
@@ -837,7 +1036,7 @@ fn health_alert_context(event: &HealthEvent) -> Result<Context, tera::Error> {
         "system_name": "Network Mapping",
         "alert_type": event.alert_type,
         "severity": event.severity,
-        "occurred_at": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "occurred_at": crate::system_time::format_now(),
         "summary": event.summary,
         "details": details,
     }))
@@ -887,12 +1086,87 @@ pub fn audit_source_metadata(source: &MailTemplateSource) -> Value {
     })
 }
 
+/// Render and freeze the published report template using the statistics transaction.
+pub(crate) async fn render_report<C: deadpool_postgres::GenericClient + Sync>(
+    client: &C,
+    key: &str,
+    payload: &Value,
+    id: uuid::Uuid,
+) -> Result<(Option<RenderedMailTemplate>, i32), String> {
+    let definition = template_definition(key).ok_or("未知报告模板")?;
+    let row = client.query_opt("SELECT t.enabled, t.active_version, v.subject_template, v.html_template, v.text_template \
+        FROM mail_template t LEFT JOIN mail_template_version v ON v.template_key = t.template_key AND v.version = t.active_version \
+        WHERE t.template_key = $1;", &[&key]).await.map_err(|e| e.to_string())?;
+    let mut version = 0;
+    let mut source = default_source(definition);
+    if let Some(row) = row {
+        if !row.get::<_, bool>("enabled") {
+            return Ok((None, 0));
+        }
+        if let Some(subject) = row.get::<_, Option<String>>("subject_template") {
+            version = row.get::<_, Option<i32>>("active_version").unwrap_or(0);
+            source = MailTemplateSource {
+                subject_template: subject,
+                html_template: row.get("html_template"),
+                text_template: row.get("text_template"),
+            };
+        }
+    }
+    let start = payload["period"]["start_at"]
+        .as_str()
+        .ok_or("缺少周期开始时间")?;
+    let end = payload["period"]["end_at"]
+        .as_str()
+        .ok_or("缺少周期结束时间")?;
+    let timezone = payload["period"]["timezone"]
+        .as_str()
+        .unwrap_or(crate::system_time::DEFAULT_TIMEZONE);
+    let tz = timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| "无效报告时区")?;
+    let format = |text: &str| -> Result<String, String> {
+        let t = DateTime::parse_from_rfc3339(text)
+            .map_err(|e| e.to_string())?
+            .with_timezone(&Utc);
+        Ok(t.with_timezone(&tz).date_naive().to_string())
+    };
+    let context = Context::from_serialize(json!({
+        "system_name": "Network Mapping", "report_label": if key == REPORT_WEEKLY_TEMPLATE_KEY { "周报" } else { "月报" },
+        "period_label": format!("{} 至 {}（不含），{}", format(start)?, format(end)?, timezone),
+        "tasks": payload["tasks"], "scan_output": payload["scan_output"], "recommendations": payload["recommendations"],
+        "detail_path": format!("/reports/{id}")
+    })).map_err(|e| e.to_string())?;
+    let rendered = render_template(key, &source, &context).map_err(|e| e.to_string())?;
+    Ok((Some(rendered), version))
+}
+
+pub(crate) async fn send_archived_report(
+    pool: &Pool,
+    encryption_key: &str,
+    recipient: &str,
+    rendered: Value,
+    delivery_id: uuid::Uuid,
+) -> Result<(), String> {
+    let rendered: RenderedMailTemplate =
+        serde_json::from_value(rendered).map_err(|e| e.to_string())?;
+    send_rendered_mail_with_id(
+        pool,
+        encryption_key,
+        recipient,
+        rendered,
+        MailRetryPolicy::Background,
+        Some(format!("<report-{delivery_id}@network-mapping.local>")),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LOGIN_SUCCESS_TEMPLATE_KEY, MailTemplateSource, default_source, login_context,
-        normalize_user_notification_recipient, render_template, sanitize_email_html,
-        template_definition, validate_template,
+        LOGIN_SUCCESS_TEMPLATE_KEY, MailTemplateSource, SCANNER_OUTAGE_TEMPLATE_KEY,
+        default_source, login_context, normalize_user_notification_recipient, render_template,
+        sample_context, sanitize_email_html, template_definition, validate_template,
     };
 
     #[test]
@@ -909,6 +1183,20 @@ mod tests {
         assert!(rendered.html_body.contains("alice"));
         assert!(rendered.html_body.contains("style="));
         assert!(rendered.text_body.contains("192.0.2.10"));
+    }
+
+    #[test]
+    fn scanner_outage_template_renders_both_bodies() {
+        let definition = template_definition(SCANNER_OUTAGE_TEMPLATE_KEY).unwrap();
+        let rendered = render_template(
+            SCANNER_OUTAGE_TEMPLATE_KEY,
+            &default_source(definition),
+            &sample_context(SCANNER_OUTAGE_TEMPLATE_KEY).unwrap(),
+        )
+        .unwrap();
+        assert!(rendered.subject.contains("扫描器掉线"));
+        assert!(rendered.html_body.contains("/scanner/01952f0c"));
+        assert!(rendered.text_body.contains("最后心跳"));
     }
 
     #[test]

@@ -12,6 +12,16 @@ use crate::{ApplyTaskError, validate_scanner_credentials};
 
 pub const SCHEMA_VERSION: i32 = 1;
 
+pub fn default_batch_endpoints() -> usize {
+    512
+}
+pub fn default_idle_timeout() -> u64 {
+    120
+}
+pub fn default_service_runtime() -> u64 {
+    1800
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScannerRuntimeConfig {
     pub masscan: MasscanRuntimeConfig,
@@ -27,6 +37,12 @@ pub struct MasscanRuntimeConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServiceDetectionRuntimeConfig {
+    #[serde(default = "default_batch_endpoints")]
+    pub batch_endpoints: usize,
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_seconds: u64,
+    #[serde(default = "default_service_runtime")]
+    pub max_runtime_seconds: u64,
     pub enabled: bool,
     pub strategy: String,
     pub max_probes_per_endpoint: usize,
@@ -65,6 +81,9 @@ impl Default for ScannerRuntimeConfig {
         Self {
             masscan: MasscanRuntimeConfig { rate: 100_000 },
             service_detection: ServiceDetectionRuntimeConfig {
+                batch_endpoints: default_batch_endpoints(),
+                idle_timeout_seconds: default_idle_timeout(),
+                max_runtime_seconds: default_service_runtime(),
                 enabled: true,
                 strategy: "adaptive".into(),
                 max_probes_per_endpoint: 8,
@@ -102,6 +121,24 @@ impl Default for ScannerRuntimeConfig {
 
 impl ScannerRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
+        check_range(
+            "service_detection.batch_endpoints",
+            self.service_detection.batch_endpoints,
+            1,
+            4096,
+        )?;
+        check_range(
+            "service_detection.idle_timeout_seconds",
+            self.service_detection.idle_timeout_seconds,
+            1,
+            3600,
+        )?;
+        check_range(
+            "service_detection.max_runtime_seconds",
+            self.service_detection.max_runtime_seconds,
+            1,
+            86400,
+        )?;
         check_range("masscan.rate", self.masscan.rate, 1, i32::MAX)?;
         if !matches!(
             self.service_detection.strategy.as_str(),
@@ -445,11 +482,22 @@ pub async fn update_scanner_configuration(
         .resource("scanner", &scanner_id);
     event.changes = Some(json!({"revision": revision, "change_reason": body.change_reason.trim()}));
     event.response_status = Some(200);
-    if write_audit(&transaction, &AuditContext::from_request(&req), &event)
-        .await
-        .is_err()
-        || transaction.commit().await.is_err()
-    {
+    if let Err(error) = write_audit(&transaction, &AuditContext::from_request(&req), &event).await {
+        error_logs_error(
+            &req,
+            "ScannerConfigurationAuditError",
+            "write_configuration_audit",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        error_logs_error(
+            &req,
+            "ScannerConfigurationCommitError",
+            "commit_configuration_update",
+            &error,
+        );
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true, "data": {
@@ -487,11 +535,27 @@ pub async fn get_runtime_scanner_configuration(
         Err(ApplyTaskError::ScannerUnauthorized) => {
             return HttpResponse::Unauthorized().body("unauthorized");
         }
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerRuntimeCredentialError",
+                "validate_scanner_credentials",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     }
     let client = match pool.get().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ScannerRuntimePoolError",
+                "acquire_scanner_configuration_connection",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     match load_configuration(&client, &query.scannerid.to_string()).await {
         Ok(Some(configuration)) => {
@@ -512,6 +576,20 @@ pub async fn get_runtime_scanner_configuration(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_configuration_documents_use_service_runtime_defaults() {
+        let mut value = serde_json::to_value(super::ScannerRuntimeConfig::default()).unwrap();
+        let service = value["service_detection"].as_object_mut().unwrap();
+        service.remove("batch_endpoints");
+        service.remove("idle_timeout_seconds");
+        service.remove("max_runtime_seconds");
+        let config: super::ScannerRuntimeConfig = serde_json::from_value(value).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.service_detection.batch_endpoints, 512);
+        assert_eq!(config.service_detection.idle_timeout_seconds, 120);
+        assert_eq!(config.service_detection.max_runtime_seconds, 1800);
+    }
+
     use super::*;
 
     #[test]

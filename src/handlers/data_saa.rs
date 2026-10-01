@@ -15,7 +15,6 @@ use crate::runtime_config::RuntimeConfig;
 use crate::system_resource_cache::SystemResourceCache;
 use crate::{SystemDetails, SystemStatusJson, Systems};
 
-const ANALYSIS_TIMEZONE: &str = "Asia/Shanghai";
 const DEFAULT_RANGE_WEEKS: i64 = 12;
 const MAX_RANGE_DAYS: i64 = 366;
 
@@ -42,6 +41,7 @@ pub(crate) struct HeatmapQuery {
 }
 
 struct AnalysisFilters {
+    timezone: String,
     start_at: DateTime<Utc>,
     end_at: DateTime<Utc>,
     start_ms: i64,
@@ -77,7 +77,7 @@ impl DistributionDimension {
 struct AnalysisMeta {
     start_at: DateTime<Utc>,
     end_at: DateTime<Utc>,
-    timezone: &'static str,
+    timezone: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_as_of: Option<DateTime<Utc>>,
 }
@@ -134,6 +134,7 @@ fn normalize_filters(query: &AnalysisFilterQuery) -> Result<AnalysisFilters, &'s
     }
 
     Ok(AnalysisFilters {
+        timezone: crate::system_time::snapshot().document.timezone,
         start_at,
         end_at,
         start_ms: start_at.timestamp_millis(),
@@ -147,7 +148,7 @@ fn analysis_meta(filters: &AnalysisFilters) -> AnalysisMeta {
     AnalysisMeta {
         start_at: filters.start_at,
         end_at: filters.end_at,
-        timezone: ANALYSIS_TIMEZONE,
+        timezone: filters.timezone.clone(),
         data_as_of: None,
     }
 }
@@ -418,11 +419,13 @@ async fn analysis_heatmap_from_snapshot(
                 .json(json!({"success": false, "code": "analytics_watermark_unavailable", "message": "分析快照水位读取失败，请检查数据库及迁移状态"}));
         }
     };
+    // Legacy DATE facts can only be read in their original Shanghai calendar.
+    // UTC facts support arbitrary calendars without rebuilding on each settings change.
     let mut conditions = vec![
-        "day_start >= (($1 AT TIME ZONE 'Asia/Shanghai')::DATE)".to_owned(),
-        "day_start < (($2 AT TIME ZONE 'Asia/Shanghai')::DATE)".to_owned(),
+        "((first_observed_at >= $1 AND first_observed_at < $2) OR (first_observed_at IS NULL AND day_start >= ($1 AT TIME ZONE 'Asia/Shanghai')::DATE AND day_start < ($2 AT TIME ZONE 'Asia/Shanghai')::DATE))".to_owned(),
     ];
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&filters.start_at, &filters.end_at];
+    let mut params: Vec<&(dyn ToSql + Sync)> =
+        vec![&filters.start_at, &filters.end_at, &filters.timezone];
     if user.role != 1 {
         params.push(&user.id);
         conditions.push(format!("owner_id = ${}", params.len()));
@@ -435,9 +438,25 @@ async fn analysis_heatmap_from_snapshot(
         params.push(task_source);
         conditions.push(format!("task_source = ${}", params.len()));
     }
+    if filters.timezone != crate::system_time::DEFAULT_TIMEZONE {
+        // $3 is included explicitly so parameter typing remains stable.
+        let legacy_sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM analytics_discovery_fact WHERE {} AND first_observed_at IS NULL AND $3::TEXT <> 'Asia/Shanghai') AS legacy",
+            conditions
+                .join(" AND ")
+                .replace("day_start < ($2", "day_start <= ($2")
+        );
+        match client.query_one(&legacy_sql, &params).await {
+            Ok(row) if row.get::<_, bool>("legacy") => return HttpResponse::ServiceUnavailable().json(json!({"success": false, "code": "analytics_timezone_backfill_required", "message": "该范围包含仅保留上海日期的旧统计，请重建分析快照；已删除原始观测的数据无法换算时区。"})),
+            Ok(_) => {},
+            Err(error) => {
+                error_logs_error(req, "AnalysisTimezoneLegacyCheckError", "database_operation", &error);
+                return HttpResponse::ServiceUnavailable().finish();
+            }
+        }
+    }
     let sql = format!(
-        "SELECT to_char(day_start, 'YYYY-MM-DD') AS day, COUNT(DISTINCT ip_address)::BIGINT AS discovered_count \
-         FROM analytics_discovery_fact WHERE {} GROUP BY day_start ORDER BY day_start;",
+        "SELECT to_char(COALESCE((first_observed_at AT TIME ZONE $3)::DATE, day_start), 'YYYY-MM-DD') AS day, COUNT(DISTINCT ip_address)::BIGINT AS discovered_count FROM analytics_discovery_fact WHERE {} GROUP BY COALESCE((first_observed_at AT TIME ZONE $3)::DATE, day_start) ORDER BY day;",
         conditions.join(" AND ")
     );
     let rows = match client.query(&sql, &params).await {
@@ -595,7 +614,7 @@ async fn analysis_heatmap_from_elasticsearch(
             "size": 1000,
             "sources": [
                 {"day": {"date_histogram": {"field": "observed_at",
-                    "calendar_interval": "1d", "time_zone": "+08:00"}}},
+                    "calendar_interval": "1d", "time_zone": filters.timezone}}},
                 {"address": {"terms": {"field": "ip_address"}}}
             ]
         });
@@ -638,7 +657,10 @@ async fn analysis_heatmap_from_elasticsearch(
             break;
         }
     }
-    let timezone = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset");
+    let timezone = filters
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .unwrap_or(chrono_tz::Asia::Shanghai);
     let items = counts
         .into_iter()
         .filter_map(|(day, count)| {
@@ -663,6 +685,76 @@ mod tests {
     use super::{
         AnalysisFilterQuery, DistributionDimension, MAX_RANGE_DAYS, normalize_filters, percentage,
     };
+
+    #[tokio::test]
+    #[ignore = "requires disposable ANALYTICS_TEST_DATABASE_URL"]
+    async fn snapshot_heatmap_uses_named_timezone_and_rejects_unconvertible_history() {
+        use actix_web::{body::to_bytes, test::TestRequest};
+        use deadpool_postgres::{Manager, Pool};
+        let config = std::env::var("ANALYTICS_TEST_DATABASE_URL")
+            .expect("test database")
+            .parse::<tokio_postgres::Config>()
+            .expect("config");
+        let pool = Pool::builder(Manager::new(config, tokio_postgres::NoTls))
+            .max_size(1)
+            .build()
+            .expect("pool");
+        let client = pool.get().await.expect("client");
+        client.batch_execute("CREATE TEMP TABLE analytics_watermark(watermark_key TEXT, data_as_of TIMESTAMPTZ); INSERT INTO analytics_watermark VALUES('scan_analysis', NOW()); \
+            CREATE TEMP TABLE analytics_discovery_fact(day_start DATE, first_observed_at TIMESTAMPTZ, owner_id INT, scanner_id TEXT, task_source TEXT, ip_address INET); \
+            INSERT INTO analytics_discovery_fact VALUES \
+            ('2026-09-02','2026-09-01T20:00:00Z',1,'scanner','manual','192.0.2.1'), \
+            ('2026-09-02','2026-09-01T20:05:00Z',1,'scanner','manual','192.0.2.1'), \
+            ('2026-09-02','2026-09-02T05:00:00Z',1,'scanner','manual','192.0.2.2');").await.expect("fixtures");
+        drop(client);
+        let req = TestRequest::default().to_http_request();
+        let user = crate::admin::UserBaseI {
+            id: 1,
+            username: "admin".into(),
+            role: 1,
+            email: None,
+            limit_login: false,
+            enable_2fa: false,
+        };
+        let mut filters = super::normalize_filters(&AnalysisFilterQuery {
+            start_at: Some(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap()),
+            end_at: Some(Utc.with_ymd_and_hms(2026, 9, 3, 0, 0, 0).unwrap()),
+            scanner_id: None,
+            task_source: None,
+        })
+        .expect("filters");
+        filters.timezone = "Asia/Shanghai".into();
+        let response = super::analysis_heatmap_from_snapshot(&req, &pool, &filters, &user).await;
+        assert_eq!(response.status(), 200);
+        let data: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body()).await.expect("body"))
+                .expect("JSON");
+        assert_eq!(
+            data["data"]["items"],
+            serde_json::json!([{"date":"2026-09-02","count":2}])
+        );
+        filters.timezone = "America/New_York".into();
+        let response = super::analysis_heatmap_from_snapshot(&req, &pool, &filters, &user).await;
+        assert_eq!(response.status(), 200);
+        let data: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body()).await.expect("body"))
+                .expect("JSON");
+        assert_eq!(
+            data["data"]["items"],
+            serde_json::json!([{"date":"2026-09-01","count":1},{"date":"2026-09-02","count":1}])
+        );
+        pool.get().await.expect("client").batch_execute("INSERT INTO analytics_discovery_fact VALUES('2026-09-02', NULL, 9, 'scanner', 'manual', '192.0.2.3');").await.expect("legacy");
+        let response = super::analysis_heatmap_from_snapshot(&req, &pool, &filters, &user).await;
+        assert_eq!(response.status(), 503);
+        let ordinary = crate::admin::UserBaseI { role: 2, ..user };
+        let response =
+            super::analysis_heatmap_from_snapshot(&req, &pool, &filters, &ordinary).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "another user's legacy data must not block this user's statistics"
+        );
+    }
 
     fn query(start_offset_days: i64, task_source: Option<&str>) -> AnalysisFilterQuery {
         let end_at = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();

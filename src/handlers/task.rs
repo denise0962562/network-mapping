@@ -14,7 +14,7 @@ use crate::system_maintenance::{
 use crate::{
     ApplyTaskError, ApplyTaskQuery, CreateTask, CurrentTaskQuery, ReceiveTaskItemQueryInfo, STask,
     TargetIP, TaskItemJson, TaskListFilters, apply_task, build_scan_plan, get_filtered_task_page,
-    recover_scanner_task, validate_scanner_credentials,
+    validate_scanner_credentials,
 };
 use crate::{Permission, TEXT_HTML_UTF_8};
 use crate::{SaveScannerResultsError, ScannerResultUpload, save_scanner_results};
@@ -506,7 +506,10 @@ async fn maintenance_gate_for_runtime_scanner(
         Err(ApplyTaskError::ScannerUnauthorized) => {
             Some(HttpResponse::Unauthorized().body("unauthorized"))
         }
-        Err(_) => Some(HttpResponse::InternalServerError().finish()),
+        Err(error) => {
+            tracing::error!(event = "ScannerMaintenanceCredentialError", operation = "validate_scanner_credentials", error = ?error, scanner_id = %scanner_id);
+            Some(HttpResponse::InternalServerError().finish())
+        }
     }
 }
 
@@ -957,7 +960,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         .query_opt(
             "UPDATE scanner_info SET system_version = $1, scanner_version = $2, cpu_model = $3, \
              cpus = $4, ram = $5, uptime = $6, runtime_state = $7, last_seen_at = NOW(), \
-             update_time = NOW(), is_run = ($7 <> 'stopping'), \
+             update_time = NOW(), outage_monitored_at = NOW(), is_run = ($7 <> 'stopping'), \
              ip_address = COALESCE($8::text::inet, ip_address), supports_ipv4 = $9, \
              supports_ipv6 = $10, ipv4_ready = $11, ipv6_ready = $12, \
              public_ipv4 = $13::text::inet, public_ipv6 = $14::text::inet, \
@@ -1066,6 +1069,17 @@ pub(crate) async fn scanner_heartbeat_handler(
             revision: value.revision,
             schema_version: value.schema_version,
         });
+    if let Err(error) =
+        crate::scanner_outage::record_recovery(&scanner_transaction, &scanner_id).await
+    {
+        error_logs_error(
+            &req,
+            "ScannerRecoveryError",
+            "record_scanner_recovery",
+            &error,
+        );
+        return HttpResponse::InternalServerError().finish();
+    }
     // 扫描器状态行与任务执行行使用两个短事务。过去这里会在等待任务租约锁时一直
     // 持有 scanner_info 行锁，导致同一扫描器后续心跳形成分钟级锁队列。
     if let Err(error) = scanner_transaction.commit().await {
@@ -1077,6 +1091,7 @@ pub(crate) async fn scanner_heartbeat_handler(
         );
         return HttpResponse::InternalServerError().finish();
     }
+    let lease_started = std::time::Instant::now();
     let mut lease = None;
     let mut cancel_task_id = None;
     if let Some(task_id) = heartbeat.active_task_id {
@@ -1169,6 +1184,8 @@ pub(crate) async fn scanner_heartbeat_handler(
             return HttpResponse::ServiceUnavailable().finish();
         }
     }
+    tracing::debug!(event="ScannerLeaseRenewCompleted", scanner_id, task_id=?heartbeat.active_task_id,
+        elapsed_ms=lease_started.elapsed().as_millis() as u64, "scanner lease transaction completed");
     if let Some(latency) = latency {
         latency_history.record(ScannerLatencyHistoryEntry {
             scanner_id,
@@ -1823,7 +1840,15 @@ async fn get_dns_comparison(
     let task_id = task_id.into_inner().to_string();
     let connection = match pool.get().await {
         Ok(connection) => connection,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "DnsComparisonPoolError",
+                "acquire_dns_comparison_connection",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let task_kind = match connection.query_opt(
         "SELECT task_kind FROM scan_task WHERE task_id = $1 AND ($2 = 1 OR user_id = $3) LIMIT 1;",
@@ -1943,7 +1968,10 @@ async fn create_task(
             let ids: HashSet<String> = create_data.scanner_ids.iter().map(Uuid::to_string).collect();
             let connection = match database_conn.get().await {
                 Ok(value) => value,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
+                Err(error) => {
+                    error_logs_error(&req, "ResolveSelectedScannersPoolError", "acquire_scanner_connection", &error);
+                    return HttpResponse::InternalServerError().finish();
+                }
             };
             let values: Vec<String> = ids.into_iter().collect();
             let query = format!(
@@ -1963,7 +1991,10 @@ async fn create_task(
         "all" if create_data.scanner_ids.is_empty() => {
             let connection = match database_conn.get().await {
                 Ok(value) => value,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
+                Err(error) => {
+                    error_logs_error(&req, "ResolveAllScannersPoolError", "acquire_scanner_connection", &error);
+                    return HttpResponse::InternalServerError().finish();
+                }
             };
             let query = format!(
                 "SELECT scanner_id FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
@@ -2092,7 +2123,15 @@ async fn create_dns_task(
     domains.dedup();
     let mut connection = match pool.get().await {
         Ok(connection) => connection,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "CreateDnsTaskPoolError",
+                "acquire_dns_task_connection",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let dispatch_mode = input.dispatch_mode.trim().to_ascii_lowercase();
     let requires_explicit_resolvers = !dns_resolvers.is_empty();
@@ -2339,11 +2378,22 @@ async fn current_task_handler(
         return response;
     }
 
-    match recover_scanner_task(
+    let recovery_failure = match (query.failure_taskid, query.failure_count) {
+        (None, None) => None,
+        (Some(task_id), Some(count)) if (1..=3).contains(&count) => {
+            Some(crate::RecoveryFailureReport { task_id, count })
+        }
+        _ => {
+            return HttpResponse::BadRequest()
+                .body("failure_taskid and failure_count (1..=3) must be supplied together");
+        }
+    };
+    match crate::recover_scanner_task_with_failure(
         pool.get_ref(),
         query.scannerid,
         query.taskid,
         query.uploadid,
+        recovery_failure,
         token,
         &security.scanner_token_pepper,
     )
@@ -2531,8 +2581,19 @@ async fn upload_scanner_result_handler(
                 SaveScannerResultsError::InvalidBatchEnvelope { reason, .. } => {
                     HttpResponse::BadRequest().body(reason)
                 }
-                SaveScannerResultsError::UploadIdentityConflict { .. } => HttpResponse::BadRequest()
-                    .body("an execution cannot contain batches from multiple upload_id values"),
+                SaveScannerResultsError::UploadIdentityConflict {
+                    execution_id,
+                    ref conflicting_upload_id,
+                    ..
+                } => HttpResponse::BadRequest().json(serde_json::json!({
+                    "success": false,
+                    "code": "execution_upload_id_conflict",
+                    "message": "an execution cannot contain batches from multiple upload_id values",
+                    "retryable": false,
+                    "action": "recover_execution",
+                    "execution_id": execution_id,
+                    "conflicting_upload_id": conflicting_upload_id,
+                })),
                 SaveScannerResultsError::BatchPayloadConflict { content_kind, .. } => {
                     HttpResponse::BadRequest().body(format!(
                         "batch identity was already used with different {content_kind} content"

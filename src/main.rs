@@ -8,6 +8,7 @@ use tracing::{Instrument, error, info};
 use network_mapping_server::admin::{
     check_default_admin_user, check_system_user, reset_admin_password,
 };
+use network_mapping_server::api_response::ApiErrorMiddleware;
 use network_mapping_server::audit::RequestId;
 use network_mapping_server::backup::BackupManager;
 use network_mapping_server::cli_progress::CliProgressReporter;
@@ -30,6 +31,7 @@ use network_mapping_server::open_source::OpenSourceCatalog;
 use network_mapping_server::request_log;
 use network_mapping_server::runtime_config::{RuntimeSettings, RuntimeSettingsBootstrap};
 use network_mapping_server::scanner_latency::{self, ScannerLatencyHistory};
+use network_mapping_server::scanner_outage;
 use network_mapping_server::system_maintenance::{
     SystemMaintenanceState, run_reconciler as run_system_maintenance_reconciler,
 };
@@ -249,6 +251,17 @@ async fn main() -> io::Result<()> {
     )
     .await
     .map_err(|error| io::Error::other(format!("加载运行时配置失败：{error}")))?;
+    let general_pool = db_pool.clone();
+    let general_config = runtime_settings.general.clone();
+    tokio::spawn(async move {
+        loop {
+            match network_mapping_server::system_time::refresh(&general_pool).await {
+                Ok(value) => general_config.replace(value.document, value.revision).await,
+                Err(error) => tracing::warn!(event = "GeneralSettingsRefreshFailed", %error),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
     let trusted_proxy_state = web::Data::new(
         TrustedProxyState::from_database(&db_pool)
             .await
@@ -262,6 +275,11 @@ async fn main() -> io::Result<()> {
     tokio::spawn(run_system_maintenance_reconciler(
         system_maintenance_state.clone(),
         db_pool.clone(),
+    ));
+    tokio::spawn(scanner_outage::run_worker(
+        db_pool.clone(),
+        ser_con.encrypt_key.clone(),
+        system_maintenance_state.clone(),
     ));
     if let Ok(client) = db_pool.get().await
         && let Err(error_value) = client
@@ -301,6 +319,13 @@ async fn main() -> io::Result<()> {
         runtime_settings.analytics_snapshot.clone(),
         db_pool.clone(),
         elasticsearch_service.clone(),
+    ));
+
+    tokio::spawn(network_mapping_server::reports::run_worker(
+        db_pool.clone(),
+        ser_con.encrypt_key.clone(),
+        runtime_settings.analytics_snapshot.clone(),
+        system_maintenance_state.clone(),
     ));
 
     info!(target: "server::startup", "正在检查系统账户");
@@ -475,6 +500,7 @@ async fn main() -> io::Result<()> {
             .wrap(SHeaderM)
             .wrap(AuthMiddleware)
             .wrap(rate_limiter.clone())
+            .wrap(ApiErrorMiddleware)
             .wrap_fn(move |req, service| {
                 let request_id = req
                     .headers()
@@ -508,6 +534,9 @@ async fn main() -> io::Result<()> {
                 let actor = std::sync::Arc::new(std::sync::Mutex::new(None));
                 req.extensions_mut()
                     .insert(request_log::RequestActor(actor.clone()));
+                let reason = std::sync::Arc::new(std::sync::Mutex::new(None));
+                req.extensions_mut()
+                    .insert(request_log::RequestReason(reason.clone()));
                 let method = req.method().to_string();
                 let client_ip = request_ip(req.request());
                 let user_agent = req
@@ -559,6 +588,10 @@ async fn main() -> io::Result<()> {
                     {
                         let status = response.status().as_u16();
                         let (error_level, error_type) = request_log::classify_status(status);
+                        let reason_code = reason
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
                         let elapsed = started.elapsed();
                         let duration_ms = i32::try_from(elapsed.as_millis()).ok();
                         let duration_us = i64::try_from(elapsed.as_micros()).ok();
@@ -571,6 +604,24 @@ async fn main() -> io::Result<()> {
                             Some((id, name)) => (Some(id), Some(name)),
                             None => (None, None),
                         };
+
+                        if status >= 500
+                            || (status >= 400
+                                && (path.starts_with("/api/totp/")
+                                    || path == "/api/login"
+                                    || path == "/api/scanner/register"))
+                        {
+                            tracing::warn!(
+                                event = "request_completed",
+                                request_id = %request_id,
+                                method,
+                                path,
+                                status,
+                                duration_us = ?duration_us,
+                                reason_code = ?reason_code,
+                                actor_user_id = ?actor_id,
+                            );
+                        }
 
                         // 健康告警：慢请求与 5xx 错误实时判定，仅在命中阈值时才分配/克隆字符串。
                         {
@@ -627,8 +678,20 @@ async fn main() -> io::Result<()> {
                                 actor_name,
                                 error_level: error_level.to_owned(),
                                 error_type: error_type.map(str::to_owned),
+                                reason_code,
                             };
-                            let _ = request_log_tx.try_send(entry);
+                            if request_log_tx.try_send(entry).is_err() {
+                                let dropped = request_log::record_enqueue_drop();
+                                if dropped.is_power_of_two() {
+                                    tracing::warn!(
+                                        event = "RequestLogEnqueueDropped",
+                                        operation = "enqueue_request_log",
+                                        reason_code = "request_log_queue_unavailable",
+                                        dropped_total = dropped,
+                                        request_id = %request_id,
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(response)

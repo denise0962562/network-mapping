@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod analytics_snapshot;
+pub mod api_response;
 pub mod audit;
 pub mod backup;
 pub mod cli_progress;
@@ -31,15 +32,18 @@ pub mod rir; // 该模块用于从五大 RIR 获取 ASN 和组织等信息
 // 自己的中间件
 pub mod middlewares;
 pub mod open_source;
+pub mod reports;
 pub mod request_log;
 pub mod runtime_config;
 pub mod scan_migration;
 pub mod scanner_config;
 pub mod scanner_latency;
+pub mod scanner_outage;
 mod search_content;
 pub mod search_projection;
 pub mod system_maintenance;
 pub mod system_resource_cache;
+pub mod system_time;
 
 #[cfg(test)]
 pub mod test; // 测试模块
@@ -88,7 +92,7 @@ pub const APPLICATION_JAVASCRIPT_UTF_8: &str = "application/javascript; charset=
 pub const IMAGE_PNG: &str = "image/png";
 pub const APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
 pub const APPLICATION_JSON: &str = "application/json";
-pub const _SYSTEM_TIME_ZONE: &str = "Asia/Shanghai";
+
 pub const TASK_LEASE_MS: i64 = 90_000;
 const DNS_BATCH_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DNS_BATCH_WRITE_LEASE_SECONDS: i64 = 45;
@@ -1149,7 +1153,7 @@ pub fn generate_hash_password(
 pub async fn get_password_and_id_from_database(
     pool: &deadpool_postgres::Pool,
     username: &str,
-) -> Result<(i32, String, UserLoginInfo), Box<dyn std::error::Error>> {
+) -> Result<Option<(i32, String, UserLoginInfo)>, Box<dyn std::error::Error>> {
     let client = pool.get().await?;
     if let Some(row) = client.query_opt(
         "SELECT id, username, password, role, email, enable_2fa, totp_secret, login_ip_allowlist FROM users \
@@ -1180,15 +1184,10 @@ pub async fn get_password_and_id_from_database(
             twofa: get_twofa_info(row),
         };
 
-        Ok((u_id, u_pwd, userinfo))
+        Ok(Some((u_id, u_pwd, userinfo)))
     }
     else {
-        info!(
-                event = "UserPasswordHASHNotFound",
-                path = "fn get_password_from_database",
-                message = "用户密码哈希值未找到"
-            );
-        Err("未找到密码".into())
+        Ok(None)
     }
 }
 
@@ -1202,7 +1201,10 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
             let result = argon2
                 .verify_password(password.as_bytes(), &parsed_hash)
                 .is_ok();
-            println!("verify_pwd {:>6} ms", start.elapsed().as_millis());
+            tracing::debug!(
+                event = "PasswordHashVerified",
+                duration_ms = start.elapsed().as_millis() as u64
+            );
             result
         }
         Err(e) => {
@@ -1215,7 +1217,10 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
                 retryable = false,
                 outcome = "authentication_failed_closed",
             );
-            println!("verify_pwd_e {:>6}", start.elapsed().as_millis());
+            tracing::debug!(
+                event = "PasswordHashVerificationFailed",
+                duration_ms = start.elapsed().as_millis() as u64
+            );
             false
         }
     }
@@ -3797,6 +3802,99 @@ fn assigned_task_from_row(
     })
 }
 
+/// Return an execution that can safely accept the caller's next upload.
+///
+/// A scanner with a durable upload may continue only that upload (plus its
+/// deterministic DNS sidecar). A scanner without a durable upload is starting
+/// a fresh attempt, so any existing receipt makes the old execution immutable.
+/// The caller must already hold a row lock for `execution_id`.
+async fn execution_for_upload_attempt(
+    transaction: &tokio_postgres::Transaction<'_>,
+    execution_id: i32,
+    expected_upload_id: Option<Uuid>,
+    now: i64,
+    scanner_id: &str,
+    public_task_id: &str,
+) -> Result<i32, ApplyTaskError> {
+    let conflict = if let Some(upload_id) = expected_upload_id {
+        let allowed_upload_ids = vec![
+            upload_id.to_string(),
+            dns_sidecar_upload_id(upload_id).to_string(),
+        ];
+        transaction
+            .query_opt(
+                "SELECT upload_id FROM scan_result_batch \
+                 WHERE execution_id = $1 AND NOT (upload_id = ANY($2::TEXT[])) \
+                 ORDER BY upload_id LIMIT 1;",
+                &[&execution_id, &allowed_upload_ids],
+            )
+            .await
+            .map_err(apply_task_database_error)?
+    } else {
+        transaction
+            .query_opt(
+                "SELECT upload_id FROM scan_result_batch \
+                 WHERE execution_id = $1 ORDER BY upload_id LIMIT 1;",
+                &[&execution_id],
+            )
+            .await
+            .map_err(apply_task_database_error)?
+    };
+    let Some(conflict) = conflict else {
+        return Ok(execution_id);
+    };
+
+    let conflicting_upload_id: String = conflict.get("upload_id");
+    let execution = transaction
+        .query_one(
+            "SELECT task_id, requested_scanner_id, recovery_failure_count FROM scan_task_execution WHERE id = $1;",
+            &[&execution_id],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+    let task_db_id: i32 = execution.get("task_id");
+    let requested_scanner_id: Option<String> = execution.get("requested_scanner_id");
+    let recovery_failure_count: i32 = execution.get("recovery_failure_count");
+    let reason = if expected_upload_id.is_some() {
+        "superseded after durable upload identity changed"
+    } else {
+        "superseded before a fresh upload attempt"
+    };
+    transaction
+        .execute(
+            "UPDATE scan_task_execution SET execution_status = 'superseded', \
+             requested_scanner_id = NULL, lease_expires_at = NULL, task_end_time = $2, \
+             cancel_requested = false, maintenance_hold = FALSE, maintenance_hold_until = NULL, \
+             failure_reason = $3 WHERE id = $1;",
+            &[&execution_id, &now, &reason],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+    let replacement_public_id = Uuid::now_v7().to_string();
+    let replacement = transaction
+        .query_one(
+            "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id, recovery_failure_count) \
+             VALUES ($1, $2, $3, $4) RETURNING id;",
+            &[&replacement_public_id, &task_db_id, &requested_scanner_id, &recovery_failure_count],
+        )
+        .await
+        .map_err(apply_task_database_error)?;
+    let replacement_id: i32 = replacement.get("id");
+    info!(
+        event = "ROTATE-UPLOAD-EXECUTION",
+        scanner_id,
+        task_id = public_task_id,
+        upload_id = ?expected_upload_id,
+        conflicting_upload_id,
+        retired_execution_id = execution_id,
+        replacement_execution_id = replacement_id,
+        replacement_public_execution_id = replacement_public_id,
+        reason,
+        "retired an execution that cannot accept the scanner's next upload"
+    );
+    Ok(replacement_id)
+}
+
 /// Return and renew a running task already owned by this scanner.
 ///
 /// When `task_id` is supplied, only that exact task is considered. This is used
@@ -3806,6 +3904,33 @@ pub async fn recover_scanner_task(
     scanner_id: Uuid,
     task_id: Option<Uuid>,
     upload_id: Option<Uuid>,
+    token: &str,
+    token_pepper: &str,
+) -> Result<ApplyTask, ApplyTaskError> {
+    recover_scanner_task_with_failure(
+        pool,
+        scanner_id,
+        task_id,
+        upload_id,
+        None,
+        token,
+        token_pepper,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryFailureReport {
+    pub task_id: Uuid,
+    pub count: u32,
+}
+
+pub async fn recover_scanner_task_with_failure(
+    pool: &deadpool_postgres::Pool,
+    scanner_id: Uuid,
+    task_id: Option<Uuid>,
+    upload_id: Option<Uuid>,
+    failure: Option<RecoveryFailureReport>,
     token: &str,
     token_pepper: &str,
 ) -> Result<ApplyTask, ApplyTaskError> {
@@ -3828,6 +3953,29 @@ pub async fn recover_scanner_task(
         .await
         .map_err(apply_task_database_error)?;
 
+    if let Some(failure) = failure {
+        // The client reports a durable cumulative count; repeated recovery requests
+        // (including a lost HTTP response) must never count the same failure twice.
+        let now = get_unix_epoch_ms();
+        let count = i32::try_from(failure.count.min(3)).unwrap_or(3);
+        let changed = transaction.query(
+            "UPDATE scan_task_execution SET recovery_failure_count=GREATEST(recovery_failure_count,$1), \
+             execution_status=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN 'failed' ELSE execution_status END, \
+             task_end_time=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN $2 ELSE task_end_time END, \
+             lease_expires_at=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN NULL ELSE lease_expires_at END, \
+             failure_reason=CASE WHEN GREATEST(recovery_failure_count,$1)>=3 THEN 'scanner recovery limit exceeded' ELSE failure_reason END \
+             WHERE task_id=(SELECT id FROM scan_task WHERE task_id=$3) AND assigned_scanner_id=$4 \
+             AND execution_status='running' RETURNING task_id;",
+            &[&count,&now,&failure.task_id.to_string(),&scanner_id]).await.map_err(apply_task_database_error)?;
+        for row in changed {
+            refresh_task_aggregate(&transaction, row.get("task_id"))
+                .await
+                .map_err(apply_task_database_error)?;
+        }
+        info!(event="RECOVERY-FAILURE-REPORTED",scanner_id,task_id=%failure.task_id,count,
+            "recorded cumulative scanner recovery failures");
+    }
+
     let requested_task_id = task_id.map(|value| value.to_string());
     let now = get_unix_epoch_ms();
     let cancelled = transaction
@@ -3849,83 +3997,6 @@ pub async fn recover_scanner_task(
         refresh_task_aggregate(&transaction, task_id)
             .await
             .map_err(apply_task_database_error)?;
-    }
-
-    // A lease expiry makes the same execution claimable again, but it does not
-    // remove result batches already accepted for that execution. If the
-    // scanner's durable cache belongs to a different upload, retire the old
-    // execution before recovering the task. This preserves the old partial
-    // attempt for audit while giving the durable upload a clean execution.
-    if let (Some(requested_task_id), Some(upload_id)) = (&requested_task_id, upload_id) {
-        let recovery_candidate = transaction
-            .query_opt(
-                "SELECT e.id, e.task_id, e.requested_scanner_id \
-                 FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
-                 JOIN scanner_info s ON s.scanner_id = $2 \
-                 WHERE t.task_id = $1 AND ( \
-                    (e.execution_status = 'running' AND e.assigned_scanner_id = $2) OR \
-                    (e.execution_status = 'pending' AND e.assigned_scanner_id IS NULL \
-                     AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $2) \
-                     AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
-                       OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
-                     AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \
-                     AND (jsonb_array_length(t.dns_resolvers) = 0 \
-                       OR COALESCE((s.scan_capabilities->>'explicit_dns_resolvers')::BOOLEAN, FALSE)))) \
-                 ORDER BY CASE WHEN e.execution_status = 'running' THEN 0 ELSE 1 END, e.id \
-                 FOR UPDATE OF e LIMIT 1;",
-                &[requested_task_id, &scanner_id],
-            )
-            .await
-            .map_err(apply_task_database_error)?;
-        if let Some(candidate) = recovery_candidate {
-            let execution_id: i32 = candidate.get("id");
-            let allowed_upload_ids = vec![
-                upload_id.to_string(),
-                dns_sidecar_upload_id(upload_id).to_string(),
-            ];
-            let conflicting_upload = transaction
-                .query_opt(
-                    "SELECT upload_id FROM scan_result_batch \
-                     WHERE execution_id = $1 AND NOT (upload_id = ANY($2::TEXT[])) \
-                     ORDER BY upload_id LIMIT 1;",
-                    &[&execution_id, &allowed_upload_ids],
-                )
-                .await
-                .map_err(apply_task_database_error)?;
-            if let Some(conflict) = conflicting_upload {
-                let conflicting_upload_id: String = conflict.get("upload_id");
-                let requested_scanner_id: Option<String> = candidate.get("requested_scanner_id");
-                let task_db_id: i32 = candidate.get("task_id");
-                transaction
-                    .execute(
-                        "UPDATE scan_task_execution SET execution_status = 'superseded', \
-                         requested_scanner_id = NULL, lease_expires_at = NULL, task_end_time = $2, \
-                         cancel_requested = false, maintenance_hold = FALSE, maintenance_hold_until = NULL, \
-                         failure_reason = 'superseded after durable upload identity changed' \
-                         WHERE id = $1;",
-                        &[&execution_id, &now],
-                    )
-                    .await
-                    .map_err(apply_task_database_error)?;
-                transaction
-                    .execute(
-                        "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) \
-                         VALUES ($1, $2, $3);",
-                        &[&Uuid::now_v7().to_string(), &task_db_id, &requested_scanner_id],
-                    )
-                    .await
-                    .map_err(apply_task_database_error)?;
-                info!(
-                    event = "ROTATE-UPLOAD-EXECUTION",
-                    scanner_id,
-                    task_id = requested_task_id,
-                    upload_id = %upload_id,
-                    conflicting_upload_id,
-                    retired_execution_id = execution_id,
-                    "retired an execution whose result upload identity no longer matches the scanner cache"
-                );
-            }
-        }
     }
 
     let row = transaction
@@ -3962,6 +4033,15 @@ pub async fn recover_scanner_task(
         return Err(ApplyTaskError::NoTask);
     };
 
+    let execution_pk = execution_for_upload_attempt(
+        &transaction,
+        row.get("execution_pk"),
+        upload_id,
+        now,
+        &scanner_id,
+        row.get("task_id"),
+    )
+    .await?;
     let lease_expires_at = now + TASK_LEASE_MS;
     transaction
         .execute(
@@ -3974,7 +4054,7 @@ pub async fn recover_scanner_task(
                 &scanner_id,
                 &now,
                 &lease_expires_at,
-                &row.get::<_, i32>("execution_pk"),
+                &execution_pk,
             ],
         )
         .await
@@ -4133,7 +4213,15 @@ pub async fn apply_task(
     };
 
     let task_pk: i32 = row.get("task_pk");
-    let execution_pk: i32 = row.get("execution_pk");
+    let execution_pk = execution_for_upload_attempt(
+        &transaction,
+        row.get("execution_pk"),
+        None,
+        get_unix_epoch_ms(),
+        &scanner_id,
+        row.get("task_id"),
+    )
+    .await?;
     let lease_expires_at = get_unix_epoch_ms() + TASK_LEASE_MS;
     transaction
         .execute(
@@ -4179,6 +4267,8 @@ pub struct CurrentTaskQuery {
     pub scannerid: Uuid,
     pub taskid: Option<Uuid>,
     pub uploadid: Option<Uuid>,
+    pub failure_taskid: Option<Uuid>,
+    pub failure_count: Option<u32>,
 }
 
 /// 该函数用于退出登录

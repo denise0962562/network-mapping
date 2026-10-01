@@ -459,13 +459,16 @@ pub(crate) async fn dashboard_overview(
         Ok(row) => row.get("count"),
         Err(error) => { log_database_error(&req, "DashboardDatabaseError", &error); return HttpResponse::InternalServerError().finish(); }
     };
-    let mut trend_conditions =
-        vec!["to_timestamp(t.task_create_time / 1000.0)::date = days.day::date".to_owned()];
-    let mut trend_params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    let mut trend_conditions = vec![
+        "(to_timestamp(t.task_create_time / 1000.0) AT TIME ZONE $1)::date = days.day::date"
+            .to_owned(),
+    ];
+    let timezone = crate::system_time::snapshot().document.timezone;
+    let mut trend_params: Vec<&(dyn ToSql + Sync)> = vec![&timezone];
     push_task_owner_scope(&mut trend_conditions, &mut trend_params, &user, "t.user_id");
     let trend_sql = format!(
         "SELECT to_char(days.day, 'YYYY-MM-DD') AS day, COALESCE(s.name, t.assigned_scanner_id, '未分配') AS scanner, COUNT(t.id)::BIGINT AS count \
-         FROM generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day') days(day) \
+         FROM generate_series((NOW() AT TIME ZONE $1)::DATE - INTERVAL '6 days', (NOW() AT TIME ZONE $1)::DATE::TIMESTAMP, INTERVAL '1 day') days(day) \
          LEFT JOIN scan_task t ON {} \
          LEFT JOIN scanner_info s ON s.scanner_id = t.assigned_scanner_id GROUP BY days.day, scanner ORDER BY days.day, scanner;",
         trend_conditions.join(" AND ")
@@ -554,7 +557,7 @@ pub(crate) async fn update_scanner(
             return HttpResponse::InternalServerError().finish();
         }
     }
-    if audit(
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -564,9 +567,12 @@ pub(crate) async fn update_scanner(
         json!({"name": name}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "UpdateScannerAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "UpdateScannerCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true}))
@@ -615,10 +621,13 @@ pub(crate) async fn set_scanner_enabled(
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            log_database_error(&req, "SetScannerEnabledTransactionError", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let id = scanner_id.into_inner().to_string();
-    let changed = transaction.execute("UPDATE scanner_info SET is_enable = $1, runtime_state = CASE WHEN $1 THEN runtime_state ELSE 'offline' END, is_run = CASE WHEN $1 THEN is_run ELSE false END, update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&body.enabled, &id]).await;
+    let changed = transaction.execute("UPDATE scanner_info SET is_enable = $1, runtime_state = CASE WHEN $1 THEN runtime_state ELSE 'offline' END, is_run = CASE WHEN $1 THEN is_run ELSE false END, outage_monitored_at = NULL, update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&body.enabled, &id]).await;
     match changed {
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
@@ -627,15 +636,24 @@ pub(crate) async fn set_scanner_enabled(
             return HttpResponse::InternalServerError().finish();
         }
     }
+    if !body.enabled
+        && let Err(error) = crate::scanner_outage::close_without_recovery(&transaction, &id).await
+    {
+        log_database_error(&req, "SetScannerEnabledOutageError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
     let released = if body.enabled {
         0
     } else {
         match release_scanner_tasks(&transaction, &id, "scanner disabled by administrator").await {
             Ok(count) => count,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(error) => {
+                log_database_error(&req, "SetScannerEnabledReleaseError", &error);
+                return HttpResponse::InternalServerError().finish();
+            }
         }
     };
-    if audit(
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -649,9 +667,12 @@ pub(crate) async fn set_scanner_enabled(
         json!({"released_tasks": released}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "SetScannerEnabledAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "SetScannerEnabledCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true, "released_tasks": released}))
@@ -670,11 +691,27 @@ pub(crate) async fn reissue_scanner_token(
     }
     let token = match generate_scanner_token("nm_reg") {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ReissueScannerTokenGenerationError",
+                "generate_scanner_token",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let token_hash = match hash_scanner_token(&token, &security.scanner_token_pepper) {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            error_logs_error(
+                &req,
+                "ReissueScannerTokenHashError",
+                "hash_scanner_token",
+                &error,
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let mut connection = match pool.get().await {
         Ok(value) => value,
@@ -685,11 +722,14 @@ pub(crate) async fn reissue_scanner_token(
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            log_database_error(&req, "ReissueScannerTokenTransactionError", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let id = scanner_id.into_inner().to_string();
     let changed = transaction.execute(
-        "UPDATE scanner_info SET registration_token_hash = $1, registration_token_expires_at = NOW() + INTERVAL '24 hours', registration_consumed_at = NULL, runtime_token_hash = NULL, is_enable = false, is_run = false, runtime_state = 'offline', update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&token_hash, &id]).await;
+        "UPDATE scanner_info SET registration_token_hash = $1, registration_token_expires_at = NOW() + INTERVAL '24 hours', registration_consumed_at = NULL, runtime_token_hash = NULL, is_enable = false, is_run = false, runtime_state = 'offline', outage_monitored_at = NULL, update_time = NOW() WHERE scanner_id = $2 AND deleted_at IS NULL;", &[&token_hash, &id]).await;
     match changed {
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
@@ -698,12 +738,19 @@ pub(crate) async fn reissue_scanner_token(
             return HttpResponse::InternalServerError().finish();
         }
     }
+    if let Err(error) = crate::scanner_outage::close_without_recovery(&transaction, &id).await {
+        log_database_error(&req, "ReissueScannerTokenOutageError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
     let released =
         match release_scanner_tasks(&transaction, &id, "scanner credentials revoked").await {
             Ok(value) => value,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(error) => {
+                log_database_error(&req, "ReissueScannerTokenReleaseError", &error);
+                return HttpResponse::InternalServerError().finish();
+            }
         };
-    if audit(
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -713,9 +760,12 @@ pub(crate) async fn reissue_scanner_token(
         json!({"released_tasks": released}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "ReissueScannerTokenAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "ReissueScannerTokenCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok()
@@ -741,15 +791,21 @@ pub(crate) async fn delete_scanner(
     };
     let transaction = match connection.transaction().await {
         Ok(value) => value,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(error) => {
+            log_database_error(&req, "DeleteScannerTransactionError", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let id = scanner_id.into_inner().to_string();
     let released =
         match release_scanner_tasks(&transaction, &id, "scanner deleted by administrator").await {
             Ok(value) => value,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(error) => {
+                log_database_error(&req, "DeleteScannerReleaseError", &error);
+                return HttpResponse::InternalServerError().finish();
+            }
         };
-    let changed = transaction.execute("UPDATE scanner_info SET deleted_at = NOW(), is_enable = false, is_run = false, runtime_state = 'offline', registration_token_hash = NULL, runtime_token_hash = NULL, update_time = NOW() WHERE scanner_id = $1 AND deleted_at IS NULL;", &[&id]).await;
+    let changed = transaction.execute("UPDATE scanner_info SET deleted_at = NOW(), is_enable = false, is_run = false, runtime_state = 'offline', outage_monitored_at = NULL, registration_token_hash = NULL, runtime_token_hash = NULL, update_time = NOW() WHERE scanner_id = $1 AND deleted_at IS NULL;", &[&id]).await;
     match changed {
         Ok(1) => {}
         Ok(_) => return HttpResponse::NotFound().finish(),
@@ -758,7 +814,11 @@ pub(crate) async fn delete_scanner(
             return HttpResponse::InternalServerError().finish();
         }
     }
-    if audit(
+    if let Err(error) = crate::scanner_outage::close_without_recovery(&transaction, &id).await {
+        log_database_error(&req, "DeleteScannerOutageError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = audit(
         &transaction,
         &req,
         &user,
@@ -768,9 +828,12 @@ pub(crate) async fn delete_scanner(
         json!({"released_tasks": released}),
     )
     .await
-    .is_err()
-        || transaction.commit().await.is_err()
     {
+        log_database_error(&req, "DeleteScannerAuditError", &error);
+        return HttpResponse::InternalServerError().finish();
+    }
+    if let Err(error) = transaction.commit().await {
+        log_database_error(&req, "DeleteScannerCommitError", &error);
         return HttpResponse::InternalServerError().finish();
     }
     HttpResponse::Ok().json(json!({"success": true}))

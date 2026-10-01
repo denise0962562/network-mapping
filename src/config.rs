@@ -1190,6 +1190,14 @@ pub struct NotificationPreferences {
     /// 字段级默认值为 `true`，保证旧前端保存邮件设置时不带该字段也能正常反序列化。
     #[serde(default = "default_health_alert_enabled")]
     pub health_alert_enabled: bool,
+    #[serde(default)]
+    pub scanner_offline_enabled: bool,
+    #[serde(default = "default_scanner_recovery_enabled")]
+    pub scanner_recovery_enabled: bool,
+}
+
+fn default_scanner_recovery_enabled() -> bool {
+    true
 }
 
 fn default_health_alert_enabled() -> bool {
@@ -1206,6 +1214,8 @@ impl Default for NotificationPreferences {
             report_weekly: true,
             report_monthly: false,
             health_alert_enabled: true,
+            scanner_offline_enabled: false,
+            scanner_recovery_enabled: true,
         }
     }
 }
@@ -1334,6 +1344,8 @@ mod tests {
         }))
         .expect("旧前端缺少 healthAlertEnabled 时应能正常反序列化");
         assert!(prefs.health_alert_enabled);
+        assert!(!prefs.scanner_offline_enabled);
+        assert!(prefs.scanner_recovery_enabled);
     }
 
     #[test]
@@ -1695,7 +1707,16 @@ mod tests {
 }
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(user::user_login_h)
+    cfg.service(handlers::reports::generate)
+        .service(handlers::reports::list)
+        .service(handlers::reports::detail)
+        .service(handlers::reports::revise)
+        .service(handlers::reports::retry)
+        .service(handlers::reports::deliveries)
+        .service(handlers::reports::send)
+        .service(handlers::reports::schedules)
+        .service(handlers::reports::save_schedule)
+        .service(user::user_login_h)
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::data_saa::get_analysis_distribution)
         .service(handlers::data_saa::get_analysis_discovery_heatmap)
@@ -1802,6 +1823,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(user::scanner_register_h)
         .service(utils::get_config_h)
         .service(utils::get_server_config_h)
+        .service(utils::get_system_preferences)
+        .service(utils::get_system_timezones)
         .service(utils::get_runtime_config_h)
         .service(utils::save_runtime_config_h)
         .service(utils::get_mail_settings_h)

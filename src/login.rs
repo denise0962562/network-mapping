@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::UserLoginInfo;
@@ -108,9 +108,25 @@ impl fmt::Display for LoginIpNotAllowlisted {
 
 impl Error for LoginIpNotAllowlisted {}
 
+#[derive(Debug)]
+pub struct LoginInvalidCredentials;
+
+impl fmt::Display for LoginInvalidCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("登录失败")
+    }
+}
+
+impl Error for LoginInvalidCredentials {}
+
 pub(crate) struct SessionAuthentication {
     pub(crate) user: UserBaseI,
     pub(crate) csrf_token: String,
+}
+
+pub(crate) enum SessionCheck {
+    Valid(SessionAuthentication),
+    Rejected(&'static str),
 }
 
 pub struct SessionInfo<'a> {
@@ -264,33 +280,52 @@ impl LoginToken {
         &self,
         session: &str,
         require_totp: bool,
-    ) -> Result<Option<SessionAuthentication>, Box<dyn std::error::Error>> {
+    ) -> Result<SessionCheck, Box<dyn std::error::Error>> {
         let now = get_unix_epoch_ms();
         let client = self.pool.get().await?;
         let row = client
             .query_opt(
                 "SELECT u.id, u.username, u.role, u.email, u.limit_login, u.enable_2fa, \
-                        s.csrf_token \
-                 FROM session s JOIN users u ON u.id = s.user_id \
-                 WHERE s.token = $1 AND s.is_enable = TRUE AND s.deleted_at IS NULL \
-                   AND s.create_time + s.ttl::BIGINT * 1000 > $2 \
-                   AND (NOT $3::BOOLEAN OR s.totp_verify_successful = TRUE) \
-                   AND u.limit_login = FALSE AND u.disabled_at IS NULL \
-                   AND u.deleted_at IS NULL LIMIT 1;",
-                &[&session, &now, &require_totp],
+                        u.disabled_at IS NOT NULL AS user_disabled, \
+                        u.deleted_at IS NOT NULL AS user_deleted, \
+                        s.csrf_token, s.is_enable, s.deleted_at IS NOT NULL AS session_deleted, \
+                        s.create_time, s.ttl, s.totp_verify_successful \
+                 FROM session s LEFT JOIN users u ON u.id = s.user_id \
+                 WHERE s.token = $1 ORDER BY s.is_enable DESC, s.id DESC LIMIT 1;",
+                &[&session],
             )
             .await?;
 
         let Some(row) = row else {
-            warn!(
-                event = "TokenInvaild",
-                path = "fn check_token",
-                message = "Token 无效"
-            );
-            return Ok(None);
+            return Ok(SessionCheck::Rejected("session_not_found"));
         };
 
-        Ok(Some(SessionAuthentication {
+        let reason = if !row.get::<_, bool>("is_enable") || row.get::<_, bool>("session_deleted") {
+            Some("session_inactive")
+        } else if row
+            .get::<_, Option<i64>>("create_time")
+            .zip(row.get::<_, Option<i32>>("ttl"))
+            .and_then(|(created, ttl)| created.checked_add(i64::from(ttl) * 1000))
+            .is_none_or(|expires| expires <= now)
+        {
+            Some("session_expired")
+        } else if require_totp && !row.get::<_, bool>("totp_verify_successful") {
+            Some("session_totp_pending")
+        } else if row.get::<_, Option<i32>>("id").is_none() {
+            Some("session_user_missing")
+        } else if row.get::<_, bool>("user_disabled")
+            || row.get::<_, bool>("user_deleted")
+            || row.get::<_, bool>("limit_login")
+        {
+            Some("session_user_inactive")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Ok(SessionCheck::Rejected(reason));
+        }
+
+        Ok(SessionCheck::Valid(SessionAuthentication {
             user: UserBaseI {
                 id: row.get("id"),
                 username: row.get("username"),
@@ -318,35 +353,14 @@ pub async fn user_login(
     source_ip: Option<IpAddr>,
     pool: &deadpool_postgres::Pool,
 ) -> Result<LoginResult, Box<dyn std::error::Error>> {
-    let l_successful: bool;
     let start = Instant::now();
 
     // 即使用户名不存在也校验密码，预防时序攻击
-    let (user_id, pwd_hash, user_login_info) = match get_password_and_id_from_database(
-        pool, username,
-    )
-    .await
-    {
-        Ok(o) => {
-            l_successful = true;
-            o
-        }
-        Err(e) => {
-            l_successful = false;
-            let diagnostics = error_diagnostics(e.as_ref());
-            error!(
-                event = "GetUserPasswordHashError",
-                operation = "load_login_identity",
-                error_kind = "database",
-                error_code = "login_identity_lookup_failed",
-                error_message = %diagnostics.error_message,
-                error_chain = %diagnostics.error_chain,
-                root_cause = %diagnostics.root_cause,
-                error_truncated = diagnostics.error_truncated,
-                retryable = false,
-                outcome = "login_denied",
-                username,
-            );
+    let identity = get_password_and_id_from_database(pool, username).await?;
+    let identity_found = identity.is_some();
+    let (user_id, pwd_hash, user_login_info) = match identity {
+        Some(value) => value,
+        None => {
             let t = UserLoginInfo {
                 username: String::new(),
                 role: -1,
@@ -354,15 +368,17 @@ pub async fn user_login(
                 twofa: None,
                 login_ip_allowlist: Vec::new(),
             };
-            // FIXME 当用户不存在时会提供一个默认的校验，但是，如果用户自己调整了密码加密参数，则会导致默认提供的参数实际计算时间与用户其他的密码校验时间不一致
+            // 用户不存在时仍执行 Argon2 校验，避免直接按用户名暴露明显的时序差异。
             (-1_i32, "$argon2id$v=19$m=65536,t=2,p=2$nuz5oKNAIFXP1wPaVW3aQw$9piWt9X5WVTIbCnq2DQuNDbGDhW5s2UnTe9rVWtx3II".to_string(), t)
         }
     };
-    let get_pwd_h = start.elapsed();
-    println!("get_p   : {:>6} ms", get_pwd_h.as_millis());
+    tracing::debug!(
+        event = "LoginIdentityLoaded",
+        duration_ms = start.elapsed().as_millis() as u64
+    );
 
     // 当用户不存在或者是查找用户错误时使用提供的默认密文校验密码
-    if verify_password(password, &pwd_hash) && l_successful {
+    if verify_password(password, &pwd_hash) && identity_found {
         if !login_ip_is_allowed(&user_login_info.login_ip_allowlist, source_ip) {
             return Err(Box::new(LoginIpNotAllowlisted { user_id }));
         }
@@ -374,7 +390,10 @@ pub async fn user_login(
         let (session, csrf_token) = login_token
             .create_session(session_ttl_seconds, username, enable_2fa)
             .await?;
-        println!("c_sess  : {:>6} ms", start.elapsed().as_millis());
+        tracing::debug!(
+            event = "LoginSessionCreated",
+            duration_ms = start.elapsed().as_millis() as u64
+        );
 
         Ok(LoginResult {
             session: session.session,
@@ -384,7 +403,7 @@ pub async fn user_login(
             user_id,
         })
     } else {
-        Err("登录失败".into())
+        Err(Box::new(LoginInvalidCredentials))
     }
 }
 

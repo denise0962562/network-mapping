@@ -1,0 +1,7 @@
+扫描器{{ event_label }}：{{ scanner_name }}
+
+扫描器 ID：{{ scanner_id }}
+位置：{{ location }}
+最后心跳：{{ last_seen_at }}
+发现或恢复时间：{{ event_at }}
+登录 Network Mapping 后访问扫描器详情：{{ detail_path }}

@@ -451,7 +451,9 @@ Content-Type: application/json
 {
   "query": "country = CN AND port = 443 AND tag = \"生产环境\"",
   "limit": 50,
-  "offset": 0
+  "offset": 0,
+  "sort_field": "last_seen",
+  "sort_order": "desc"
 }
 ```
 
@@ -459,7 +461,11 @@ Content-Type: application/json
 |---|---|---|---|---|
 | `query` | 是 | 无 | 最多 2048 字符 | 搜索表达式 |
 | `limit` | 否 | 50 | 1–100 | 每页条数 |
-| `offset` | 否 | 0 | 0–10000 | 分页偏移 |
+| `offset` | 否 | 0 | `offset + limit ≤ 10000` | 分页偏移；最多浏览前 10000 条 |
+| `sort_field` | 否 | `last_seen` | `last_seen`、`first_seen`、`ip`、`port` | 排序字段 |
+| `sort_order` | 否 | 时间字段为 `desc`，IP/端口为 `asc` | `asc`、`desc` | 排序方向 |
+
+排序在 Elasticsearch 中针对全部匹配结果执行，然后分页；页面仅导出当前页，CSV 保持响应顺序。默认结果按最近扫描时间降序、IP 升序、端口升序排列。同值时使用固定的端点键维持确定顺序；首次发现时间缺失的结果排在末尾。排序字段和方向只接受上述枚举值，非法值或超出分页窗口返回 HTTP `400`。索引在两次翻页之间若有更新，偏移分页仍可能出现重复或遗漏；需要遍历全部结果的客户端应等待后续游标分页接口。
 
 ### 8.2 成功响应
 
@@ -495,11 +501,13 @@ Content-Type: application/json
   ],
   "total": 1,
   "limit": 50,
-  "offset": 0
+  "offset": 0,
+  "sort_field": "last_seen",
+  "sort_order": "desc"
 }
 ```
 
-`scan_time` 是 `last_seen` 的 Unix 毫秒时间戳。
+`scan_time` 是 `last_seen` 的 Unix 毫秒时间戳。`sort_field` 和 `sort_order` 回显实际使用的排序设置。
 
 ### 8.3 语法错误
 
@@ -566,6 +574,8 @@ GET /api/search/port
 GET /api/search/service
 GET /api/search/banner
 ```
+
+这些 GET 接口也接受相同的可选 `sort_field`、`sort_order` 查询参数，并遵守相同的分页窗口限制；未传参数时保持原有默认顺序。
 
 新客户端应只使用 `/api/search/v2`，避免把查询拆分为互斥的搜索类型。
 

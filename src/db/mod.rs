@@ -31,6 +31,7 @@ pub async fn create_postgresql_pool(
     db_poll_cfg.dbname = Some(config.db_name.clone());
     db_poll_cfg.host = Some(config.host.clone());
     db_poll_cfg.port = Some(config.port);
+    db_poll_cfg.options = Some("-c timezone=UTC".into());
     db_poll_cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Verified,
     });
@@ -157,6 +158,14 @@ pub async fn init_database_table(
     let transaction = client.transaction().await?;
     debug!(init_database_file = file_path, "开始执行数据库初始化事务");
     transaction.batch_execute(&sql).await?;
+    transaction
+        .batch_execute(include_str!("../../source/database/migrate_reports.sql"))
+        .await?;
+    transaction
+        .batch_execute(include_str!(
+            "../../source/database/migrate_system_time.sql"
+        ))
+        .await?;
     transaction.commit().await?;
 
     Ok(())

@@ -11,7 +11,6 @@ use crate::logs::write::{database_error_diagnostics, error_logs};
 const DEFAULT_RANGE_MINUTES: i64 = 30;
 const MAX_RANGE_DAYS: i64 = 30;
 pub(crate) const MAX_BUCKETS: i64 = 1_500;
-const RESOURCE_TIMEZONE: &str = "Asia/Shanghai";
 const RESOURCE_HISTORY_SQL: &str = r#"
 WITH bucket_range AS (
     SELECT generate_series(
@@ -264,7 +263,7 @@ struct ResourceHistoryMeta {
     end_at: DateTime<Utc>,
     granularity: &'static str,
     granularity_seconds: i64,
-    timezone: &'static str,
+    timezone: String,
     point_count: usize,
 }
 
@@ -485,7 +484,7 @@ pub(crate) async fn get_system_resource_history(
             end_at: normalized.end_at,
             granularity: normalized.granularity.label(),
             granularity_seconds: bucket_seconds,
-            timezone: RESOURCE_TIMEZONE,
+            timezone: crate::system_time::snapshot().document.timezone,
             point_count,
         },
     })
@@ -574,7 +573,7 @@ pub(crate) async fn get_database_size_history(
             end_at: normalized.end_at,
             granularity: normalized.granularity.label(),
             granularity_seconds: bucket_seconds,
-            timezone: RESOURCE_TIMEZONE,
+            timezone: crate::system_time::snapshot().document.timezone,
             point_count,
         },
     })

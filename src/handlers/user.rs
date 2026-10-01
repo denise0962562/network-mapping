@@ -8,21 +8,22 @@ use tracing::{error, warn};
 
 use crate::TemplatesInit;
 use crate::admin::{
-    AddScanner, GetUserInfoH, ScannerRegisterData, Unbind2FAH, UserBaseI, UserBaseInfo,
-    UserSession, VerifyTotp, bind_twofa, check_twofa_bind, confirm_twofa_binding, get_scanner,
-    get_scanners, get_user_info, scanner_register, totp_struct, totp_token_verify,
-    totp_verify_status_change, unbind_2fa, update_user_info, web_add_scanner,
+    AddScanner, GetUserInfoH, ScannerRegisterData, ScannerRegistrationUnauthorized, Unbind2FAH,
+    UserBaseI, UserBaseInfo, UserSession, VerifyTotp, bind_twofa, check_twofa_bind,
+    confirm_twofa_binding, get_scanner, get_scanners, get_user_info, scanner_register, totp_struct,
+    totp_token_verify, totp_verify_status_change, unbind_2fa, update_user_info, web_add_scanner,
 };
 use crate::audit::{AuditContext, AuditEvent, write as write_audit, write_standalone};
 use crate::client_ip::request_ip;
 use crate::config::{PasswordHashConfig, SecurityConfig, ServerConfig};
 use crate::handlers::ReceiveLoginInfo;
 use crate::handlers::login_record::{login_failure_event, record_completed_login};
-use crate::login::{LoginIpNotAllowlisted, user_login};
+use crate::login::{LoginInvalidCredentials, LoginIpNotAllowlisted, user_login};
 use crate::login_allowlist::{load_login_allowlist, login_ip_is_allowed};
 use crate::logs::write::{error_logs, error_logs_error, info_logs};
 use crate::mail_template::send_login_notification;
 use crate::middlewares::render_500;
+use crate::request_log::set_reason;
 use crate::system_maintenance::{SystemMaintenanceState, maintenance_response};
 use crate::{generate_hash_password, get_conn_ip, log_out, verify_password};
 use uuid::Uuid;
@@ -84,7 +85,6 @@ async fn user_login_h(
     server_config: web::Data<ServerConfig>,
     receiveinfo: web::Json<ReceiveLoginInfo>,
 ) -> impl Responder {
-    println!("================= Benchmark =================");
     let total_start = Instant::now(); // 总的开始时间
     let start = Instant::now(); // 登录函数开始时间
     let p = pool.get_ref();
@@ -94,30 +94,37 @@ async fn user_login_h(
             Ok(value) => value,
             Err(e) => {
                 let ip_denied = e.downcast_ref::<LoginIpNotAllowlisted>();
-                let mut audit_event = login_failure_event(
-                    None,
-                    &receiveinfo.username,
-                    if ip_denied.is_some() {
-                        "ip_not_allowlisted"
-                    } else {
-                        "invalid_credentials"
-                    },
-                    "password",
-                );
+                let invalid_credentials = e.downcast_ref::<LoginInvalidCredentials>().is_some();
+                let reason = if ip_denied.is_some() {
+                    "ip_not_allowlisted"
+                } else if invalid_credentials {
+                    "invalid_credentials"
+                } else {
+                    "login_internal_error"
+                };
+                set_reason(&req, reason);
+                let mut audit_event =
+                    login_failure_event(None, &receiveinfo.username, reason, "password");
+                if !invalid_credentials && ip_denied.is_none() {
+                    audit_event.response_status = Some(500);
+                }
                 if let Some(denied) = ip_denied {
                     audit_event.resource_type = Some("user".to_owned());
                     audit_event.resource_id = Some(denied.user_id.to_string());
                     audit_event.response_status = Some(403);
                 }
                 write_standalone(p, &AuditContext::from_request(&req), &audit_event).await;
-                warn!(
-                    event = "UserLoginRejected",
-                    operation = "authenticate_user",
-                    reason = %e,
-                    error_code = "user_login_rejected",
-                    outcome = "login_denied",
-                    username = %receiveinfo.username,
-                );
+                if invalid_credentials || ip_denied.is_some() {
+                    warn!(
+                        event = "UserLoginRejected",
+                        operation = "authenticate_user",
+                        reason_code = reason,
+                        outcome = "login_denied",
+                        username = %receiveinfo.username,
+                    );
+                } else {
+                    error_logs_error(&req, "UserLoginError", "authenticate_user", e.as_ref());
+                }
                 let body = if ip_denied.is_some() {
                     json!({
                         "success": false,
@@ -132,11 +139,16 @@ async fn user_login_h(
                 };
                 let total_es = total_start.elapsed();
                 let login_function = start.elapsed();
-                println!("Total   : {:>6} ms", total_es.as_millis());
-                println!("Login_f : {:>6} ms", login_function.as_millis());
-                println!("=============================================");
+                tracing::debug!(
+                    event = "LoginCompleted",
+                    total_ms = total_es.as_millis() as u64,
+                    authentication_ms = login_function.as_millis() as u64,
+                    reason_code = reason
+                );
                 return if ip_denied.is_some() {
                     HttpResponse::Forbidden().json(body)
+                } else if !invalid_credentials {
+                    HttpResponse::InternalServerError().json(body)
                 } else {
                     HttpResponse::Unauthorized().json(body)
                 };
@@ -224,9 +236,11 @@ async fn user_login_h(
     let total_es = total_start.elapsed();
     let login_function = start.elapsed();
 
-    println!("Total   : {:>6} ms", total_es.as_millis());
-    println!("Login_f : {:>6} ms", login_function.as_millis());
-    println!("=============================================");
+    tracing::debug!(
+        event = "LoginCompleted",
+        total_ms = total_es.as_millis() as u64,
+        authentication_ms = login_function.as_millis() as u64
+    );
     if !enable_twofa {
         queue_login_notification(
             p.clone(),
@@ -245,6 +259,7 @@ async fn user_login_h(
                 .cookie(cookie_csrf_token)
                 .json(json!({
                     "success": true,
+                    "code": "totp_required",
                     "message": "请验证 2FA 验证码"
                 }))
         }
@@ -352,8 +367,19 @@ async fn bind_twofa_h(
     )
     .await
     {
-        Ok(tmp) => HttpResponse::Ok().json(json!({"success": true, "data": tmp})),
+        Ok(binding) => {
+            tracing::info!(
+                event = "TotpBindStarted",
+                operation = "create_totp_binding",
+                outcome = "pending_confirmation",
+                actor_user_id = user_base_i.id,
+                binding_attempt_id = %binding.attempt_id,
+                expires_at_ms = binding.expires_at_ms,
+            );
+            HttpResponse::Ok().json(json!({"success": true, "data": binding.url}))
+        }
         Err(e) => {
+            set_reason(&req, "totp_bind_initialization_failed");
             error_logs_error(
                 &req,
                 "CreateOptauthUrlError",
@@ -388,7 +414,14 @@ async fn verify_totp_h(
         )
         .await
         {
-            Ok(true) => {
+            Ok(result) if result.rejection.is_none() => {
+                tracing::info!(
+                    event = "TotpBindConfirmed",
+                    operation = "confirm_totp_binding",
+                    outcome = "success",
+                    actor_user_id = user_base_i.id,
+                    binding_attempt_id = ?result.attempt_id,
+                );
                 let mut audit_event =
                     AuditEvent::user("user_security", "user.totp_bind", "success", &user_base_i)
                         .resource("user", user_base_i.id.to_string());
@@ -411,11 +444,27 @@ async fn verify_totp_h(
                     .cookie(csrf_cookie)
                     .json(json!({"success": true, "message": "2FA 绑定成功，请重新登录"}))
             }
-            Ok(false) => {
+            Ok(result) => {
+                let reason = result
+                    .rejection
+                    .map(|value| value.reason_code())
+                    .unwrap_or("totp_bind_unknown_rejection");
+                set_reason(&req, reason);
+                warn!(
+                    event = "TotpBindRejected",
+                    operation = "confirm_totp_binding",
+                    reason_code = reason,
+                    outcome = "binding_denied",
+                    actor_user_id = user_base_i.id,
+                    binding_attempt_id = ?result.attempt_id,
+                    expires_in_ms = ?result.expires_in_ms,
+                    server_totp_step = chrono::Utc::now().timestamp() / 30,
+                );
                 let mut audit_event =
                     AuditEvent::user("user_security", "user.totp_bind", "failure", &user_base_i);
                 audit_event.response_status = Some(401);
-                audit_event.reason_code = Some("invalid_totp".to_owned());
+                audit_event.reason_code = Some(reason.to_owned());
+                audit_event.metadata = json!({"binding_attempt_id": result.attempt_id, "expires_in_ms": result.expires_in_ms});
                 write_standalone(
                     database_conn,
                     &AuditContext::from_request(&req),
@@ -426,6 +475,7 @@ async fn verify_totp_h(
                     .json(json!({"success": false, "message": "验证码无效或绑定已过期"}))
             }
             Err(e) => {
+                set_reason(&req, "totp_bind_confirmation_failed");
                 error_logs_error(
                     &req,
                     "ConfirmTotpBindingError",
@@ -440,6 +490,7 @@ async fn verify_totp_h(
     let source_ip = request_ip(&req);
     match load_login_allowlist(database_conn, user_base_i.id).await {
         Ok(allowlist) if !login_ip_is_allowed(&allowlist, source_ip) => {
+            set_reason(&req, "login_ip_not_allowlisted");
             let mut event = login_failure_event(
                 Some(&user_base_i),
                 &user_base_i.username,
@@ -480,6 +531,7 @@ async fn verify_totp_h(
         }
         Ok(_) => {}
         Err(error_value) => {
+            set_reason(&req, "login_ip_allowlist_load_failed");
             error_logs_error(
                 &req,
                 "LoadLoginIpAllowlistForTotpError",
@@ -494,10 +546,12 @@ async fn verify_totp_h(
     let totp = match totp_struct(username, &s_config.encrypt_key, database_conn).await {
         Ok(Some(tmp)) => tmp,
         Ok(None) => {
+            set_reason(&req, "totp_login_secret_missing");
             info_logs(&req, "TOTPSecretNotFound", "查找用户的 totp secret 错误");
             return HttpResponse::NotFound().finish();
         }
         Err(e) => {
+            set_reason(&req, "totp_login_secret_load_failed");
             error_logs_error(&req, "生成 TOTP 结构体错误", "load_totp_secret", e.as_ref());
             return HttpResponse::InternalServerError().finish();
         }
@@ -562,6 +616,7 @@ async fn verify_totp_h(
                 HttpResponse::Ok().finish()
             }
             Err(error_value) => {
+                set_reason(&req, "totp_login_session_update_failed");
                 error_logs_error(
                     &req,
                     "TotpSessionUpdateError",
@@ -572,6 +627,7 @@ async fn verify_totp_h(
             }
         },
         Ok(false) => {
+            set_reason(&req, "totp_login_code_mismatch");
             let mut audit_event = AuditEvent::user(
                 "authentication",
                 "auth.totp_verify",
@@ -579,7 +635,7 @@ async fn verify_totp_h(
                 &user_base_i,
             );
             audit_event.response_status = Some(401);
-            audit_event.reason_code = Some("invalid_totp".to_owned());
+            audit_event.reason_code = Some("totp_login_code_mismatch".to_owned());
             write_standalone(
                 database_conn,
                 &AuditContext::from_request(&req),
@@ -589,7 +645,7 @@ async fn verify_totp_h(
             let login_event = login_failure_event(
                 Some(&user_base_i),
                 &user_base_i.username,
-                "invalid_totp",
+                "totp_login_code_mismatch",
                 "password_totp",
             );
             write_standalone(
@@ -598,10 +654,18 @@ async fn verify_totp_h(
                 &login_event,
             )
             .await;
-            info_logs(&req, "TOTPTokenVerifyFaild", "TOTP Token 验证不通过");
+            warn!(
+                event = "TotpLoginRejected",
+                operation = "verify_totp_token",
+                reason_code = "totp_login_code_mismatch",
+                outcome = "login_denied",
+                actor_user_id = user_base_i.id,
+                server_totp_step = chrono::Utc::now().timestamp() / 30,
+            );
             HttpResponse::Unauthorized().finish()
         }
         Err(e) => {
+            set_reason(&req, "totp_login_verification_failed");
             error_logs_error(
                 &req,
                 "TOTPTokenVerifyError",
@@ -1046,6 +1110,7 @@ async fn scanner_register_h(
         .and_then(|value| value.strip_prefix("Bearer "));
 
     let Some(registration_token) = registration_token else {
+        set_reason(&req, "registration_token_missing");
         return HttpResponse::Unauthorized().body("missing scanner registration token");
     };
 
@@ -1054,11 +1119,29 @@ async fn scanner_register_h(
         let token_hash =
             match crate::hash_scanner_token(registration_token, &security.scanner_token_pepper) {
                 Ok(value) => value,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
+                Err(error_value) => {
+                    set_reason(&req, "registration_token_hash_failed");
+                    error_logs_error(
+                        &req,
+                        "ScannerRegistrationTokenHashError",
+                        "hash_scanner_token",
+                        &error_value,
+                    );
+                    return HttpResponse::InternalServerError().finish();
+                }
             };
         let client = match pool.get().await {
             Ok(client) => client,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(error_value) => {
+                set_reason(&req, "scanner_registration_pool_failed");
+                error_logs_error(
+                    &req,
+                    "ScannerRegistrationPoolError",
+                    "acquire_registration_connection",
+                    &error_value,
+                );
+                return HttpResponse::InternalServerError().finish();
+            }
         };
         let authorized = client
             .query_opt(
@@ -1070,8 +1153,20 @@ async fn scanner_register_h(
             .await;
         match authorized {
             Ok(Some(_)) => return maintenance_response(&maintenance_snapshot),
-            Ok(None) => return HttpResponse::Unauthorized().finish(),
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Ok(None) => {
+                set_reason(&req, "invalid_registration_token");
+                return HttpResponse::Unauthorized().finish();
+            }
+            Err(error_value) => {
+                set_reason(&req, "scanner_registration_lookup_failed");
+                error_logs_error(
+                    &req,
+                    "ScannerRegistrationLookupError",
+                    "validate_registration_token",
+                    &error_value,
+                );
+                return HttpResponse::InternalServerError().finish();
+            }
         }
     }
 
@@ -1091,26 +1186,28 @@ async fn scanner_register_h(
             audit_event.actor_id = Some(register_data.scanner_id.clone());
             audit_event.resource_type = Some("scanner".to_owned());
             audit_event.resource_id = Some(register_data.scanner_id.clone());
-            audit_event.response_status = Some(if e.to_string() == "scanner unauthorized" {
-                401
+            let unauthorized = e
+                .downcast_ref::<ScannerRegistrationUnauthorized>()
+                .is_some();
+            let reason = if unauthorized {
+                "invalid_registration_token"
             } else {
-                500
-            });
-            audit_event.reason_code = Some(if e.to_string() == "scanner unauthorized" {
-                "invalid_registration_token".to_owned()
-            } else {
-                "registration_error".to_owned()
-            });
+                "registration_error"
+            };
+            set_reason(&req, reason);
+            audit_event.response_status = Some(if unauthorized { 401 } else { 500 });
+            audit_event.reason_code = Some(reason.to_owned());
             write_standalone(
                 pool.get_ref(),
                 &AuditContext::from_request(&req),
                 &audit_event,
             )
             .await;
-            error_logs_error(&req, "ScannerRegister", "register_scanner", e.as_ref());
-            if e.to_string() == "scanner unauthorized" {
+            if unauthorized {
+                warn!(event = "ScannerRegistrationRejected", operation = "register_scanner", reason_code = reason, scanner_id = %register_data.scanner_id);
                 return HttpResponse::Unauthorized().finish();
             }
+            error_logs_error(&req, "ScannerRegister", "register_scanner", e.as_ref());
             HttpResponse::InternalServerError().finish()
         }
     }

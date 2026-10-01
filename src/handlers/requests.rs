@@ -20,6 +20,7 @@ pub struct RequestQuery {
     status: Option<i16>,
     error_level: Option<String>,
     error_type: Option<String>,
+    reason_code: Option<String>,
     request_id: Option<Uuid>,
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
@@ -35,6 +36,7 @@ pub struct RequestSummaryQuery {
     status: Option<i16>,
     error_level: Option<String>,
     error_type: Option<String>,
+    reason_code: Option<String>,
     request_id: Option<Uuid>,
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
@@ -121,6 +123,7 @@ fn request_filter<'a>(
     push_filter!(query.status(), "status_code = ${}");
     push_filter!(query.error_level(), "error_level = ${}");
     push_filter!(query.error_type(), "error_type = ${}");
+    push_filter!(query.reason_code(), "reason_code = ${}");
     push_filter!(query.request_id(), "request_id = ${}");
     push_filter!(start, "occurred_at >= ${}");
     push_filter!(end, "occurred_at <= ${}");
@@ -185,6 +188,7 @@ trait RequestFilter {
     fn status(&self) -> &Option<i16>;
     fn error_level(&self) -> &Option<String>;
     fn error_type(&self) -> &Option<String>;
+    fn reason_code(&self) -> &Option<String>;
     fn request_id(&self) -> &Option<Uuid>;
     fn only_errors(&self) -> &Option<bool>;
 }
@@ -204,6 +208,9 @@ impl RequestFilter for RequestQuery {
     }
     fn error_type(&self) -> &Option<String> {
         &self.error_type
+    }
+    fn reason_code(&self) -> &Option<String> {
+        &self.reason_code
     }
     fn request_id(&self) -> &Option<Uuid> {
         &self.request_id
@@ -228,6 +235,9 @@ impl RequestFilter for RequestSummaryQuery {
     }
     fn error_type(&self) -> &Option<String> {
         &self.error_type
+    }
+    fn reason_code(&self) -> &Option<String> {
+        &self.reason_code
     }
     fn request_id(&self) -> &Option<Uuid> {
         &self.request_id
@@ -441,6 +451,7 @@ fn row_to_value(row: tokio_postgres::Row) -> Value {
         "actor_name": row.get::<_, Option<String>>("actor_name"),
         "error_level": row.get::<_, String>("error_level"),
         "error_type": row.get::<_, Option<String>>("error_type"),
+        "reason_code": row.get::<_, Option<String>>("reason_code"),
     })
 }
 
@@ -487,7 +498,7 @@ pub(crate) async fn list_requests(
 
     let list_sql = format!(
         "SELECT id, request_id, occurred_at, http_method, request_path, status_code, duration_ms, \
-         client_ip, user_agent, actor_id, actor_name, error_level, error_type \
+         client_ip, user_agent, actor_id, actor_name, error_level, error_type, reason_code \
          FROM request_log{filter_sql} ORDER BY occurred_at DESC, id DESC \
          LIMIT ${} OFFSET ${}",
         params.len() + 1,
@@ -919,6 +930,7 @@ mod tests {
             status: None,
             error_level: None,
             error_type: None,
+            reason_code: None,
             request_id: None,
             start: None,
             end: None,
@@ -941,13 +953,14 @@ mod tests {
         let mut value = request_query();
         value.method = Some("GET".to_owned());
         value.status = Some(500);
+        value.reason_code = Some("totp_bind_expired".to_owned());
         value.only_errors = Some(true);
         let (sql, params) = request_filter(&value, &value.start, &value.end);
         assert_eq!(
             sql,
-            " WHERE http_method = $1 AND status_code = $2 AND error_level <> 'ok'"
+            " WHERE http_method = $1 AND status_code = $2 AND reason_code = $3 AND error_level <> 'ok'"
         );
-        assert_eq!(params.len(), 2);
+        assert_eq!(params.len(), 3);
     }
 
     #[test]

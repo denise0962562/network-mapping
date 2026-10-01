@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use deadpool_postgres::Pool;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -41,7 +41,7 @@ struct ExecutionContext {
 #[derive(Default)]
 struct ExecutionFacts {
     distribution: BTreeMap<(DateTime<Utc>, String, String), i64>,
-    discovery: BTreeSet<(NaiveDate, IpAddr)>,
+    discovery: BTreeSet<(DateTime<Utc>, IpAddr)>,
 }
 
 #[derive(Serialize)]
@@ -190,6 +190,13 @@ async fn reconcile(pool: &Pool) -> Result<(), String> {
         )
         .await
         .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
+    // Upgrade completed legacy facts through the same bounded, retryable outbox.
+    // If source observations were deleted, keep the legacy facts and report their limitation.
+    transaction.execute(
+        "UPDATE analytics_outbox o SET status = 'pending', available_at = NOW(), attempts = 0, updated_at = NOW() \
+         WHERE o.status = 'completed' AND EXISTS(SELECT 1 FROM analytics_discovery_fact f WHERE f.execution_id = o.execution_id AND f.first_observed_at IS NULL);",
+        &[],
+    ).await.map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
     // Membership is immutable until published, even when its last execution was
     // deleted. An empty membership table alone must not admit new arrivals.
     if inserted > 0
@@ -633,9 +640,7 @@ async fn facts_from_elasticsearch(
             .or_default() += 1;
     }
     for (ip, first_observed_at) in ip_first {
-        facts
-            .discovery
-            .insert((shanghai_day(first_observed_at), ip));
+        facts.discovery.insert((first_observed_at, ip));
     }
     Ok(facts)
 }
@@ -681,6 +686,15 @@ async fn replace_execution_facts(
     {
         return Err("扫描统计任务已被重新排队，丢弃过期计算结果".to_owned());
     }
+    // Older scanners may have no observation counters. An empty/partial retained
+    // source must not replace their existing legacy IP facts with an incomplete set.
+    let legacy_count: i64 = transaction.query_one(
+        "SELECT COUNT(*)::BIGINT AS count FROM analytics_discovery_fact WHERE execution_id = $1 AND first_observed_at IS NULL;",
+        &[&context.database_id],
+    ).await.map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?.get("count");
+    if legacy_count > facts.discovery.len() as i64 {
+        return Err("原始观测不足以恢复旧统计的 UTC 时间，保留原有历史事实".into());
+    }
     transaction
         .execute(
             "DELETE FROM analytics_distribution_30m WHERE execution_id = $1;",
@@ -725,7 +739,7 @@ async fn replace_execution_facts(
             .by_ref()
             .take(WRITE_BATCH_SIZE)
             .map(
-                |(day_start, ip_address)| json!({"day_start": day_start, "ip_address": ip_address}),
+                |(first_observed_at, ip_address)| json!({"day_start": shanghai_day(first_observed_at), "first_observed_at": first_observed_at, "ip_address": ip_address}),
             )
             .collect::<Vec<_>>();
         if batch.is_empty() {
@@ -734,9 +748,9 @@ async fn replace_execution_facts(
         transaction
             .execute(
                 "INSERT INTO analytics_discovery_fact \
-             (execution_id, owner_id, scanner_id, task_source, day_start, ip_address) \
-             SELECT $1, $2, $3, $4, x.day_start, x.ip_address \
-             FROM jsonb_to_recordset($5::JSONB) AS x(day_start DATE, ip_address INET);",
+             (execution_id, owner_id, scanner_id, task_source, day_start, ip_address, first_observed_at) \
+             SELECT $1, $2, $3, $4, x.day_start, x.ip_address, x.first_observed_at \
+             FROM jsonb_to_recordset($5::JSONB) AS x(day_start DATE, ip_address INET, first_observed_at TIMESTAMPTZ);",
                 &[
                     &context.database_id,
                     &context.owner_id,
@@ -800,7 +814,7 @@ fn bucket_start(timestamp: DateTime<Utc>) -> DateTime<Utc> {
 
 fn shanghai_day(timestamp: DateTime<Utc>) -> NaiveDate {
     timestamp
-        .with_timezone(&FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset"))
+        .with_timezone(&chrono_tz::Asia::Shanghai)
         .date_naive()
 }
 
@@ -893,14 +907,13 @@ mod tests {
             facts
                 .distribution
                 .insert((timestamp, "service".into(), format!("service-{i}")), 1);
-            facts.discovery.insert((
-                shanghai_day(timestamp),
-                IpAddr::V4(std::net::Ipv4Addr::from(i + 1)),
-            ));
+            facts
+                .discovery
+                .insert((timestamp, IpAddr::V4(std::net::Ipv4Addr::from(i + 1))));
         }
         facts
             .discovery
-            .insert((shanghai_day(timestamp), "2001:db8::1".parse().unwrap()));
+            .insert((timestamp, "2001:db8::1".parse().unwrap()));
         replace_execution_facts(&pool, &first, facts).await.unwrap();
         let client = pool.get().await.unwrap();
         assert_eq!(

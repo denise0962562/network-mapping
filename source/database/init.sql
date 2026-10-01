@@ -333,6 +333,7 @@ CREATE INDEX IF NOT EXISTS idx_analytics_distribution_query
 CREATE TABLE IF NOT EXISTS analytics_discovery_fact (
 	execution_id INT NOT NULL REFERENCES scan_task_execution(id) ON DELETE CASCADE,
 	day_start DATE NOT NULL,
+	first_observed_at TIMESTAMPTZ,
 	owner_id INT NOT NULL,
 	scanner_id TEXT NOT NULL,
 	task_source TEXT NOT NULL,
@@ -368,6 +369,7 @@ CREATE TABLE IF NOT EXISTS session (
 	totp_verify_successful boolean DEFAULT false,
 	pending_totp_secret TEXT,
 	pending_totp_expires_at BIGINT,
+	pending_totp_attempt_id UUID,
 	create_time BIGINT DEFAULT (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT, 
 	is_enable boolean DEFAULT true,
 	deleted_at TIMESTAMPTZ,
@@ -378,6 +380,7 @@ CREATE TABLE IF NOT EXISTS session (
 -- Session 使用软删除保留认证历史，便于安全事件回溯。旧库升级时只补充审计字段，
 -- 不物理删除既有失效记录；历史记录的精确失效时间未知，因此明确标记为迁移时间。
 ALTER TABLE session ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE session ADD COLUMN IF NOT EXISTS pending_totp_attempt_id UUID;
 ALTER TABLE session ADD COLUMN IF NOT EXISTS deletion_reason TEXT;
 ALTER TABLE session ADD COLUMN IF NOT EXISTS deleted_by_user_id INT;
 DO $$
@@ -461,6 +464,42 @@ CREATE TABLE IF NOT EXISTS scanner_info (
 	tag TEXT,                                                                       -- 扫描器的标签
 	deleted_at TIMESTAMPTZ                                                          -- 软删除时间
 );
+
+-- 仅新版本服务成功处理过的心跳会启用掉线监控，避免升级时补发历史离线告警。
+ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS outage_monitored_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS scanner_outage (
+	id BIGSERIAL PRIMARY KEY,
+	scanner_id VARCHAR(36) NOT NULL REFERENCES scanner_info(scanner_id) ON DELETE CASCADE,
+	last_seen_at TIMESTAMPTZ NOT NULL,
+	detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	recovered_at TIMESTAMPTZ,
+	recovery_requested BOOLEAN NOT NULL DEFAULT FALSE,
+	recovery_delivery_prepared BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scanner_outage_active
+	ON scanner_outage(scanner_id) WHERE recovered_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_scanner_outage_recovery_queue
+	ON scanner_outage(id)
+	WHERE recovered_at IS NOT NULL AND recovery_requested AND NOT recovery_delivery_prepared;
+
+CREATE TABLE IF NOT EXISTS scanner_outage_delivery (
+	id BIGSERIAL PRIMARY KEY,
+	outage_id BIGINT NOT NULL REFERENCES scanner_outage(id) ON DELETE CASCADE,
+	kind TEXT NOT NULL CHECK (kind IN ('offline', 'recovered')),
+	recipient TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'pending'
+		CHECK (status IN ('pending', 'sending', 'sent', 'cancelled', 'failed')),
+	attempts INT NOT NULL DEFAULT 0,
+	available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	claimed_until TIMESTAMPTZ,
+	sent_at TIMESTAMPTZ,
+	last_error TEXT,
+	UNIQUE (outage_id, kind, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_scanner_outage_delivery_ready
+	ON scanner_outage_delivery(available_at, id)
+	WHERE status IN ('pending', 'sending');
 
 -- 旧版扫描器没有网络能力心跳，安全地按仅支持 IPv4 处理。
 ALTER TABLE scanner_info ADD COLUMN IF NOT EXISTS supports_ipv4 BOOLEAN NOT NULL DEFAULT true;
@@ -977,12 +1016,14 @@ CREATE TABLE IF NOT EXISTS request_log (
 	actor_name TEXT,                     -- 已认证用户名；匿名/扫描器请求为 NULL
 	error_level TEXT NOT NULL DEFAULT 'ok'
 		CHECK (error_level IN ('ok', 'client_error', 'server_error')),
-	error_type TEXT                      -- bad_request / unauthorized / not_found / ...
+	error_type TEXT,                     -- bad_request / unauthorized / not_found / ...
+	reason_code TEXT                     -- 服务端判定的稳定原因代码，不存储请求体或凭据
 );
 
 -- 兼容已经创建 request_log 的部署：保留 duration_ms，新增微秒精度和标准化路由。
 ALTER TABLE request_log ADD COLUMN IF NOT EXISTS duration_us BIGINT;
 ALTER TABLE request_log ADD COLUMN IF NOT EXISTS route_pattern TEXT;
+ALTER TABLE request_log ADD COLUMN IF NOT EXISTS reason_code TEXT;
 
 -- 只保留 2 个索引：分页/趋势/保留清理走 time 索引，错误查询与错误率趋势走 error 索引。
 CREATE INDEX IF NOT EXISTS idx_request_log_time
@@ -1072,3 +1113,102 @@ CREATE TABLE IF NOT EXISTS search_generation_admission (
 CREATE INDEX IF NOT EXISTS idx_search_generation_admission_owner_time ON search_generation_admission(owner_id, generated_at);
 CREATE INDEX IF NOT EXISTS idx_search_generation_admission_time ON search_generation_admission(generated_at);
 CREATE INDEX IF NOT EXISTS idx_scan_task_search_source ON scan_task(id) WHERE task_source = 'search';
+
+-- Persistent recovery count; safe to reapply on existing databases.
+ALTER TABLE scan_task_execution ADD COLUMN IF NOT EXISTS recovery_failure_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_failure_count >= 0);
+
+-- Administrator platform reports. Plans remain disabled on upgrades.
+CREATE TABLE IF NOT EXISTS report_schedule (
+    period_type TEXT PRIMARY KEY CHECK (period_type IN ('weekly', 'monthly')),
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    send_hour SMALLINT NOT NULL DEFAULT 9 CHECK (send_hour BETWEEN 0 AND 23),
+    send_minute SMALLINT NOT NULL DEFAULT 0 CHECK (send_minute BETWEEN 0 AND 59),
+    recipient_ids INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[],
+    enabled_at TIMESTAMPTZ,
+    last_period_end TIMESTAMPTZ,
+    revision BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (cardinality(recipient_ids) <= 100)
+);
+INSERT INTO report_schedule(period_type) VALUES ('weekly'), ('monthly') ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS report_run (
+    id UUID PRIMARY KEY,
+    period_type TEXT NOT NULL REFERENCES report_schedule(period_type),
+    period_start TIMESTAMPTZ NOT NULL,
+    period_end TIMESTAMPTZ NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    source TEXT NOT NULL CHECK (source IN ('manual', 'automatic', 'revision')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'waiting_data', 'generating', 'ready', 'failed')),
+    requested_by INTEGER,
+    send_email BOOLEAN NOT NULL DEFAULT FALSE,
+    recipient_ids INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[],
+    cutoff_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    task_snapshot JSONB NOT NULL,
+    payload JSONB,
+    quality JSONB NOT NULL DEFAULT '{}'::JSONB,
+    last_error TEXT,
+    template_key TEXT,
+    template_version INTEGER,
+    rendered_mail JSONB,
+    content_checksum TEXT,
+    supersedes_report_id UUID REFERENCES report_run(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    generated_at TIMESTAMPTZ,
+    UNIQUE(period_type, period_start, period_end, revision),
+    CHECK (period_end > period_start)
+);
+CREATE INDEX IF NOT EXISTS idx_report_run_list ON report_run(period_start DESC, created_at DESC);
+-- No cascading FK to scan executions: cleaning scan history must not delete reports.
+CREATE TABLE IF NOT EXISTS report_input_execution (
+    report_id UUID NOT NULL REFERENCES report_run(id) ON DELETE CASCADE,
+    execution_id INTEGER NOT NULL,
+    period_slot TEXT NOT NULL CHECK (period_slot IN ('current', 'previous')),
+    expected_observations BIGINT NOT NULL,
+    PRIMARY KEY(report_id, execution_id)
+);
+CREATE TABLE IF NOT EXISTS report_job (
+    report_id UUID PRIMARY KEY REFERENCES report_run(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'retry_wait', 'succeeded', 'failed')),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    wait_deadline TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
+    claim_token UUID,
+    lease_until TIMESTAMPTZ,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_report_job_ready ON report_job(available_at, report_id)
+    WHERE status IN ('pending', 'retry_wait');
+CREATE TABLE IF NOT EXISTS report_delivery (
+    id UUID PRIMARY KEY,
+    report_id UUID NOT NULL REFERENCES report_run(id) ON DELETE CASCADE,
+    recipient_user_id INTEGER NOT NULL,
+    recipient TEXT NOT NULL,
+    dispatch_seq INTEGER NOT NULL DEFAULT 1,
+    automatic BOOLEAN NOT NULL DEFAULT FALSE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'cancelled')),
+    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    claim_token UUID,
+    lease_until TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(report_id, recipient_user_id, dispatch_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_report_delivery_ready ON report_delivery(available_at, id)
+    WHERE status IN ('pending', 'sending');
+CREATE INDEX IF NOT EXISTS idx_scan_execution_report_end ON scan_task_execution(task_end_time, id)
+    WHERE execution_status = 'succeeded';
+INSERT INTO mail_template(template_key, display_name) VALUES
+    ('report_weekly', '平台周报'), ('report_monthly', '平台月报') ON CONFLICT DO NOTHING;
+
+-- Preserve absolute observation instants and immutable report calendar rules.
+ALTER TABLE analytics_discovery_fact ADD COLUMN IF NOT EXISTS first_observed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_analytics_discovery_instant ON analytics_discovery_fact(first_observed_at, owner_id, scanner_id, task_source);
+ALTER TABLE report_run ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai';
+ALTER TABLE report_run ADD COLUMN IF NOT EXISTS settings_revision BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE report_run DROP CONSTRAINT IF EXISTS report_run_period_type_period_start_period_end_revision_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_report_run_calendar_revision ON report_run(period_type, period_start, period_end, timezone, revision);
+INSERT INTO runtime_configuration(namespace, document) VALUES ('general', '{"timezone":"Asia/Shanghai","hourCycle":"24","dateFormat":"YYYY-MM-DD"}'::JSONB) ON CONFLICT(namespace) DO NOTHING;

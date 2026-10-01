@@ -911,6 +911,7 @@ async fn durable_upload_recovery_rotates_an_execution_with_a_different_upload_id
     client.execute("INSERT INTO scan_task(id,user_id,task_id,task_initiator,task_target,task_status) VALUES(1,1,$1,'fixture',ARRAY['192.0.2.1'::inet],'running')", &[&task_id.to_string()]).await.unwrap();
     client.execute("INSERT INTO scan_task_execution(id,execution_id,task_id,requested_scanner_id,assigned_scanner_id,execution_status,attempt_count,task_start_time,lease_expires_at) VALUES(1,'old-execution',1,$1,$1,'running',1,1,1)", &[&scanner.to_string()]).await.unwrap();
     client.execute("INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,protocol_version,storage_backend) VALUES(1,'old-upload',0,false,500,3,'elasticsearch')", &[]).await.unwrap();
+    client.batch_execute("SELECT setval(pg_get_serial_sequence('scan_task_execution','id'),(SELECT MAX(id) FROM scan_task_execution),true)").await.unwrap();
     drop(client);
 
     let recovered = crate::recover_scanner_task(
@@ -955,6 +956,126 @@ async fn durable_upload_recovery_rotates_an_execution_with_a_different_upload_id
             .get::<_, i32>(0),
         rows[0].get::<_, i32>("id")
     );
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL"]
+async fn fresh_recovery_rotates_an_execution_that_already_has_batches() {
+    let (pool, schema) = isolated_pool().await;
+    let scanner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let token_hash = crate::hash_scanner_token("fixture-token", "fixture-pepper").unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .batch_execute("INSERT INTO users(id,username,password) VALUES(1,'fixture','unused')")
+        .await
+        .unwrap();
+    client.execute("INSERT INTO scanner_info(scanner_id,create_user,runtime_token_hash,is_enable) VALUES($1,1,$2,true)", &[&scanner.to_string(), &token_hash]).await.unwrap();
+    client.execute("INSERT INTO scan_task(id,user_id,task_id,task_initiator,task_target,task_status) VALUES(1,1,$1,'fixture',ARRAY['192.0.2.1'::inet],'running')", &[&task_id.to_string()]).await.unwrap();
+    client.execute("INSERT INTO scan_task_execution(id,execution_id,task_id,requested_scanner_id,assigned_scanner_id,execution_status,attempt_count,task_start_time,lease_expires_at) VALUES(1,'old-execution',1,$1,$1,'running',1,1,1)", &[&scanner.to_string()]).await.unwrap();
+    client.execute("INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,protocol_version,storage_backend) VALUES(1,'old-upload',0,false,500,3,'elasticsearch')", &[]).await.unwrap();
+    client.batch_execute("SELECT setval(pg_get_serial_sequence('scan_task_execution','id'),(SELECT MAX(id) FROM scan_task_execution),true)").await.unwrap();
+    drop(client);
+
+    let recovered = crate::recover_scanner_task(
+        &pool,
+        scanner,
+        None,
+        None,
+        "fixture-token",
+        "fixture-pepper",
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.task_id, task_id);
+
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT id, execution_status, requested_scanner_id, assigned_scanner_id, attempt_count FROM scan_task_execution ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>("execution_status"), "superseded");
+    assert_eq!(rows[1].get::<_, String>("execution_status"), "running");
+    assert_eq!(
+        rows[1]
+            .get::<_, Option<String>>("assigned_scanner_id")
+            .as_deref(),
+        Some(scanner.to_string().as_str())
+    );
+    assert_eq!(rows[1].get::<_, i32>("attempt_count"), 1);
+    assert_eq!(
+        client
+            .query_one("SELECT execution_id FROM scan_result_batch", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        rows[0].get::<_, i32>("id")
+    );
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL"]
+async fn expired_execution_claim_rotates_existing_batches_for_the_next_scanner() {
+    let (pool, schema) = isolated_pool().await;
+    let first_scanner = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let second_scanner = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+    let second_token_hash =
+        crate::hash_scanner_token("second-fixture-token", "fixture-pepper").unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .batch_execute("INSERT INTO users(id,username,password) VALUES(1,'fixture','unused')")
+        .await
+        .unwrap();
+    client.execute("INSERT INTO scanner_info(scanner_id,create_user,runtime_token_hash,is_enable) VALUES($1,1,'unused',true),($2,1,$3,true)", &[&first_scanner.to_string(), &second_scanner.to_string(), &second_token_hash]).await.unwrap();
+    client.execute("INSERT INTO scan_task(id,user_id,task_id,task_initiator,task_target,task_status) VALUES(1,1,$1,'fixture',ARRAY['192.0.2.1'::inet],'running')", &[&task_id.to_string()]).await.unwrap();
+    client.execute("INSERT INTO scan_task_execution(id,execution_id,task_id,assigned_scanner_id,execution_status,attempt_count,task_start_time,lease_expires_at) VALUES(1,'old-execution',1,$1,'running',1,1,1)", &[&first_scanner.to_string()]).await.unwrap();
+    client.execute("INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,protocol_version,storage_backend) VALUES(1,'old-upload',0,false,500,3,'elasticsearch')", &[]).await.unwrap();
+    client.batch_execute("SELECT setval(pg_get_serial_sequence('scan_task_execution','id'),(SELECT MAX(id) FROM scan_task_execution),true)").await.unwrap();
+    drop(client);
+
+    let claimed = crate::apply_task(
+        &pool,
+        second_scanner,
+        "second-fixture-token",
+        "fixture-pepper",
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.task_id, task_id);
+
+    let client = pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT id, execution_status, assigned_scanner_id, attempt_count FROM scan_task_execution ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>("execution_status"), "superseded");
+    assert_eq!(rows[1].get::<_, String>("execution_status"), "running");
+    assert_eq!(
+        rows[1]
+            .get::<_, Option<String>>("assigned_scanner_id")
+            .as_deref(),
+        Some(second_scanner.to_string().as_str())
+    );
+    assert_eq!(rows[1].get::<_, i32>("attempt_count"), 1);
 
     client
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
@@ -1853,6 +1974,67 @@ async fn mixed_upload_cannot_finish_with_an_unmatched_dns_child() {
             .get::<_, String>(0),
         "running"
     );
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL"]
+async fn recovery_failure_reports_are_idempotent_and_stop_after_three_failures() {
+    let (pool, schema) = isolated_pool().await;
+    let scanner = Uuid::now_v7();
+    let task = Uuid::now_v7();
+    let hash = crate::hash_scanner_token("fixture-token", "fixture-pepper").unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .batch_execute("INSERT INTO users(id,username,password) VALUES(1,'fixture','unused')")
+        .await
+        .unwrap();
+    client.execute("INSERT INTO scanner_info(scanner_id,create_user,runtime_token_hash,is_enable) VALUES($1,1,$2,true)",&[&scanner.to_string(),&hash]).await.unwrap();
+    client.execute("INSERT INTO scan_task(id,user_id,task_id,task_initiator,task_target,task_status) VALUES(1,1,$1,'fixture',ARRAY['192.0.2.1'::inet],'running')",&[&task.to_string()]).await.unwrap();
+    client.execute("INSERT INTO scan_task_execution(id,execution_id,task_id,assigned_scanner_id,execution_status,attempt_count,lease_expires_at) VALUES(1,'execution',1,$1,'running',1,1)",&[&scanner.to_string()]).await.unwrap();
+    drop(client);
+    for count in [1, 1, 2, 2] {
+        let recovered = crate::recover_scanner_task_with_failure(
+            &pool,
+            scanner,
+            None,
+            None,
+            Some(crate::RecoveryFailureReport {
+                task_id: task,
+                count,
+            }),
+            "fixture-token",
+            "fixture-pepper",
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.task_id, task);
+        let row = pool.get().await.unwrap().query_one("SELECT recovery_failure_count,execution_status FROM scan_task_execution WHERE id=1",&[]).await.unwrap();
+        assert_eq!(row.get::<_, i32>(0), count as i32);
+        assert_eq!(row.get::<_, String>(1), "running");
+    }
+    let outcome = crate::recover_scanner_task_with_failure(
+        &pool,
+        scanner,
+        None,
+        None,
+        Some(crate::RecoveryFailureReport {
+            task_id: task,
+            count: 3,
+        }),
+        "fixture-token",
+        "fixture-pepper",
+    )
+    .await;
+    assert!(matches!(outcome, Err(crate::ApplyTaskError::NoTask)));
+    let client = pool.get().await.unwrap();
+    let row = client.query_one("SELECT recovery_failure_count,execution_status,lease_expires_at FROM scan_task_execution WHERE id=1",&[]).await.unwrap();
+    assert_eq!(row.get::<_, i32>(0), 3);
+    assert_eq!(row.get::<_, String>(1), "failed");
+    assert!(row.get::<_, Option<i64>>(2).is_none());
     client
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
