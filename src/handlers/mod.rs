@@ -15,6 +15,7 @@ pub mod scanner_diagnostics;
 pub mod scanner_latency;
 pub mod search;
 pub(crate) mod search_dsl;
+pub mod statistics;
 pub mod system_maintenance;
 pub mod system_resources;
 pub mod tags;

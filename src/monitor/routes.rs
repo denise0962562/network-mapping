@@ -21,6 +21,8 @@ pub const WEB_OPERATIONS: &[(&str, &str)] = &[
     ),
     ("GET /api/analysis/discovery-heatmap", "读取资产发现热力图"),
     ("GET /api/analysis/distribution", "读取扫描结果分布"),
+    ("GET /api/analysis/statistics/catalog", "读取统计分析配置"),
+    ("POST /api/analysis/statistics/query", "生成统计分析"),
     ("GET /api/assets/port-history", "读取资产端口历史"),
     ("GET /api/assets/ports", "读取资产端口列表"),
     ("GET /api/assets/summary", "资产汇总"),

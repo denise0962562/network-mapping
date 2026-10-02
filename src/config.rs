@@ -1887,6 +1887,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::data_saa::get_analysis_distribution)
         .service(handlers::data_saa::get_analysis_discovery_heatmap)
+        .service(handlers::statistics::catalog)
+        .service(handlers::statistics::query)
         .service(handlers::system_resources::get_system_resource_history)
         .service(handlers::system_resources::get_database_size_history)
         .service(handlers::scanner_latency::get_scanner_latency_history)
