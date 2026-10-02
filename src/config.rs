@@ -293,6 +293,7 @@ pub struct ElasticsearchConfig {
     pub scan_number_of_replicas: u32,
     /// Bulk 写入等待的分片副本数；单节点应使用 `1`（仅主分片）。
     pub write_wait_for_active_shards: String,
+    /// `9.5.x` 接受正式补丁版本；`9.5.N` 精确锁定版本。
     pub expected_version: String,
     pub api_key: Option<String>,
     pub username: Option<String>,
@@ -409,7 +410,7 @@ impl Default for ElasticsearchConfig {
             dns_observation_retention_days: 180,
             scan_number_of_replicas: 0,
             write_wait_for_active_shards: "1".to_owned(),
-            expected_version: "9.5.3".to_owned(),
+            expected_version: "9.5.x".to_owned(),
             api_key: None,
             username: None,
             password: None,
@@ -434,7 +435,48 @@ impl Default for ElasticsearchConfig {
     }
 }
 
+/// Only canonical stable 9.5 patch versions are supported.
+fn elasticsearch_patch_version(version: &str) -> Option<u64> {
+    let mut parts = version.split('.');
+    if parts.next()? != "9" || parts.next()? != "5" {
+        return None;
+    }
+    let patch = parts.next()?;
+    if parts.next().is_some()
+        || patch.is_empty()
+        || !patch.bytes().all(|byte| byte.is_ascii_digit())
+        || (patch.len() > 1 && patch.starts_with('0'))
+    {
+        return None;
+    }
+    patch.parse().ok()
+}
+
 impl ElasticsearchConfig {
+    pub(crate) fn validate_version_policy(&self) -> Result<(), String> {
+        if self.expected_version == "9.5.x"
+            || elasticsearch_patch_version(&self.expected_version).is_some()
+        {
+            Ok(())
+        } else {
+            Err("elasticsearch.expected_version 必须为 9.5.x 或正式精确版本 9.5.N".to_owned())
+        }
+    }
+
+    pub(crate) fn validate_server_version(&self, version: &str) -> Result<(), String> {
+        self.validate_version_policy()?;
+        if elasticsearch_patch_version(version).is_some()
+            && (self.expected_version == "9.5.x" || self.expected_version == version)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "Elasticsearch 版本不匹配：允许 {}，实际 {version}（仅支持正式版 9.5.x）",
+                self.expected_version
+            ))
+        }
+    }
+
     fn resolve_relative_to(&mut self, config_path: &Path) {
         let Some(certificate) = &mut self.ca_certificate_file else {
             return;
@@ -481,9 +523,7 @@ impl SelfChecking for ElasticsearchConfig {
         if !url.username().is_empty() || url.password().is_some() {
             return Err("elasticsearch.url 不得包含用户名或密码，请使用独立认证字段".into());
         }
-        if self.expected_version != "9.5.3" {
-            return Err("当前接入固定要求 elasticsearch.expected_version = 9.5.3".into());
-        }
+        self.validate_version_policy()?;
         for (name, value) in [
             ("observation_index_prefix", &self.observation_index_prefix),
             ("execution_endpoint_index", &self.execution_endpoint_index),
@@ -1588,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn elasticsearch_config_is_safe_by_default_and_requires_9_5_3() {
+    fn elasticsearch_config_is_safe_by_default_and_supports_9_5_patches() {
         let mut config = ElasticsearchConfig::default();
         assert!(config.enabled);
         assert!(config.read_enabled);
@@ -1602,13 +1642,64 @@ mod tests {
         assert!(config.try_check().unwrap());
 
         config.enabled = true;
+        assert_eq!(config.expected_version, "9.5.x");
         config.expected_version = "9.5.2".to_owned();
-        assert!(config.try_check().is_err());
+        assert!(config.try_check().unwrap());
         config.expected_version = "9.5.3".to_owned();
         assert!(config.try_check().unwrap());
         config.read_enabled = true;
         config.enabled = false;
         assert!(config.try_check().is_err());
+    }
+
+    #[test]
+    fn elasticsearch_version_policy_rejects_unsupported_and_malformed_versions() {
+        let mut config = ElasticsearchConfig::default();
+        for version in ["9.5.0", "9.5.2", "9.5.3", "9.5.123"] {
+            assert!(config.validate_server_version(version).is_ok(), "{version}");
+            config.expected_version = version.to_owned();
+            assert!(config.try_check().unwrap());
+            assert!(config.validate_server_version(version).is_ok());
+            assert!(config.validate_server_version("9.5.124").is_err());
+            config.expected_version = "9.5.x".to_owned();
+        }
+        for version in [
+            "",
+            "9",
+            "9.5",
+            "9.5.x",
+            "9.4.9",
+            "9.6.0",
+            "10.5.0",
+            "9.50.0",
+            "9.5.0-SNAPSHOT",
+            "9.5.0-rc1",
+            "9.5.3+build",
+            "9.5.03",
+            "9.5.-1",
+            "9.5.+1",
+            "9.5.3.0",
+            " 9.5.3",
+            "9.5.3 ",
+            "9.5.18446744073709551616",
+        ] {
+            assert!(
+                config.validate_server_version(version).is_err(),
+                "{version}"
+            );
+            if version != "9.5.x" {
+                config.expected_version = version.to_owned();
+                assert!(config.try_check().is_err(), "{version}");
+                assert!(config.validate_server_version("9.5.3").is_err());
+                config.expected_version = "9.5.x".to_owned();
+            }
+        }
+        // Existing configurations keep their exact pin after deserialization.
+        let pinned: ElasticsearchConfig = toml::from_str("expected_version = \"9.5.3\"").unwrap();
+        assert!(pinned.validate_server_version("9.5.3").is_ok());
+        assert!(pinned.validate_server_version("9.5.2").is_err());
+        let omitted: ElasticsearchConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.expected_version, "9.5.x");
     }
 
     #[test]

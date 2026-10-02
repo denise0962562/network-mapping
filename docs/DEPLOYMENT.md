@@ -13,7 +13,7 @@
 | 服务端二进制 | 与目标系统架构、运行库兼容；源码构建使用 Rust stable，edition 2024 |
 | 编译工具 | 源码构建需要 C 编译工具、OpenSSL 开发库和 pkg-config；CI 使用 Ubuntu 24.04 |
 | PostgreSQL | 预先创建数据库和登录角色；角色需要执行初始化 SQL 中的建表、索引及升级 DDL |
-| Elasticsearch | 当前固定要求 9.5.3，服务端必须可访问并有创建/管理所需索引及读写权限 |
+| Elasticsearch | 支持正式版 9.5.x，服务端必须可访问并有创建/管理所需索引及读写权限 |
 | 前端 | 已构建的 `dist/`，包含 `index.html`、`login.html`、`search.html`、`asset.html` 和 `assets/` |
 | HTTPS | PEM 证书链与匹配私钥，域名与客户端访问地址一致 |
 
@@ -180,7 +180,7 @@ read_enabled = true
 scan_storage = "elasticsearch"
 fallback_to_postgres = false
 url = "https://127.0.0.1:9200"
-expected_version = "9.5.3"
+expected_version = "9.5.x"
 scan_number_of_replicas = 0
 write_wait_for_active_shards = "1"
 # 私有 CA：填写实际 CA 文件路径。

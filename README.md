@@ -43,7 +43,7 @@ flowchart LR
 | --- | --- |
 | Rust / Cargo | 编译服务端；项目使用 edition 2024 |
 | PostgreSQL | 用户、权限、任务、配置、上传回执和分析快照 |
-| Elasticsearch 9.5.3 | 必需的扫描结果存储与搜索服务 |
+| Elasticsearch 9.5.x | 必需的扫描结果存储与搜索服务 |
 | TLS 证书与私钥 | 服务端 HTTPS |
 | 前端 `dist/` | 登录、控制台、搜索和资产页面 |
 

@@ -1,4 +1,13 @@
-# Elasticsearch 9.5.3 扫描结果存储
+# Elasticsearch 9.5.x 扫描结果存储
+
+版本策略默认 `expected_version = "9.5.x"`，接受任意正式版 `9.5.N`；也可设置
+`expected_version = "9.5.3"` 等精确版本，仅允许该补丁版本。已有配置中的精确锁定继续
+生效，如需允许整个 9.5 系列，须显式改为 `9.5.x`。其他主次版本、预发布版和非法版本
+均会在启动索引初始化前被拒绝；状态接口保留配置策略并显示实际服务端版本。
+
+版本范围放行不等同于所有补丁版本均通过真实集群验收。HTTP fixture 验证启动检查和
+请求协议；生产采用的补丁版本仍需在隔离集群验证 mapping、Painless、Data Stream、
+Bulk、搜索聚合及恢复流程。此次范围调整未新增真实 ES 集群验收记录。
 
 服务端正常运行仅支持 Elasticsearch 扫描结果存储。PostgreSQL 保留用户、权限、标签、
 任务、执行状态、扫描器、上传回执、补偿队列和紧凑分析快照，不再读写完整扫描事实。
@@ -21,7 +30,7 @@ dns_record_index = "network-mapping-dns-records-v1"
 dns_observation_retention_days = 180
 scan_number_of_replicas = 1
 write_wait_for_active_shards = "all"
-expected_version = "9.5.3"
+expected_version = "9.5.x"
 # api_key 和 CA 路径由部署环境提供。
 ```
 
@@ -115,7 +124,7 @@ ANALYTICS_TEST_DATABASE_URL='host=127.0.0.1 port=5432 dbname=storage_test user=t
 ```
 
 存储集成测试使用真实 PG 隔离 schema 与本地 ES HTTP fixture，验证协议和恢复边界；它不替代
-实际 ES 9.5.3 的 mapping、Painless、rollover、副本故障、性能和 Snapshot/Restore 验收。
+实际 ES 9.5.x 的 mapping、Painless、rollover、副本故障、性能和 Snapshot/Restore 验收。
 
 ## 慢查询诊断
 

@@ -986,12 +986,7 @@ impl ElasticsearchService {
             .pointer("/version/number")
             .and_then(Value::as_str)
             .ok_or_else(|| "Elasticsearch 根响应缺少 version.number".to_owned())?;
-        if version != self.inner.config.expected_version {
-            return Err(format!(
-                "Elasticsearch 版本不匹配：期望 {}，实际 {version}",
-                self.inner.config.expected_version
-            ));
-        }
+        self.inner.config.validate_server_version(version)?;
 
         self.ensure_scan_indices().await?;
         // Domain search reads the current DNS RR index even before the first DNS

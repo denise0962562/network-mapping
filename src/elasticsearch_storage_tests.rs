@@ -14,6 +14,7 @@ pub(super) struct FixtureState {
     pub(super) projection_bulk_sizes: Vec<usize>,
     pub(super) malformed_projection_bulk: bool,
     pub(super) projection_fail_after: Option<usize>,
+    server_version: Option<String>,
     dns_generation: usize,
 }
 
@@ -134,7 +135,7 @@ impl Drop for EsFixture {
 
 fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &str) -> Value {
     if path == "/" {
-        return json!({"version": {"number": "9.5.3"}});
+        return json!({"version": {"number": state.server_version.as_deref().unwrap_or("9.5.3")}});
     }
     if path.starts_with("/_data_stream/") {
         return json!({"data_streams": [{"indices": [{"index_name": format!(".ds-dns-{}", state.dns_generation)}]}]});
@@ -2097,4 +2098,53 @@ async fn recovery_failure_reports_are_idempotent_and_stop_after_three_failures()
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn startup_checks_version_before_index_writes_and_reports_actual_version() {
+    // initialize does not acquire a PG connection; keep this protocol test independent of PG.
+    let manager =
+        deadpool_postgres::Manager::new(tokio_postgres::Config::new(), tokio_postgres::NoTls);
+    let pool = Pool::builder(manager).max_size(1).build().unwrap();
+    for (policy, version, accepted) in [
+        ("9.5.x", "9.5.0", true),
+        ("9.5.x", "9.5.2", true),
+        ("9.5.x", "9.5.3", true),
+        ("9.5.x", "9.5.123", true),
+        ("9.5.3", "9.5.3", true),
+        ("9.5.3", "9.5.2", false),
+        ("9.5.x", "9.4.9", false),
+        ("9.5.x", "9.6.0", false),
+        ("9.5.x", "10.0.0", false),
+        ("9.5.x", "9.5.3-SNAPSHOT", false),
+        ("9.5.x", "invalid", false),
+    ] {
+        let fixture = EsFixture::start();
+        fixture.state.lock().unwrap().server_version = Some(version.to_owned());
+        let service = ElasticsearchService::new(ElasticsearchConfig {
+            url: fixture.url.clone(),
+            expected_version: policy.to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = service.initialize(&pool).await;
+        let runtime = service.inner.runtime.read().unwrap();
+        let state = fixture.state.lock().unwrap();
+        if accepted {
+            assert!(result.is_ok(), "{policy}: {version}: {result:?}");
+            assert!(runtime.connected && runtime.read_ready);
+            assert_eq!(runtime.server_version.as_deref(), Some(version));
+            assert!(
+                state
+                    .requests
+                    .iter()
+                    .any(|request| request.starts_with("PUT "))
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.contains(policy) && error.contains(version), "{error}");
+            assert_eq!(state.requests, ["GET /"]);
+            assert!(!runtime.connected && !runtime.read_ready);
+        }
+    }
 }
