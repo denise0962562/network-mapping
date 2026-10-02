@@ -279,6 +279,14 @@ CREATE TABLE IF NOT EXISTS scan_projection_outbox (
 CREATE INDEX IF NOT EXISTS idx_scan_projection_outbox_pending
 	ON scan_projection_outbox(available_at, execution_id) WHERE processed_at IS NULL;
 
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS claim_token UUID;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS cursor JSONB;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'promoting'
+    CHECK (phase IN ('promoting', 'refreshing'));
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS processed_endpoints BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT NOT NULL DEFAULT 2;
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS payload_checksum VARCHAR(64);
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';

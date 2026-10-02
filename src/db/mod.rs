@@ -3,10 +3,60 @@ use crate::path_secure_join;
 use actix_web::web;
 use deadpool_postgres::{ManagerConfig, RecyclingMethod, Runtime};
 use std::time::Duration;
+use std::time::Instant;
 use tokio::fs;
 use tracing::{debug, error, info};
 
 use crate::logs::write::error_diagnostics;
+
+/// Instrument only write-path leases, without logging SQL, payloads or credentials.
+pub(crate) struct WriteConnection {
+    connection: deadpool_postgres::Object,
+    acquired_at: Instant,
+    operation: &'static str,
+}
+
+impl std::ops::Deref for WriteConnection {
+    type Target = deadpool_postgres::Object;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for WriteConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for WriteConnection {
+    fn drop(&mut self) {
+        info!(
+            event = "ScanWriteConnectionReleased",
+            operation = self.operation,
+            hold_ms = self.acquired_at.elapsed().as_millis() as u64
+        );
+    }
+}
+
+pub(crate) async fn acquire_write_connection(
+    pool: &deadpool_postgres::Pool,
+    operation: &'static str,
+) -> Result<WriteConnection, deadpool_postgres::PoolError> {
+    let started = Instant::now();
+    let result = pool.get().await;
+    info!(
+        event = "ScanWriteConnectionAcquired",
+        operation,
+        wait_ms = started.elapsed().as_millis() as u64,
+        success = result.is_ok()
+    );
+    Ok(WriteConnection {
+        connection: result?,
+        acquired_at: Instant::now(),
+        operation,
+    })
+}
 
 pub struct SqlFile {
     pub root_path: String,
@@ -158,6 +208,11 @@ pub async fn init_database_table(
     let transaction = client.transaction().await?;
     debug!(init_database_file = file_path, "开始执行数据库初始化事务");
     transaction.batch_execute(&sql).await?;
+    transaction
+        .batch_execute(include_str!(
+            "../../source/database/migrate_scan_projection.sql"
+        ))
+        .await?;
     transaction
         .batch_execute(include_str!(
             "../../source/database/migrate_scanner_diagnostics.sql"

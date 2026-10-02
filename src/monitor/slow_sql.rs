@@ -1,7 +1,7 @@
 //! 慢 SQL 检测：轮询 `pg_stat_statements` 视图，按统计窗口内的平均耗时识别近期慢查询。
 //!
 //! 依赖 PostgreSQL 的 `pg_stat_statements` 扩展；未启用或无权读取时轮询失败，
-//! 首轮失败记录一次警告后不再重复告警，后续失败仅记录 error 日志。
+//! 首次扩展/权限故障记录警告；连接池等临时故障独立记录采样失败。
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -102,6 +102,7 @@ pub async fn run_monitor(
         }
         match poll(&pool).await {
             Ok(rows) => {
+                warned_unavailable = false;
                 if !baseline_ready {
                     for row in rows {
                         if let Some(queryid) = row.queryid {
@@ -141,7 +142,11 @@ pub async fn run_monitor(
             }
             Err(error) => {
                 let diagnostics = error_diagnostics(error.as_ref());
-                if !warned_unavailable {
+                let unavailable = error
+                    .downcast_ref::<tokio_postgres::Error>()
+                    .and_then(|error| error.code())
+                    .is_some_and(|code| matches!(code.code(), "42P01" | "42501" | "55000"));
+                if unavailable && !warned_unavailable {
                     warn!(
                         event = "SlowSqlMonitorUnavailable",
                         operation = "query_pg_stat_statements",

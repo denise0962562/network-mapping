@@ -50,6 +50,9 @@ fn log_scanner_result_error(
         SaveScannerResultsError::Storage(_) | SaveScannerResultsError::BatchBusy { .. } => {
             "batch_retained_for_retry"
         }
+        SaveScannerResultsError::Database(_) if error_value.retryable() => {
+            "batch_retained_for_retry"
+        }
         SaveScannerResultsError::Database(_) => "server_error",
         _ => "request_rejected",
     };
@@ -1603,8 +1606,14 @@ async fn get_task(
          COALESCE(s.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, s.location, \
          e.execution_status, e.attempt_count, e.task_start_time, e.task_end_time, e.lease_expires_at, \
          e.failure_reason, e.cancel_requested, COALESCE(e.result_ip_count, 0)::BIGINT AS ip_count, \
-         COALESCE(e.result_port_count, 0)::BIGINT AS port_count, COALESCE(e.result_observation_count, 0)::BIGINT AS result_count \
-         FROM scan_task_execution e \
+         COALESCE(e.result_port_count, 0)::BIGINT AS port_count, COALESCE(e.result_observation_count, 0)::BIGINT AS result_count, \
+         CASE WHEN t.scan_profile = 'dns_records' THEN 'not_applicable' \
+              WHEN e.execution_status <> 'succeeded' THEN 'not_started' \
+              WHEN p.processed_at IS NOT NULL THEN 'ready' \
+              WHEN p.claim_token IS NOT NULL AND p.lease_expires_at > clock_timestamp() THEN 'running' \
+              WHEN p.last_error IS NOT NULL THEN 'retrying' ELSE 'pending' END AS projection_status \
+         FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+         LEFT JOIN scan_projection_outbox p ON p.execution_id = e.id \
          LEFT JOIN scanner_info s ON s.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
          WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
          ORDER BY e.id;", &[&task_pk]).await {
@@ -1634,6 +1643,7 @@ async fn get_task(
         "scanner_name": row.get::<_, Option<String>>("scanner_name"),
         "scanner_location": row.get::<_, Option<String>>("location"),
         "status": row.get::<_, String>("execution_status"),
+        "projection_status": row.get::<_, String>("projection_status"),
         "attempt_count": row.get::<_, i32>("attempt_count"),
         "task_start_time": row.get::<_, Option<i64>>("task_start_time"),
         "task_end_time": row.get::<_, Option<i64>>("task_end_time"),
@@ -1649,6 +1659,8 @@ async fn get_task(
     let task_kind = task.get::<_, String>("task_kind");
     let generation_metadata = task.get::<_, Option<Value>>("generation_metadata");
     let stored_scan_profile = task.get::<_, String>("scan_profile");
+    // Rows own their values; permission checks and metadata loading are complete.
+    drop(connection);
     let (results, endpoint_results_available) =
         if should_load_endpoint_results(&task_kind, result_count) {
             match load_execution_results_from_elasticsearch(
@@ -1712,6 +1724,7 @@ async fn get_task(
             "scan_plan": task.get::<_, Value>("scan_plan"),
             "dns_resolvers": task.get::<_, Value>("dns_resolvers"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
+            "projection_status": selected_execution.get::<_, String>("projection_status"),
             "executions": executions,
             "scanner_id": selected_execution.get::<_, Option<String>>("assigned_scanner_id"),
             "scanner_name": selected_execution.get::<_, Option<String>>("scanner_name"),
@@ -2671,6 +2684,11 @@ async fn upload_scanner_result_handler(
                 }
                 SaveScannerResultsError::TaskNotOwned => {
                     HttpResponse::Conflict().body("task is not owned by scanner")
+                }
+                SaveScannerResultsError::Database(_) if e.retryable() => {
+                    HttpResponse::ServiceUnavailable()
+                        .insert_header((header::RETRY_AFTER, "2"))
+                        .body("scan database temporarily busy")
                 }
                 SaveScannerResultsError::Database(_) => {
                     HttpResponse::InternalServerError().body("500")

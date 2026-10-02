@@ -314,6 +314,12 @@ pub struct ElasticsearchConfig {
     pub bulk_total_timeout_seconds: u64,
     /// 进程内允许并发执行的 Bulk 数量，防止故障时重试风暴。
     pub bulk_max_concurrency: usize,
+    /// Endpoint page size and serialized request limit for current projections.
+    pub projection_page_size: usize,
+    pub projection_bulk_max_bytes: usize,
+    pub projection_pages_per_tick: usize,
+    pub projection_lease_seconds: u64,
+    pub projection_heartbeat_seconds: u64,
     /// Persist migration progress after at least this many newly migrated batches.
     pub scan_migration_checkpoint_batches: u64,
     pub fallback_to_postgres: bool,
@@ -359,6 +365,14 @@ impl fmt::Debug for ElasticsearchConfig {
             .field("request_timeout_seconds", &self.request_timeout_seconds)
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("bulk_batch_size", &self.bulk_batch_size)
+            .field("projection_page_size", &self.projection_page_size)
+            .field("projection_bulk_max_bytes", &self.projection_bulk_max_bytes)
+            .field("projection_pages_per_tick", &self.projection_pages_per_tick)
+            .field("projection_lease_seconds", &self.projection_lease_seconds)
+            .field(
+                "projection_heartbeat_seconds",
+                &self.projection_heartbeat_seconds,
+            )
             .field(
                 "scan_migration_concurrency",
                 &self.scan_migration_concurrency,
@@ -409,6 +423,11 @@ impl Default for ElasticsearchConfig {
             bulk_retry_initial_ms: 200,
             bulk_total_timeout_seconds: 25,
             bulk_max_concurrency: 2,
+            projection_page_size: 1000,
+            projection_bulk_max_bytes: 5 * 1024 * 1024,
+            projection_pages_per_tick: 4,
+            projection_lease_seconds: 120,
+            projection_heartbeat_seconds: 20,
             scan_migration_checkpoint_batches: 100,
             fallback_to_postgres: false,
         }
@@ -526,6 +545,17 @@ impl SelfChecking for ElasticsearchConfig {
         }
         if !(1..=32).contains(&self.bulk_max_concurrency) {
             return Err("elasticsearch.bulk_max_concurrency 必须在 1 到 32 之间".into());
+        }
+        if !(1..=2000).contains(&self.projection_page_size)
+            || !(64 * 1024..=16 * 1024 * 1024).contains(&self.projection_bulk_max_bytes)
+            || !(1..=32).contains(&self.projection_pages_per_tick)
+            || !(10..=3600).contains(&self.projection_lease_seconds)
+            || self.projection_heartbeat_seconds == 0
+            || self.projection_heartbeat_seconds > self.projection_lease_seconds / 3
+        {
+            return Err(
+                "elasticsearch.projection_* 配置超出范围或续租周期超过租约的三分之一".into(),
+            );
         }
         if self.write_wait_for_active_shards != "1"
             && self.write_wait_for_active_shards != "all"
@@ -1570,6 +1600,21 @@ mod tests {
         assert!(config.try_check().unwrap());
         config.read_enabled = true;
         config.enabled = false;
+        assert!(config.try_check().is_err());
+    }
+
+    #[test]
+    fn projection_configuration_bounds_memory_and_lease_renewal() {
+        let mut config = ElasticsearchConfig {
+            enabled: true,
+            read_enabled: true,
+            ..Default::default()
+        };
+        assert!(config.try_check().unwrap());
+        config.projection_heartbeat_seconds = config.projection_lease_seconds;
+        assert!(config.try_check().is_err());
+        config.projection_heartbeat_seconds = 20;
+        config.projection_bulk_max_bytes = usize::MAX;
         assert!(config.try_check().is_err());
     }
 
