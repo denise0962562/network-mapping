@@ -138,6 +138,10 @@ API 请求响应和限制参见[资产搜索语法与 API](docs/SEARCH_SYNTAX.md
 
 任务详情接口 `GET /api/task/{task_id}` 返回 `executions`，并可通过 `execution_id` 查询参数选择某个执行实例的分页结果。同一个逻辑任务下，各扫描器的状态、失败原因和扫描结果相互独立；导出的 CSV/JSON 也包含执行实例和扫描器标识。
 
+## 运行时配置
+
+请求日志、健康监控、自动目标、DNS 后续任务和分析快照配置以数据库已发布值为准；对应 TOML 段仅在数据库记录缺失时初始化。管理员在“设置 → 运行时配置”保存，接口为 `POST /api/config/runtime/{namespace}`。首次初始化沿用 TOML 的扫描开关，应预先核对授权范围。生效规则、多实例限制和后续计划见[服务端运行时配置](docs/SERVER_CONFIGURATION_DATABASE_PLAN.md)。
+
 ## 自动目标生成
 
 服务端可以从明确授权的 IPv4/IPv6 CIDR 中顺序生成扫描任务。两个地址族使用独立的
@@ -184,7 +188,7 @@ repeat_after_seconds = 604800
 ## 健康监控与告警
 
 服务端内置健康监控，实时检测慢请求、5xx 服务端错误和 Elasticsearch 慢查询/写入，并轮询
-`pg_stat_statements` 检测 PostgreSQL 慢 SQL，命中阈值后通过邮件通知所有启用中的管理员。`[monitor]` 配置段控制阈值、
+`pg_stat_statements` 检测 PostgreSQL 慢 SQL，命中阈值后通过邮件通知所有启用中的管理员。`monitor` 运行时配置控制阈值、
 轮询间隔与冷却时间，通知偏好中的 `health_alert_enabled`（默认开启）控制是否发送。
 慢 SQL 检测需要数据库预先启用 `pg_stat_statements` 扩展。完整的使用方法、前提与
 注意事项参见
