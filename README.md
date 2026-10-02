@@ -63,7 +63,7 @@ cargo build --locked --release
 ./target/release/network_mapping_server --config config.toml
 ```
 
-打开配置的 HTTPS 地址，通过[用户管理 CLI](docs/USER_MANAGEMENT_CLI.md)创建初始管理员，再从控制台创建扫描器并按扫描器仓库说明注册节点。
+空库首次正常启动会自动创建管理员并在终端显示随机密码；保存凭据，打开配置的 HTTPS 地址登录并改密，再创建和注册扫描器。账号管理见[用户管理 CLI](docs/USER_MANAGEMENT_CLI.md)，完整启动验收见[部署指南](docs/DEPLOYMENT.md#首次启动)。
 
 ## 配置与使用
 
