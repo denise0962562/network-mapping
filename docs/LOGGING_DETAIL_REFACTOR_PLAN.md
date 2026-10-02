@@ -1,5 +1,8 @@
 # 日志详细化改造任务
 
+> 文档类型：归档设计记录。保留实施背景、阶段目标与验收依据，不作为当前部署操作指南。
+> 当前使用说明见[结构化日志改造](SCANNER_DIAGNOSTICS.md)。
+
 状态：代码实施完成；自动化验证完成；依赖真实 PostgreSQL/Elasticsearch 与故障注入的人工演练待运维环境执行
 
 范围：`network-mapping` 服务端与 `Network-Mapping-Scanner` 扫描端

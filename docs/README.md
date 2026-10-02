@@ -19,10 +19,10 @@
 | --- | --- |
 | [扫描计划与结果协议](SCAN_PIPELINE.md) | 扫描阶段、能力声明和结果上传协议 |
 | [双栈扫描、协议能力与自动目标](DUAL_STACK_SCANNING.md) | IPv4/IPv6 能力调度与自动目标生成 |
-| [DNS 测绘（第一阶段）](DNS_MAPPING.md) | DNS 任务与解析结果处理 |
+| [DNS 测绘](DNS_MAPPING.md) | DNS 任务与解析结果处理 |
 | [搜索触发目标更新](SEARCH_TARGET_GENERATION.md) | 搜索触发更新的范围、去重与限制 |
 | [资产端口状态与历史](ASSET_PORT_HISTORY.md) | 端口当前状态与历史记录语义 |
-| [扫描器恢复协议补充](scanner-recovery.md) | 服务端任务恢复与检查点协议 |
+| [扫描器任务恢复协议](scanner-recovery.md) | 服务端任务恢复与检查点协议 |
 
 ## 存储与分析
 
@@ -46,9 +46,9 @@
 | [系统资源读取与慢依赖隔离](SYSTEM_RESOURCE_RESILIENCE.md) | 资源读取、缓存与慢依赖处理 |
 | [SQL 热路径优化与对比](SQL_HOT_PATH_OPTIMIZATION.md) | 认证热路径及性能对比 |
 
-## 实施方案与设计记录
+## 归档设计记录
 
-本组包含实施背景和设计目标；功能是否已提供应以当前代码与对应使用文档为准。
+本组保留实施背景、设计目标和验收记录。部署操作请使用上方的使用与运维文档。
 
 | 文档 | 内容 |
 | --- | --- |

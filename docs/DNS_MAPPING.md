@@ -1,6 +1,6 @@
-# DNS 测绘（第一阶段）
+# DNS 测绘
 
-本阶段将 DNS 数据分为不可变查询证据和可更新的当前 RR。PostgreSQL 继续负责任务、扫描器身份、执行租约和上传回执；DNS 原始响应与当前解析状态由 Elasticsearch 管理。
+DNS 数据分为不可变查询证据和可更新的当前 RR。PostgreSQL 继续负责任务、扫描器身份、执行租约和上传回执；DNS 原始响应与当前解析状态由 Elasticsearch 管理。
 
 ## 数据模型
 
@@ -15,7 +15,7 @@
 
 成功 `NOERROR` answer 会 upsert 为 `active` 并刷新 `last_seen_at`。`NXDOMAIN`、NODATA、`SERVFAIL`、拒绝和超时始终写入 observations，但不会将已有 RR 标为失活，避免短暂解析器故障误删资产。
 
-“失活”需要后续完整覆盖确认：按 `(domain, record_type, dns_view)` 记录成功扫描代次，仅当该代次确认 RR 缺失时增加 `missing_completed_scans`。该状态机尚未启用，因此本阶段不会自动失活记录。
+“失活”需要后续完整覆盖确认：按 `(domain, record_type, dns_view)` 记录成功扫描代次，仅当该代次确认 RR 缺失时增加 `missing_completed_scans`。该状态机尚未启用，因此当前不会自动失活记录。
 
 ## 扫描器和任务
 

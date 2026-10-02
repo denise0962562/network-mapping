@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_request_log_error
 
 不建 `request_path`、`status_code`、`request_id` 单列索引：`request_path` 仅偶尔排查、列表查询自带时间范围；
 `status_code` 与 `error_level`/`error_type` 冗余；`request_log` 每请求一行，`request_id` 近乎唯一、索引无收益。
-若后续按 `error_type` 高频过滤，再补一个部分索引即可。
+
 
 ## 采集与错误分类
 
@@ -100,7 +100,7 @@ pub struct RequestActor(pub Arc<std::sync::Mutex<Option<(i32, String)>>>); // (u
   3. 仍失败 → **整批丢弃 + `dropped` 计数自增 + `error!` 记一条日志**，继续下一轮循环。
   4. 绝不无限重入队、绝不阻塞、绝不退出。
 
-`dropped` 计数先通过日志暴露，后续可并入 summary。
+`dropped` 计数通过日志暴露，当前未并入 summary。
 
 ## 查询接口
 
@@ -123,12 +123,9 @@ summary 拆两层语义，避免大表实时 `percentile_cont` 全表扫描：
 
 不提供「任意范围 × 任意过滤 × 实时 P95/P99」。
 
-升级路径（量大后）：flush 时顺带维护 `duration_ms` 的 log2 直方图，P95/P99 从直方图估算（O(桶数)），
-即可支持任意窗口。此为后续项，不纳入 v1。
-
 ## 前端
 
-新增 `/requests` 页（仅管理员）：
+`/requests` 页面仅管理员可访问：
 
 - 过滤栏：method、path、status、error_type、仅看错误、时间范围、request_id。
 - 汇总卡片：总请求数、错误率、P95 耗时、5xx 数。
@@ -138,13 +135,12 @@ summary 拆两层语义，避免大表实时 `percentile_cont` 全表扫描：
 ## 保留与清理
 
 - 配置 `retention_days`（默认 30 天）。
-- v1 单表 + 分批 `DELETE`（每批删几千行，避免长事务锁）。
-- 升级触发条件：单表超 5000 万行、或保留清理扫描明显变慢 → 迁到按天 range 分区，
-  保留变成 `DROP PARTITION`、索引变分区局部。v1 不引入分区。
+- 当前使用单表和分批 `DELETE` 清理，避免长事务锁。
+- 当前未使用按天分区；应根据实际保留量和清理耗时评估容量。
 
 ## 配置
 
-`config.toml` 新增：
+在“设置 → 运行时配置 → 请求日志”发布配置。对应 `requests` 数据库记录缺失时，以下 TOML 用于初始化；已有记录不会被修改文件或重启覆盖。发布接口与版本冲突规则见[服务端运行时配置](SERVER_CONFIGURATION_DATABASE_PLAN.md)。
 
 ```toml
 [requests]
@@ -158,27 +154,3 @@ retention_days = 30   # 在线保留天数
   扫描器注册/运行 Token 及其哈希。只记录 method、path（不含 query）、状态码、耗时、IP、UA 与操作者。
 - 查询接口仅管理员可见，复用审计接口的鉴权方式。
 - 生产环境建议沿用 `audit_event` 的角色权限模型：应用角色只持有 `request_log` 的 `INSERT` / `SELECT`。
-
-## 涉及文件
-
-后端：
-
-- `source/database/init.sql`：新增表与索引（幂等）。
-- `src/request_log.rs`：`RequestActor`、错误分类器、后台 writer、批量插入。
-- `src/main.rs`：`wrap_fn` 采集、spawn writer、注册路由。
-- `src/config.rs`：`[requests]` 配置与 `SelfChecking`。
-- `src/handlers/requests.rs`：list 与 summary handler。
-- `src/handlers/mod.rs`、`src/lib.rs`：模块与路由注册。
-
-前端：
-
-- `src/views/Requests.vue`：新页面。
-- `src/router/index.js`：新增 `/requests` 路由。
-
-## 待定 / 后续
-
-- 扫描器请求的 `actor`（从 payload 中的 `scanner_id` 补一列），v1 为 NULL。
-- `duration_ms` 直方图预聚合，替换 `percentile_cont`。
-- 按天分区，替换分批 `DELETE`。
-- `dropped` 计数并入 summary。
-- 幂等（task/create 以 `X-Request-ID` 为幂等键）为独立方案，不在此文档范围内。
