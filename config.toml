@@ -133,7 +133,7 @@ dns_observation_retention_days = 180
 # 多节点生产环境可设为 1 或更高，并同步调整 write_wait_for_active_shards。
 scan_number_of_replicas = 0
 write_wait_for_active_shards = "1"
-# 9.5.x 接受正式补丁版本；填写 9.5.3 等精确版本可锁定补丁版本。
+# 接受整个正式版 9.5.x 系列；旧值 9.5.3 等同样允许其他 9.5 补丁版本。
 expected_version = "9.5.x"
 # 认证二选一；生产环境不要把真实密钥提交到仓库。
 # api_key = "base64-encoded-api-key"

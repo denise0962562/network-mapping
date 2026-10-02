@@ -293,7 +293,7 @@ pub struct ElasticsearchConfig {
     pub scan_number_of_replicas: u32,
     /// Bulk 写入等待的分片副本数；单节点应使用 `1`（仅主分片）。
     pub write_wait_for_active_shards: String,
-    /// `9.5.x` 接受正式补丁版本；`9.5.N` 精确锁定版本。
+    /// 支持正式版 `9.5.x`；兼容旧 `9.5.N` 配置，不限制补丁版本。
     pub expected_version: String,
     pub api_key: Option<String>,
     pub username: Option<String>,
@@ -459,19 +459,19 @@ impl ElasticsearchConfig {
         {
             Ok(())
         } else {
-            Err("elasticsearch.expected_version 必须为 9.5.x 或正式精确版本 9.5.N".to_owned())
+            Err("elasticsearch.expected_version 必须为 9.5.x 或旧格式 9.5.N（均允许整个 9.5.x 系列）".to_owned())
         }
     }
 
     pub(crate) fn validate_server_version(&self, version: &str) -> Result<(), String> {
         self.validate_version_policy()?;
-        if elasticsearch_patch_version(version).is_some()
-            && (self.expected_version == "9.5.x" || self.expected_version == version)
-        {
+        // Legacy configurations such as 9.5.3 select the supported 9.5 series,
+        // rather than pinning a patch and preventing routine ES patch upgrades.
+        if elasticsearch_patch_version(version).is_some() {
             Ok(())
         } else {
             Err(format!(
-                "Elasticsearch 版本不匹配：允许 {}，实际 {version}（仅支持正式版 9.5.x）",
+                "Elasticsearch 版本不匹配：允许正式版 9.5.x，实际 {version}（配置 expected_version={}）",
                 self.expected_version
             ))
         }
@@ -1655,12 +1655,12 @@ mod tests {
     #[test]
     fn elasticsearch_version_policy_rejects_unsupported_and_malformed_versions() {
         let mut config = ElasticsearchConfig::default();
-        for version in ["9.5.0", "9.5.2", "9.5.3", "9.5.123"] {
+        for version in ["9.5.0", "9.5.2", "9.5.3", "9.5.4", "9.5.123"] {
             assert!(config.validate_server_version(version).is_ok(), "{version}");
             config.expected_version = version.to_owned();
             assert!(config.try_check().unwrap());
             assert!(config.validate_server_version(version).is_ok());
-            assert!(config.validate_server_version("9.5.124").is_err());
+            assert!(config.validate_server_version("9.5.124").is_ok());
             config.expected_version = "9.5.x".to_owned();
         }
         for version in [
@@ -1694,10 +1694,18 @@ mod tests {
                 config.expected_version = "9.5.x".to_owned();
             }
         }
-        // Existing configurations keep their exact pin after deserialization.
-        let pinned: ElasticsearchConfig = toml::from_str("expected_version = \"9.5.3\"").unwrap();
-        assert!(pinned.validate_server_version("9.5.3").is_ok());
-        assert!(pinned.validate_server_version("9.5.2").is_err());
+        // Old deployment configs accept patch upgrades without being edited.
+        let legacy: ElasticsearchConfig = toml::from_str("expected_version = \"9.5.3\"").unwrap();
+        assert!(legacy.try_check().unwrap());
+        for version in ["9.5.0", "9.5.2", "9.5.3", "9.5.4", "9.5.123"] {
+            assert!(legacy.validate_server_version(version).is_ok(), "{version}");
+        }
+        for version in ["9.4.9", "9.6.0", "10.0.0", "9.5.4-SNAPSHOT"] {
+            assert!(
+                legacy.validate_server_version(version).is_err(),
+                "{version}"
+            );
+        }
         let omitted: ElasticsearchConfig = toml::from_str("").unwrap();
         assert_eq!(omitted.expected_version, "9.5.x");
     }
