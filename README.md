@@ -71,7 +71,7 @@ cargo build --locked --release
 - **运行策略**：数据库已发布值为准；对应 TOML 段仅在记录缺失时初始化。保存接口为 `POST /api/config/runtime/{namespace}`。
 - **首次扫描**：确认授权范围和节点能力，再选择“全部”“仅端口”“服务识别”或“仅 DNS”。
 
-首次初始化会沿用 TOML 的扫描启用状态；多实例配置同步存在限制。完整说明见[运行时配置](docs/SERVER_CONFIGURATION_DATABASE_PLAN.md)和[功能指南](docs/FEATURES.md)。
+首次初始化会沿用 TOML 的扫描启用状态；多实例配置同步存在限制。完整说明见[运行时配置](docs/RUNTIME_CONFIGURATION.md)和[功能指南](docs/FEATURES.md)。
 
 ## 开发与验证
 

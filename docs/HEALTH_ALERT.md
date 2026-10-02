@@ -80,7 +80,7 @@
 
 ## 配置
 
-以下是首次初始化使用的 TOML 配置示例。数据库已有 `monitor` 记录后，应通过管理页面或 `POST /api/config/runtime/monitor` 发布；修改 TOML 并重启不会覆盖数据库值。接口、版本冲突和多实例限制参见[服务端运行时配置](SERVER_CONFIGURATION_DATABASE_PLAN.md)。
+以下是首次初始化使用的 TOML 配置示例。数据库已有 `monitor` 记录后，应通过管理页面或 `POST /api/config/runtime/monitor` 发布；修改 TOML 并重启不会覆盖数据库值。接口、版本冲突和多实例限制参见[服务端运行时配置](RUNTIME_CONFIGURATION.md)。
 
 ```toml
 [monitor]

@@ -26,8 +26,6 @@ API 请求响应和限制参见[资产搜索语法与 API](SEARCH_SYNTAX.md)。
 服务端仅支持 Elasticsearch 9.5.3 存储扫描结果，PostgreSQL 保留用户、权限、任务、标签、
 上传回执和派生分析快照。PG 旧结果仅支持通过独立命令迁移到 ES。幂等回填、启动检查、
 查询覆盖、快照和回滚流程参见[Elasticsearch 9.5.3 扫描存储与搜索](ELASTICSEARCH.md)。
-存储职责、迁移验收和旧数据归档边界参见
-[扫描结果 ES 存储实施方案](ES_SCAN_STORAGE_PLAN.md)。
 
 ## 扫描器调度
 
@@ -47,7 +45,7 @@ API 请求响应和限制参见[资产搜索语法与 API](SEARCH_SYNTAX.md)。
 
 ## 运行时配置
 
-请求日志、健康监控、自动目标、DNS 后续任务和分析快照配置以数据库已发布值为准；对应 TOML 段仅在数据库记录缺失时初始化。管理员在“设置 → 运行时配置”保存，接口为 `POST /api/config/runtime/{namespace}`。首次初始化沿用 TOML 的扫描开关，应预先核对授权范围。生效规则、多实例限制和后续计划见[服务端运行时配置](SERVER_CONFIGURATION_DATABASE_PLAN.md)。
+请求日志、健康监控、自动目标、DNS 后续任务和分析快照配置以数据库已发布值为准；对应 TOML 段仅在数据库记录缺失时初始化。管理员在“设置 → 运行时配置”保存，接口为 `POST /api/config/runtime/{namespace}`。首次初始化沿用 TOML 的扫描开关，应预先核对授权范围。生效规则、多实例限制见[服务端运行时配置](RUNTIME_CONFIGURATION.md)。
 
 ## 自动目标生成
 

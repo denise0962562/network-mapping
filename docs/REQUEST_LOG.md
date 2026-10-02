@@ -140,7 +140,7 @@ summary 拆两层语义，避免大表实时 `percentile_cont` 全表扫描：
 
 ## 配置
 
-在“设置 → 运行时配置 → 请求日志”发布配置。对应 `requests` 数据库记录缺失时，以下 TOML 用于初始化；已有记录不会被修改文件或重启覆盖。发布接口与版本冲突规则见[服务端运行时配置](SERVER_CONFIGURATION_DATABASE_PLAN.md)。
+在“设置 → 运行时配置 → 请求日志”发布配置。对应 `requests` 数据库记录缺失时，以下 TOML 用于初始化；已有记录不会被修改文件或重启覆盖。发布接口与版本冲突规则见[服务端运行时配置](RUNTIME_CONFIGURATION.md)。
 
 ```toml
 [requests]

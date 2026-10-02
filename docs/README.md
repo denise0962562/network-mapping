@@ -36,7 +36,7 @@
 
 | 文档 | 内容 |
 | --- | --- |
-| [服务端运行时配置：当前实现与后续计划](SERVER_CONFIGURATION_DATABASE_PLAN.md) | 配置来源、发布接口及当前实现边界 |
+| [服务端运行时配置](RUNTIME_CONFIGURATION.md) | 配置来源、发布接口及当前实现边界 |
 | [扫描器错误诊断与日志采集](SCANNER_DIAGNOSTICS.md) | 远程错误事件、日志采集与服务端治理 |
 | [请求日志与错误识别](REQUEST_LOG.md) | 请求采集、查询与错误分类 |
 | [审计日志](AUDIT_LOG.md) | 操作审计与查询约定 |
@@ -45,15 +45,6 @@
 | [系统业务时区与常规设置](SYSTEM_TIME.md) | 业务时区与时间展示规则 |
 | [系统资源读取与慢依赖隔离](SYSTEM_RESOURCE_RESILIENCE.md) | 资源读取、缓存与慢依赖处理 |
 | [SQL 热路径优化与对比](SQL_HOT_PATH_OPTIMIZATION.md) | 认证热路径及性能对比 |
-
-## 归档设计记录
-
-本组保留实施背景、设计目标和验收记录。部署操作请使用上方的使用与运维文档。
-
-| 文档 | 内容 |
-| --- | --- |
-| [扫描结果统一存储于 Elasticsearch 的实施方案](ES_SCAN_STORAGE_PLAN.md) | 存储职责、实施背景与迁移验收 |
-| [日志详细化改造任务](LOGGING_DETAIL_REFACTOR_PLAN.md) | 日志改造目标与任务记录 |
 
 ## 文档维护约定
 
