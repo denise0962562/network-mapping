@@ -673,19 +673,21 @@ fn is_excluded(generator: &FamilyGenerator, cidr: &str) -> bool {
     })
 }
 
-fn ready_scanner_exists_query(family: &str) -> String {
+pub(crate) fn ready_scanner_exists_query(family: &str) -> String {
     format!(
         "SELECT EXISTS(SELECT 1 FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
-        AND last_seen_at >= NOW() - INTERVAL '90 seconds' AND supports_{family} AND {family}_ready \
-        AND ($1 = 'legacy' OR scan_capabilities->'profiles' ? $1)) AS available;"
+        AND runtime_state <> 'stopping' AND last_seen_at >= NOW() - ({}) * INTERVAL '1 second' AND supports_{family} AND {family}_ready \
+        AND ($1 = 'legacy' OR scan_capabilities->'profiles' ? $1)) AS available;",
+        crate::scanner_health::seconds_sql()
     )
 }
 
 fn ready_scanner_count_query(family: &str) -> String {
     format!(
         "SELECT COUNT(*)::BIGINT AS count FROM scanner_info WHERE is_enable = true AND deleted_at IS NULL \
-        AND last_seen_at >= NOW() - INTERVAL '90 seconds' AND supports_{family} AND {family}_ready \
-        AND ($1 = 'legacy' OR scan_capabilities->'profiles' ? $1);"
+        AND runtime_state <> 'stopping' AND last_seen_at >= NOW() - ({}) * INTERVAL '1 second' AND supports_{family} AND {family}_ready \
+        AND ($1 = 'legacy' OR scan_capabilities->'profiles' ? $1);",
+        crate::scanner_health::seconds_sql()
     )
 }
 

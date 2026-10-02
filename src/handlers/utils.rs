@@ -20,9 +20,10 @@ use crate::monitor::MonitorHandle;
 use crate::runtime_config::{
     ANALYTICS_SNAPSHOT_NAMESPACE, AUTOMATIC_TARGET_NAMESPACE, DNS_FOLLOW_UP_NAMESPACE,
     DNS_RESOLVERS_NAMESPACE, GENERAL_NAMESPACE, MONITOR_NAMESPACE, PersistError,
-    REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings, UpdateRuntimeConfigRequest,
-    parse_analytics_snapshot, parse_automatic_target, parse_dns_follow_up, parse_dns_resolvers,
-    parse_general, parse_monitor, parse_requests, persist,
+    REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings, SCANNER_HEALTH_NAMESPACE,
+    UpdateRuntimeConfigRequest, parse_analytics_snapshot, parse_automatic_target,
+    parse_dns_follow_up, parse_dns_resolvers, parse_general, parse_monitor, parse_requests,
+    parse_scanner_health, persist,
 };
 use crate::trusted_proxy::{
     MAX_CLIENT_IP_HEADER_LENGTH, MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState,
@@ -126,6 +127,10 @@ async fn get_runtime_config_h(
             let value = settings.requests.get().await;
             HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: REQUESTS_NAMESPACE, revision: value.revision, document: value.value }}))
         }
+        SCANNER_HEALTH_NAMESPACE => {
+            let value = settings.scanner_health.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: SCANNER_HEALTH_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
         MONITOR_NAMESPACE => {
             let value = settings.monitor.get().await;
             HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: MONITOR_NAMESPACE, revision: value.revision, document: value.value }}))
@@ -159,6 +164,43 @@ async fn get_runtime_config_h(
         _ => {
             HttpResponse::NotFound().json(json!({"success": false, "message": "未知运行时配置域"}))
         }
+    }
+}
+
+#[get("/api/config/runtime/{namespace}/history")]
+pub(crate) async fn runtime_config_history(
+    namespace: web::Path<String>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    user: UserBaseI,
+) -> impl Responder {
+    if user.role != 1 {
+        return HttpResponse::Forbidden()
+            .json(json!({"success": false, "message": "仅管理员可以读取配置历史"}));
+    }
+    if !matches!(
+        namespace.as_str(),
+        MONITOR_NAMESPACE | SCANNER_HEALTH_NAMESPACE
+    ) {
+        return HttpResponse::NotFound()
+            .json(json!({"success": false, "message": "此配置域不支持历史查看"}));
+    }
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"success": false, "message": "配置历史暂不可用"}));
+        }
+    };
+    match client.query("SELECT revision, document, changed_at, change_reason FROM runtime_configuration_revision WHERE namespace = $1 ORDER BY revision DESC LIMIT 30;", &[&namespace.as_str()]).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows.iter().map(|row| json!({
+                "revision": row.get::<_, i64>("revision"), "document": row.get::<_, serde_json::Value>("document"),
+                "changed_at": row.get::<_, chrono::DateTime<chrono::Utc>>("changed_at"),
+                "change_reason": row.get::<_, String>("change_reason")
+            })).collect();
+            HttpResponse::Ok().json(json!({"success": true, "data": items}))
+        },
+        Err(_) => HttpResponse::ServiceUnavailable().json(json!({"success": false, "message": "配置历史读取失败"})),
     }
 }
 
@@ -229,12 +271,19 @@ async fn save_runtime_config_h(
                 crate::system_time::apply(value.clone(), body.expected_revision + 1);
             }
         ),
+        SCANNER_HEALTH_NAMESPACE => publish!(
+            SCANNER_HEALTH_NAMESPACE,
+            parse_scanner_health,
+            scanner_health,
+            |_| {}
+        ),
         REQUESTS_NAMESPACE => publish!(REQUESTS_NAMESPACE, parse_requests, requests, |_| {}),
         MONITOR_NAMESPACE => publish!(
             MONITOR_NAMESPACE,
             parse_monitor,
             monitor,
-            |value: &crate::config::MonitorConfig| monitor.replace_config(value.clone())
+            |value: &crate::config::MonitorConfig| monitor
+                .replace_config(value.clone(), body.expected_revision + 1)
         ),
         AUTOMATIC_TARGET_NAMESPACE => publish!(
             AUTOMATIC_TARGET_NAMESPACE,

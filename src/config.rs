@@ -653,7 +653,7 @@ impl SelfChecking for RequestsConfig {
 /// 慢请求与 5xx 错误由请求中间件实时判定，慢 SQL 由后台任务轮询
 /// `pg_stat_statements` 视图判定，三者统一走邮件通知并共享同一冷却去重窗口。
 #[derive(Debug, Deserialize, Clone, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitorConfig {
     /// 是否启用健康监控与告警。
     pub enabled: bool,
@@ -675,6 +675,11 @@ pub struct MonitorConfig {
     pub elasticsearch_write_critical_threshold_ms: i64,
     /// 同一告警 key 的冷却时间（秒），冷却窗口内的重复事件被合并丢弃。
     pub alert_cooldown_seconds: u64,
+    pub service_defaults: std::collections::BTreeMap<
+        crate::monitor::rules::MonitorService,
+        crate::monitor::rules::SlowRule,
+    >,
+    pub operation_rules: Vec<crate::monitor::rules::OperationRule>,
 }
 
 impl Default for MonitorConfig {
@@ -690,6 +695,8 @@ impl Default for MonitorConfig {
             elasticsearch_write_warning_threshold_ms: 5000,
             elasticsearch_write_critical_threshold_ms: 15000,
             alert_cooldown_seconds: 300,
+            service_defaults: Default::default(),
+            operation_rules: Vec::new(),
         }
     }
 }
@@ -709,8 +716,8 @@ impl SelfChecking for MonitorConfig {
         if self.slow_sql_threshold_ms <= 0 {
             return Err("monitor.slow_sql_threshold_ms 必须大于 0".into());
         }
-        if self.slow_sql_check_interval_seconds == 0 {
-            return Err("monitor.slow_sql_check_interval_seconds 必须大于 0".into());
+        if !(1..=86_400).contains(&self.slow_sql_check_interval_seconds) {
+            return Err("monitor.slow_sql_check_interval_seconds 必须为 1～86400 秒".into());
         }
         for (name, value) in [
             (
@@ -744,6 +751,7 @@ impl SelfChecking for MonitorConfig {
         {
             return Err("Elasticsearch 写入严重阈值不能小于告警阈值".into());
         }
+        self.validate_rules()?;
         if self.alert_cooldown_seconds == 0 {
             return Err("monitor.alert_cooldown_seconds 必须大于 0".into());
         }
@@ -1885,6 +1893,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(utils::get_server_config_h)
         .service(utils::get_system_preferences)
         .service(utils::get_system_timezones)
+        .service(handlers::health::monitor_operations)
+        .service(utils::runtime_config_history)
         .service(utils::get_runtime_config_h)
         .service(utils::save_runtime_config_h)
         .service(utils::get_mail_settings_h)

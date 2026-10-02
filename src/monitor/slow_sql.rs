@@ -11,9 +11,11 @@ use deadpool_postgres::Pool;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
+use super::rules::MonitorService;
 use super::{HealthEvent, SlowSqlObservation};
 use crate::config::MonitorConfig;
 use crate::logs::write::error_diagnostics;
+use crate::runtime_config::Versioned;
 
 struct SlowQueryRow {
     queryid: Option<i64>,
@@ -85,19 +87,25 @@ impl StatementStats {
 pub async fn run_monitor(
     pool: Pool,
     tx: mpsc::Sender<HealthEvent>,
-    config: Arc<RwLock<MonitorConfig>>,
+    config: Arc<RwLock<Versioned<MonitorConfig>>>,
+    mut revisions: tokio::sync::watch::Receiver<i64>,
 ) {
     let mut baselines: HashMap<i64, StatementStats> = HashMap::new();
     let mut baseline_ready = false;
     let mut warned_unavailable = false;
 
     loop {
-        let settings = config
+        let snapshot = config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let settings = snapshot.value;
         if !settings.enabled {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            baselines.clear();
+            baseline_ready = false;
+            if !wait_for_poll(5, &mut revisions).await {
+                return;
+            }
             continue;
         }
         match poll(&pool).await {
@@ -110,6 +118,11 @@ pub async fn run_monitor(
                         }
                     }
                     baseline_ready = true;
+                    if !wait_for_poll(settings.slow_sql_check_interval_seconds, &mut revisions)
+                        .await
+                    {
+                        return;
+                    }
                     continue;
                 }
                 for row in rows {
@@ -122,8 +135,13 @@ pub async fn run_monitor(
                     let Some(window) = row.stats.since(previous) else {
                         continue;
                     };
-                    if window.mean_exec_time_ms >= settings.slow_sql_threshold_ms as f64 {
-                        let event = HealthEvent::slow_sql(&SlowSqlObservation {
+                    let applied = settings.resolve_rule(
+                        MonitorService::Postgresql,
+                        &queryid.to_string(),
+                        snapshot.revision,
+                    );
+                    if let Some(severity) = applied.rule.severity(window.mean_exec_time_ms) {
+                        let mut event = HealthEvent::slow_sql(&SlowSqlObservation {
                             queryid,
                             query: &row.query,
                             mean_exec_time_ms: window.mean_exec_time_ms,
@@ -136,7 +154,8 @@ pub async fn run_monitor(
                             temp_blks_read_delta: window.temp_blks_read,
                             temp_blks_written_delta: window.temp_blks_written,
                         });
-                        let _ = tx.try_send(event);
+                        event.severity = severity;
+                        let _ = tx.try_send(event.with_rule(applied));
                     }
                 }
             }
@@ -175,10 +194,16 @@ pub async fn run_monitor(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(
-            settings.slow_sql_check_interval_seconds,
-        ))
-        .await;
+        if !wait_for_poll(settings.slow_sql_check_interval_seconds, &mut revisions).await {
+            return;
+        }
+    }
+}
+
+async fn wait_for_poll(seconds: u64, revisions: &mut tokio::sync::watch::Receiver<i64>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(seconds)) => true,
+        result = revisions.changed() => result.is_ok(),
     }
 }
 

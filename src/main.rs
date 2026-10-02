@@ -281,6 +281,7 @@ async fn main() -> io::Result<()> {
         db_pool.clone(),
         ser_con.encrypt_key.clone(),
         system_maintenance_state.clone(),
+        runtime_settings.scanner_health.clone(),
     ));
     if let Ok(client) = db_pool.get().await
         && let Err(error_value) = client
@@ -346,11 +347,26 @@ async fn main() -> io::Result<()> {
     let mail_c = config.email_config;
 
     let monitor_handle = monitor::MonitorHandle::new(
-        runtime_settings.monitor.get().await.value,
+        runtime_settings.monitor.get().await,
         db_pool.clone(),
         ser_con.encrypt_key.clone(),
     );
     elasticsearch_service.set_monitor(Some(monitor_handle.clone()));
+    let health_settings = runtime_settings.clone();
+    let health_pool = db_pool.clone();
+    let health_monitor = monitor_handle.clone();
+    tokio::spawn(async move {
+        loop {
+            match health_settings.refresh_health(&health_pool).await {
+                Ok(()) => {
+                    let current = health_settings.monitor.get().await;
+                    health_monitor.replace_config(current.value, current.revision);
+                }
+                Err(error) => tracing::warn!(event = "HealthPolicyRefreshFailed", %error),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 
     let tls = build_acceptor(&config.tls)?;
     let frontend_assets = FrontendAssets::new(frontend_directory);
@@ -635,35 +651,45 @@ async fn main() -> io::Result<()> {
                             );
                         }
 
-                        // 健康告警：慢请求与 5xx 错误实时判定，仅在命中阈值时才分配/克隆字符串。
+                        // 健康告警：慢请求按匹配路由模板解析规则，5xx 错误独立判定。
                         {
                             let monitor = &monitor_handle;
-                            let slow_duration = duration_ms
-                                .map(i64::from)
-                                .filter(|value| monitor.is_slow_request(*value));
+                            let monitor_route = route_pattern.as_deref().unwrap_or("(unmatched)");
+                            let slow_rule = duration_ms.and_then(|value| {
+                                monitor.classify_request(&method, monitor_route, i64::from(value))
+                            });
                             let is_expected_maintenance =
                                 response.headers().contains_key("nm-maintenance-version");
                             let is_server_error = monitor.server_error_enabled()
                                 && status >= 500
                                 && !is_expected_maintenance;
-                            if slow_duration.is_some() || is_server_error {
+                            if slow_rule.is_some() || is_server_error {
                                 let client_ip_str = client_ip.map(|ip| ip.to_string());
                                 let actor_name_str = actor_name.clone();
-                                if let Some(duration_ms) = slow_duration {
-                                    monitor.emit(HealthEvent::slow_request(
+                                if let Some(applied) = slow_rule {
+                                    let measured_ms =
+                                        duration_ms.map(i64::from).unwrap_or_default();
+                                    let severity = applied
+                                        .rule
+                                        .severity(measured_ms as f64)
+                                        .unwrap_or("warning");
+                                    let mut event = HealthEvent::slow_request(
                                         &method,
-                                        &path,
+                                        monitor_route,
                                         status,
-                                        duration_ms,
+                                        measured_ms,
                                         request_id,
                                         client_ip_str.clone(),
                                         actor_name_str.clone(),
-                                    ));
+                                    )
+                                    .with_rule(applied);
+                                    event.severity = severity;
+                                    monitor.emit(event);
                                 }
                                 if is_server_error {
                                     monitor.emit(HealthEvent::server_error(
                                         &method,
-                                        &path,
+                                        monitor_route,
                                         status,
                                         duration_ms.map(i64::from),
                                         request_id,

@@ -453,11 +453,17 @@ pub(crate) async fn dashboard_overview(
             return HttpResponse::InternalServerError().finish();
         }
     };
-    let online: i64 = match connection.query_one(
+    let online_sql = format!(
         "SELECT COUNT(*)::BIGINT AS count FROM scanner_info WHERE deleted_at IS NULL AND is_enable = true \
-         AND runtime_state <> 'stopping' AND last_seen_at >= NOW() - INTERVAL '90 seconds';", &[]).await {
+         AND runtime_state <> 'stopping' AND last_seen_at >= NOW() - ({}) * INTERVAL '1 second';",
+        crate::scanner_health::seconds_sql()
+    );
+    let online: i64 = match connection.query_one(&online_sql, &[]).await {
         Ok(row) => row.get("count"),
-        Err(error) => { log_database_error(&req, "DashboardDatabaseError", &error); return HttpResponse::InternalServerError().finish(); }
+        Err(error) => {
+            log_database_error(&req, "DashboardDatabaseError", &error);
+            return HttpResponse::InternalServerError().finish();
+        }
     };
     let mut trend_conditions = vec![
         "(to_timestamp(t.task_create_time / 1000.0) AT TIME ZONE $1)::date = days.day::date"

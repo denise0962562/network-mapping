@@ -73,6 +73,7 @@ struct PerformanceSummary {
     max_ms: Option<f64>,
     error_rate: f64,
     slow_rate: f64,
+    policy_slow_rate: f64,
     normalized_coverage: f64,
 }
 
@@ -294,6 +295,7 @@ fn performance_summary_value(summary: &PerformanceSummary) -> Value {
         "max_ms": summary.max_ms,
         "error_rate": summary.error_rate,
         "slow_rate": summary.slow_rate,
+        "policy_slow_rate": summary.policy_slow_rate,
         "normalized_coverage": summary.normalized_coverage,
     })
 }
@@ -308,6 +310,7 @@ fn performance_summary_from_row(row: Row) -> PerformanceSummary {
         max_ms: row.get("max_ms"),
         error_rate: row.get("error_rate"),
         slow_rate: row.get("slow_rate"),
+        policy_slow_rate: row.get("policy_slow_rate"),
         normalized_coverage: row.get("normalized_coverage"),
     }
 }
@@ -317,8 +320,27 @@ async fn query_performance_summary(
     filters: &PerformanceFilters,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    policy: &crate::config::MonitorConfig,
 ) -> Result<PerformanceSummary, tokio_postgres::Error> {
-    let (filter_sql, params) = performance_filter(filters, &start, &end);
+    use crate::monitor::rules::MonitorService;
+    let (filter_sql, mut params) = performance_filter(filters, &start, &end);
+    let operation_rules = serde_json::to_value(
+        policy
+            .operation_rules
+            .iter()
+            .filter(|item| item.service == MonitorService::WebApi)
+            .collect::<Vec<_>>(),
+    )
+    .expect("serializable slow-operation rules");
+    let default_rule = policy.default_rule(MonitorService::WebApi);
+    let defaults = serde_json::to_value(&default_rule).expect("serializable default rule");
+    params.push(&operation_rules);
+    let operations_param = params.len();
+    params.push(&defaults);
+    let defaults_param = params.len();
+    let monitor_enabled = policy.enabled;
+    params.push(&monitor_enabled);
+    let enabled_param = params.len();
     let sql = format!(
         "SELECT COUNT(*)::BIGINT AS sample_count, \
                 AVG(({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION) / 1000.0 AS avg_ms, \
@@ -328,8 +350,11 @@ async fn query_performance_summary(
                 MAX({PERFORMANCE_DURATION_SQL})::DOUBLE PRECISION / 1000.0 AS max_ms, \
                 COALESCE(COUNT(*) FILTER (WHERE status_code >= 400)::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS error_rate, \
                 COALESCE(COUNT(*) FILTER (WHERE {PERFORMANCE_DURATION_SQL} >= {SLOW_REQUEST_US})::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS slow_rate, \
+                COALESCE(COUNT(*) FILTER (WHERE ${enabled_param}::boolean AND COALESCE((policy_rule.rule->>'enabled')::boolean, (${defaults_param}::jsonb->>'enabled')::boolean) \
+                    AND {PERFORMANCE_DURATION_SQL} >= COALESCE((policy_rule.rule->>'warning_threshold_ms')::bigint, (${defaults_param}::jsonb->>'warning_threshold_ms')::bigint) * 1000)::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS policy_slow_rate, \
                 COALESCE(COUNT(*) FILTER (WHERE route_pattern IS NOT NULL)::DOUBLE PRECISION / NULLIF(COUNT(*), 0), 0) AS normalized_coverage \
-         FROM request_log{filter_sql}"
+         FROM request_log LEFT JOIN jsonb_to_recordset(${operations_param}::jsonb) AS policy_rule(operation TEXT, rule JSONB) \
+         ON policy_rule.operation = http_method || ' ' || route_pattern{filter_sql}"
     );
     client
         .query_one(&sql, &params)
@@ -773,6 +798,7 @@ pub(crate) async fn request_performance(
     req: HttpRequest,
     pool: web::Data<Pool>,
     query: web::Query<RequestPerformanceQuery>,
+    settings: web::Data<crate::runtime_config::RuntimeSettings>,
     user: UserBaseI,
 ) -> impl Responder {
     if !is_admin(&user) {
@@ -825,11 +851,19 @@ pub(crate) async fn request_performance(
         }
     };
 
+    let monitor_policy = settings.monitor.get().await;
+    // Both periods use the same current policy, so rule changes do not skew comparison.
     // tokio-postgres 会对同时轮询的查询进行流水线处理，降低六组聚合的总等待时间。
     let (current_summary, baseline_summary, trend, baseline_trend, current_events, baseline_events) =
         match tokio::try_join!(
-            query_performance_summary(&client, &filters, start, end),
-            query_performance_summary(&client, &filters, baseline_start, baseline_end),
+            query_performance_summary(&client, &filters, start, end, &monitor_policy.value),
+            query_performance_summary(
+                &client,
+                &filters,
+                baseline_start,
+                baseline_end,
+                &monitor_policy.value
+            ),
             query_performance_trend(&client, &filters, start, end, granularity.seconds()),
             query_performance_trend(
                 &client,
@@ -910,6 +944,9 @@ pub(crate) async fn request_performance(
             "comparison_shift_seconds": duration.num_seconds(),
             "granularity": granularity.label(),
             "slow_threshold_ms": SLOW_REQUEST_US / 1000,
+            "policy_revision": monitor_policy.revision,
+            "policy_enabled": monitor_policy.value.enabled,
+            "policy_basis": "current_policy",
             "event_limit": limit,
         }
     }))
@@ -922,6 +959,55 @@ mod tests {
         performance_window, request_filter, resolve_granularity, window_range,
     };
     use chrono::{Duration, Utc};
+
+    #[tokio::test]
+    #[ignore = "requires disposable HEALTH_TEST_DATABASE_URL"]
+    async fn health_policy_request_rates_use_current_defaults_and_operation_overrides() {
+        use crate::monitor::rules::{MonitorService, OperationRule};
+        let (pool, schema) = crate::monitor::policy_tests::isolated_pool().await;
+        let client = pool.get().await.unwrap();
+        client.batch_execute("INSERT INTO request_log(request_id,http_method,request_path,route_pattern,status_code,duration_us) VALUES
+            (gen_random_uuid(),'GET','/api/task/one','/api/task/{task_id}',200,2000000),
+            (gen_random_uuid(),'GET','/api/task/two','/api/task/{task_id}',200,5000000),
+            (gen_random_uuid(),'GET','/api/task/all','/api/task/all',200,4000000),
+            (gen_random_uuid(),'GET','/historical',NULL,200,4000000);").await.unwrap();
+        let filters = PerformanceFilters {
+            method: None,
+            route: None,
+            status_class: None,
+        };
+        let mut config = crate::config::MonitorConfig::default();
+        let start = Utc::now() - Duration::hours(1);
+        let end = Utc::now() + Duration::seconds(1);
+        let summary = super::query_performance_summary(&client, &filters, start, end, &config)
+            .await
+            .unwrap();
+        assert_eq!(summary.sample_count, 4);
+        assert_eq!(summary.slow_rate, 1.0);
+        assert_eq!(summary.policy_slow_rate, 0.75);
+        let mut rule = config.default_rule(MonitorService::WebApi);
+        rule.enabled = false;
+        config.operation_rules.push(OperationRule {
+            service: MonitorService::WebApi,
+            operation: "GET /api/task/{task_id}".into(),
+            rule,
+        });
+        let summary = super::query_performance_summary(&client, &filters, start, end, &config)
+            .await
+            .unwrap();
+        assert_eq!(summary.policy_slow_rate, 0.5);
+        assert_eq!(summary.slow_rate, 1.0);
+        config.enabled = false;
+        assert_eq!(
+            super::query_performance_summary(&client, &filters, start, end, &config)
+                .await
+                .unwrap()
+                .policy_slow_rate,
+            0.0
+        );
+        drop(client);
+        crate::monitor::policy_tests::cleanup(&pool, &schema).await;
+    }
 
     fn request_query() -> RequestQuery {
         RequestQuery {

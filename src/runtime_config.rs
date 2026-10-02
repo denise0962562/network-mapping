@@ -20,6 +20,7 @@ use crate::dns_resolvers::DnsResolverSettings;
 pub const GENERAL_NAMESPACE: &str = "general";
 
 pub const REQUESTS_NAMESPACE: &str = "requests";
+pub const SCANNER_HEALTH_NAMESPACE: &str = "scanner_health";
 pub const MONITOR_NAMESPACE: &str = "monitor";
 pub const AUTOMATIC_TARGET_NAMESPACE: &str = "automatic_target";
 pub const DNS_FOLLOW_UP_NAMESPACE: &str = "dns_follow_up";
@@ -52,8 +53,11 @@ impl<T: Clone> RuntimeConfig<T> {
     }
 
     pub async fn replace(&self, value: T, revision: i64) {
-        *self.value.write().await = Versioned { value, revision };
-        self.revisions.send_replace(revision);
+        let mut current = self.value.write().await;
+        if revision > current.revision {
+            *current = Versioned { value, revision };
+            self.revisions.send_replace(revision);
+        }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<i64> {
@@ -66,6 +70,7 @@ pub struct RuntimeSettings {
     pub general: RuntimeConfig<crate::system_time::GeneralSettings>,
     pub requests: RuntimeConfig<RequestsConfig>,
     pub monitor: RuntimeConfig<MonitorConfig>,
+    pub scanner_health: RuntimeConfig<crate::scanner_health::ScannerHealthConfig>,
     pub automatic_target: RuntimeConfig<AutomaticTargetConfig>,
     pub dns_follow_up: RuntimeConfig<DnsFollowUpConfig>,
     pub dns_resolvers: RuntimeConfig<DnsResolverSettings>,
@@ -100,6 +105,41 @@ pub struct RuntimeConfigResponse<T> {
 }
 
 impl RuntimeSettings {
+    /// Refresh only the new policy domains; never replace a validated snapshot
+    /// with an invalid document or an older revision from a racing publisher.
+    pub async fn refresh_health(
+        &self,
+        pool: &Pool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = pool.get().await?;
+        let rows = client.query("SELECT namespace, document, revision FROM runtime_configuration WHERE namespace IN ('monitor', 'scanner_health');", &[]).await?;
+        for row in rows {
+            let namespace: String = row.get("namespace");
+            let document: Value = row.get("document");
+            let revision: i64 = row.get("revision");
+            match namespace.as_str() {
+                MONITOR_NAMESPACE => {
+                    self.monitor
+                        .replace(
+                            parse_monitor(document).map_err(std::io::Error::other)?,
+                            revision,
+                        )
+                        .await
+                }
+                SCANNER_HEALTH_NAMESPACE => {
+                    self.scanner_health
+                        .replace(
+                            parse_scanner_health(document).map_err(std::io::Error::other)?,
+                            revision,
+                        )
+                        .await
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub async fn load(
         pool: &Pool,
         bootstrap: RuntimeSettingsBootstrap,
@@ -130,6 +170,14 @@ impl RuntimeSettings {
                 bootstrap.monitor.clone(),
                 bootstrap.monitor,
                 validate_monitor,
+            )
+            .await?,
+            scanner_health: load_namespace(
+                pool,
+                SCANNER_HEALTH_NAMESPACE,
+                Default::default(),
+                Default::default(),
+                crate::scanner_health::ScannerHealthConfig::validate,
             )
             .await?,
             automatic_target: load_namespace(
@@ -325,8 +373,33 @@ pub fn parse_general(value: Value) -> Result<crate::system_time::GeneralSettings
 pub fn parse_requests(value: Value) -> Result<RequestsConfig, String> {
     parse(value, validate_requests)
 }
+pub fn parse_scanner_health(
+    value: Value,
+) -> Result<crate::scanner_health::ScannerHealthConfig, String> {
+    parse(value, crate::scanner_health::ScannerHealthConfig::validate)
+}
+
 pub fn parse_monitor(value: Value) -> Result<MonitorConfig, String> {
-    parse(value, validate_monitor)
+    let mut config: MonitorConfig = parse(value, validate_monitor)?;
+    // Keep legacy metadata meaningful after editing a service default in the UI.
+    use crate::monitor::rules::MonitorService;
+    config.slow_request_threshold_ms = config
+        .default_rule(MonitorService::WebApi)
+        .warning_threshold_ms;
+    config.slow_sql_threshold_ms = config
+        .default_rule(MonitorService::Postgresql)
+        .warning_threshold_ms;
+    let query = config.default_rule(MonitorService::ElasticsearchQuery);
+    config.elasticsearch_query_warning_threshold_ms = query.warning_threshold_ms;
+    config.elasticsearch_query_critical_threshold_ms = query
+        .critical_threshold_ms
+        .unwrap_or(query.warning_threshold_ms);
+    let write = config.default_rule(MonitorService::ElasticsearchWrite);
+    config.elasticsearch_write_warning_threshold_ms = write.warning_threshold_ms;
+    config.elasticsearch_write_critical_threshold_ms = write
+        .critical_threshold_ms
+        .unwrap_or(write.warning_threshold_ms);
+    Ok(config)
 }
 pub fn parse_automatic_target(value: Value) -> Result<AutomaticTargetConfig, String> {
     parse(value, validate_automatic_target)

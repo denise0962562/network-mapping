@@ -38,6 +38,7 @@ pub mod runtime_config;
 pub mod scan_migration;
 pub mod scanner_config;
 pub mod scanner_diagnostics;
+pub mod scanner_health;
 pub mod scanner_latency;
 pub mod scanner_outage;
 mod search_content;
