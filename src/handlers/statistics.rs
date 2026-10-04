@@ -1,15 +1,16 @@
 //! Interactive statistics: all rows and exports share one query result.
+use crate::statistics::{Failure, StatisticsService};
 use actix_web::{HttpResponse, get, post, web};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use deadpool_postgres::{GenericClient, Pool};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration as StdDuration, Instant};
 use tokio_postgres::IsolationLevel;
 
 use super::data_saa::{
     AnalysisFilterQuery, AnalysisFilters, analysis_es_filters, normalize_filters,
-    snapshot_not_ready,
 };
 use crate::{
     admin::UserBaseI,
@@ -19,15 +20,19 @@ use crate::{
 };
 
 const MAX_GROUPS: usize = 10_000;
-const MAX_ES_BUCKETS: usize = 250_000;
+const MAX_ES_BUCKETS: usize = 50_000;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct StatisticsQuery {
     #[serde(flatten)]
     filters: AnalysisFilterQuery,
     data_type: String,
     group_by: String,
     timezone: String,
+    #[serde(default)]
+    metrics: Option<Vec<String>>,
+    #[serde(default)]
+    comparison: Option<String>,
 }
 
 fn definitions() -> Value {
@@ -36,7 +41,7 @@ fn definitions() -> Value {
         {"id":"port","label":"端口分布","groups":["port"],"metrics":["count","percentage"],"charts":["bar","donut"]},
         {"id":"service","label":"服务分布","groups":["service"],"metrics":["count","percentage"],"charts":["bar","donut"]},
         {"id":"tasks","label":"任务执行","groups":["day","week","month","task_source"],"metrics":["created","completed","succeeded","failed","partial","cancelled","success_rate"],"charts":["bar","line","stacked"]},
-        {"id":"scanners","label":"扫描器表现","groups":["scanner","day","week","month","task_source"],"metrics":["completed","succeeded","failed","partial","cancelled","success_rate","avg_duration_ms","p95_ms"],"charts":["bar","line","stacked"]}
+        {"id":"scanners","label":"扫描器表现","groups":["scanner","day","week","month","task_source"],"metrics":["completed","succeeded","failed","partial","cancelled","success_rate","avg_duration_ms","p50_ms","p95_ms"],"charts":["bar","line","stacked"]}
     ])
 }
 
@@ -61,17 +66,145 @@ fn failure(message: &str) -> HttpResponse {
     HttpResponse::ServiceUnavailable().json(json!({"success":false,"message":message}))
 }
 
+#[get("/api/analysis/statistics/cache")]
+pub(crate) async fn cache_status(
+    pool: web::Data<Pool>,
+    service: web::Data<StatisticsService>,
+    user: UserBaseI,
+) -> HttpResponse {
+    if user.role != 1 {
+        return HttpResponse::Forbidden().finish();
+    }
+    if service.refresh(&pool).await.is_err() {
+        return failure("缓存配置读取失败");
+    }
+    let client = match pool.get().await {
+        Ok(c) => c,
+        Err(_) => return failure("缓存状态读取失败"),
+    };
+    let rows=match client.query("SELECT status, updated_at FROM statistics_instance WHERE updated_at>NOW()-INTERVAL '2 minutes' ORDER BY instance_id", &[]).await {Ok(r)=>r,Err(_)=>return failure("实例状态读取失败")};
+    HttpResponse::Ok().json(json!({"success":true,"data":{"current":service.status(),"instances":rows.iter().map(|r|json!({"status":r.get::<_,Value>("status"),"updated_at":r.get::<_,DateTime<Utc>>("updated_at")})).collect::<Vec<_>>(),
+        "limits":{"realtime_ttl_seconds":[5,300],"history_ttl_seconds":[5,300],"snapshot_ttl_seconds":[10,900],"max_entries":[16,4096],"max_size_mib":[8,256],"max_entry_kib":[256,8192]}}}))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ClearCache {
+    expected_revision: i64,
+}
+#[post("/api/analysis/statistics/cache/clear")]
+pub(crate) async fn clear_cache(
+    req: actix_web::HttpRequest,
+    body: web::Json<ClearCache>,
+    pool: web::Data<Pool>,
+    service: web::Data<StatisticsService>,
+    user: UserBaseI,
+) -> HttpResponse {
+    if user.role != 1 {
+        return HttpResponse::Forbidden().finish();
+    }
+    let client = match pool.get().await {
+        Ok(c) => c,
+        Err(_) => return failure("缓存配置读取失败"),
+    };
+    let row = match client
+        .query_one(
+            "SELECT document FROM runtime_configuration WHERE namespace=$1",
+            &[&crate::statistics::NAMESPACE],
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return failure("缓存配置读取失败"),
+    };
+    let config = match crate::statistics::parse_config(row.get("document")) {
+        Ok(v) => v,
+        Err(_) => return failure("缓存配置无效"),
+    };
+    drop(client);
+    let revision = match crate::runtime_config::persist(
+        &pool,
+        crate::statistics::NAMESPACE,
+        body.expected_revision,
+        &config,
+        "清空统计缓存",
+        user.id,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(crate::runtime_config::PersistError::Conflict) => {
+            return HttpResponse::Conflict()
+                .json(json!({"success":false,"message":"配置已变化，请重新加载后清理"}));
+        }
+        Err(_) => return failure("缓存清理失败"),
+    };
+    // Refresh first so applying the same settings always invalidates retained entries.
+    service.apply(config.clone(), body.expected_revision);
+    service.apply(config.clone(), revision);
+    let event =
+        crate::audit::AuditEvent::user("configuration", "statistics_cache_clear", "success", &user)
+            .resource("setting", crate::statistics::NAMESPACE);
+    crate::audit::write_standalone(
+        &pool,
+        &crate::audit::AuditContext::from_request(&req),
+        &event,
+    )
+    .await;
+    HttpResponse::Ok().json(json!({"success":true,"data":{"namespace":crate::statistics::NAMESPACE,"revision":revision,"document":config}}))
+}
+
 #[post("/api/analysis/statistics/query")]
 pub(crate) async fn query(
     body: web::Json<StatisticsQuery>,
     pool: web::Data<Pool>,
     elasticsearch: web::Data<ElasticsearchService>,
     config: web::Data<RuntimeConfig<AnalyticsSnapshotConfig>>,
+    service: web::Data<StatisticsService>,
     user: UserBaseI,
 ) -> HttpResponse {
-    if !valid_combination(&body.data_type, &body.group_by) {
+    let mut body = body.into_inner();
+    if !valid_combination(&body.data_type, &body.group_by)
+        || body.comparison.as_deref().is_some_and(|v| v != "previous")
+    {
         return HttpResponse::BadRequest()
-            .json(json!({"success":false,"message":"不支持的数据类型或汇总维度"}));
+            .json(json!({"success":false,"message":"不支持的数据类型、汇总维度或对比方式"}));
+    }
+    // Quantiles require sorting all matching durations; calculate them only on request.
+    if body.metrics.is_none() {
+        body.metrics = definitions().as_array().and_then(|types| {
+            types.iter().find(|t| t["id"] == body.data_type).map(|t| {
+                t["metrics"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|m| !matches!(*m, "p50_ms" | "p95_ms"))
+                    .map(str::to_owned)
+                    .collect()
+            })
+        });
+    }
+    if let Some(ref mut metrics) = body.metrics {
+        let type_catalog = definitions();
+        let Some(definition) = type_catalog
+            .as_array()
+            .and_then(|types| types.iter().find(|t| t["id"] == body.data_type))
+        else {
+            return HttpResponse::BadRequest().finish();
+        };
+        if metrics.is_empty()
+            || metrics.len() > 16
+            || metrics.iter().any(|m| {
+                !definition["metrics"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == m))
+            })
+        {
+            return HttpResponse::BadRequest()
+                .json(json!({"success":false,"message":"统计指标无效"}));
+        }
+        metrics.sort();
+        metrics.dedup();
     }
     let filters = match normalize_filters(&body.filters) {
         Ok(f) => f,
@@ -79,72 +212,174 @@ pub(crate) async fn query(
     };
     if body.timezone != filters.timezone {
         return HttpResponse::Conflict()
-            .json(json!({"success":false,"message":"系统时区已改变，请刷新设置后重新生成统计"}));
+            .json(json!({"success":false,"message":"系统时区已改变，请重新生成统计"}));
     }
+    if service.refresh(&pool).await.is_err() {
+        return failure("统计配置暂不可用");
+    }
+    let settings = config.get().await;
+    let is_scan = matches!(body.data_type.as_str(), "discovery" | "port" | "service");
+    let snapshot = is_scan && settings.value.mode.reads_snapshot();
+    let mode = if snapshot {
+        "snapshot"
+    } else if is_scan {
+        "realtime"
+    } else {
+        "retained_history"
+    };
+    let key=json!({"user":user.id,"role":user.role,"type":body.data_type,"group":body.group_by,"metrics":body.metrics,
+        "comparison":body.comparison,"start":filters.start_at,"end":filters.end_at,"timezone":filters.timezone,
+        "scanner":filters.scanner_id,"source":filters.task_source,"mode":mode,"mode_revision":settings.revision,"version":2}).to_string();
+    let result=service.execute(key,user.id,mode.to_owned(),move |deadline| async move {
+        let mut cluster_slot=crate::statistics::ClusterSlot::acquire(&pool).await?;
+        let output=async {
+        let mut buckets=0;
+        let mut value=compute(&body,&filters,cluster_slot.client()?,&elasticsearch,&user,snapshot,deadline,&mut buckets).await?;
+        if body.comparison.is_some() {
+            let previous=previous_filters(&filters)?;
+            let other=compute(&body,&previous,cluster_slot.client()?,&elasticsearch,&user,snapshot,deadline,&mut buckets).await?;
+            value["comparison"]=json!({"period":"previous","data":other["data"],"meta":other["meta"],"basis":"retained_data",
+                "note":"基于保留数据的前一等长日历周期；历史完整性未确认，差异不代表资产新增。"});
+        }
+        Ok(value)
+        }.await;
+        cluster_slot.release().await?;
+        output
+    }).await;
+    match result {
+        Ok((bytes, cache)) => HttpResponse::Ok()
+            .insert_header(("X-Statistics-Cache", cache))
+            .content_type("application/json; charset=utf-8")
+            .body(bytes),
+        Err(e) => error_response(e),
+    }
+}
+pub(super) fn error_response(error: Failure) -> HttpResponse {
+    let mut response = if error.0 == "statistics_busy" {
+        HttpResponse::TooManyRequests()
+    } else {
+        HttpResponse::ServiceUnavailable()
+    };
+    response
+        .insert_header(("Retry-After", "5"))
+        .json(json!({"success":false,"code":error.0,"message":error.1}))
+}
+fn remaining(deadline: Instant) -> Result<StdDuration, Failure> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(Failure::timeout)
+}
+fn previous_filters(f: &AnalysisFilters) -> Result<AnalysisFilters, Failure> {
+    let tz = f
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| Failure("statistics_failed", "统计时区无效"))?;
+    let start = f.start_at.with_timezone(&tz);
+    let end = f.end_at.with_timezone(&tz);
+    let days = (end.date_naive() - start.date_naive()).num_days();
+    if days < 1 {
+        return Err(Failure("statistics_failed", "周期对比需要完整日历日期"));
+    }
+    let previous = start
+        .checked_sub_days(chrono::Days::new(days as u64))
+        .ok_or(Failure("statistics_failed", "无法计算上期日期"))?
+        .with_timezone(&Utc);
+    let mut result = f.clone();
+    result.start_at = previous;
+    result.end_at = f.start_at;
+    result.start_ms = previous.timestamp_millis();
+    result.end_ms = f.start_ms;
+    Ok(result)
+}
+#[allow(clippy::too_many_arguments)]
+async fn compute(
+    body: &StatisticsQuery,
+    filters: &AnalysisFilters,
+    client: &mut deadpool_postgres::Client,
+    es: &ElasticsearchService,
+    user: &UserBaseI,
+    snapshot: bool,
+    deadline: Instant,
+    buckets: &mut usize,
+) -> Result<Value, Failure> {
+    remaining(deadline)?;
     let generated_at = Utc::now();
     let is_scan = matches!(body.data_type.as_str(), "discovery" | "service" | "port");
-    let snapshot = is_scan && config.get().await.value.mode.reads_snapshot();
     let mut data_as_of = None;
-    let result = async {
-        if is_scan && !snapshot {
-            return scan_realtime(
-                &elasticsearch,
-                &filters,
-                &user,
-                &body.data_type,
-                &body.group_by,
-            )
-            .await;
-        }
-        let mut client = pool.get().await.map_err(|e| e.to_string())?;
+    let output = if is_scan && !snapshot {
+        scan_realtime(
+            es,
+            filters,
+            user,
+            &body.data_type,
+            &body.group_by,
+            deadline,
+            buckets,
+        )
+        .await
+    } else {
         let tx = client
             .build_transaction()
             .isolation_level(IsolationLevel::RepeatableRead)
             .read_only(true)
             .start()
             .await
-            .map_err(|e| e.to_string())?;
-        tx.batch_execute("SET LOCAL statement_timeout = '20s'")
-            .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| Failure("statistics_failed", "统计事务暂不可用"))?;
+        let calculation=async {
+        let milliseconds = remaining(deadline)?.as_millis().clamp(1, 8000);
+        tx.batch_execute(&format!("SET LOCAL statement_timeout = '{milliseconds}ms'; SET LOCAL lock_timeout = '500ms'; SET LOCAL max_parallel_workers_per_gather = 0;")).await.map_err(|_|Failure("statistics_failed","统计预算设置失败"))?;
         if snapshot {
-            data_as_of = tx.query_opt("SELECT data_as_of FROM analytics_watermark WHERE watermark_key = 'scan_analysis'", &[])
-                .await.map_err(|e| e.to_string())?.map(|r| r.get::<_, DateTime<Utc>>("data_as_of"));
+            data_as_of=tx.query_opt("SELECT data_as_of FROM analytics_watermark WHERE watermark_key='scan_analysis'",&[]).await.map_err(|_|Failure("statistics_failed","快照状态暂不可用"))?.map(|r|r.get::<_,DateTime<Utc>>("data_as_of"));
             if data_as_of.is_none() {
-                return Err("snapshot_pending".to_owned());
+                return Err(Failure(
+                    "statistics_snapshot_pending",
+                    "分析快照尚未就绪，请稍后重试",
+                ));
             }
         }
-        let data = if is_scan {
-            scan_snapshot(&tx, &filters, &user, &body.data_type, &body.group_by).await?
+        let percentiles = body
+            .metrics
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|m| m == "p50_ms" || m == "p95_ms"));
+        let milliseconds = remaining(deadline)?.as_millis().clamp(1,8000);
+        tx.batch_execute(&format!("SET LOCAL statement_timeout = '{milliseconds}ms'")).await.map_err(|_|Failure::timeout())?;
+        let result = if is_scan {
+            scan_snapshot(&tx, filters, user, &body.data_type, &body.group_by).await
         } else {
-            operations(&tx, &filters, &user, &body.data_type, &body.group_by).await?
+            operations(
+                &tx,
+                filters,
+                user,
+                &body.data_type,
+                &body.group_by,
+                percentiles,
+            )
+            .await
         };
-        tx.commit().await.map_err(|e| e.to_string())?;
-        Ok(data)
+        Ok::<_,Failure>(result)
+        }.await;
+        // Await cleanup before returning the connection or releasing the computation permit.
+        tx.rollback()
+            .await
+            .map_err(|_| Failure("statistics_failed", "统计事务清理失败"))?;
+        calculation?
     };
-    let (mut rows, summary) =
-        match tokio::time::timeout(std::time::Duration::from_secs(45), result).await {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) if e == "snapshot_pending" => {
-                return match pool.get().await {
-                    Ok(client) => snapshot_not_ready(&client, &user).await,
-                    Err(_) => failure("分析快照状态暂时不可用"),
-                };
-            }
-            Ok(Err(e)) if e == "legacy_timezone" => {
-                return failure("该范围包含无法换算时区的旧统计，请联系管理员重建分析快照");
-            }
-            Ok(Err(e)) if e == "too_large" => {
-                return failure("统计数据量过大，请缩小时间范围或增加筛选条件");
-            }
-            Ok(Err(e)) => {
-                tracing::error!(event = "StatisticsQueryFailed", error = %e);
-                return failure("统计查询暂时不可用，请稍后重试");
-            }
-            Err(_) => return failure("统计查询超时，请缩小范围后重试"),
-        };
+    let (mut rows, summary) = output.map_err(|error| match error.as_str() {
+        "too_large" => Failure(
+            "statistics_budget_exceeded",
+            "统计量超过在线预算，请缩小范围、增加筛选或使用就绪快照",
+        ),
+        "timeout" => Failure::timeout(),
+        "legacy_timezone" => Failure("statistics_failed", "旧快照无法换算时区，请联系管理员重建"),
+        _ => {
+            tracing::warn!(event="StatisticsQueryFailed",%error);
+            Failure("statistics_failed", "统计查询暂不可用，请稍后重试")
+        }
+    })?;
+    remaining(deadline)?;
     if matches!(body.group_by.as_str(), "day" | "week" | "month") {
-        fill_dates(&mut rows, &filters, &body.group_by, &body.data_type);
+        fill_dates(&mut rows, filters, &body.group_by, &body.data_type);
     }
     let notes = if is_scan {
         if snapshot {
@@ -168,12 +403,15 @@ pub(crate) async fn query(
             "统计基于查询时保留的历史。",
         ]
     };
-    HttpResponse::Ok().json(json!({"success":true,"data":{"rows":rows,"summary":summary},"meta":{
-        "data_type":body.data_type,"group_by":body.group_by,"start_at":filters.start_at,"end_at":filters.end_at,
-        "timezone":filters.timezone,"scanner_id":filters.scanner_id,"task_source":filters.task_source,
-        "generated_at":generated_at,"data_as_of":data_as_of,"mode":if snapshot {"snapshot"} else if is_scan {"realtime"} else {"retained_history"},
-        "completeness":"retained_data","notes":notes,"metric_version":1
-    }}))
+
+    Ok(
+        json!({"success":true,"data":{"rows":rows,"summary":summary},"meta":{
+            "data_type":body.data_type,"group_by":body.group_by,"start_at":filters.start_at,"end_at":filters.end_at,
+            "timezone":filters.timezone,"scanner_id":filters.scanner_id,"task_source":filters.task_source,
+            "generated_at":generated_at,"period_complete":filters.end_at <= generated_at,"data_as_of":data_as_of,"mode":if snapshot {"snapshot"} else if is_scan {"realtime"} else {"retained_history"},
+            "completeness":"retained_data","notes":notes,"metric_version":2,"metrics":body.metrics
+        }}),
+    )
 }
 
 fn rate(succeeded: i64, failed: i64, partial: i64) -> Option<f64> {
@@ -202,6 +440,7 @@ async fn operations<C: GenericClient + Sync>(
     user: &UserBaseI,
     kind: &str,
     group: &str,
+    percentiles: bool,
 ) -> Result<(Vec<Value>, Value), String> {
     let owner = (user.role != 1).then_some(user.id);
     let scope = "($3::INT IS NULL OR t.user_id = $3) AND ($4::TEXT IS NULL OR EXISTS(SELECT 1 FROM scan_task_execution se WHERE se.task_id = t.id AND se.assigned_scanner_id = $4)) AND ($5::TEXT IS NULL OR t.task_source = $5)";
@@ -224,11 +463,15 @@ async fn operations<C: GenericClient + Sync>(
             "task_source" => "t.task_source".to_owned(),
             _ => time_group("to_timestamp(e.task_end_time / 1000.0) AT TIME ZONE $6", group),
         };
-        format!("SELECT {label} AS label, GROUPING({label}) AS is_total,
+        let duration = if percentiles {
+            "percentile_cont(ARRAY[0.5,0.95]::FLOAT8[]) WITHIN GROUP(ORDER BY (e.task_end_time-e.task_start_time)::FLOAT8) FILTER(WHERE e.execution_status='succeeded' AND e.task_start_time IS NOT NULL AND e.task_end_time>=e.task_start_time)"
+        } else {
+            "NULL::FLOAT8[]"
+        };
+        format!("SELECT {label} AS label, GROUPING({label}) AS is_total, {duration} AS percentiles,
           jsonb_build_object('succeeded',COUNT(*) FILTER(WHERE e.execution_status='succeeded'),
           'failed',COUNT(*) FILTER(WHERE e.execution_status='failed'),'partial',COUNT(*) FILTER(WHERE e.execution_status='partial'),'cancelled',COUNT(*) FILTER(WHERE e.execution_status='cancelled'),
-          'avg_duration_ms',AVG(e.task_end_time-e.task_start_time) FILTER(WHERE e.execution_status='succeeded' AND e.task_start_time IS NOT NULL AND e.task_end_time>=e.task_start_time),
-          'p95_ms',percentile_cont(0.95) WITHIN GROUP(ORDER BY (e.task_end_time-e.task_start_time)::FLOAT8) FILTER(WHERE e.execution_status='succeeded' AND e.task_start_time IS NOT NULL AND e.task_end_time>=e.task_start_time)) AS metrics
+          'avg_duration_ms',AVG(e.task_end_time-e.task_start_time) FILTER(WHERE e.execution_status='succeeded' AND e.task_start_time IS NOT NULL AND e.task_end_time>=e.task_start_time)) AS metrics
           FROM scan_task_execution e JOIN scan_task t ON t.id=e.task_id LEFT JOIN scanner_info s ON s.scanner_id=e.assigned_scanner_id
           WHERE ($3::INT IS NULL OR t.user_id=$3) AND ($4::TEXT IS NULL OR e.assigned_scanner_id=$4) AND ($5::TEXT IS NULL OR t.task_source=$5) AND $6::TEXT IS NOT NULL
           AND e.task_end_time >= $1 AND e.task_end_time < $2 AND e.execution_status IN ('succeeded','failed','partial','cancelled')
@@ -255,6 +498,11 @@ async fn operations<C: GenericClient + Sync>(
     let mut summary = json!({});
     for row in result {
         let mut value = counts(row.get("metrics"));
+        if kind == "scanners" {
+            let quantiles: Option<Vec<f64>> = row.get("percentiles");
+            value["p50_ms"] = json!(quantiles.as_ref().and_then(|q| q.first()));
+            value["p95_ms"] = json!(quantiles.as_ref().and_then(|q| q.get(1)));
+        }
         if row.get::<_, i32>("is_total") == 1 {
             summary = value;
         } else {
@@ -340,6 +588,8 @@ async fn scan_realtime(
     user: &UserBaseI,
     kind: &str,
     group: &str,
+    deadline: Instant,
+    processed: &mut usize,
 ) -> Result<(Vec<Value>, Value), String> {
     let mut filters = analysis_es_filters(f, user);
     let sources = if kind == "discovery" {
@@ -361,7 +611,7 @@ async fn scan_realtime(
     let mut after: Option<Value> = None;
     let mut counts = BTreeMap::<String, i64>::new();
     let mut unique = HashSet::new();
-    let mut processed = 0;
+
     let tz = f
         .timezone
         .parse::<chrono_tz::Tz>()
@@ -371,13 +621,26 @@ async fn scan_realtime(
         if let Some(ref cursor) = after {
             composite["after"] = cursor.clone();
         }
-        let result=es.scan_query(ScanQueryIndex::Observations,&json!({"size":0,"query":{"bool":{"filter":filters}},"aggs":{"groups":{"composite":composite}}})).await?;
+        if *processed >= MAX_ES_BUCKETS {
+            return Err("too_large".into());
+        }
+        let budget = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("timeout")?
+            .min(StdDuration::from_secs(3));
+        let request = json!({"size":0,"track_total_hits":false,"timeout":format!("{}ms",budget.as_millis().saturating_sub(200).max(1)),"query":{"bool":{"filter":filters}},"aggs":{"groups":{"composite":composite}}});
+        let result = tokio::time::timeout(
+            budget,
+            es.scan_query(ScanQueryIndex::Observations, &request),
+        )
+        .await
+        .map_err(|_| "timeout".to_string())??;
         let buckets = result
             .pointer("/aggregations/groups/buckets")
             .and_then(Value::as_array)
             .ok_or("missing aggregation")?;
-        processed += buckets.len();
-        if processed > MAX_ES_BUCKETS {
+        *processed += buckets.len();
+        if *processed > MAX_ES_BUCKETS {
             return Err("too_large".into());
         }
         for bucket in buckets {
@@ -557,14 +820,14 @@ mod tests {
             scanner_id: None,
             task_source: None,
         };
-        let (rows, summary) = operations(&client, &f, &user, "tasks", "day")
+        let (rows, summary) = operations(&client, &f, &user, "tasks", "day", true)
             .await
             .expect("tasks");
         assert_eq!(summary["created"], 2);
         assert_eq!(summary["completed"], 2);
         assert_eq!(summary["success_rate"], 50.0);
         assert_eq!(rows.len(), 2);
-        let (rows, summary) = operations(&client, &f, &user, "scanners", "scanner")
+        let (rows, summary) = operations(&client, &f, &user, "scanners", "scanner", true)
             .await
             .expect("scanners");
         assert_eq!(rows.len(), 2, "same scanner names remain separate");
@@ -587,10 +850,10 @@ mod tests {
         assert_eq!(summary["count"], 5);
         assert_eq!(rows.len(), 1);
         for group in ["week", "month", "task_source"] {
-            operations(&client, &f, &user, "tasks", group)
+            operations(&client, &f, &user, "tasks", group, true)
                 .await
                 .expect("task groups");
-            operations(&client, &f, &user, "scanners", group)
+            operations(&client, &f, &user, "scanners", group, true)
                 .await
                 .expect("scanner groups");
             scan_snapshot(&client, &f, &user, "discovery", group)
@@ -602,14 +865,14 @@ mod tests {
             .expect("scanner IP");
         f.scanner_id = Some("b".into());
         f.task_source = Some("manual".into());
-        let (_, summary) = operations(&client, &f, &user, "tasks", "day")
+        let (_, summary) = operations(&client, &f, &user, "tasks", "day", true)
             .await
             .expect("filter tasks");
         assert_eq!(
             summary["created"], 1,
             "EXISTS does not duplicate multi-scanner tasks"
         );
-        let (_, summary) = operations(&client, &f, &user, "scanners", "day")
+        let (_, summary) = operations(&client, &f, &user, "scanners", "day", true)
             .await
             .expect("filter scanner");
         assert_eq!(summary["completed"], 1);
@@ -620,7 +883,7 @@ mod tests {
         let admin = UserBaseI { role: 1, ..user };
         f.scanner_id = None;
         f.task_source = None;
-        let (_, summary) = operations(&client, &f, &admin, "tasks", "task_source")
+        let (_, summary) = operations(&client, &f, &admin, "tasks", "task_source", true)
             .await
             .expect("admin");
         assert_eq!(summary["failed"], 1);

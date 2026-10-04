@@ -25,6 +25,9 @@ use crate::runtime_config::{
     parse_dns_follow_up, parse_dns_resolvers, parse_general, parse_monitor, parse_requests,
     parse_scanner_health, persist,
 };
+use crate::statistics::{
+    NAMESPACE as STATISTICS_CACHE_NAMESPACE, parse_config as parse_statistics_cache,
+};
 use crate::trusted_proxy::{
     MAX_CLIENT_IP_HEADER_LENGTH, MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState,
     validate_settings, write_settings_to_database,
@@ -117,6 +120,13 @@ async fn get_runtime_config_h(
             .json(json!({"success": false, "message": "仅管理员可以读取运行时配置"}));
     }
     match namespace.as_str() {
+        STATISTICS_CACHE_NAMESPACE => {
+            let client = match pool.get().await { Ok(c)=>c, Err(_)=>return HttpResponse::ServiceUnavailable().finish() };
+            match client.query_one("SELECT document,revision FROM runtime_configuration WHERE namespace=$1", &[&STATISTICS_CACHE_NAMESPACE]).await {
+                Ok(row)=>HttpResponse::Ok().json(json!({"success":true,"data":{"namespace":STATISTICS_CACHE_NAMESPACE,"revision":row.get::<_,i64>("revision"),"document":row.get::<_,serde_json::Value>("document")}})),
+                Err(_)=>HttpResponse::ServiceUnavailable().finish()
+            }
+        }
         GENERAL_NAMESPACE => {
             match crate::system_time::refresh(pool.get_ref()).await {
                 Ok(value) => HttpResponse::Ok().json(json!({"success": true, "data": {"namespace": "general", "revision": value.revision, "document": value.document}})),
@@ -179,7 +189,7 @@ pub(crate) async fn runtime_config_history(
     }
     if !matches!(
         namespace.as_str(),
-        MONITOR_NAMESPACE | SCANNER_HEALTH_NAMESPACE
+        MONITOR_NAMESPACE | SCANNER_HEALTH_NAMESPACE | STATISTICS_CACHE_NAMESPACE
     ) {
         return HttpResponse::NotFound()
             .json(json!({"success": false, "message": "此配置域不支持历史查看"}));
@@ -204,6 +214,7 @@ pub(crate) async fn runtime_config_history(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[post("/api/config/runtime/{namespace}")]
 async fn save_runtime_config_h(
     req: HttpRequest,
@@ -212,6 +223,7 @@ async fn save_runtime_config_h(
     pool: web::Data<deadpool_postgres::Pool>,
     settings: web::Data<RuntimeSettings>,
     monitor: web::Data<MonitorHandle>,
+    statistics: web::Data<crate::statistics::StatisticsService>,
     user: UserBaseI,
 ) -> impl Responder {
     if user.role != 1 {
@@ -262,6 +274,13 @@ async fn save_runtime_config_h(
     }
 
     match namespace.as_str() {
+        STATISTICS_CACHE_NAMESPACE => publish!(
+            STATISTICS_CACHE_NAMESPACE,
+            parse_statistics_cache,
+            statistics_cache,
+            |value: &crate::statistics::CacheConfig| statistics
+                .apply(value.clone(), body.expected_revision + 1)
+        ),
         GENERAL_NAMESPACE => publish!(
             GENERAL_NAMESPACE,
             parse_general,

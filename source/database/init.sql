@@ -1220,3 +1220,10 @@ ALTER TABLE report_run ADD COLUMN IF NOT EXISTS settings_revision BIGINT NOT NUL
 ALTER TABLE report_run DROP CONSTRAINT IF EXISTS report_run_period_type_period_start_period_end_revision_key;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_report_run_calendar_revision ON report_run(period_type, period_start, period_end, timezone, revision);
 INSERT INTO runtime_configuration(namespace, document) VALUES ('general', '{"timezone":"Asia/Shanghai","hourCycle":"24","dateFormat":"YYYY-MM-DD"}'::JSONB) ON CONFLICT(namespace) DO NOTHING;
+
+-- Lightweight instance metadata; aggregation queries reuse existing indexes.
+CREATE TABLE IF NOT EXISTS statistics_instance (
+    instance_id TEXT PRIMARY KEY,
+    status JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

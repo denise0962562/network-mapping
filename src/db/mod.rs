@@ -226,6 +226,9 @@ pub async fn init_database_table(
             "../../source/database/migrate_system_time.sql"
         ))
         .await?;
+    transaction
+        .batch_execute(include_str!("../../source/database/migrate_statistics.sql"))
+        .await?;
     transaction.commit().await?;
 
     Ok(())

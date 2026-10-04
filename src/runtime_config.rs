@@ -67,6 +67,7 @@ impl<T: Clone> RuntimeConfig<T> {
 
 #[derive(Clone)]
 pub struct RuntimeSettings {
+    pub statistics_cache: RuntimeConfig<crate::statistics::CacheConfig>,
     pub general: RuntimeConfig<crate::system_time::GeneralSettings>,
     pub requests: RuntimeConfig<RequestsConfig>,
     pub monitor: RuntimeConfig<MonitorConfig>,
@@ -155,6 +156,14 @@ impl RuntimeSettings {
         let loaded = general.get().await;
         crate::system_time::apply(loaded.value, loaded.revision);
         Ok(Self {
+            statistics_cache: load_namespace(
+                pool,
+                crate::statistics::NAMESPACE,
+                Default::default(),
+                Default::default(),
+                crate::statistics::CacheConfig::validate,
+            )
+            .await?,
             general,
             requests: load_namespace(
                 pool,

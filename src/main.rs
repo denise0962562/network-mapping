@@ -383,6 +383,23 @@ async fn main() -> io::Result<()> {
     let dns_follow_up = web::Data::new(runtime_settings.dns_follow_up.clone());
     let security = web::Data::new(config.security);
     let analytics_snapshot = web::Data::new(runtime_settings.analytics_snapshot.clone());
+    let statistics_service =
+        web::Data::new(network_mapping_server::statistics::StatisticsService::new());
+    let statistics_settings = runtime_settings.statistics_cache.get().await;
+    statistics_service.apply(statistics_settings.value, statistics_settings.revision);
+    let statistics_refresh = statistics_service.clone();
+    let statistics_pool = db_pool.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = statistics_refresh.refresh(&statistics_pool).await {
+                tracing::warn!(event="StatisticsConfigRefreshFailed", %error);
+            }
+            if let Err(error) = statistics_refresh.publish_status(&statistics_pool).await {
+                tracing::warn!(event="StatisticsStatusPublishFailed", %error);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
     let rate_limiter = RateLimitMiddleware::default();
     let open_source_catalog = web::Data::new(
         OpenSourceCatalog::from_embedded()
@@ -519,6 +536,7 @@ async fn main() -> io::Result<()> {
             .app_data(system_maintenance_state.clone())
             .app_data(security.clone())
             .app_data(analytics_snapshot.clone())
+            .app_data(statistics_service.clone())
             .app_data(runtime_settings.clone())
             .app_data(web::Data::new(scanner_latency_history.clone()))
             .app_data(frontend_assets.clone())

@@ -18,7 +18,7 @@ use crate::{SystemDetails, SystemStatusJson, Systems};
 const DEFAULT_RANGE_WEEKS: i64 = 12;
 const MAX_RANGE_DAYS: i64 = 366;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct AnalysisFilterQuery {
     start_at: Option<DateTime<Utc>>,
     end_at: Option<DateTime<Utc>>,
@@ -40,6 +40,7 @@ pub(crate) struct HeatmapQuery {
     filters: AnalysisFilterQuery,
 }
 
+#[derive(Clone)]
 pub(super) struct AnalysisFilters {
     pub(super) timezone: String,
     pub(super) start_at: DateTime<Utc>,
