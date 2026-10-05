@@ -49,6 +49,8 @@ pub struct Config {
     pub elasticsearch: ElasticsearchConfig,
     #[serde(default)]
     pub analytics_snapshot: AnalyticsSnapshotConfig,
+    #[serde(default)]
+    pub report_mail: crate::reports::mail_config::ReportMailConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -87,6 +89,9 @@ impl SelfChecking for Config {
         let _ = &self.backup.check();
         let _ = &self.elasticsearch.check();
         let _ = &self.analytics_snapshot.check();
+        self.report_mail
+            .validate()
+            .expect("invalid report mail configuration");
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -115,6 +120,7 @@ impl SelfChecking for Config {
         self.backup.try_check()?;
         self.elasticsearch.try_check()?;
         self.analytics_snapshot.try_check()?;
+        self.report_mail.validate()?;
         self.automatic_target.validate()?;
         self.dns_follow_up.validate()?;
         Ok(true)
@@ -1874,6 +1880,9 @@ mod tests {
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
     cfg.configure(handlers::scanner_diagnostics::configure);
+    cfg.service(handlers::report_mail_assets::sample)
+        .service(handlers::report_mail_assets::trend)
+        .service(handlers::report_mail_assets::revoke);
     cfg.service(handlers::reports::generate)
         .service(handlers::reports::list)
         .service(handlers::reports::detail)

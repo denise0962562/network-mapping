@@ -248,6 +248,7 @@ async fn main() -> io::Result<()> {
             dns_follow_up: dns_follow_up_config,
             dns_resolvers: Default::default(),
             analytics_snapshot: analytics_snapshot_config,
+            report_mail: config.report_mail.clone(),
         },
     )
     .await
@@ -560,7 +561,8 @@ async fn main() -> io::Result<()> {
 
                 // 请求日志采集：service.call 前抓取元数据，响应后抓取状态码与耗时。
                 // 跳过静态资源与高频心跳，避免污染与放大数据量。
-                let path = req.path().to_owned();
+                let path =
+                    network_mapping_server::reports::redact_mail_image_path(req.path()).to_owned();
                 let is_scanner_heartbeat = path == "/api/scanner/heartbeat";
                 let latency_probe = (is_scanner_heartbeat
                     && req

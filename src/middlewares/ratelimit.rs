@@ -95,7 +95,7 @@ where
             let retry_after_secs = retry_after.as_secs().max(1);
             warn!(
                 event = "RateLimitExceeded",
-                path = path.as_str(),
+                path = crate::reports::assets::redact_path(&path),
                 client = client.as_str(),
                 retry_after = retry_after_secs
             );
@@ -123,6 +123,13 @@ where
 }
 
 fn policy_for_path(path: &str) -> Option<RateLimitPolicy> {
+    if path.starts_with(crate::reports::assets::IMAGE_PREFIX) {
+        return Some(RateLimitPolicy {
+            max_requests: 600,
+            window: Duration::from_secs(60),
+            message: "报告图片请求过于频繁",
+        });
+    }
     match path {
         "/api/scanner/diagnostics/chunk"
         | "/api/scanner/diagnostics/upload-status"
@@ -234,7 +241,12 @@ fn rate_limit_key(req: &ServiceRequest, path: &str, client: &str) -> String {
         return format!("scanner-result:{}", token_fingerprint);
     }
 
-    format!("{}:{}:{}", req.method(), path, client)
+    format!(
+        "{}:{}:{}",
+        req.method(),
+        crate::reports::assets::redact_path(path),
+        client
+    )
 }
 
 fn client_identifier(req: &ServiceRequest) -> String {

@@ -121,7 +121,7 @@ pub fn error_chain_diagnostics(error: &(dyn StdError + 'static)) -> String {
 //TODO:需要获取代理状态下用户的原始ip
 pub fn info_logs(req: &HttpRequest, event: &str, message: &str) {
     let req_method = req.method();
-    let req_path = req.path();
+    let req_path = crate::reports::redact_mail_image_path(req.path());
     info!(
         event = event,  //"requests_received"
         client_ip = get_conn_ip(req),
@@ -134,7 +134,7 @@ pub fn info_logs(req: &HttpRequest, event: &str, message: &str) {
 
 pub fn warn_logs(req: &HttpRequest, event: &str, message: &str) {
     let req_method = req.method();
-    let req_path = req.path();
+    let req_path = crate::reports::redact_mail_image_path(req.path());
     let actor = req.extensions().get::<UserBaseI>().cloned();
     warn!(
         event = event,
@@ -152,7 +152,7 @@ pub fn warn_logs(req: &HttpRequest, event: &str, message: &str) {
 pub fn error_logs(req: &HttpRequest, event: &str, message: &str) {
     set_reason_if_absent(req, event);
     let req_method = req.method();
-    let req_path = req.path();
+    let req_path = crate::reports::redact_mail_image_path(req.path());
     let actor = req.extensions().get::<UserBaseI>().cloned();
     let resource = request_resource_context(req);
     error!(
@@ -211,7 +211,7 @@ pub fn error_logs_error(
             client_ip = get_conn_ip(req),
             method = %req.method(),
             user_agent = get_user_agent(req),
-            path = req.path(),
+            path = crate::reports::redact_mail_image_path(req.path()),
             route_pattern = ?req.match_pattern(),
             actor_user_id = ?actor.as_ref().map(|value| value.id),
             actor_role = ?actor.as_ref().map(|value| value.role),
@@ -233,7 +233,7 @@ pub fn error_logs_error(
             client_ip = get_conn_ip(req),
             method = %req.method(),
             user_agent = get_user_agent(req),
-            path = req.path(),
+            path = crate::reports::redact_mail_image_path(req.path()),
             route_pattern = ?req.match_pattern(),
             actor_user_id = ?actor.as_ref().map(|value| value.id),
             actor_role = ?actor.as_ref().map(|value| value.role),

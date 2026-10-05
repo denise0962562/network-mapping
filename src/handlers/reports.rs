@@ -103,7 +103,7 @@ pub(crate) async fn detail(
     let result = async {
         let client = pool.get().await.map_err(|e| e.to_string())?;
         client
-            .query_opt("SELECT * FROM report_run WHERE id = $1;", &[&*id])
+            .query_opt("SELECT r.*, (SELECT jsonb_build_object('expires_at', a.expires_at, 'revoked_at', a.revoked_at, 'renderer_version', a.renderer_version) FROM report_mail_asset a WHERE a.report_id = r.id) AS mail_image FROM report_run r WHERE r.id = $1;", &[&*id])
             .await
             .map_err(|e| e.to_string())
     }
@@ -262,6 +262,15 @@ pub(crate) async fn schedules(
     match storage::schedules(&pool).await {
         Ok(mut data) => {
             data["analytics_ready"] = json!(analytics.get().await.value.mode.runs_worker());
+            let client = match pool.get().await {
+                Ok(client) => client,
+                Err(e) => return internal(e),
+            };
+            match crate::reports::mail_config::load(&client).await {
+                Ok(settings) => data["mail_images_ready"] = json!(settings.remote_images_enabled),
+                Err(e) => return internal(e),
+            }
+            drop(client);
             match crate::admin::get_mail_settings_from_database(&pool).await {
                 Ok(settings) => {
                     data["mail_ready"] = json!(
@@ -384,7 +393,8 @@ pub(crate) async fn send(
         let row = tx.query_opt("SELECT status, rendered_mail FROM report_run WHERE id = $1 FOR UPDATE;", &[&*id]).await.map_err(|e| e.to_string())?;
         let Some(row) = row else { return Ok::<_, String>(missing()); };
         if row.get::<_, String>("status") != "ready" { return Ok(conflict("报告尚未生成完成")); }
-        if row.get::<_, Option<Value>>("rendered_mail").is_none() { return Ok(conflict("当前报告没有可发送的邮件摘要，请检查模板后创建修订版")); }
+        if row.get::<_, Option<Value>>("rendered_mail").is_none() { return Ok(conflict("当前报告没有可发送的邮件内容，请检查模板后创建修订版")); }
+        if tx.query_opt("SELECT report_id FROM report_mail_asset WHERE report_id = $1 AND revoked_at IS NOT NULL", &[&*id]).await.map_err(|e| e.to_string())?.is_some() { return Ok(conflict("报告趋势图片已撤销，请生成修订版后发送")); }
         let mut selected = body.recipient_ids.clone(); selected.sort_unstable(); selected.dedup();
         if storage::recipients(&tx, &selected).await?.len() != selected.len() { return Ok(bad("收件人必须是有有效邮箱的启用中管理员")); }
         let active: bool = tx.query_one("SELECT EXISTS (SELECT 1 FROM report_delivery WHERE report_id = $1 AND status IN ('pending','sending')) AS active;", &[&*id]).await.map_err(|e| e.to_string())?.get("active");

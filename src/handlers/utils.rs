@@ -20,10 +20,10 @@ use crate::monitor::MonitorHandle;
 use crate::runtime_config::{
     ANALYTICS_SNAPSHOT_NAMESPACE, AUTOMATIC_TARGET_NAMESPACE, DNS_FOLLOW_UP_NAMESPACE,
     DNS_RESOLVERS_NAMESPACE, GENERAL_NAMESPACE, MONITOR_NAMESPACE, PersistError,
-    REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings, SCANNER_HEALTH_NAMESPACE,
-    UpdateRuntimeConfigRequest, parse_analytics_snapshot, parse_automatic_target,
-    parse_dns_follow_up, parse_dns_resolvers, parse_general, parse_monitor, parse_requests,
-    parse_scanner_health, persist,
+    REPORT_MAIL_NAMESPACE, REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings,
+    SCANNER_HEALTH_NAMESPACE, UpdateRuntimeConfigRequest, parse_analytics_snapshot,
+    parse_automatic_target, parse_dns_follow_up, parse_dns_resolvers, parse_general, parse_monitor,
+    parse_report_mail, parse_requests, parse_scanner_health, persist,
 };
 use crate::statistics::{
     NAMESPACE as STATISTICS_CACHE_NAMESPACE, parse_config as parse_statistics_cache,
@@ -156,6 +156,13 @@ async fn get_runtime_config_h(
         DNS_RESOLVERS_NAMESPACE => {
             let value = settings.dns_resolvers.get().await;
             HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: DNS_RESOLVERS_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        REPORT_MAIL_NAMESPACE => {
+            if crate::reports::mail_config::refresh(pool.get_ref(), &settings.report_mail).await.is_err() {
+                return HttpResponse::ServiceUnavailable().json(json!({"success": false, "message": "报告邮件配置读取失败"}));
+            }
+            let value = settings.report_mail.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: REPORT_MAIL_NAMESPACE, revision: value.revision, document: value.value }}))
         }
         ANALYTICS_SNAPSHOT_NAMESPACE => {
             let value = settings.analytics_snapshot.get().await;
@@ -320,6 +327,12 @@ async fn save_runtime_config_h(
             DNS_RESOLVERS_NAMESPACE,
             parse_dns_resolvers,
             dns_resolvers,
+            |_| {}
+        ),
+        REPORT_MAIL_NAMESPACE => publish!(
+            REPORT_MAIL_NAMESPACE,
+            parse_report_mail,
+            report_mail,
             |_| {}
         ),
         ANALYTICS_SNAPSHOT_NAMESPACE => publish!(

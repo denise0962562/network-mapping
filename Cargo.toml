@@ -43,6 +43,8 @@ rpassword = "7"
 maxminddb = "0.28.1"
 ammonia = "4.1.4"
 css-inline = "0.21.1"
+plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "ab_glyph"] }
+png = "0.18"
 
 [features]
 default = []

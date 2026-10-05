@@ -25,6 +25,8 @@ pub const MONITOR_NAMESPACE: &str = "monitor";
 pub const AUTOMATIC_TARGET_NAMESPACE: &str = "automatic_target";
 pub const DNS_FOLLOW_UP_NAMESPACE: &str = "dns_follow_up";
 pub const DNS_RESOLVERS_NAMESPACE: &str = "dns_resolvers";
+pub const REPORT_MAIL_NAMESPACE: &str = crate::reports::mail_config::NAMESPACE;
+
 pub const ANALYTICS_SNAPSHOT_NAMESPACE: &str = "analytics_snapshot";
 
 #[derive(Clone, Debug)]
@@ -76,6 +78,7 @@ pub struct RuntimeSettings {
     pub dns_follow_up: RuntimeConfig<DnsFollowUpConfig>,
     pub dns_resolvers: RuntimeConfig<DnsResolverSettings>,
     pub analytics_snapshot: RuntimeConfig<AnalyticsSnapshotConfig>,
+    pub report_mail: RuntimeConfig<crate::reports::mail_config::ReportMailConfig>,
 }
 
 #[derive(Clone)]
@@ -86,6 +89,7 @@ pub struct RuntimeSettingsBootstrap {
     pub dns_follow_up: DnsFollowUpConfig,
     pub dns_resolvers: DnsResolverSettings,
     pub analytics_snapshot: AnalyticsSnapshotConfig,
+    pub report_mail: crate::reports::mail_config::ReportMailConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +215,14 @@ impl RuntimeSettings {
                 bootstrap.dns_resolvers,
                 DnsResolverSettings::default(),
                 validate_dns_resolvers,
+            )
+            .await?,
+            report_mail: load_namespace(
+                pool,
+                REPORT_MAIL_NAMESPACE,
+                bootstrap.report_mail,
+                Default::default(),
+                crate::reports::mail_config::ReportMailConfig::validate,
             )
             .await?,
             analytics_snapshot: load_namespace(
@@ -419,6 +431,15 @@ pub fn parse_dns_follow_up(value: Value) -> Result<DnsFollowUpConfig, String> {
 pub fn parse_dns_resolvers(value: Value) -> Result<DnsResolverSettings, String> {
     parse(value, validate_dns_resolvers)
 }
+pub fn parse_report_mail(
+    value: Value,
+) -> Result<crate::reports::mail_config::ReportMailConfig, String> {
+    parse(
+        value,
+        crate::reports::mail_config::ReportMailConfig::validate,
+    )
+}
+
 pub fn parse_analytics_snapshot(value: Value) -> Result<AnalyticsSnapshotConfig, String> {
     parse(value, validate_analytics_snapshot)
 }

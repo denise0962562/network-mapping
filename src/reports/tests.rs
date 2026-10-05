@@ -1,7 +1,7 @@
 use crate::mail_template::{self, MailTemplateSource};
 
 #[test]
-fn report_templates_render_summary_in_html_and_text() {
+fn report_templates_render_complete_content_in_html_and_text() {
     for key in [
         mail_template::REPORT_WEEKLY_TEMPLATE_KEY,
         mail_template::REPORT_MONTHLY_TEMPLATE_KEY,
@@ -20,7 +20,23 @@ fn report_templates_render_summary_in_html_and_text() {
         assert!(rendered.html_body.contains("100"));
         assert!(rendered.text_body.contains("83.3%"));
         assert!(rendered.text_body.contains("/reports/"));
-        assert!(rendered.html_body.contains("不代表资产存量"));
+        assert!(rendered.html_body.contains("不是资产存量"));
+        for label in [
+            "与上一周期比较",
+            "每日完成任务",
+            "端口观测 Top 10",
+            "服务观测 Top 10",
+            "扫描器执行表现",
+            "统计口径与完整性",
+        ] {
+            assert!(rendered.html_body.contains(label), "HTML missing {label}");
+            assert!(rendered.text_body.contains(label), "text missing {label}");
+        }
+        assert!(
+            rendered
+                .html_body
+                .contains("/mail/report-images/sample/trend.png")
+        );
     }
 }
 
@@ -37,6 +53,278 @@ use deadpool_postgres::{Manager, Pool};
 use serde_json::{Value, json};
 use tokio_postgres::NoTls;
 use uuid::Uuid;
+
+#[actix_web::test]
+#[ignore = "requires disposable REPORT_TEST_DATABASE_URL"]
+async fn remote_mail_images_preserve_archives_and_enforce_capabilities() {
+    use super::{assets, mail_config::ReportMailConfig};
+    use actix_web::{
+        App, HttpMessage,
+        dev::Service,
+        http::{StatusCode, header},
+        test, web,
+    };
+    let (pool, schema) = isolated_pool().await;
+    let period = Period::last_closed(PeriodType::Weekly, Utc::now()).expect("period");
+    execution(
+        &pool,
+        period.start.timestamp_millis() + 7_200_000,
+        "succeeded",
+        true,
+        "192.0.2.1",
+    )
+    .await;
+    let settings = ReportMailConfig {
+        public_base_url: "https://reports.example.invalid/nm".into(),
+        remote_images_enabled: true,
+        ..Default::default()
+    };
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO runtime_configuration(namespace,document) VALUES('report_mail',$1)",
+            &[&serde_json::to_value(&settings).unwrap()],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    let id = storage::create(&pool, &period, Some(1), "manual", None)
+        .await
+        .unwrap();
+    assert!(worker::process_one(&pool, &config()).await.unwrap());
+    let archived = report(&pool, id).await;
+    assert_eq!(archived.get::<_, String>("status"), "ready");
+    let rendered: Value = archived.get("rendered_mail");
+    let html = rendered["htmlBody"].as_str().unwrap();
+    let image_url = html
+        .split("src=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert!(image_url.starts_with("https://reports.example.invalid/nm/mail/report-images/"));
+    assert!(html.contains(&format!("https://reports.example.invalid/nm/reports/{id}")));
+    assert!(!html.contains("scanner-a"), "scanner identifier is aliased");
+    assert!(
+        !html.contains("192.0.2.1"),
+        "mail does not expose individual IPs"
+    );
+    let uri = image_url
+        .strip_prefix("https://reports.example.invalid/nm")
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .wrap(crate::middlewares::smiddleware::AuthMiddleware)
+            .wrap(crate::middlewares::csrfmiddleware::CsrfMiddleware)
+            .service(crate::handlers::report_mail_assets::sample)
+            .service(crate::handlers::report_mail_assets::trend),
+    )
+    .await;
+    let response = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let png = test::read_body(response).await;
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let response = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::HEAD)
+            .uri(uri)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(test::read_body(response).await.is_empty());
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header((header::IF_NONE_MATCH, etag.clone()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    for uri in [
+        "/mail/report-images/invalid/trend.png".to_owned(),
+        format!("/mail/report-images/{}/trend.png", "a".repeat(64)),
+    ] {
+        assert_eq!(
+            test::call_service(&app, test::TestRequest::get().uri(&uri).to_request())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/reports/{id}"))
+                .to_request()
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        test::call_service(&app, test::TestRequest::post().uri(uri).to_request())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let client = pool.get().await.unwrap();
+    client
+        .batch_execute("DELETE FROM scan_task;")
+        .await
+        .unwrap();
+    assert_eq!(
+        report(&pool, id).await.get::<_, Value>("rendered_mail"),
+        rendered
+    );
+    let response = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+    assert_eq!(test::read_body(response).await, png);
+    client
+        .execute(
+            "UPDATE report_mail_asset SET expires_at=NOW()-INTERVAL '1 day' WHERE report_id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header((header::IF_NONE_MATCH, etag.clone()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "expiry must precede ETag validation"
+    );
+    storage::enqueue_delivery(&client, id, &[1], false, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        test::call_service(&app, test::TestRequest::get().uri(uri).to_request())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        report(&pool, id).await.get::<_, Value>("rendered_mail"),
+        rendered
+    );
+    if let Ok(directory) = std::env::var("REPORT_MAIL_QA_DIR") {
+        std::fs::write(format!("{directory}/trend.png"), &png).unwrap();
+        std::fs::write(
+            format!("{directory}/report.html"),
+            html.replace(image_url, "trend.png"),
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{directory}/report.txt"),
+            rendered["textBody"].as_str().unwrap(),
+        )
+        .unwrap();
+    }
+    drop(client);
+    let admin_app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .wrap_fn(|req, srv| {
+                req.extensions_mut().insert(crate::admin::UserBaseI {
+                    id: 1,
+                    username: "admin".into(),
+                    role: 1,
+                    email: Some("admin@example.invalid".into()),
+                    limit_login: false,
+                    enable_2fa: false,
+                });
+                srv.call(req)
+            })
+            .service(crate::handlers::report_mail_assets::revoke),
+    )
+    .await;
+    let response = test::call_service(
+        &admin_app,
+        test::TestRequest::post()
+            .uri(&format!("/api/reports/{id}/mail-image/revoke"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header((header::IF_NONE_MATCH, etag))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "revocation must precede ETag validation"
+    );
+    let client = pool.get().await.unwrap();
+    assert!(assets::renew(&client, id).await.is_err());
+    let pending: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM report_delivery WHERE report_id=$1 AND status='pending'",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(pending, 0);
+    // Keep a previously published summary template usable after enabling images.
+    // It must neither be overwritten nor gain an unused image access capability.
+    client.batch_execute("INSERT INTO mail_template_version(template_key,version,status,subject_template,html_template,text_template) VALUES('report_weekly',1,'published','Legacy {{ report_label }}','<p>{{ tasks.created }} {{ detail_path }}</p>','{{ scan_output.unique_ips }} {{ detail_path }}'); UPDATE mail_template SET active_version=1 WHERE template_key='report_weekly';").await.unwrap();
+    drop(client);
+    let legacy_id = storage::create(&pool, &period, Some(1), "revision", Some(id))
+        .await
+        .unwrap();
+    assert!(worker::process_one(&pool, &config()).await.unwrap());
+    let legacy = report(&pool, legacy_id).await;
+    assert_eq!(legacy.get::<_, i32>("template_version"), 1);
+    assert_eq!(
+        legacy.get::<_, Value>("rendered_mail")["subject"],
+        "Legacy 周报"
+    );
+    let client = pool.get().await.unwrap();
+    assert!(
+        client
+            .query_opt(
+                "SELECT report_id FROM report_mail_asset WHERE report_id=$1",
+                &[&legacy_id]
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        storage::enqueue_delivery(&client, legacy_id, &[1], false, true)
+            .await
+            .unwrap(),
+        1
+    );
+    drop(client);
+    cleanup(&pool, schema).await;
+}
 
 async fn isolated_pool() -> (Pool, String) {
     let mut config: tokio_postgres::Config = std::env::var("REPORT_TEST_DATABASE_URL")
@@ -58,6 +346,18 @@ async fn isolated_pool() -> (Pool, String) {
         .batch_execute(include_str!("../../source/database/init.sql"))
         .await
         .expect("initialization");
+    client
+        .batch_execute(include_str!(
+            "../../source/database/migrate_report_mail_assets.sql"
+        ))
+        .await
+        .expect("mail assets migration");
+    client
+        .batch_execute(include_str!(
+            "../../source/database/migrate_report_mail_assets.sql"
+        ))
+        .await
+        .expect("mail assets migration rerun");
     // Verify that upgrade migration is independently idempotent.
     client
         .batch_execute(include_str!("../../source/database/migrate_reports.sql"))
@@ -432,10 +732,15 @@ async fn ordinary_users_cannot_query_or_generate_platform_reports() {
             .service(crate::handlers::reports::list)
             .service(crate::handlers::reports::generate)
             .service(crate::handlers::reports::detail)
-            .service(crate::handlers::reports::send),
+            .service(crate::handlers::reports::send)
+            .service(crate::handlers::report_mail_assets::revoke),
     )
     .await;
     for request in [
+        test::TestRequest::post().uri(&format!(
+            "/api/reports/{}/mail-image/revoke",
+            Uuid::new_v4()
+        )),
         test::TestRequest::get().uri("/api/reports"),
         test::TestRequest::post()
             .uri("/api/reports/generate")

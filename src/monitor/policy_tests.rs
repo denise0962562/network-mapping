@@ -59,6 +59,7 @@ async fn health_policy_database_publication_presence_and_outage_lifecycle() {
             dns_follow_up: Default::default(),
             dns_resolvers: Default::default(),
             analytics_snapshot: Default::default(),
+            report_mail: Default::default(),
         },
     )
     .await
@@ -72,6 +73,7 @@ async fn health_policy_database_publication_presence_and_outage_lifecycle() {
             dns_follow_up: Default::default(),
             dns_resolvers: Default::default(),
             analytics_snapshot: Default::default(),
+            report_mail: Default::default(),
         },
     )
     .await
@@ -129,6 +131,7 @@ async fn health_policy_database_publication_presence_and_outage_lifecycle() {
             dns_follow_up: Default::default(),
             dns_resolvers: Default::default(),
             analytics_snapshot: Default::default(),
+            report_mail: Default::default(),
         },
     )
     .await
@@ -330,6 +333,7 @@ async fn health_policy_catalogue_authorization_and_restorable_sql_ids() {
             dns_follow_up: Default::default(),
             dns_resolvers: Default::default(),
             analytics_snapshot: Default::default(),
+            report_mail: Default::default(),
         },
     )
     .await

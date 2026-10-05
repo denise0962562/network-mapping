@@ -17,6 +17,7 @@
 | `dns_follow_up` | TOML `[dns_follow_up]` | 运行时配置 → DNS 后续任务 |
 | `dns_resolvers` | 内置默认值 | 运行时配置 → DNS 服务器 |
 | `analytics_snapshot` | TOML `[analytics_snapshot]` | 运行时配置 → 分析快照 |
+| `report_mail` | TOML `[report_mail]`，默认关闭图片 | 运行时配置 → 报告邮件 |
 
 数据库中已有的配置不会被启动时的 TOML 覆盖。文件中的这些策略段只在对应数据库记录缺失时作为种子；修改文件并重启不能替代发布运行时配置。启动时仍会校验 TOML，文件必须保持合法。
 
@@ -68,3 +69,5 @@
 - `GET /api/scanner/runtime-config?scannerid={scanner_id}`：扫描器使用运行凭据获取下发文档。
 
 前端入口是 `/scanner/{id}/configuration`。本地部署开关、速率限制和任务边界应用规则见扫描器仓库的 `docs/MAINTENANCE.md`“本地部署配置与远程运行配置”。
+
+`report_mail` 在每次报告生成时读取数据库权威文档，读取该配置接口也刷新本实例快照；多实例无需重启即可在新报告中使用已发布配置。归档邮件与图片不会随配置变化而改写。详见 [报告邮件](reports.md#完整邮件与远程趋势图片)。

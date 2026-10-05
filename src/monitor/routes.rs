@@ -190,6 +190,10 @@ pub const WEB_OPERATIONS: &[(&str, &str)] = &[
     ("POST /api/reports/{id}/deliveries", "提交报告投递记录"),
     ("POST /api/reports/{id}/retry", "提交报告重试"),
     ("POST /api/reports/{id}/revisions", "提交报告修订"),
+    (
+        "POST /api/reports/{id}/mail-image/revoke",
+        "撤销报告邮件图片",
+    ),
     ("POST /api/scanner/add", "提交扫描器"),
     ("POST /api/scanner/diagnostics/ack", "提交诊断任务确认"),
     ("POST /api/scanner/diagnostics/complete", "提交诊断上传完成"),

@@ -29,10 +29,17 @@ pub struct Report {
     pub last_error: Option<String>,
     pub content_checksum: Option<String>,
     pub payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mail_image: Option<Value>,
 }
 impl Report {
     pub fn from_row(r: Row, detail: bool) -> Self {
         Self {
+            mail_image: if detail {
+                r.try_get("mail_image").ok().flatten()
+            } else {
+                None
+            },
             timezone: r.get("timezone"),
             settings_revision: r.get("settings_revision"),
             id: r.get("id"),
@@ -81,6 +88,7 @@ pub async fn enqueue_delivery<C: GenericClient + Sync>(
     automatic: bool,
     resend: bool,
 ) -> Result<usize, String> {
+    super::assets::renew(client, id).await?;
     let recipients = recipients(client, selected).await?;
     let seq: i32 = if resend {
         client.query_one("SELECT COALESCE(MAX(dispatch_seq), 0) + 1 AS seq FROM report_delivery WHERE report_id = $1;", &[&id]).await.map_err(|e| e.to_string())?.get("seq")

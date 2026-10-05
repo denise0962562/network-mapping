@@ -9,6 +9,7 @@ pub mod login_record;
 pub mod mail_template;
 pub mod open_source;
 pub mod operations;
+pub mod report_mail_assets;
 pub mod reports;
 pub mod requests;
 pub mod scanner_diagnostics;

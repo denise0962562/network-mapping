@@ -1,11 +1,43 @@
-{{ system_name }} {{ report_label }}
+{{ system_name }} {{ report_label }} · 修订 #{{ report_meta.revision }}
 周期：{{ period_label }}
+归档于：{{ report_meta.generated_at }} · {{ report_meta.timezone }}
+输入固定于：{{ report_meta.cutoff_at }}
+
+核心指标与任务完成情况
 新建任务：{{ tasks.created }}
 成功 / 失败 / 部分完成 / 取消：{{ tasks.succeeded }} / {{ tasks.failed }} / {{ tasks.partial }} / {{ tasks.cancelled }}
-成功率：{% if tasks.success_rate is number %}{{ tasks.success_rate }}%{% else %}无完成任务{% endif %}
-去重 IP：{{ scan_output.unique_ips }}
+任务成功率：{% if tasks.success_rate is number %}{{ tasks.success_rate }}%{% else %}--（无完成任务）{% endif %}
+成功执行发现的去重 IP：{{ scan_output.unique_ips }}
 端口 / 服务观测次数：{{ scan_output.port_observations }} / {{ scan_output.service_observations }}
-{% for item in recommendations %}建议：{{ item }}
+成功率 = 成功 /（成功 + 失败 + 部分完成），取消单列。
+
+与上一周期比较
+{% if previous_available %}{% for row in comparison_rows %}{{ row.label }}：{{ row.value }}
+{% endfor %}{% else %}上期历史或统计不完整，暂不提供环比。
+{% endif %}
+每日完成任务（日期 | 成功 | 失败 | 部分完成 | 取消）
+{% for day in trend_rows %}{{ day.day }} | {{ day.succeeded }} | {{ day.failed }} | {{ day.partial }} | {{ day.cancelled }}
+{% else %}本期无每日统计记录。
 {% endfor %}
-统计数据已完整归档。任务按完成时间归属；端口和服务按扫描执行累加，不代表资产存量。数据范围为生成时保留的历史。
-登录平台后查看完整报告：{{ detail_path }}
+端口观测 Top 10（端口 | 观测次数）
+{% for item in scan_output.ports %}{{ item.name }} | {{ item.count }}
+{% else %}本期无端口观测记录。
+{% endfor %}
+服务观测 Top 10（服务 | 观测次数）
+{% for item in scan_output.services %}{{ item.name }} | {{ item.count }}
+{% else %}本期无服务观测记录。
+{% endfor %}
+扫描器执行表现
+{% for scanner in scanners %}{{ scanner.name }}：总执行 {{ scanner.total }}；成功 / 失败 / 取消 {{ scanner.succeeded }} / {{ scanner.failed }} / {{ scanner.cancelled }}；成功执行平均耗时 {{ scanner.avg_duration }}；P50 / P95 {{ scanner.p50 }} / {{ scanner.p95 }}
+{% else %}本期无完成执行。
+{% endfor %}{% if scanner_omitted > 0 %}另有 {{ scanner_omitted }} 个扫描器，完整列表请登录平台查看。
+{% endif %}
+处理建议
+{% for item in recommendations %}{{ item }}
+{% else %}本期未发现需要提示的任务异常。
+{% endfor %}
+统计口径与完整性
+成功执行统计已完成：{{ quality_summary.ready }} / {{ quality_summary.expected }}
+{% for note in notes %}{{ note }}
+{% endfor %}
+登录平台查看完整报告：{% if detail_url %}{{ detail_url }}{% else %}{{ detail_path }}{% endif %}
