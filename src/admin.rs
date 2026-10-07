@@ -144,6 +144,10 @@ impl Error for ScannerRegistrationUnauthorized {}
 
 #[derive(Serialize)]
 pub struct ScannerInfo {
+    pub diagnostics_capabilities: serde_json::Value,
+    pub accepting_tasks: bool,
+    pub diagnostic_health: String,
+    pub diagnostic_dropped_events: i64,
     pub scanner_id: String,
     pub name: Option<String>,
     pub creator: Option<String>,
@@ -186,6 +190,7 @@ pub struct ScannerLatencyInfo {
     pub server_processing_ms: f64,
     pub measured_at: DateTime<Utc>,
     pub stale: bool,
+    pub severity: String,
 }
 
 pub enum ScannerEvent {
@@ -1937,12 +1942,12 @@ pub async fn scanner_register(
 }
 
 const SCANNER_INFO_SELECT: &str = "\
-    SELECT s.scanner_id, s.name, u.username AS creator, s.location, \
+    SELECT s.diagnostic_dropped_events, s.diagnostics_capabilities, s.accepting_tasks, s.diagnostic_health, s.scanner_id, s.name, u.username AS creator, s.location, \
            s.ip_address, s.system_version, s.scanner_version, \
            s.cpu_model, s.cpus, s.ram, s.uptime, s.create_time, s.register_time, s.update_time, \
            s.last_seen_at, s.runtime_state, \
-           (s.runtime_state <> 'stopping' AND s.last_seen_at IS NOT NULL \
-              AND s.last_seen_at >= NOW() - INTERVAL '90 seconds') AS is_online, \
+           (s.is_enable = TRUE AND s.runtime_state <> 'stopping' AND s.last_seen_at IS NOT NULL \
+              AND s.last_seen_at >= NOW() - (@offline_seconds@) * INTERVAL '1 second') AS is_online, \
            (SELECT t.task_id FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
               WHERE e.assigned_scanner_id = s.scanner_id AND e.execution_status = 'running' \
               AND e.lease_expires_at > (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)::BIGINT \
@@ -1952,10 +1957,29 @@ const SCANNER_INFO_SELECT: &str = "\
            s.network_capabilities_updated_at, s.scan_capabilities, s.scan_capabilities_updated_at, \
            s.latency_rtt_us, s.latency_network_rtt_us, s.latency_server_processing_us, \
            s.latency_measured_at, \
-           (s.latency_measured_at IS NULL OR s.latency_measured_at < NOW() - INTERVAL '90 seconds') \
-              AS latency_stale \
+           (s.latency_measured_at IS NULL OR s.latency_measured_at < NOW() - (@latency_stale_seconds@) * INTERVAL '1 second') \
+              AS latency_stale, \
+           CASE WHEN s.latency_network_rtt_us >= (@latency_critical_ms@) * 1000 THEN 'critical' \
+                WHEN s.latency_network_rtt_us >= (@latency_warning_ms@) * 1000 THEN 'warning' ELSE 'normal' END AS latency_severity \
     FROM scanner_info s \
     LEFT JOIN users u ON u.id = s.create_user";
+
+fn scanner_info_select() -> String {
+    SCANNER_INFO_SELECT
+        .replace("@offline_seconds@", &crate::scanner_health::seconds_sql())
+        .replace(
+            "@latency_stale_seconds@",
+            &crate::scanner_health::latency_stale_seconds_sql(),
+        )
+        .replace(
+            "@latency_warning_ms@",
+            &crate::scanner_health::latency_warning_sql(),
+        )
+        .replace(
+            "@latency_critical_ms@",
+            &crate::scanner_health::latency_critical_sql(),
+        )
+}
 
 fn scanner_info_from_row(row: &Row) -> ScannerInfo {
     let latency = match (
@@ -1971,11 +1995,16 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
                 server_processing_ms: processing as f64 / 1_000.0,
                 measured_at,
                 stale: row.get("latency_stale"),
+                severity: row.get("latency_severity"),
             })
         }
         _ => None,
     };
     ScannerInfo {
+        diagnostics_capabilities: row.get("diagnostics_capabilities"),
+        accepting_tasks: row.get("accepting_tasks"),
+        diagnostic_health: row.get("diagnostic_health"),
+        diagnostic_dropped_events: row.get("diagnostic_dropped_events"),
         scanner_id: row.get("scanner_id"),
         name: row.get("name"),
         creator: row.get("creator"),
@@ -2015,7 +2044,8 @@ fn scanner_info_from_row(row: &Row) -> ScannerInfo {
 pub async fn get_scanners(pool: &Pool) -> Result<Vec<ScannerInfo>, Box<dyn std::error::Error>> {
     let connection = pool.get().await?;
     let query = format!(
-        "{SCANNER_INFO_SELECT} WHERE s.deleted_at IS NULL ORDER BY s.create_time DESC NULLS LAST, s.id DESC;"
+        "{} WHERE s.deleted_at IS NULL ORDER BY s.create_time DESC NULLS LAST, s.id DESC;",
+        scanner_info_select()
     );
     let rows = connection.query(&query, &[]).await?;
     Ok(rows.iter().map(scanner_info_from_row).collect())
@@ -2026,8 +2056,10 @@ pub async fn get_scanner(
     scanner_id: Uuid,
 ) -> Result<Option<ScannerInfo>, Box<dyn std::error::Error>> {
     let connection = pool.get().await?;
-    let query =
-        format!("{SCANNER_INFO_SELECT} WHERE s.scanner_id = $1 AND s.deleted_at IS NULL LIMIT 1;");
+    let query = format!(
+        "{} WHERE s.scanner_id = $1 AND s.deleted_at IS NULL LIMIT 1;",
+        scanner_info_select()
+    );
     let row = connection
         .query_opt(&query, &[&scanner_id.to_string()])
         .await?;

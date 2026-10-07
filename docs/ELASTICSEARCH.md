@@ -1,4 +1,14 @@
-# Elasticsearch 9.5.3 扫描结果存储
+# Elasticsearch 9.5.x 扫描结果存储
+
+版本策略默认 `expected_version = "9.5.x"`，接受任意正式版 `9.5.N`。
+兼容旧配置中的 `expected_version = "9.5.3"` 等 `9.5.N` 值，这些值同样表示支持整个
+9.5 系列，不再锁定补丁版本。因此，已有 9.5.3 配置可以直接连接 ES 9.5.4，无需修改
+配置文件。其他主次版本、预发布版和非法版本均会在启动索引初始化前被拒绝；状态接口
+保留原配置值并显示实际服务端版本。
+
+版本范围放行不等同于所有补丁版本均通过真实集群验收。HTTP fixture 验证启动检查和
+请求协议；生产采用的补丁版本仍需在隔离集群验证 mapping、Painless、Data Stream、
+Bulk、搜索聚合及恢复流程。此次范围调整未新增真实 ES 集群验收记录。
 
 服务端正常运行仅支持 Elasticsearch 扫描结果存储。PostgreSQL 保留用户、权限、标签、
 任务、执行状态、扫描器、上传回执、补偿队列和紧凑分析快照，不再读写完整扫描事实。
@@ -21,7 +31,7 @@ dns_record_index = "network-mapping-dns-records-v1"
 dns_observation_retention_days = 180
 scan_number_of_replicas = 1
 write_wait_for_active_shards = "all"
-expected_version = "9.5.3"
+expected_version = "9.5.x"
 # api_key 和 CA 路径由部署环境提供。
 ```
 
@@ -80,6 +90,8 @@ ES 成功而 PG 确认失败时，相同身份重试收敛；完成后的重复�
 最后一批没有触及早先月份/分片造成漏计。执行成功、任务聚合和 outbox 在同一 PG 事务提交。
 
 当前端点发布在该事务之后，失败由 outbox 补偿；执行成功不代表所有投影/分析同时可见。
+当前投影只由后台分段发布，上传及重复 final 不等待整批资产发布；任务详情提供独立的
+`projection_status`。领取令牌、续租和分页检查点见[扫描写入与后台资产发布](WRITE_SPEED.md)。
 状态接口统计扫描投影和标签两个队列，不再将旧副本事件计为运行积压。
 
 DNS observation 始终通过 Data Stream 名执行 `create`，不直接写 backing index。同一 pending
@@ -96,8 +108,8 @@ PG 尚未确认、并发重试或 Data Stream rollover 都不会产生重复事�
 索引不可用返回 503，不回退旧 PG 事实，也不将失败分片作为完整统计。
 
 ES 快照和 PG 备份必须配对恢复，并对回执、事实与投影对账。定期快照、磁盘监控和恢复演练
-仍是部署要求；本次代码调整没有为实际集群执行这些运维动作。索引过期前需定义可恢复归档，
-否则完整历史查询及全量重建不再有保证。详细步骤见[实施方案](ES_SCAN_STORAGE_PLAN.md)。
+属于部署运维要求。索引过期前需定义可恢复归档，
+否则完整历史查询及全量重建不再有保证。
 
 自动验证：
 
@@ -113,7 +125,7 @@ ANALYTICS_TEST_DATABASE_URL='host=127.0.0.1 port=5432 dbname=storage_test user=t
 ```
 
 存储集成测试使用真实 PG 隔离 schema 与本地 ES HTTP fixture，验证协议和恢复边界；它不替代
-实际 ES 9.5.3 的 mapping、Painless、rollover、副本故障、性能和 Snapshot/Restore 验收。
+实际 ES 9.5.x 的 mapping、Painless、rollover、副本故障、性能和 Snapshot/Restore 验收。
 
 ## 慢查询诊断
 

@@ -5,24 +5,28 @@ use std::net::TcpListener;
 use std::sync::Mutex;
 
 #[derive(Default)]
-struct FixtureState {
-    requests: Vec<String>,
-    documents: BTreeMap<(String, String), Value>,
-    fail_path: Option<String>,
-    delay_path: Option<String>,
-    delay_ms: u64,
+pub(super) struct FixtureState {
+    pub(super) requests: Vec<String>,
+    pub(super) documents: BTreeMap<(String, String), Value>,
+    pub(super) fail_path: Option<String>,
+    pub(super) delay_path: Option<String>,
+    pub(super) delay_ms: u64,
+    pub(super) projection_bulk_sizes: Vec<usize>,
+    pub(super) malformed_projection_bulk: bool,
+    pub(super) projection_fail_after: Option<usize>,
+    server_version: Option<String>,
     dns_generation: usize,
 }
 
-struct EsFixture {
-    url: String,
-    state: Arc<Mutex<FixtureState>>,
+pub(super) struct EsFixture {
+    pub(super) url: String,
+    pub(super) state: Arc<Mutex<FixtureState>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EsFixture {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -112,7 +116,7 @@ impl EsFixture {
         }
     }
 
-    fn service(&self) -> ElasticsearchService {
+    pub(super) fn service(&self) -> ElasticsearchService {
         ElasticsearchService::new(ElasticsearchConfig {
             url: self.url.clone(),
             bulk_max_retries: 0,
@@ -131,7 +135,7 @@ impl Drop for EsFixture {
 
 fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &str) -> Value {
     if path == "/" {
-        return json!({"version": {"number": "9.5.3"}});
+        return json!({"version": {"number": state.server_version.as_deref().unwrap_or("9.5.3")}});
     }
     if path.starts_with("/_data_stream/") {
         return json!({"data_streams": [{"indices": [{"index_name": format!(".ds-dns-{}", state.dns_generation)}]}]});
@@ -141,6 +145,21 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        let is_projection = lines
+            .first()
+            .and_then(|line| line.pointer("/update/_index"))
+            .and_then(Value::as_str)
+            .is_some_and(|index| index.contains("endpoints-current"));
+        if is_projection {
+            state.projection_bulk_sizes.push(body.len());
+            if state.malformed_projection_bulk
+                || state
+                    .projection_fail_after
+                    .is_some_and(|n| state.projection_bulk_sizes.len() > n)
+            {
+                return json!({"errors":false,"items":[]});
+            }
+        }
         let mut items = Vec::new();
         for pair in lines.chunks_exact(2) {
             let (operation, action) = pair[0].as_object().unwrap().iter().next().unwrap();
@@ -221,6 +240,38 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
         if request.pointer("/aggs/indices").is_some() {
             return json!({"aggregations": {"indices": {"buckets": []}}, "_shards": {"failed":0}});
         }
+        if request.pointer("/sort/0/ip").is_some() {
+            let execution = request
+                .pointer("/query/term/execution_id")
+                .and_then(Value::as_str);
+            let mut hits = state
+                .documents
+                .iter()
+                .filter(|((index, _), doc)| {
+                    path.contains(index)
+                        && doc.get("execution_id").and_then(Value::as_str) == execution
+                })
+                .map(
+                    |((_, id), doc)| json!({"_id":id,"_source":doc,"sort":[doc["ip"],doc["port"]]}),
+                )
+                .collect::<Vec<_>>();
+            let key = |hit: &Value| {
+                (
+                    hit["sort"][0].as_str().unwrap().to_owned(),
+                    hit["sort"][1].as_i64().unwrap(),
+                )
+            };
+            hits.sort_by_key(&key);
+            if let Some(after) = request.get("search_after") {
+                let after = (
+                    after[0].as_str().unwrap().to_owned(),
+                    after[1].as_i64().unwrap(),
+                );
+                hits.retain(|hit| key(hit) > after);
+            }
+            hits.truncate(request["size"].as_u64().unwrap() as usize);
+            return json!({"hits":{"hits":hits},"_shards":{"failed":0}});
+        }
         let hits: Vec<_> = state
             .documents
             .iter()
@@ -241,7 +292,7 @@ async fn isolated_pool() -> (Pool, String) {
     isolated_pool_with_size(8).await
 }
 
-async fn isolated_pool_with_size(max_size: usize) -> (Pool, String) {
+pub(super) async fn isolated_pool_with_size(max_size: usize) -> (Pool, String) {
     let mut config: tokio_postgres::Config = std::env::var("STORAGE_TEST_DATABASE_URL")
         .expect("disposable PG URL")
         .parse()
@@ -259,10 +310,17 @@ async fn isolated_pool_with_size(max_size: usize) -> (Pool, String) {
         .batch_execute(include_str!("../source/database/init.sql"))
         .await
         .unwrap();
+    // Match startup: task claims also read the scanner admission/health fields.
+    client
+        .batch_execute(include_str!(
+            "../source/database/migrate_scanner_diagnostics.sql"
+        ))
+        .await
+        .unwrap();
     (pool, schema)
 }
 
-async fn seed_execution(pool: &Pool) {
+pub(super) async fn seed_execution(pool: &Pool) {
     pool.get().await.unwrap().batch_execute(
         "INSERT INTO users(id,username,password) VALUES(1,'fixture','unused');
          INSERT INTO scan_task(id,user_id,task_id,task_initiator,task_target) VALUES(1,1,'task','fixture',ARRAY['192.0.2.1'::inet]);
@@ -573,7 +631,7 @@ async fn dns_reconciliation_rejects_duplicate_id_across_backing_indices() {
     assert!(error.contains("跨 backing index 重复"));
 }
 
-async fn seed_dns_upload(pool: &Pool) -> crate::ScannerResultUpload {
+pub(super) async fn seed_dns_upload(pool: &Pool) -> crate::ScannerResultUpload {
     seed_execution(pool).await;
     let scanner = "00000000-0000-0000-0000-000000000001";
     let task = "00000000-0000-0000-0000-000000000002";
@@ -744,9 +802,10 @@ async fn dns_elasticsearch_wait_does_not_hold_the_postgres_connection() {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::timeout(Duration::from_millis(250), pool.get())
-            .await
-            .is_ok()
+        matches!(
+            tokio::time::timeout(Duration::from_millis(250), pool.get()).await,
+            Ok(Ok(_))
+        )
     };
     let (write_result, pool_was_available) = tokio::join!(write, pool_probe);
     assert!(
@@ -1617,7 +1676,7 @@ async fn save_upload_fixture(
     .await
 }
 
-fn port_observation() -> crate::ScannerObservation {
+pub(super) fn port_observation() -> crate::ScannerObservation {
     serde_json::from_value(json!({
         "kind": "port", "ip": "192.0.2.1", "port": 443,
         "protocol": "tcp", "state": "open", "source": "masscan",
@@ -2039,4 +2098,56 @@ async fn recovery_failure_reports_are_idempotent_and_stop_after_three_failures()
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn startup_checks_version_before_index_writes_and_reports_actual_version() {
+    // initialize does not acquire a PG connection; keep this protocol test independent of PG.
+    let manager =
+        deadpool_postgres::Manager::new(tokio_postgres::Config::new(), tokio_postgres::NoTls);
+    let pool = Pool::builder(manager).max_size(1).build().unwrap();
+    for (policy, version, accepted) in [
+        ("9.5.x", "9.5.0", true),
+        ("9.5.x", "9.5.2", true),
+        ("9.5.x", "9.5.3", true),
+        ("9.5.x", "9.5.123", true),
+        ("9.5.3", "9.5.3", true),
+        ("9.5.3", "9.5.2", true),
+        ("9.5.3", "9.5.4", true),
+        ("9.5.3", "9.6.0", false),
+        ("9.5.3", "9.5.4-SNAPSHOT", false),
+        ("9.5.x", "9.4.9", false),
+        ("9.5.x", "9.6.0", false),
+        ("9.5.x", "10.0.0", false),
+        ("9.5.x", "9.5.3-SNAPSHOT", false),
+        ("9.5.x", "invalid", false),
+    ] {
+        let fixture = EsFixture::start();
+        fixture.state.lock().unwrap().server_version = Some(version.to_owned());
+        let service = ElasticsearchService::new(ElasticsearchConfig {
+            url: fixture.url.clone(),
+            expected_version: policy.to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = service.initialize(&pool).await;
+        let runtime = service.inner.runtime.read().unwrap();
+        let state = fixture.state.lock().unwrap();
+        if accepted {
+            assert!(result.is_ok(), "{policy}: {version}: {result:?}");
+            assert!(runtime.connected && runtime.read_ready);
+            assert_eq!(runtime.server_version.as_deref(), Some(version));
+            assert!(
+                state
+                    .requests
+                    .iter()
+                    .any(|request| request.starts_with("PUT "))
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.contains(policy) && error.contains(version), "{error}");
+            assert_eq!(state.requests, ["GET /"]);
+            assert!(!runtime.connected && !runtime.read_ready);
+        }
+    }
 }

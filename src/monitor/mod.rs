@@ -7,6 +7,10 @@
 //!
 //! 三类信号统一由 [`run_notifier`] 消费，做冷却去重后复用邮件模板系统发送给管理员。
 
+#[cfg(test)]
+pub(crate) mod policy_tests;
+mod routes;
+pub mod rules;
 mod slow_sql;
 
 use std::collections::HashMap;
@@ -22,6 +26,8 @@ use uuid::Uuid;
 use crate::config::MonitorConfig;
 use crate::logs::write::error_diagnostics;
 use crate::mail_template;
+use crate::runtime_config::Versioned;
+use rules::{AppliedRule, MonitorService};
 
 pub const CHANNEL_CAPACITY: usize = 1024;
 
@@ -53,6 +59,7 @@ pub struct HealthEvent {
     pub key: String,
     pub summary: String,
     pub details: Vec<(String, String)>,
+    pub applied_rule: Option<AppliedRule>,
 }
 
 struct SlowSqlObservation<'a> {
@@ -70,6 +77,31 @@ struct SlowSqlObservation<'a> {
 }
 
 impl HealthEvent {
+    pub fn with_rule(mut self, applied: AppliedRule) -> Self {
+        self.details.extend([
+            ("命中规则".into(), applied.source.clone()),
+            (
+                "警告阈值".into(),
+                format!("{} ms", applied.rule.warning_threshold_ms),
+            ),
+            (
+                "严重阈值".into(),
+                applied
+                    .rule
+                    .critical_threshold_ms
+                    .map(|ms| format!("{ms} ms"))
+                    .unwrap_or_else(|| "未启用".into()),
+            ),
+            (
+                "冷却时间".into(),
+                format!("{} 秒", applied.rule.cooldown_seconds),
+            ),
+            ("配置版本".into(), applied.revision.to_string()),
+        ]);
+        self.applied_rule = Some(applied);
+        self
+    }
+
     pub fn slow_request(
         method: &str,
         path: &str,
@@ -80,6 +112,7 @@ impl HealthEvent {
         actor_name: Option<String>,
     ) -> Self {
         Self {
+            applied_rule: None,
             alert_type: "slow_request",
             severity: "warning",
             key: format!("slow_request:{method}:{path}"),
@@ -106,6 +139,7 @@ impl HealthEvent {
         actor_name: Option<String>,
     ) -> Self {
         Self {
+            applied_rule: None,
             alert_type: "server_error",
             severity: "critical",
             key: format!("server_error:{path}:{status}"),
@@ -142,6 +176,7 @@ impl HealthEvent {
             query.chars().take(2000).collect()
         };
         Self {
+            applied_rule: None,
             alert_type: "slow_sql",
             severity: "warning",
             key: format!("slow_sql:{queryid}"),
@@ -253,6 +288,7 @@ impl HealthEvent {
             details.push(("失败类型".to_owned(), failure_kind.to_owned()));
         }
         Self {
+            applied_rule: None,
             alert_type,
             severity,
             key: format!("{alert_type}:{}", observation.operation),
@@ -297,14 +333,16 @@ fn request_details(
 #[derive(Clone)]
 pub struct MonitorHandle {
     tx: mpsc::Sender<HealthEvent>,
-    config: Arc<RwLock<MonitorConfig>>,
+    config: Arc<RwLock<Versioned<MonitorConfig>>>,
     dropped_events: Arc<AtomicU64>,
+    revisions: tokio::sync::watch::Sender<i64>,
 }
 
 impl MonitorHandle {
     /// 启动后台通知与慢 SQL 轮询任务。开关由运行时快照控制，关闭时 worker 保持空闲。
-    pub fn new(config: MonitorConfig, pool: Pool, encryption_key: String) -> Self {
+    pub fn new(config: Versioned<MonitorConfig>, pool: Pool, encryption_key: String) -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (revisions, _) = tokio::sync::watch::channel(config.revision);
         let config = Arc::new(RwLock::new(config));
         tokio::spawn(run_notifier(
             rx,
@@ -312,36 +350,62 @@ impl MonitorHandle {
             encryption_key,
             config.clone(),
         ));
-        tokio::spawn(slow_sql::run_monitor(pool, tx.clone(), config.clone()));
+        tokio::spawn(slow_sql::run_monitor(
+            pool,
+            tx.clone(),
+            config.clone(),
+            revisions.subscribe(),
+        ));
         info!(target: "server::startup", component = "monitor", "健康监控任务已启动");
         Self {
             tx,
             config,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            revisions,
         }
     }
 
-    pub fn replace_config(&self, config: MonitorConfig) {
-        *self
+    pub fn replace_config(&self, config: MonitorConfig, revision: i64) {
+        let mut current = self
             .config
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if revision > current.revision {
+            *current = Versioned {
+                value: config,
+                revision,
+            };
+            self.revisions.send_replace(revision);
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .value
             .enabled
     }
 
-    /// 该耗时是否达到慢请求阈值。
-    pub fn is_slow_request(&self, duration_ms: i64) -> bool {
-        let config = self
+    pub fn classify_request(
+        &self,
+        method: &str,
+        route: &str,
+        duration_ms: i64,
+    ) -> Option<AppliedRule> {
+        let current = self
             .config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        config.enabled && duration_ms >= config.slow_request_threshold_ms
+        if !current.value.enabled {
+            return None;
+        }
+        let applied = current.value.resolve_rule(
+            MonitorService::WebApi,
+            &format!("{method} {route}"),
+            current.revision,
+        );
+        applied.rule.severity(duration_ms as f64).map(|_| applied)
     }
 
     /// 是否启用 5xx 服务端错误告警。
@@ -350,7 +414,7 @@ impl MonitorHandle {
             .config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        config.enabled && config.server_error_enabled
+        config.value.enabled && config.value.server_error_enabled
     }
 
     /// 非阻塞投递一条告警事件；channel 满时直接丢弃，绝不阻塞请求路径。
@@ -375,32 +439,30 @@ impl MonitorHandle {
             .config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !config.enabled {
+        if !config.value.enabled {
             return;
         }
-        let (warning_threshold, critical_threshold) = match observation.kind {
-            ElasticsearchOperationKind::Query => (
-                config.elasticsearch_query_warning_threshold_ms,
-                config.elasticsearch_query_critical_threshold_ms,
-            ),
-            ElasticsearchOperationKind::Write => (
-                config.elasticsearch_write_warning_threshold_ms,
-                config.elasticsearch_write_critical_threshold_ms,
-            ),
+        let service = match observation.kind {
+            ElasticsearchOperationKind::Query => MonitorService::ElasticsearchQuery,
+            ElasticsearchOperationKind::Write => MonitorService::ElasticsearchWrite,
             ElasticsearchOperationKind::Maintenance => return,
         };
+        let applied = config
+            .value
+            .resolve_rule(service, observation.operation, config.revision);
         let failed = observation.failure_kind.is_some()
             || observation.http_status.is_some_and(|status| status >= 400)
             || observation.timed_out
             || observation.failed_shards > 0;
-        if !failed && observation.duration_ms < warning_threshold {
-            return;
-        }
-        let severity = if failed || observation.duration_ms >= critical_threshold {
+        let severity = if failed {
             "critical"
         } else {
-            "warning"
+            let Some(severity) = applied.rule.severity(observation.duration_ms as f64) else {
+                return;
+            };
+            severity
         };
+        drop(config);
         warn!(
             event = "ElasticsearchSlowOperation",
             operation = observation.operation,
@@ -414,7 +476,7 @@ impl MonitorHandle {
             failure_kind = observation.failure_kind,
             "Elasticsearch 操作达到告警条件"
         );
-        self.emit(HealthEvent::elasticsearch(&observation, severity));
+        self.emit(HealthEvent::elasticsearch(&observation, severity).with_rule(applied));
     }
 }
 
@@ -428,7 +490,9 @@ async fn record_health_alert(
         .iter()
         .map(|(label, value)| serde_json::json!({ "label": label, "value": value }))
         .collect::<Vec<_>>();
-    let detail = serde_json::json!({ "details": details });
+    let detail = serde_json::json!({ "details": details, "policy": event.applied_rule.as_ref().map(|applied| serde_json::json!({
+        "source": applied.source, "revision": applied.revision, "rule": applied.rule
+    })) });
     let conn = pool.get().await?;
     conn.execute(
         "INSERT INTO health_alert (alert_type, alert_key, severity, summary, detail) \
@@ -445,41 +509,71 @@ async fn record_health_alert(
     Ok(())
 }
 
+#[derive(Default)]
+struct AlertCooldown {
+    entries: HashMap<String, (Instant, &'static str)>,
+}
+
+impl AlertCooldown {
+    fn allow(
+        &mut self,
+        key: &str,
+        severity: &'static str,
+        cooldown: Duration,
+        now: Instant,
+    ) -> bool {
+        // Keep finite memory even when many SQL query IDs are observed over time.
+        if self.entries.len() >= 4096 {
+            self.entries
+                .retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(604_800));
+            if self.entries.len() >= 4096 {
+                self.entries.clear();
+            }
+        }
+        if let Some((previous, previous_severity)) = self.entries.get(key)
+            && now.duration_since(*previous) < cooldown
+            && !(severity == "critical" && *previous_severity != "critical")
+        {
+            return false;
+        }
+        self.entries.insert(key.to_owned(), (now, severity));
+        true
+    }
+}
+
 /// 消费健康事件：冷却去重后写入历史并调用邮件模板系统向管理员发送告警。
 async fn run_notifier(
     mut rx: mpsc::Receiver<HealthEvent>,
     pool: Pool,
     encryption_key: String,
-    config: Arc<RwLock<MonitorConfig>>,
+    config: Arc<RwLock<Versioned<MonitorConfig>>>,
 ) {
-    let last_alert = Mutex::new(HashMap::<String, Instant>::new());
+    let last_alert = Mutex::new(AlertCooldown::default());
 
     while let Some(event) = rx.recv().await {
         let settings = config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if !settings.enabled {
+        if !settings.value.enabled {
             continue;
         }
-        let cooldown = Duration::from_secs(settings.alert_cooldown_seconds);
+        let cooldown = Duration::from_secs(
+            event
+                .applied_rule
+                .as_ref()
+                .map(|applied| applied.rule.cooldown_seconds)
+                .unwrap_or(settings.value.alert_cooldown_seconds),
+        );
         {
             let mut last = last_alert
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let now = Instant::now();
-            if let Some(previous) = last.get(&event.key)
-                && now.duration_since(*previous) < cooldown
-            {
-                debug!(
-                    event = "HealthAlertCooldown",
-                    alert_type = event.alert_type,
-                    key = %event.key,
-                    "告警处于冷却期，已合并丢弃"
-                );
+            if !last.allow(&event.key, event.severity, cooldown, now) {
+                debug!(event = "HealthAlertCooldown", alert_type = event.alert_type, key = %event.key, "告警处于冷却期，已合并丢弃");
                 continue;
             }
-            last.insert(event.key.clone(), now);
         }
 
         if let Err(error) = record_health_alert(&pool, &event).await {
@@ -529,6 +623,106 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
+    #[test]
+    fn cooldown_suppresses_repeats_but_allows_immediate_escalation() {
+        let mut cooldown = super::AlertCooldown::default();
+        let at = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(300);
+        assert!(cooldown.allow("operation", "warning", window, at));
+        assert!(!cooldown.allow(
+            "operation",
+            "warning",
+            window,
+            at + std::time::Duration::from_secs(1)
+        ));
+        assert!(cooldown.allow(
+            "operation",
+            "critical",
+            window,
+            at + std::time::Duration::from_secs(2)
+        ));
+        assert!(!cooldown.allow(
+            "operation",
+            "critical",
+            window,
+            at + std::time::Duration::from_secs(3)
+        ));
+        assert!(cooldown.allow("different-operation", "warning", window, at));
+        assert!(cooldown.allow(
+            "operation",
+            "critical",
+            window,
+            at + window + std::time::Duration::from_secs(2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_slow_rule_preserves_failure_alerts_and_records_policy_revision() {
+        use super::rules::{MonitorService, OperationRule};
+        let (handle, mut rx) = handle();
+        let mut config = MonitorConfig::default();
+        let mut rule = config.default_rule(MonitorService::ElasticsearchQuery);
+        rule.enabled = false;
+        config.operation_rules.push(OperationRule {
+            service: MonitorService::ElasticsearchQuery,
+            operation: "asset-search".into(),
+            rule,
+        });
+        handle.replace_config(config, 2);
+        handle.observe_elasticsearch(query_observation(10_000));
+        assert!(rx.try_recv().is_err());
+        let mut failed = query_observation(20);
+        failed.timed_out = true;
+        handle.observe_elasticsearch(failed);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.alert_type, "elasticsearch_query_error");
+        assert_eq!(event.severity, "critical");
+        assert_eq!(event.applied_rule.as_ref().unwrap().revision, 2);
+        assert!(
+            event
+                .details
+                .iter()
+                .any(|(key, value)| key == "配置版本" && value == "2")
+        );
+        handle.replace_config(MonitorConfig::default(), 1);
+        assert!(
+            handle
+                .classify_request("GET", "/api/task/all", 3000)
+                .is_some()
+        );
+        assert_eq!(handle.config.read().unwrap().revision, 2);
+    }
+
+    #[test]
+    fn request_overrides_use_method_and_route_template() {
+        use super::rules::{MonitorService, OperationRule};
+        let (handle, _) = handle();
+        let mut config = MonitorConfig::default();
+        let mut rule = config.default_rule(MonitorService::WebApi);
+        rule.warning_threshold_ms = 1000;
+        rule.critical_threshold_ms = Some(2000);
+        config.operation_rules.push(OperationRule {
+            service: MonitorService::WebApi,
+            operation: "GET /api/task/{task_id}".into(),
+            rule,
+        });
+        handle.replace_config(config, 2);
+        assert!(
+            handle
+                .classify_request("GET", "/api/task/{task_id}", 999)
+                .is_none()
+        );
+        let applied = handle
+            .classify_request("GET", "/api/task/{task_id}", 2000)
+            .unwrap();
+        assert_eq!(applied.rule.severity(2000.0), Some("critical"));
+        assert!(
+            handle
+                .classify_request("POST", "/api/task/{task_id}", 2000)
+                .is_none()
+        );
+    }
+
     fn handle() -> (
         MonitorHandle,
         tokio::sync::mpsc::Receiver<super::HealthEvent>,
@@ -537,8 +731,12 @@ mod tests {
         (
             MonitorHandle {
                 tx,
-                config: Arc::new(std::sync::RwLock::new(MonitorConfig::default())),
+                config: Arc::new(std::sync::RwLock::new(crate::runtime_config::Versioned {
+                    value: MonitorConfig::default(),
+                    revision: 1,
+                })),
                 dropped_events: Arc::new(AtomicU64::new(0)),
+                revisions: tokio::sync::watch::channel(1).0,
             },
             rx,
         )

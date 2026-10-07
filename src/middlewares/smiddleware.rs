@@ -115,7 +115,7 @@ where
                 .get("User-Agent")
                 .map(|u| u.to_str().unwrap_or("Invalid UTF-8"))
                 .unwrap_or("Unknown or None"),
-            path = &req.path(),
+            path = crate::reports::redact_mail_image_path(req.path()),
             request_id = %request_id,
         );
 
@@ -148,7 +148,7 @@ where
                         event = "InvalidSession",
                         reason = "missing_session_cookie",
                         method = %req.method(),
-                        path = req.path(),
+                        path = crate::reports::redact_mail_image_path(req.path()),
                         request_id = %request_id,
                         "request rejected because no session cookie was provided",
                     );
@@ -210,7 +210,7 @@ where
                         event = "InvalidSession",
                         reason,
                         method = %req.method(),
-                        path = req.path(),
+                        path = crate::reports::redact_mail_image_path(req.path()),
                         request_id = %request_id,
                         "request rejected because the session is invalid or expired",
                     );
@@ -234,7 +234,7 @@ where
                         middleware = "session_authentication",
                         http_status = 500_u16,
                         method = %req.method(),
-                        path = req.path(),
+                        path = crate::reports::redact_mail_image_path(req.path()),
                     );
                     let resp = HttpResponse::InternalServerError().finish();
                     Ok(req.into_response(resp).map_into_right_body())

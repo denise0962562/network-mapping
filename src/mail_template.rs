@@ -70,6 +70,7 @@ pub struct MailTemplateDetail {
     pub is_default: bool,
     pub source: MailTemplateSource,
     pub variables: Vec<MailTemplateVariable>,
+    pub default_source: MailTemplateSource,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -298,6 +299,61 @@ fn template_variables(template_key: &str) -> Vec<MailTemplateVariable> {
                 label: "报告详情路径",
                 example: "/reports/报告ID",
             },
+            MailTemplateVariable {
+                key: "report_meta",
+                label: "报告版本与归档信息",
+                example: "revision / timezone / generated_at / cutoff_at",
+            },
+            MailTemplateVariable {
+                key: "previous_available",
+                label: "环比是否可用",
+                example: "true / false",
+            },
+            MailTemplateVariable {
+                key: "comparison",
+                label: "环比数值",
+                example: "created_growth_percent / unique_ips_growth_percent / daily_unique_ips_growth_percent / success_rate_change_points",
+            },
+            MailTemplateVariable {
+                key: "comparison_rows",
+                label: "格式化环比列表",
+                example: "label / value",
+            },
+            MailTemplateVariable {
+                key: "trend_rows",
+                label: "每日完成任务",
+                example: "day / succeeded / failed / partial / cancelled",
+            },
+            MailTemplateVariable {
+                key: "trend_image_url",
+                label: "服务器趋势图片地址",
+                example: "启用远程图片后生成；预览使用示例图",
+            },
+            MailTemplateVariable {
+                key: "scanners",
+                label: "扫描器执行表现",
+                example: "name / total / succeeded / failed / cancelled / avg_duration / p50 / p95",
+            },
+            MailTemplateVariable {
+                key: "scanner_omitted",
+                label: "未展示的扫描器数量",
+                example: "0",
+            },
+            MailTemplateVariable {
+                key: "quality_summary",
+                label: "统计完整性",
+                example: "ready / expected",
+            },
+            MailTemplateVariable {
+                key: "notes",
+                label: "统计口径说明",
+                example: "[统计说明]",
+            },
+            MailTemplateVariable {
+                key: "detail_url",
+                label: "报告详情绝对地址",
+                example: "https://平台地址/reports/报告ID",
+            },
         ],
         _ => Vec::new(),
     }
@@ -311,14 +367,14 @@ pub fn sample_context(template_key: &str) -> Result<Context, Box<dyn std::error:
         template_key,
         REPORT_WEEKLY_TEMPLATE_KEY | REPORT_MONTHLY_TEMPLATE_KEY
     ) {
-        return Ok(Context::from_serialize(json!({
-            "system_name": "Network Mapping", "report_label": if template_key == REPORT_WEEKLY_TEMPLATE_KEY { "周报" } else { "月报" },
-            "period_label": "2026-09-21 至 2026-09-28（不含）",
-            "tasks": {"created": 12, "succeeded": 10, "failed": 1, "partial": 1, "cancelled": 0, "success_rate": 83.3},
-            "scan_output": {"unique_ips": 100, "port_observations": 240, "service_observations": 180},
-            "recommendations": ["存在失败任务，请检查失败原因。"],
-            "detail_path": "/reports/01952f0c-0000-7000-8000-000000000001"
-        }))?);
+        let mut sample = crate::reports::mail_context::sample();
+        sample["report_label"] = json!(if template_key == REPORT_WEEKLY_TEMPLATE_KEY {
+            "周报"
+        } else {
+            "月报"
+        });
+        sample["trend_image_url"] = json!("/mail/report-images/sample/trend.png");
+        return Ok(Context::from_serialize(sample)?);
     }
     if template_key == HEALTH_ALERT_TEMPLATE_KEY {
         return Ok(Context::from_serialize(json!({
@@ -585,6 +641,7 @@ pub async fn get_template_detail(
         is_default,
         source,
         variables: template_variables(template_key),
+        default_source: default_source(definition),
     })
 }
 
@@ -858,7 +915,26 @@ pub async fn send_template_test(
     recipient: &str,
     source: &MailTemplateSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rendered = validate_template(template_key, source)?;
+    let mut context = sample_context(template_key)?;
+    if matches!(
+        template_key,
+        REPORT_WEEKLY_TEMPLATE_KEY | REPORT_MONTHLY_TEMPLATE_KEY
+    ) {
+        let client = pool.get().await?;
+        let settings = crate::reports::mail_config::load(&client)
+            .await
+            .map_err(std::io::Error::other)?;
+        context.insert(
+            "trend_image_url",
+            &if settings.remote_images_enabled {
+                settings.url("/mail/report-images/sample/trend.png")
+            } else {
+                String::new()
+            },
+        );
+        context.insert("detail_url", &settings.url("/reports"));
+    }
+    let rendered = render_template(template_key, source, &context)?;
     send_rendered_mail(
         pool,
         encryption_key,
@@ -1090,8 +1166,7 @@ pub fn audit_source_metadata(source: &MailTemplateSource) -> Value {
 pub(crate) async fn render_report<C: deadpool_postgres::GenericClient + Sync>(
     client: &C,
     key: &str,
-    payload: &Value,
-    id: uuid::Uuid,
+    context: &Context,
 ) -> Result<(Option<RenderedMailTemplate>, i32), String> {
     let definition = template_definition(key).ok_or("未知报告模板")?;
     let row = client.query_opt("SELECT t.enabled, t.active_version, v.subject_template, v.html_template, v.text_template \
@@ -1112,31 +1187,7 @@ pub(crate) async fn render_report<C: deadpool_postgres::GenericClient + Sync>(
             };
         }
     }
-    let start = payload["period"]["start_at"]
-        .as_str()
-        .ok_or("缺少周期开始时间")?;
-    let end = payload["period"]["end_at"]
-        .as_str()
-        .ok_or("缺少周期结束时间")?;
-    let timezone = payload["period"]["timezone"]
-        .as_str()
-        .unwrap_or(crate::system_time::DEFAULT_TIMEZONE);
-    let tz = timezone
-        .parse::<chrono_tz::Tz>()
-        .map_err(|_| "无效报告时区")?;
-    let format = |text: &str| -> Result<String, String> {
-        let t = DateTime::parse_from_rfc3339(text)
-            .map_err(|e| e.to_string())?
-            .with_timezone(&Utc);
-        Ok(t.with_timezone(&tz).date_naive().to_string())
-    };
-    let context = Context::from_serialize(json!({
-        "system_name": "Network Mapping", "report_label": if key == REPORT_WEEKLY_TEMPLATE_KEY { "周报" } else { "月报" },
-        "period_label": format!("{} 至 {}（不含），{}", format(start)?, format(end)?, timezone),
-        "tasks": payload["tasks"], "scan_output": payload["scan_output"], "recommendations": payload["recommendations"],
-        "detail_path": format!("/reports/{id}")
-    })).map_err(|e| e.to_string())?;
-    let rendered = render_template(key, &source, &context).map_err(|e| e.to_string())?;
+    let rendered = render_template(key, &source, context).map_err(|e| e.to_string())?;
     Ok((Some(rendered), version))
 }
 

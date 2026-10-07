@@ -50,6 +50,9 @@ fn log_scanner_result_error(
         SaveScannerResultsError::Storage(_) | SaveScannerResultsError::BatchBusy { .. } => {
             "batch_retained_for_retry"
         }
+        SaveScannerResultsError::Database(_) if error_value.retryable() => {
+            "batch_retained_for_retry"
+        }
         SaveScannerResultsError::Database(_) => "server_error",
         _ => "request_rejected",
     };
@@ -274,6 +277,8 @@ struct ScannerHeartbeatCommand {
 
 #[derive(Serialize)]
 struct ScannerHeartbeatResponse {
+    diagnostics_enabled: bool,
+    diagnostic_requests: Vec<crate::scanner_diagnostics::protocol::Job>,
     success: bool,
     lease: Option<ScannerHeartbeatLease>,
     command: Option<ScannerHeartbeatCommand>,
@@ -304,6 +309,10 @@ pub struct ScannerSystemInfo {
 
 #[derive(Deserialize)]
 pub struct ScannerHeartbeat {
+    #[serde(default)]
+    diagnostics: crate::scanner_diagnostics::protocol::Capabilities,
+    #[serde(default)]
+    diagnostic_health: Option<crate::scanner_diagnostics::Health>,
     scanner_id: Uuid,
     state: String,
     active_task_id: Option<Uuid>,
@@ -810,6 +819,7 @@ pub(crate) async fn scanner_heartbeat_handler(
     latency_history: web::Data<ScannerLatencyHistory>,
     maintenance: web::Data<SystemMaintenanceState>,
     heartbeat: web::Json<ScannerHeartbeat>,
+    diagnostics: Option<web::Data<std::sync::Arc<crate::scanner_diagnostics::Diagnostics>>>,
 ) -> impl Responder {
     let Some(token) = bearer_token(&req) else {
         return HttpResponse::Unauthorized().body("missing scanner token");
@@ -856,6 +866,14 @@ pub(crate) async fn scanner_heartbeat_handler(
             .is_some_and(|value| !matches!(value, "local" | "staged" | "applied" | "rejected"))
     {
         return HttpResponse::BadRequest().body("invalid scanner configuration state");
+    }
+    if heartbeat.diagnostics.supported_versions.len() > 8
+        || heartbeat
+            .diagnostic_health
+            .as_ref()
+            .is_some_and(|h| !matches!(h.status.as_str(), "healthy" | "error" | "degraded"))
+    {
+        return HttpResponse::BadRequest().body("invalid diagnostics capabilities");
     }
     let token_hash = match crate::hash_scanner_token(token, &security.scanner_token_pepper) {
         Ok(value) => value,
@@ -1022,6 +1040,23 @@ pub(crate) async fn scanner_heartbeat_handler(
             );
             return HttpResponse::InternalServerError().finish();
         }
+    }
+    let diagnostic_health = heartbeat
+        .diagnostic_health
+        .as_ref()
+        .map(|h| h.status.as_str())
+        .unwrap_or("unknown");
+    let accepting_tasks = heartbeat
+        .diagnostic_health
+        .as_ref()
+        .map(|h| h.accepting_tasks)
+        .unwrap_or(true);
+    if let Err(error) = scanner_transaction.execute(
+        "UPDATE scanner_info SET diagnostics_capabilities=$2, accepting_tasks=$3, diagnostic_health=$4, diagnostic_dropped_events=$5 WHERE scanner_id=$1",
+        &[&scanner_id, &serde_json::json!(heartbeat.diagnostics), &accepting_tasks, &diagnostic_health, &(heartbeat.diagnostic_health.as_ref().map(|h| h.dropped_events).unwrap_or(0).min(i64::MAX as u64) as i64)],
+    ).await {
+        error_logs_error(&req, "ScannerDiagnosticHealthError", "update_diagnostic_health", &error);
+        return HttpResponse::InternalServerError().finish();
     }
     let configuration =
         match crate::scanner_config::load_configuration(&scanner_transaction, &scanner_id).await {
@@ -1196,7 +1231,26 @@ pub(crate) async fn scanner_heartbeat_handler(
             network_rtt_us: latency.network_rtt_us,
         });
     }
+    let diagnostic_requests = if diagnostics.as_ref().is_some_and(|d| d.config.enabled)
+        && !maintenance_snapshot.blocks_new_work()
+        && heartbeat
+            .diagnostics
+            .supported_versions
+            .contains(&crate::scanner_diagnostics::protocol::VERSION)
+    {
+        match crate::scanner_diagnostics::pending_jobs(pool.get_ref(), heartbeat.scanner_id).await {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::warn!(event="ScannerDiagnosticDispatchFailed", %error);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     HttpResponse::Ok().json(ScannerHeartbeatResponse {
+        diagnostics_enabled: diagnostics.as_ref().is_some_and(|d| d.config.enabled),
+        diagnostic_requests,
         success: true,
         lease,
         command: cancel_task_id.map(|task_id| ScannerHeartbeatCommand {
@@ -1552,8 +1606,14 @@ async fn get_task(
          COALESCE(s.name, e.assigned_scanner_id, e.requested_scanner_id) AS scanner_name, s.location, \
          e.execution_status, e.attempt_count, e.task_start_time, e.task_end_time, e.lease_expires_at, \
          e.failure_reason, e.cancel_requested, COALESCE(e.result_ip_count, 0)::BIGINT AS ip_count, \
-         COALESCE(e.result_port_count, 0)::BIGINT AS port_count, COALESCE(e.result_observation_count, 0)::BIGINT AS result_count \
-         FROM scan_task_execution e \
+         COALESCE(e.result_port_count, 0)::BIGINT AS port_count, COALESCE(e.result_observation_count, 0)::BIGINT AS result_count, \
+         CASE WHEN t.scan_profile = 'dns_records' THEN 'not_applicable' \
+              WHEN e.execution_status <> 'succeeded' THEN 'not_started' \
+              WHEN p.processed_at IS NOT NULL THEN 'ready' \
+              WHEN p.claim_token IS NOT NULL AND p.lease_expires_at > clock_timestamp() THEN 'running' \
+              WHEN p.last_error IS NOT NULL THEN 'retrying' ELSE 'pending' END AS projection_status \
+         FROM scan_task_execution e JOIN scan_task t ON t.id = e.task_id \
+         LEFT JOIN scan_projection_outbox p ON p.execution_id = e.id \
          LEFT JOIN scanner_info s ON s.scanner_id = COALESCE(e.assigned_scanner_id, e.requested_scanner_id) \
          WHERE e.task_id = $1 AND e.execution_status <> 'superseded' \
          ORDER BY e.id;", &[&task_pk]).await {
@@ -1583,6 +1643,7 @@ async fn get_task(
         "scanner_name": row.get::<_, Option<String>>("scanner_name"),
         "scanner_location": row.get::<_, Option<String>>("location"),
         "status": row.get::<_, String>("execution_status"),
+        "projection_status": row.get::<_, String>("projection_status"),
         "attempt_count": row.get::<_, i32>("attempt_count"),
         "task_start_time": row.get::<_, Option<i64>>("task_start_time"),
         "task_end_time": row.get::<_, Option<i64>>("task_end_time"),
@@ -1598,6 +1659,8 @@ async fn get_task(
     let task_kind = task.get::<_, String>("task_kind");
     let generation_metadata = task.get::<_, Option<Value>>("generation_metadata");
     let stored_scan_profile = task.get::<_, String>("scan_profile");
+    // Rows own their values; permission checks and metadata loading are complete.
+    drop(connection);
     let (results, endpoint_results_available) =
         if should_load_endpoint_results(&task_kind, result_count) {
             match load_execution_results_from_elasticsearch(
@@ -1661,6 +1724,7 @@ async fn get_task(
             "scan_plan": task.get::<_, Value>("scan_plan"),
             "dns_resolvers": task.get::<_, Value>("dns_resolvers"),
             "selected_execution_id": selected_execution.get::<_, String>("execution_id"),
+            "projection_status": selected_execution.get::<_, String>("projection_status"),
             "executions": executions,
             "scanner_id": selected_execution.get::<_, Option<String>>("assigned_scanner_id"),
             "scanner_name": selected_execution.get::<_, Option<String>>("scanner_name"),
@@ -2621,6 +2685,11 @@ async fn upload_scanner_result_handler(
                 SaveScannerResultsError::TaskNotOwned => {
                     HttpResponse::Conflict().body("task is not owned by scanner")
                 }
+                SaveScannerResultsError::Database(_) if e.retryable() => {
+                    HttpResponse::ServiceUnavailable()
+                        .insert_header((header::RETRY_AFTER, "2"))
+                        .body("scan database temporarily busy")
+                }
                 SaveScannerResultsError::Database(_) => {
                     HttpResponse::InternalServerError().body("500")
                 }
@@ -3072,6 +3141,8 @@ mod tests {
     fn heartbeat_reports_lost_task_lease_explicitly() {
         let task_id = uuid::Uuid::now_v7();
         let body = serde_json::to_value(ScannerHeartbeatResponse {
+            diagnostics_enabled: false,
+            diagnostic_requests: Vec::new(),
             success: true,
             lease: Some(ScannerHeartbeatLease {
                 task_id,

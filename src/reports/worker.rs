@@ -224,7 +224,55 @@ async fn generate(pool: &Pool, id: Uuid, token: Uuid, mode_ready: bool) -> Resul
     } else {
         mail_template::REPORT_MONTHLY_TEMPLATE_KEY
     };
-    let (rendered, version) = match mail_template::render_report(&tx, key, &payload, id).await {
+    let mail_settings = match super::mail_config::load(&tx).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            quality["mail_error"] = serde_json::json!(error);
+            Default::default()
+        }
+    };
+    let generated_at: DateTime<Utc> = tx
+        .query_one("SELECT NOW() AS at", &[])
+        .await
+        .map_err(|e| e.to_string())?
+        .get("at");
+    let metadata = super::mail_context::MailMetadata {
+        revision: row.get("revision"),
+        generated_at,
+        cutoff_at: row.get("cutoff_at"),
+    };
+    let image = if mail_settings.remote_images_enabled {
+        let trend = serde_json::from_value::<Vec<super::chart::TrendDay>>(payload["trend"].clone())
+            .map_err(|e| e.to_string())?;
+        super::chart::render_async(trend).await
+    } else {
+        Ok(Vec::new())
+    };
+    let image_url = match image {
+        Ok(bytes) if !bytes.is_empty() => {
+            super::assets::create(&tx, id, &bytes, &mail_settings, generated_at).await?
+        }
+        Ok(_) => String::new(),
+        Err(error) => {
+            quality["mail_error"] = serde_json::json!(error);
+            String::new()
+        }
+    };
+    let mail = if quality.get("mail_error").is_some() {
+        Ok((None, 0))
+    } else {
+        let context = tera::Context::from_serialize(super::mail_context::build(
+            &payload,
+            &quality,
+            id,
+            &metadata,
+            &mail_settings,
+            &image_url,
+        )?)
+        .map_err(|e| e.to_string())?;
+        mail_template::render_report(&tx, key, &context).await
+    };
+    let (rendered, version) = match mail {
         Ok(value) => value,
         Err(error) => {
             quality["mail_error"] = serde_json::json!(error);
@@ -234,13 +282,23 @@ async fn generate(pool: &Pool, id: Uuid, token: Uuid, mode_ready: bool) -> Resul
     if rendered.is_none() && quality.get("mail_error").is_none() {
         quality["mail_error"] = serde_json::json!("报告邮件模板已停用");
     }
+    // Published legacy templates may intentionally omit the image variable.
+    // Keep access state only when the archived mail actually refers to the asset.
+    if rendered.as_ref().is_none_or(|mail| {
+        image_url.is_empty()
+            || (!mail.html_body.contains(&image_url) && !mail.text_body.contains(&image_url))
+    }) {
+        tx.execute("DELETE FROM report_mail_asset WHERE report_id = $1", &[&id])
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let rendered = rendered
         .map(serde_json::to_value)
         .transpose()
         .map_err(|e| e.to_string())?;
-    tx.execute("UPDATE report_run SET status = 'ready', payload = $2, quality = $3, generated_at = NOW(), last_error = NULL, \
+    tx.execute("UPDATE report_run SET status = 'ready', payload = $2, quality = $3, generated_at = $8, last_error = NULL, \
         content_checksum = $4, template_key = $5, template_version = $6, rendered_mail = $7 WHERE id = $1;",
-        &[&id, &payload, &quality, &checksum, &key, &version, &rendered]).await.map_err(|e| e.to_string())?;
+        &[&id, &payload, &quality, &checksum, &key, &version, &rendered, &generated_at]).await.map_err(|e| e.to_string())?;
     if row.get::<_, bool>("send_email") {
         let selected: Vec<i32> = row.get("recipient_ids");
         storage::enqueue_delivery(&tx, id, &selected, true, false).await?;
@@ -267,7 +325,7 @@ pub(crate) async fn send_one(pool: &Pool, encryption_key: &str) -> Result<bool, 
     let attempts: i32 = row.get("attempts");
     let automatic: bool = row.get("automatic");
     let report = client.query_one("SELECT r.rendered_mail, r.period_type, r.period_end, s.enabled, s.enabled_at, s.recipient_ids, \
-        COALESCE((SELECT enabled FROM mail_template WHERE template_key = r.template_key), TRUE) AS template_enabled \
+        NOT EXISTS (SELECT 1 FROM report_mail_asset a WHERE a.report_id = r.id AND (a.revoked_at IS NOT NULL OR a.expires_at <= NOW())) AS image_available, COALESCE((SELECT enabled FROM mail_template WHERE template_key = r.template_key), TRUE) AS template_enabled \
         FROM report_run r JOIN report_schedule s ON s.period_type = r.period_type WHERE r.id = $1;", &[&report]).await.map_err(|e| e.to_string())?;
     let active: bool = client
         .query_one(
@@ -294,6 +352,7 @@ pub(crate) async fn send_one(pool: &Pool, encryption_key: &str) -> Result<bool, 
         .get::<_, Option<DateTime<Utc>>>("enabled_at")
         .is_some_and(|at| report.get::<_, DateTime<Utc>>("period_end") >= at);
     let permitted = active
+        && report.get::<_, bool>("image_available")
         && report.get::<_, bool>("template_enabled")
         && rendered.is_some()
         && (!automatic

@@ -9,7 +9,9 @@ use futures_util::{StreamExt, stream};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
+
+mod projection;
 use tokio::time::{interval, sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -19,6 +21,17 @@ use crate::config::{ElasticsearchConfig, ScanStorageMode};
 use crate::dns::DnsObservation;
 use crate::handlers::tags::AssetTag;
 use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
+
+#[derive(Default)]
+struct BulkTiming {
+    queue_wait_ms: u64,
+    request_ms: u64,
+    backoff_ms: u64,
+    attempts: u32,
+    acquired: bool,
+    request_started: Option<Instant>,
+    backoff_started: Option<Instant>,
+}
 
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
 const SCAN_INDEX_SCHEMA_VERSION: &str = "5";
@@ -170,6 +183,7 @@ struct ElasticsearchInner {
     runtime: RwLock<ElasticsearchRuntime>,
     monitor: RwLock<Option<MonitorHandle>>,
     bulk_semaphore: Semaphore,
+    projection_notify: Notify,
     scan_indices_ready: AtomicBool,
     observation_compatibility_ready: AtomicBool,
 }
@@ -380,6 +394,7 @@ impl ElasticsearchService {
                 runtime: RwLock::new(ElasticsearchRuntime::default()),
                 monitor: RwLock::new(None),
                 bulk_semaphore: Semaphore::new(bulk_max_concurrency),
+                projection_notify: Notify::new(),
                 scan_indices_ready: AtomicBool::new(false),
                 observation_compatibility_ready: AtomicBool::new(false),
             }),
@@ -802,6 +817,7 @@ impl ElasticsearchService {
         let (trace_id, traceparent) = new_trace_context();
         let started = Instant::now();
         let budget = Duration::from_secs(self.inner.config.bulk_total_timeout_seconds);
+        let mut timing = BulkTiming::default();
         let result = match timeout(budget, async {
             let _permit = self
                 .inner
@@ -809,12 +825,15 @@ impl ElasticsearchService {
                 .acquire()
                 .await
                 .map_err(|_| "Elasticsearch Bulk 并发控制器已关闭".to_owned())?;
+            timing.queue_wait_ms = started.elapsed().as_millis() as u64;
+            timing.acquired = true;
             self.send_bulk_with_retry_inner(
                 path,
                 body,
                 create_conflict_is_success,
                 max_retries,
                 &traceparent,
+                &mut timing,
             )
             .await
         })
@@ -826,6 +845,21 @@ impl ElasticsearchService {
                 self.inner.config.bulk_total_timeout_seconds
             )),
         };
+        // Include the interrupted phase when the total budget expires.
+        if let Some(started) = timing.request_started.take() {
+            timing.request_ms += started.elapsed().as_millis() as u64;
+        }
+        if let Some(started) = timing.backoff_started.take() {
+            timing.backoff_ms += started.elapsed().as_millis() as u64;
+        }
+        info!(event = "ElasticsearchBulkCompleted", trace_id = %trace_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            queue_wait_ms = if timing.acquired { timing.queue_wait_ms } else { started.elapsed().as_millis() as u64 },
+            request_ms = timing.request_ms, backoff_ms = timing.backoff_ms,
+            attempts = timing.attempts, request_bytes = body.len(),
+            operations = body.bytes().filter(|byte| *byte == b'\n').count() / 2,
+            es_took_ms = result.as_ref().ok().and_then(|value| value.get("took")).and_then(serde_json::Value::as_i64),
+            success = result.as_ref().is_ok_and(|value| value.get("errors").and_then(serde_json::Value::as_bool) == Some(false)));
         let failure_kind = match result.as_ref() {
             Ok(value) if value.get("errors").and_then(Value::as_bool) == Some(true) => {
                 Some("bulk_items")
@@ -844,6 +878,7 @@ impl ElasticsearchService {
         result
     }
 
+    #[allow(clippy::too_many_arguments)] // request identity and per-call timing
     async fn send_bulk_with_retry_inner(
         &self,
         path: &str,
@@ -851,8 +886,12 @@ impl ElasticsearchService {
         create_conflict_is_success: bool,
         max_retries: u32,
         traceparent: &str,
+        timing: &mut BulkTiming,
     ) -> Result<Value, String> {
         for attempt in 0..=max_retries {
+            timing.attempts += 1;
+            let request_started = Instant::now();
+            timing.request_started = Some(request_started);
             let response = self
                 .request(
                     Method::POST,
@@ -864,11 +903,18 @@ impl ElasticsearchService {
                 .body(body.to_owned())
                 .send()
                 .await;
+            timing.request_ms += request_started.elapsed().as_millis() as u64;
+            timing.request_started = None;
             match response {
                 Ok(response) if is_retryable_bulk_status(response.status()) => {
                     let status = response.status();
                     if attempt == max_retries {
-                        return Err(response_error(response).await);
+                        let parse_started = Instant::now();
+                        timing.request_started = Some(parse_started);
+                        let error = response_error(response).await;
+                        timing.request_ms += parse_started.elapsed().as_millis() as u64;
+                        timing.request_started = None;
+                        return Err(error);
                     }
                     warn!(
                         event = "ElasticsearchBulkRetry",
@@ -879,7 +925,12 @@ impl ElasticsearchService {
                     );
                 }
                 Ok(response) => {
-                    let result = response_json(response).await?;
+                    let parse_started = Instant::now();
+                    timing.request_started = Some(parse_started);
+                    let result = response_json(response).await;
+                    timing.request_ms += parse_started.elapsed().as_millis() as u64;
+                    timing.request_started = None;
+                    let result = result?;
                     if !bulk_response_is_retryable(&result, create_conflict_is_success) {
                         return Ok(result);
                     }
@@ -906,11 +957,15 @@ impl ElasticsearchService {
                     );
                 }
             }
+            let backoff_started = Instant::now();
+            timing.backoff_started = Some(backoff_started);
             sleep(bulk_retry_delay(
                 self.inner.config.bulk_retry_initial_ms,
                 attempt,
             ))
             .await;
+            timing.backoff_ms += backoff_started.elapsed().as_millis() as u64;
+            timing.backoff_started = None;
         }
         unreachable!("bulk retry loop always returns")
     }
@@ -931,12 +986,7 @@ impl ElasticsearchService {
             .pointer("/version/number")
             .and_then(Value::as_str)
             .ok_or_else(|| "Elasticsearch 根响应缺少 version.number".to_owned())?;
-        if version != self.inner.config.expected_version {
-            return Err(format!(
-                "Elasticsearch 版本不匹配：期望 {}，实际 {version}",
-                self.inner.config.expected_version
-            ));
-        }
+        self.inner.config.validate_server_version(version)?;
 
         self.ensure_scan_indices().await?;
         // Domain search reads the current DNS RR index even before the first DNS
@@ -1769,228 +1819,6 @@ impl ElasticsearchService {
                 "Elasticsearch 端点投影 Bulk 部分失败：{}",
                 failures.join("; ")
             ))
-        }
-    }
-
-    pub(crate) async fn finalize_scan_projection(
-        &self,
-        pool: &Pool,
-        execution_db_id: i32,
-        context: &ScanBatchContext,
-    ) -> Result<(), String> {
-        let connection = pool.get().await.map_err(|error| error.to_string())?;
-        let pending: bool = connection
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM scan_projection_outbox \
-                 WHERE execution_id = $1 AND processed_at IS NULL) AS pending;",
-                &[&execution_db_id],
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .get("pending");
-        if !pending {
-            return Ok(());
-        }
-        self.promote_execution(context).await?;
-        connection
-            .execute(
-                "UPDATE scan_projection_outbox SET processed_at = NOW(), last_error = NULL \
-                 WHERE execution_id = $1;",
-                &[&execution_db_id],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    async fn promote_execution(&self, context: &ScanBatchContext) -> Result<(), String> {
-        let mut search_after = None;
-        let mut wrote_current_projection = false;
-        loop {
-            let mut query = json!({
-                "size": 1000,
-                "query": {"term": {"execution_id": context.execution_id}},
-                "sort": [{"ip": "asc"}, {"port": "asc"}]
-            });
-            if let Some(value) = search_after.take() {
-                query
-                    .as_object_mut()
-                    .expect("query body is object")
-                    .insert("search_after".to_owned(), value);
-            }
-            let response = self
-                .send_json_request(
-                    ElasticsearchOperation::ProjectionSearch,
-                    Method::POST,
-                    &format!("/{}/_search", self.inner.config.execution_endpoint_index),
-                    |request| request.json(&query),
-                )
-                .await?;
-            validate_scan_search_response(&response)?;
-            let hits = response
-                .pointer("/hits/hits")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if hits.is_empty() {
-                break;
-            }
-            let mut body = String::new();
-            for hit in &hits {
-                let source = hit
-                    .get("_source")
-                    .cloned()
-                    .ok_or_else(|| "执行端点投影缺少 _source".to_owned())?;
-                let ip = source.get("ip").and_then(Value::as_str).unwrap_or_default();
-                let port = source
-                    .get("port")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                for (scope_type, scope_id) in [("global", 0), ("user", context.user_id)] {
-                    let mut scoped = source.clone();
-                    let object = scoped
-                        .as_object_mut()
-                        .ok_or_else(|| "执行端点投影必须是 object".to_owned())?;
-                    object.insert("scope_type".to_owned(), json!(scope_type));
-                    object.insert("scope_id".to_owned(), json!(scope_id));
-                    let current_id =
-                        sha256_hex(format!("{scope_type}\0{scope_id}\0{ip}\0{port}").as_bytes());
-                    append_projection_update(
-                        &mut body,
-                        &self.inner.config.current_endpoint_index,
-                        &current_id,
-                        &scoped,
-                    )?;
-                }
-            }
-            let bulk = self
-                .send_bulk_with_retry(
-                    &format!(
-                        "/_bulk?wait_for_active_shards={}",
-                        self.inner.config.write_wait_for_active_shards
-                    ),
-                    &body,
-                    false,
-                )
-                .await?;
-            if bulk.get("errors").and_then(Value::as_bool) == Some(true) {
-                let failure = bulk
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|item| item.get("update"))
-                    .find(|item| {
-                        item.get("status")
-                            .and_then(Value::as_u64)
-                            .is_none_or(|v| v >= 300)
-                    });
-                if let Some(failure) = failure {
-                    return Err(format!("发布当前端点投影失败：{failure}"));
-                }
-            }
-            wrote_current_projection = true;
-            search_after = hits.last().and_then(|hit| hit.get("sort")).cloned();
-            if hits.len() < 1000 || search_after.is_none() {
-                break;
-            }
-        }
-        // A large execution is promoted in many bulk pages. Waiting for a refresh
-        // on every page serializes one refresh interval per 1,000 endpoints. One
-        // refresh after all pages preserves read-after-finalize visibility without
-        // making upload latency grow in refresh-sized steps.
-        if wrote_current_projection {
-            let refreshed = self
-                .send_json_request(
-                    ElasticsearchOperation::IndexAdmin,
-                    Method::POST,
-                    &format!("/{}/_refresh", self.inner.config.current_endpoint_index),
-                    |request| request,
-                )
-                .await?;
-            validate_scan_search_response(&refreshed)?;
-        }
-        Ok(())
-    }
-
-    async fn process_scan_projection_outbox(&self, pool: &Pool) -> Result<bool, String> {
-        let connection = pool.get().await.map_err(|error| error.to_string())?;
-        let row = connection
-            .query_opt(
-                "WITH candidate AS (SELECT execution_id FROM scan_projection_outbox \
-                    WHERE processed_at IS NULL AND available_at <= NOW() \
-                    ORDER BY available_at, execution_id FOR UPDATE SKIP LOCKED LIMIT 1) \
-                 UPDATE scan_projection_outbox outbox SET attempts = attempts + 1, \
-                    available_at = NOW() + INTERVAL '5 minutes' FROM candidate \
-                 WHERE outbox.execution_id = candidate.execution_id \
-                 RETURNING outbox.execution_id, outbox.attempts;",
-                &[],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(row) = row else {
-            return Ok(false);
-        };
-        let execution_db_id: i32 = row.get("execution_id");
-        let attempts: i32 = row.get("attempts");
-        let context = load_scan_batch_context(&connection, execution_db_id).await?;
-        match self.promote_execution(&context).await {
-            Ok(()) => {
-                connection
-                    .execute(
-                        "UPDATE scan_projection_outbox SET processed_at = NOW(), last_error = NULL \
-                     WHERE execution_id = $1;",
-                        &[&execution_db_id],
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok(true)
-            }
-            Err(error) => {
-                let delay = i64::from(2_i32.saturating_pow(attempts.clamp(1, 8) as u32));
-                let last_error = error.chars().take(2000).collect::<String>();
-                if let Err(mark_error) = connection.execute(
-                    "UPDATE scan_projection_outbox SET available_at = NOW() + ($2::BIGINT * INTERVAL '1 second'), \
-                        last_error = $3 WHERE execution_id = $1;",
-                    &[&execution_db_id, &delay, &last_error],
-                ).await {
-                    error!(
-                        event = "ScanProjectionRetryScheduleError",
-                        operation = "schedule_scan_projection_retry",
-                        error_kind = "database",
-                        error_code = "scan_projection_retry_schedule_failed",
-                        error_message = %mark_error,
-                        retryable = true,
-                        outcome = "projection_outbox_claim_retained",
-                        execution_database_id = execution_db_id,
-                        execution_id = %context.execution_id,
-                        task_id = %context.task_id,
-                        scanner_id = %context.scanner_id,
-                        upload_id = %context.upload_id,
-                        batch_index = context.batch_index,
-                        attempt = attempts,
-                        retry_after_ms = delay.saturating_mul(1_000),
-                    );
-                    return Err(mark_error.to_string());
-                }
-                warn!(
-                    event = "ScanProjectionOutboxError",
-                    operation = "promote_scan_execution",
-                    reason = %last_error,
-                    error_code = "scan_projection_failed",
-                    retryable = true,
-                    outcome = "projection_retry_scheduled",
-                    execution_database_id = execution_db_id,
-                    execution_id = %context.execution_id,
-                    task_id = %context.task_id,
-                    scanner_id = %context.scanner_id,
-                    upload_id = %context.upload_id,
-                    batch_index = context.batch_index,
-                    attempt = attempts,
-                    retry_after_ms = delay.saturating_mul(1_000),
-                );
-                Err(error)
-            }
         }
     }
 
@@ -3053,9 +2881,13 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
         return;
     }
     let mut ticker = interval(Duration::from_millis(service.inner.config.poll_interval_ms));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut initialization_failures = 0_u32;
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {},
+            _ = service.inner.projection_notify.notified() => {},
+        }
         if !service.can_read() {
             match service.validate_scan_cutover(&pool).await {
                 Ok(_) => {
@@ -3097,11 +2929,10 @@ pub async fn run_worker(service: ElasticsearchService, pool: Pool) {
             }
         }
         match service.process_scan_projection_outbox(&pool).await {
-            Ok(true) => continue,
-            Ok(false) => {}
+            Ok(_) => {}
             Err(message) => {
-                service.mark_error(&message);
-                continue;
+                warn!(event = "ScanProjectionWorkerError", error_message = %message,
+                    retryable = true, outcome = "worker_retry_scheduled");
             }
         }
 
@@ -3230,6 +3061,7 @@ async fn process_scan_tag_event(
             category_name: row.try_get("category_name").ok(),
         })
         .collect::<Vec<_>>();
+    drop(connection);
     service
         .refresh_scan_asset_tags(&event.aggregate_key, &tags)
         .await

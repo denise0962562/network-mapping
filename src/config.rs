@@ -25,6 +25,8 @@ pub trait SelfChecking {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub scanner_diagnostics: crate::scanner_diagnostics::DiagnosticsConfig,
     pub server: ServerConfig,
     pub tls: TlsConfig,
     pub log: LogConfig,
@@ -47,6 +49,8 @@ pub struct Config {
     pub elasticsearch: ElasticsearchConfig,
     #[serde(default)]
     pub analytics_snapshot: AnalyticsSnapshotConfig,
+    #[serde(default)]
+    pub report_mail: crate::reports::mail_config::ReportMailConfig,
     pub database: DatabaseConfig,
     pub pwd_hash: PasswordHashConfig,
     pub security: SecurityConfig,
@@ -74,6 +78,9 @@ impl TlsConfig {
 
 impl SelfChecking for Config {
     fn check(&self) {
+        self.scanner_diagnostics
+            .validate()
+            .expect("invalid scanner diagnostics configuration");
         let _ = &self.server.check();
         let _ = &self.database.check();
         let _ = &self.security.check();
@@ -82,6 +89,9 @@ impl SelfChecking for Config {
         let _ = &self.backup.check();
         let _ = &self.elasticsearch.check();
         let _ = &self.analytics_snapshot.check();
+        self.report_mail
+            .validate()
+            .expect("invalid report mail configuration");
         if let Err(error) = self.automatic_target.validate() {
             panic!("{error}");
         }
@@ -91,6 +101,9 @@ impl SelfChecking for Config {
     }
 
     fn try_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        self.scanner_diagnostics
+            .validate()
+            .map_err(|e| e.to_string())?;
         match self.server.try_check() {
             Ok(true) => (),
             Ok(false) => return Ok(false),
@@ -107,6 +120,7 @@ impl SelfChecking for Config {
         self.backup.try_check()?;
         self.elasticsearch.try_check()?;
         self.analytics_snapshot.try_check()?;
+        self.report_mail.validate()?;
         self.automatic_target.validate()?;
         self.dns_follow_up.validate()?;
         Ok(true)
@@ -285,6 +299,7 @@ pub struct ElasticsearchConfig {
     pub scan_number_of_replicas: u32,
     /// Bulk 写入等待的分片副本数；单节点应使用 `1`（仅主分片）。
     pub write_wait_for_active_shards: String,
+    /// 支持正式版 `9.5.x`；兼容旧 `9.5.N` 配置，不限制补丁版本。
     pub expected_version: String,
     pub api_key: Option<String>,
     pub username: Option<String>,
@@ -306,6 +321,12 @@ pub struct ElasticsearchConfig {
     pub bulk_total_timeout_seconds: u64,
     /// 进程内允许并发执行的 Bulk 数量，防止故障时重试风暴。
     pub bulk_max_concurrency: usize,
+    /// Endpoint page size and serialized request limit for current projections.
+    pub projection_page_size: usize,
+    pub projection_bulk_max_bytes: usize,
+    pub projection_pages_per_tick: usize,
+    pub projection_lease_seconds: u64,
+    pub projection_heartbeat_seconds: u64,
     /// Persist migration progress after at least this many newly migrated batches.
     pub scan_migration_checkpoint_batches: u64,
     pub fallback_to_postgres: bool,
@@ -351,6 +372,14 @@ impl fmt::Debug for ElasticsearchConfig {
             .field("request_timeout_seconds", &self.request_timeout_seconds)
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("bulk_batch_size", &self.bulk_batch_size)
+            .field("projection_page_size", &self.projection_page_size)
+            .field("projection_bulk_max_bytes", &self.projection_bulk_max_bytes)
+            .field("projection_pages_per_tick", &self.projection_pages_per_tick)
+            .field("projection_lease_seconds", &self.projection_lease_seconds)
+            .field(
+                "projection_heartbeat_seconds",
+                &self.projection_heartbeat_seconds,
+            )
             .field(
                 "scan_migration_concurrency",
                 &self.scan_migration_concurrency,
@@ -387,7 +416,7 @@ impl Default for ElasticsearchConfig {
             dns_observation_retention_days: 180,
             scan_number_of_replicas: 0,
             write_wait_for_active_shards: "1".to_owned(),
-            expected_version: "9.5.3".to_owned(),
+            expected_version: "9.5.x".to_owned(),
             api_key: None,
             username: None,
             password: None,
@@ -401,13 +430,59 @@ impl Default for ElasticsearchConfig {
             bulk_retry_initial_ms: 200,
             bulk_total_timeout_seconds: 25,
             bulk_max_concurrency: 2,
+            projection_page_size: 1000,
+            projection_bulk_max_bytes: 5 * 1024 * 1024,
+            projection_pages_per_tick: 4,
+            projection_lease_seconds: 120,
+            projection_heartbeat_seconds: 20,
             scan_migration_checkpoint_batches: 100,
             fallback_to_postgres: false,
         }
     }
 }
 
+/// Only canonical stable 9.5 patch versions are supported.
+fn elasticsearch_patch_version(version: &str) -> Option<u64> {
+    let mut parts = version.split('.');
+    if parts.next()? != "9" || parts.next()? != "5" {
+        return None;
+    }
+    let patch = parts.next()?;
+    if parts.next().is_some()
+        || patch.is_empty()
+        || !patch.bytes().all(|byte| byte.is_ascii_digit())
+        || (patch.len() > 1 && patch.starts_with('0'))
+    {
+        return None;
+    }
+    patch.parse().ok()
+}
+
 impl ElasticsearchConfig {
+    pub(crate) fn validate_version_policy(&self) -> Result<(), String> {
+        if self.expected_version == "9.5.x"
+            || elasticsearch_patch_version(&self.expected_version).is_some()
+        {
+            Ok(())
+        } else {
+            Err("elasticsearch.expected_version 必须为 9.5.x 或旧格式 9.5.N（均允许整个 9.5.x 系列）".to_owned())
+        }
+    }
+
+    pub(crate) fn validate_server_version(&self, version: &str) -> Result<(), String> {
+        self.validate_version_policy()?;
+        // Legacy configurations such as 9.5.3 select the supported 9.5 series,
+        // rather than pinning a patch and preventing routine ES patch upgrades.
+        if elasticsearch_patch_version(version).is_some() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Elasticsearch 版本不匹配：允许正式版 9.5.x，实际 {version}（配置 expected_version={}）",
+                self.expected_version
+            ))
+        }
+    }
+
     fn resolve_relative_to(&mut self, config_path: &Path) {
         let Some(certificate) = &mut self.ca_certificate_file else {
             return;
@@ -454,9 +529,7 @@ impl SelfChecking for ElasticsearchConfig {
         if !url.username().is_empty() || url.password().is_some() {
             return Err("elasticsearch.url 不得包含用户名或密码，请使用独立认证字段".into());
         }
-        if self.expected_version != "9.5.3" {
-            return Err("当前接入固定要求 elasticsearch.expected_version = 9.5.3".into());
-        }
+        self.validate_version_policy()?;
         for (name, value) in [
             ("observation_index_prefix", &self.observation_index_prefix),
             ("execution_endpoint_index", &self.execution_endpoint_index),
@@ -518,6 +591,17 @@ impl SelfChecking for ElasticsearchConfig {
         }
         if !(1..=32).contains(&self.bulk_max_concurrency) {
             return Err("elasticsearch.bulk_max_concurrency 必须在 1 到 32 之间".into());
+        }
+        if !(1..=2000).contains(&self.projection_page_size)
+            || !(64 * 1024..=16 * 1024 * 1024).contains(&self.projection_bulk_max_bytes)
+            || !(1..=32).contains(&self.projection_pages_per_tick)
+            || !(10..=3600).contains(&self.projection_lease_seconds)
+            || self.projection_heartbeat_seconds == 0
+            || self.projection_heartbeat_seconds > self.projection_lease_seconds / 3
+        {
+            return Err(
+                "elasticsearch.projection_* 配置超出范围或续租周期超过租约的三分之一".into(),
+            );
         }
         if self.write_wait_for_active_shards != "1"
             && self.write_wait_for_active_shards != "all"
@@ -615,7 +699,7 @@ impl SelfChecking for RequestsConfig {
 /// 慢请求与 5xx 错误由请求中间件实时判定，慢 SQL 由后台任务轮询
 /// `pg_stat_statements` 视图判定，三者统一走邮件通知并共享同一冷却去重窗口。
 #[derive(Debug, Deserialize, Clone, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitorConfig {
     /// 是否启用健康监控与告警。
     pub enabled: bool,
@@ -637,6 +721,11 @@ pub struct MonitorConfig {
     pub elasticsearch_write_critical_threshold_ms: i64,
     /// 同一告警 key 的冷却时间（秒），冷却窗口内的重复事件被合并丢弃。
     pub alert_cooldown_seconds: u64,
+    pub service_defaults: std::collections::BTreeMap<
+        crate::monitor::rules::MonitorService,
+        crate::monitor::rules::SlowRule,
+    >,
+    pub operation_rules: Vec<crate::monitor::rules::OperationRule>,
 }
 
 impl Default for MonitorConfig {
@@ -652,6 +741,8 @@ impl Default for MonitorConfig {
             elasticsearch_write_warning_threshold_ms: 5000,
             elasticsearch_write_critical_threshold_ms: 15000,
             alert_cooldown_seconds: 300,
+            service_defaults: Default::default(),
+            operation_rules: Vec::new(),
         }
     }
 }
@@ -671,8 +762,8 @@ impl SelfChecking for MonitorConfig {
         if self.slow_sql_threshold_ms <= 0 {
             return Err("monitor.slow_sql_threshold_ms 必须大于 0".into());
         }
-        if self.slow_sql_check_interval_seconds == 0 {
-            return Err("monitor.slow_sql_check_interval_seconds 必须大于 0".into());
+        if !(1..=86_400).contains(&self.slow_sql_check_interval_seconds) {
+            return Err("monitor.slow_sql_check_interval_seconds 必须为 1～86400 秒".into());
         }
         for (name, value) in [
             (
@@ -706,6 +797,7 @@ impl SelfChecking for MonitorConfig {
         {
             return Err("Elasticsearch 写入严重阈值不能小于告警阈值".into());
         }
+        self.validate_rules()?;
         if self.alert_cooldown_seconds == 0 {
             return Err("monitor.alert_cooldown_seconds 必须大于 0".into());
         }
@@ -1313,6 +1405,12 @@ impl Config {
         let path = path.as_ref();
         let content = fs::read_to_string(path).expect("无法读取配置文件");
         let mut config: Self = toml::from_str(&content).expect("配置文件格式错误");
+        if config.scanner_diagnostics.directory.is_relative() {
+            config.scanner_diagnostics.directory = path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(&config.scanner_diagnostics.directory);
+        }
         config.tls.resolve_relative_to(path);
         config.frontend.resolve_relative_to(path);
         config.maxmind.resolve_relative_to(path);
@@ -1536,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn elasticsearch_config_is_safe_by_default_and_requires_9_5_3() {
+    fn elasticsearch_config_is_safe_by_default_and_supports_9_5_patches() {
         let mut config = ElasticsearchConfig::default();
         assert!(config.enabled);
         assert!(config.read_enabled);
@@ -1550,12 +1648,86 @@ mod tests {
         assert!(config.try_check().unwrap());
 
         config.enabled = true;
+        assert_eq!(config.expected_version, "9.5.x");
         config.expected_version = "9.5.2".to_owned();
-        assert!(config.try_check().is_err());
+        assert!(config.try_check().unwrap());
         config.expected_version = "9.5.3".to_owned();
         assert!(config.try_check().unwrap());
         config.read_enabled = true;
         config.enabled = false;
+        assert!(config.try_check().is_err());
+    }
+
+    #[test]
+    fn elasticsearch_version_policy_rejects_unsupported_and_malformed_versions() {
+        let mut config = ElasticsearchConfig::default();
+        for version in ["9.5.0", "9.5.2", "9.5.3", "9.5.4", "9.5.123"] {
+            assert!(config.validate_server_version(version).is_ok(), "{version}");
+            config.expected_version = version.to_owned();
+            assert!(config.try_check().unwrap());
+            assert!(config.validate_server_version(version).is_ok());
+            assert!(config.validate_server_version("9.5.124").is_ok());
+            config.expected_version = "9.5.x".to_owned();
+        }
+        for version in [
+            "",
+            "9",
+            "9.5",
+            "9.5.x",
+            "9.4.9",
+            "9.6.0",
+            "10.5.0",
+            "9.50.0",
+            "9.5.0-SNAPSHOT",
+            "9.5.0-rc1",
+            "9.5.3+build",
+            "9.5.03",
+            "9.5.-1",
+            "9.5.+1",
+            "9.5.3.0",
+            " 9.5.3",
+            "9.5.3 ",
+            "9.5.18446744073709551616",
+        ] {
+            assert!(
+                config.validate_server_version(version).is_err(),
+                "{version}"
+            );
+            if version != "9.5.x" {
+                config.expected_version = version.to_owned();
+                assert!(config.try_check().is_err(), "{version}");
+                assert!(config.validate_server_version("9.5.3").is_err());
+                config.expected_version = "9.5.x".to_owned();
+            }
+        }
+        // Old deployment configs accept patch upgrades without being edited.
+        let legacy: ElasticsearchConfig = toml::from_str("expected_version = \"9.5.3\"").unwrap();
+        assert!(legacy.try_check().unwrap());
+        for version in ["9.5.0", "9.5.2", "9.5.3", "9.5.4", "9.5.123"] {
+            assert!(legacy.validate_server_version(version).is_ok(), "{version}");
+        }
+        for version in ["9.4.9", "9.6.0", "10.0.0", "9.5.4-SNAPSHOT"] {
+            assert!(
+                legacy.validate_server_version(version).is_err(),
+                "{version}"
+            );
+        }
+        let omitted: ElasticsearchConfig = toml::from_str("").unwrap();
+        assert_eq!(omitted.expected_version, "9.5.x");
+    }
+
+    #[test]
+    fn projection_configuration_bounds_memory_and_lease_renewal() {
+        let mut config = ElasticsearchConfig {
+            enabled: true,
+            read_enabled: true,
+            ..Default::default()
+        };
+        assert!(config.try_check().unwrap());
+        config.projection_heartbeat_seconds = config.projection_lease_seconds;
+        assert!(config.try_check().is_err());
+        config.projection_heartbeat_seconds = 20;
+        config.projection_bulk_max_bytes = usize::MAX;
         assert!(config.try_check().is_err());
     }
 
@@ -1707,6 +1879,10 @@ mod tests {
 }
 
 pub fn init_routes(cfg: &mut web::ServiceConfig) {
+    cfg.configure(handlers::scanner_diagnostics::configure);
+    cfg.service(handlers::report_mail_assets::sample)
+        .service(handlers::report_mail_assets::trend)
+        .service(handlers::report_mail_assets::revoke);
     cfg.service(handlers::reports::generate)
         .service(handlers::reports::list)
         .service(handlers::reports::detail)
@@ -1720,6 +1896,11 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(handlers::data_saa::get_system_data_handler)
         .service(handlers::data_saa::get_analysis_distribution)
         .service(handlers::data_saa::get_analysis_discovery_heatmap)
+        .service(handlers::statistics::cache_status)
+        .service(handlers::statistics::clear_cache)
+        .service(handlers::statistics::catalog)
+        .service(handlers::statistics::query)
+        .service(handlers::statistics_details::details)
         .service(handlers::system_resources::get_system_resource_history)
         .service(handlers::system_resources::get_database_size_history)
         .service(handlers::scanner_latency::get_scanner_latency_history)
@@ -1825,6 +2006,8 @@ pub fn init_routes(cfg: &mut web::ServiceConfig) {
         .service(utils::get_server_config_h)
         .service(utils::get_system_preferences)
         .service(utils::get_system_timezones)
+        .service(handlers::health::monitor_operations)
+        .service(utils::runtime_config_history)
         .service(utils::get_runtime_config_h)
         .service(utils::save_runtime_config_h)
         .service(utils::get_mail_settings_h)

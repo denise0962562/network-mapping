@@ -20,9 +20,13 @@ use crate::monitor::MonitorHandle;
 use crate::runtime_config::{
     ANALYTICS_SNAPSHOT_NAMESPACE, AUTOMATIC_TARGET_NAMESPACE, DNS_FOLLOW_UP_NAMESPACE,
     DNS_RESOLVERS_NAMESPACE, GENERAL_NAMESPACE, MONITOR_NAMESPACE, PersistError,
-    REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings, UpdateRuntimeConfigRequest,
-    parse_analytics_snapshot, parse_automatic_target, parse_dns_follow_up, parse_dns_resolvers,
-    parse_general, parse_monitor, parse_requests, persist,
+    REPORT_MAIL_NAMESPACE, REQUESTS_NAMESPACE, RuntimeConfigResponse, RuntimeSettings,
+    SCANNER_HEALTH_NAMESPACE, UpdateRuntimeConfigRequest, parse_analytics_snapshot,
+    parse_automatic_target, parse_dns_follow_up, parse_dns_resolvers, parse_general, parse_monitor,
+    parse_report_mail, parse_requests, parse_scanner_health, persist,
+};
+use crate::statistics::{
+    NAMESPACE as STATISTICS_CACHE_NAMESPACE, parse_config as parse_statistics_cache,
 };
 use crate::trusted_proxy::{
     MAX_CLIENT_IP_HEADER_LENGTH, MAX_TRUSTED_PROXY_CIDRS, TrustedProxySettings, TrustedProxyState,
@@ -116,6 +120,13 @@ async fn get_runtime_config_h(
             .json(json!({"success": false, "message": "仅管理员可以读取运行时配置"}));
     }
     match namespace.as_str() {
+        STATISTICS_CACHE_NAMESPACE => {
+            let client = match pool.get().await { Ok(c)=>c, Err(_)=>return HttpResponse::ServiceUnavailable().finish() };
+            match client.query_one("SELECT document,revision FROM runtime_configuration WHERE namespace=$1", &[&STATISTICS_CACHE_NAMESPACE]).await {
+                Ok(row)=>HttpResponse::Ok().json(json!({"success":true,"data":{"namespace":STATISTICS_CACHE_NAMESPACE,"revision":row.get::<_,i64>("revision"),"document":row.get::<_,serde_json::Value>("document")}})),
+                Err(_)=>HttpResponse::ServiceUnavailable().finish()
+            }
+        }
         GENERAL_NAMESPACE => {
             match crate::system_time::refresh(pool.get_ref()).await {
                 Ok(value) => HttpResponse::Ok().json(json!({"success": true, "data": {"namespace": "general", "revision": value.revision, "document": value.document}})),
@@ -125,6 +136,10 @@ async fn get_runtime_config_h(
         REQUESTS_NAMESPACE => {
             let value = settings.requests.get().await;
             HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: REQUESTS_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        SCANNER_HEALTH_NAMESPACE => {
+            let value = settings.scanner_health.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: SCANNER_HEALTH_NAMESPACE, revision: value.revision, document: value.value }}))
         }
         MONITOR_NAMESPACE => {
             let value = settings.monitor.get().await;
@@ -141,6 +156,13 @@ async fn get_runtime_config_h(
         DNS_RESOLVERS_NAMESPACE => {
             let value = settings.dns_resolvers.get().await;
             HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: DNS_RESOLVERS_NAMESPACE, revision: value.revision, document: value.value }}))
+        }
+        REPORT_MAIL_NAMESPACE => {
+            if crate::reports::mail_config::refresh(pool.get_ref(), &settings.report_mail).await.is_err() {
+                return HttpResponse::ServiceUnavailable().json(json!({"success": false, "message": "报告邮件配置读取失败"}));
+            }
+            let value = settings.report_mail.get().await;
+            HttpResponse::Ok().json(json!({"success": true, "data": RuntimeConfigResponse { namespace: REPORT_MAIL_NAMESPACE, revision: value.revision, document: value.value }}))
         }
         ANALYTICS_SNAPSHOT_NAMESPACE => {
             let value = settings.analytics_snapshot.get().await;
@@ -162,6 +184,44 @@ async fn get_runtime_config_h(
     }
 }
 
+#[get("/api/config/runtime/{namespace}/history")]
+pub(crate) async fn runtime_config_history(
+    namespace: web::Path<String>,
+    pool: web::Data<deadpool_postgres::Pool>,
+    user: UserBaseI,
+) -> impl Responder {
+    if user.role != 1 {
+        return HttpResponse::Forbidden()
+            .json(json!({"success": false, "message": "仅管理员可以读取配置历史"}));
+    }
+    if !matches!(
+        namespace.as_str(),
+        MONITOR_NAMESPACE | SCANNER_HEALTH_NAMESPACE | STATISTICS_CACHE_NAMESPACE
+    ) {
+        return HttpResponse::NotFound()
+            .json(json!({"success": false, "message": "此配置域不支持历史查看"}));
+    }
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"success": false, "message": "配置历史暂不可用"}));
+        }
+    };
+    match client.query("SELECT revision, document, changed_at, change_reason FROM runtime_configuration_revision WHERE namespace = $1 ORDER BY revision DESC LIMIT 30;", &[&namespace.as_str()]).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows.iter().map(|row| json!({
+                "revision": row.get::<_, i64>("revision"), "document": row.get::<_, serde_json::Value>("document"),
+                "changed_at": row.get::<_, chrono::DateTime<chrono::Utc>>("changed_at"),
+                "change_reason": row.get::<_, String>("change_reason")
+            })).collect();
+            HttpResponse::Ok().json(json!({"success": true, "data": items}))
+        },
+        Err(_) => HttpResponse::ServiceUnavailable().json(json!({"success": false, "message": "配置历史读取失败"})),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 #[post("/api/config/runtime/{namespace}")]
 async fn save_runtime_config_h(
     req: HttpRequest,
@@ -170,6 +230,7 @@ async fn save_runtime_config_h(
     pool: web::Data<deadpool_postgres::Pool>,
     settings: web::Data<RuntimeSettings>,
     monitor: web::Data<MonitorHandle>,
+    statistics: web::Data<crate::statistics::StatisticsService>,
     user: UserBaseI,
 ) -> impl Responder {
     if user.role != 1 {
@@ -220,6 +281,13 @@ async fn save_runtime_config_h(
     }
 
     match namespace.as_str() {
+        STATISTICS_CACHE_NAMESPACE => publish!(
+            STATISTICS_CACHE_NAMESPACE,
+            parse_statistics_cache,
+            statistics_cache,
+            |value: &crate::statistics::CacheConfig| statistics
+                .apply(value.clone(), body.expected_revision + 1)
+        ),
         GENERAL_NAMESPACE => publish!(
             GENERAL_NAMESPACE,
             parse_general,
@@ -229,12 +297,19 @@ async fn save_runtime_config_h(
                 crate::system_time::apply(value.clone(), body.expected_revision + 1);
             }
         ),
+        SCANNER_HEALTH_NAMESPACE => publish!(
+            SCANNER_HEALTH_NAMESPACE,
+            parse_scanner_health,
+            scanner_health,
+            |_| {}
+        ),
         REQUESTS_NAMESPACE => publish!(REQUESTS_NAMESPACE, parse_requests, requests, |_| {}),
         MONITOR_NAMESPACE => publish!(
             MONITOR_NAMESPACE,
             parse_monitor,
             monitor,
-            |value: &crate::config::MonitorConfig| monitor.replace_config(value.clone())
+            |value: &crate::config::MonitorConfig| monitor
+                .replace_config(value.clone(), body.expected_revision + 1)
         ),
         AUTOMATIC_TARGET_NAMESPACE => publish!(
             AUTOMATIC_TARGET_NAMESPACE,
@@ -252,6 +327,12 @@ async fn save_runtime_config_h(
             DNS_RESOLVERS_NAMESPACE,
             parse_dns_resolvers,
             dns_resolvers,
+            |_| {}
+        ),
+        REPORT_MAIL_NAMESPACE => publish!(
+            REPORT_MAIL_NAMESPACE,
+            parse_report_mail,
+            report_mail,
             |_| {}
         ),
         ANALYTICS_SNAPSHOT_NAMESPACE => publish!(

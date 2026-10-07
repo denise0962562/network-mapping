@@ -18,8 +18,8 @@ use crate::{SystemDetails, SystemStatusJson, Systems};
 const DEFAULT_RANGE_WEEKS: i64 = 12;
 const MAX_RANGE_DAYS: i64 = 366;
 
-#[derive(Deserialize)]
-struct AnalysisFilterQuery {
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct AnalysisFilterQuery {
     start_at: Option<DateTime<Utc>>,
     end_at: Option<DateTime<Utc>>,
     scanner_id: Option<Uuid>,
@@ -40,14 +40,15 @@ pub(crate) struct HeatmapQuery {
     filters: AnalysisFilterQuery,
 }
 
-struct AnalysisFilters {
-    timezone: String,
-    start_at: DateTime<Utc>,
-    end_at: DateTime<Utc>,
-    start_ms: i64,
-    end_ms: i64,
-    scanner_id: Option<String>,
-    task_source: Option<String>,
+#[derive(Clone)]
+pub(super) struct AnalysisFilters {
+    pub(super) timezone: String,
+    pub(super) start_at: DateTime<Utc>,
+    pub(super) end_at: DateTime<Utc>,
+    pub(super) start_ms: i64,
+    pub(super) end_ms: i64,
+    pub(super) scanner_id: Option<String>,
+    pub(super) task_source: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -115,7 +116,9 @@ struct HeatmapData {
     items: Vec<HeatmapItem>,
 }
 
-fn normalize_filters(query: &AnalysisFilterQuery) -> Result<AnalysisFilters, &'static str> {
+pub(super) fn normalize_filters(
+    query: &AnalysisFilterQuery,
+) -> Result<AnalysisFilters, &'static str> {
     let end_at = query.end_at.unwrap_or_else(Utc::now);
     let start_at = query
         .start_at
@@ -258,7 +261,10 @@ async fn snapshot_data_as_of(
     Ok(row.map(|row| row.get("data_as_of")))
 }
 
-async fn snapshot_not_ready(client: &deadpool_postgres::Client, user: &UserBaseI) -> HttpResponse {
+pub(super) async fn snapshot_not_ready(
+    client: &deadpool_postgres::Client,
+    user: &UserBaseI,
+) -> HttpResponse {
     if user.role == 1 {
         match crate::analytics_snapshot::snapshot_progress(client).await {
             Ok(progress) => return HttpResponse::ServiceUnavailable().json(json!({
@@ -487,7 +493,7 @@ async fn analysis_heatmap_from_snapshot(
     })
 }
 
-fn analysis_es_filters(filters: &AnalysisFilters, user: &UserBaseI) -> Vec<Value> {
+pub(super) fn analysis_es_filters(filters: &AnalysisFilters, user: &UserBaseI) -> Vec<Value> {
     let mut result = vec![json!({"range": {"observed_at": {
         "gte": filters.start_ms, "lt": filters.end_ms, "format": "epoch_millis"
     }}})];

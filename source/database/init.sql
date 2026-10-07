@@ -279,6 +279,14 @@ CREATE TABLE IF NOT EXISTS scan_projection_outbox (
 CREATE INDEX IF NOT EXISTS idx_scan_projection_outbox_pending
 	ON scan_projection_outbox(available_at, execution_id) WHERE processed_at IS NULL;
 
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS claim_token UUID;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS cursor JSONB;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'promoting'
+    CHECK (phase IN ('promoting', 'refreshing'));
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS processed_endpoints BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE scan_projection_outbox ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS protocol_version SMALLINT NOT NULL DEFAULT 2;
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS payload_checksum VARCHAR(64);
 ALTER TABLE scan_result_batch ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
@@ -1212,3 +1220,10 @@ ALTER TABLE report_run ADD COLUMN IF NOT EXISTS settings_revision BIGINT NOT NUL
 ALTER TABLE report_run DROP CONSTRAINT IF EXISTS report_run_period_type_period_start_period_end_revision_key;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_report_run_calendar_revision ON report_run(period_type, period_start, period_end, timezone, revision);
 INSERT INTO runtime_configuration(namespace, document) VALUES ('general', '{"timezone":"Asia/Shanghai","hourCycle":"24","dateFormat":"YYYY-MM-DD"}'::JSONB) ON CONFLICT(namespace) DO NOTHING;
+
+-- Lightweight instance metadata; aggregation queries reuse existing indexes.
+CREATE TABLE IF NOT EXISTS statistics_instance (
+    instance_id TEXT PRIMARY KEY,
+    status JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

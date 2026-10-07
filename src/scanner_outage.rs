@@ -1,16 +1,16 @@
 //! Persistent scanner disconnect detection and mail delivery.
 
+use crate::runtime_config::RuntimeConfig;
+use crate::scanner_health::ScannerHealthConfig;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use deadpool_postgres::Pool;
-use tokio::time::{Duration, MissedTickBehavior};
+use tokio::time::Duration;
 use tokio_postgres::Transaction;
 use tracing::{error, warn};
 
 use crate::admin::get_mail_settings_from_database;
 use crate::mail_template::{ScannerOutageMail, get_admin_recipients, send_scanner_outage_email};
 use crate::system_maintenance::SystemMaintenanceState;
-
-const OFFLINE_SECONDS: i64 = 90;
 
 /// Called inside the scanner-state transaction, after a valid heartbeat updates scanner_info.
 /// The scanner_info row lock serializes this transition with the outage detector.
@@ -69,25 +69,31 @@ pub async fn run_worker(
     pool: Pool,
     encryption_key: String,
     maintenance: actix_web::web::Data<SystemMaintenanceState>,
+    policy: RuntimeConfig<ScannerHealthConfig>,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(30));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut revisions = policy.subscribe();
     loop {
-        ticker.tick().await;
-        if let Err(error_value) = run_once(&pool, &encryption_key, &maintenance).await {
+        let current = policy.get().await.value;
+        if let Err(error_value) = run_once(&pool, &encryption_key, &maintenance, &current).await {
             error!(event = "ScannerOutageWorkerError", error = %error_value, "扫描器掉线通知处理失败");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(current.check_interval_seconds)) => {},
+            changed = revisions.changed() => { if changed.is_err() { return; } }
         }
     }
 }
 
-async fn run_once(
+pub(crate) async fn run_once(
     pool: &Pool,
     encryption_key: &str,
     maintenance: &SystemMaintenanceState,
+    policy: &ScannerHealthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot = maintenance.snapshot().await;
     if snapshot.enabled
-        || Utc::now() < snapshot.updated_at + ChronoDuration::seconds(OFFLINE_SECONDS)
+        || Utc::now()
+            < snapshot.updated_at + ChronoDuration::seconds(policy.maintenance_grace_seconds)
     {
         return Ok(());
     }
@@ -107,7 +113,7 @@ async fn run_once(
     } else {
         Vec::new()
     };
-    detect_outages(pool, &recipients).await?;
+    detect_outages(pool, &recipients, policy.alert_after_seconds).await?;
     enqueue_recoveries(pool).await?;
 
     if !settings.notification_prefs.scanner_recovery_enabled {
@@ -143,9 +149,10 @@ async fn run_once(
     Ok(())
 }
 
-async fn detect_outages(
+pub(crate) async fn detect_outages(
     pool: &Pool,
     recipients: &[String],
+    alert_after_seconds: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut connection = pool.get().await?;
     let transaction = connection.transaction().await?;
@@ -153,12 +160,12 @@ async fn detect_outages(
         .query(
             "SELECT s.scanner_id, s.last_seen_at FROM scanner_info s \
          WHERE s.deleted_at IS NULL AND s.is_enable = TRUE \
-         AND s.outage_monitored_at < NOW() - INTERVAL '90 seconds' \
-         AND s.last_seen_at < NOW() - INTERVAL '90 seconds' \
+         AND s.outage_monitored_at < NOW() - $1::BIGINT * INTERVAL '1 second' \
+         AND s.last_seen_at < NOW() - $1::BIGINT * INTERVAL '1 second' \
          AND NOT EXISTS (SELECT 1 FROM scanner_outage o \
              WHERE o.scanner_id = s.scanner_id AND o.recovered_at IS NULL) \
          ORDER BY s.outage_monitored_at LIMIT 100 FOR UPDATE OF s SKIP LOCKED;",
-            &[],
+            &[&alert_after_seconds],
         )
         .await?;
     for row in rows {

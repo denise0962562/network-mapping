@@ -100,6 +100,7 @@ pub async fn run_worker(
 ) {
     let mut changes = config.subscribe();
     let mut reconcile_at = tokio::time::Instant::now();
+    let mut reconcile_failures = 0u32;
     loop {
         let settings = config.get().await.value;
         if !settings.mode.runs_worker() {
@@ -111,6 +112,9 @@ pub async fn run_worker(
         }
         if tokio::time::Instant::now() >= reconcile_at {
             if let Err(error) = reconcile(&pool).await {
+                reconcile_failures = reconcile_failures.saturating_add(1);
+                let delay = reconcile_delay(reconcile_failures);
+                reconcile_at = tokio::time::Instant::now() + delay;
                 warn!(
                     event = "AnalyticsSnapshotReconcileError",
                     operation = "reconcile_analytics_outbox",
@@ -118,15 +122,20 @@ pub async fn run_worker(
                     error_code = "analytics_snapshot_reconcile_failed",
                     retryable = true,
                     outcome = "reconciliation_retry_scheduled",
-                    retry_after_ms = settings.interval_minutes.saturating_mul(60_000),
+                    retry_after_ms = delay.as_millis() as u64,
                 );
             } else {
+                reconcile_failures = 0;
                 reconcile_at = tokio::time::Instant::now()
                     + Duration::from_secs(settings.interval_minutes * 60);
             }
         }
         let mut exhausted = true;
+        let tick_started = tokio::time::Instant::now();
         for _ in 0..MAX_EXECUTIONS_PER_TICK {
+            if tick_started.elapsed() >= Duration::from_secs(2) {
+                break;
+            }
             if !config.get().await.value.mode.runs_worker() {
                 break;
             }
@@ -137,6 +146,7 @@ pub async fn run_worker(
                     break;
                 }
                 Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                     // The failed execution is delayed by fail_execution; continue draining
                     // independent work so one legacy/corrupt execution cannot block upgrades.
                 }
@@ -147,6 +157,12 @@ pub async fn run_worker(
             changed = changes.changed() => if changed.is_err() { return; }
         }
     }
+}
+
+fn reconcile_delay(failures: u32) -> Duration {
+    Duration::from_secs(
+        (30_u64.saturating_mul(2_u64.saturating_pow(failures.saturating_sub(1).min(6)))).min(1800),
+    )
 }
 
 fn worker_delay(exhausted: bool) -> Duration {
@@ -353,13 +369,12 @@ async fn process_one(pool: &Pool, elasticsearch: &ElasticsearchService) -> Resul
             Ok(true)
         }
         Err(error) => {
-            let retry_after_seconds =
-                i64::from(2_i32.saturating_pow(context.attempts.clamp(1, 8) as u32));
+            let retry_after_seconds = snapshot_retry_seconds(context.attempts);
             warn!(event = "AnalyticsSnapshotExecutionFailed",
                 operation = "build_analytics_snapshot",
                 reason = %error,
                 error_code = "analytics_snapshot_execution_failed",
-                retryable = true,
+                retryable = !error.starts_with("statistics_resource_limit:"),
                 outcome = "existing_snapshot_preserved",
                 execution_id = %context.execution_id,
                 execution_database_id = context.database_id,
@@ -553,6 +568,9 @@ async fn facts_from_elasticsearch(
     let mut after: Option<Value> = None;
     let mut observed_count = 0_i64;
     loop {
+        if after.is_some() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let mut body = json!({
             "size": READ_BATCH_SIZE,
             "track_total_hits": false,
@@ -617,6 +635,9 @@ async fn facts_from_elasticsearch(
                 }
             }
             update_first(&mut ip_first, ip_address, timestamp);
+            if endpoint_first.len().saturating_add(ip_first.len()) > 200_000 {
+                return Err("statistics_resource_limit: 执行去重集合超过 200000 条，需拆分扫描任务或离线处理".into());
+            }
         }
         let next = hits.last().and_then(|hit| hit.get("sort")).cloned();
         if hits.len() == READ_BATCH_SIZE && (next.is_none() || next == after) {
@@ -784,6 +805,10 @@ async fn replace_execution_facts(
     Ok(())
 }
 
+fn snapshot_retry_seconds(attempts: i32) -> i64 {
+    (30_i64.saturating_mul(2_i64.saturating_pow(attempts.clamp(1, 7) as u32 - 1))).min(1800)
+}
+
 async fn fail_execution(
     pool: &Pool,
     context: &ExecutionContext,
@@ -794,10 +819,10 @@ async fn fail_execution(
         .await
         .map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
     connection.execute(
-        "UPDATE analytics_outbox SET status = 'pending', available_at = NOW() + INTERVAL '5 minutes', \
+        "UPDATE analytics_outbox SET status = 'pending', available_at = CASE WHEN $4::BOOL THEN 'infinity'::TIMESTAMPTZ ELSE NOW() + $5::BIGINT * INTERVAL '1 second' END, \
          locked_at = NULL, updated_at = NOW(), last_error = LEFT($2, 2000) \
          WHERE execution_id = $1 AND status = 'running' AND locked_at = $3;",
-        &[&context.database_id, &message, &context.locked_at],
+        &[&context.database_id, &message, &context.locked_at, &message.starts_with("statistics_resource_limit:"), &snapshot_retry_seconds(context.attempts)],
     ).await.map_err(|error| crate::logs::write::error_chain_diagnostics(&error))?;
     Ok(())
 }
@@ -836,6 +861,16 @@ mod tests {
     fn backlog_is_drained_without_waiting_for_reconciliation_interval() {
         assert_eq!(worker_delay(true), Duration::from_secs(1));
         assert_eq!(worker_delay(false), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn failed_work_backs_off_and_caps_retry_delay() {
+        assert_eq!(reconcile_delay(1), Duration::from_secs(30));
+        assert_eq!(reconcile_delay(2), Duration::from_secs(60));
+        assert_eq!(reconcile_delay(u32::MAX), Duration::from_secs(1800));
+        assert_eq!(snapshot_retry_seconds(0), 30);
+        assert_eq!(snapshot_retry_seconds(3), 120);
+        assert_eq!(snapshot_retry_seconds(i32::MAX), 1800);
     }
 
     /// Uses only connection-local temporary tables, never application tables.

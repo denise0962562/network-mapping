@@ -37,10 +37,13 @@ pub mod request_log;
 pub mod runtime_config;
 pub mod scan_migration;
 pub mod scanner_config;
+pub mod scanner_diagnostics;
+pub mod scanner_health;
 pub mod scanner_latency;
 pub mod scanner_outage;
 mod search_content;
 pub mod search_projection;
+pub mod statistics;
 pub mod system_maintenance;
 pub mod system_resource_cache;
 pub mod system_time;
@@ -1841,6 +1844,8 @@ impl SaveScannerResultsError {
 
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Storage(_) | Self::BatchBusy { .. })
+            || matches!(self, Self::Database(error) if error.downcast_ref::<deadpool_postgres::PoolError>()
+                .is_some_and(|error| matches!(error, deadpool_postgres::PoolError::Timeout(_))))
     }
 
     pub fn http_status(&self) -> u16 {
@@ -1857,6 +1862,7 @@ impl SaveScannerResultsError {
             Self::ScannerUnauthorized => 401,
             Self::TaskNotFound => 404,
             Self::TaskNotOwned => 409,
+            Self::Database(_) if self.retryable() => 503,
             Self::Database(_) => 500,
             Self::Storage(_) | Self::BatchBusy { .. } => 503,
         }
@@ -1919,6 +1925,19 @@ impl std::error::Error for SaveScannerResultsError {
 #[cfg(test)]
 mod save_scanner_results_error_tests {
     use super::SaveScannerResultsError;
+
+    #[test]
+    fn pool_timeout_is_retryable_but_other_database_errors_are_not() {
+        let error = SaveScannerResultsError::Database(Box::new(
+            deadpool_postgres::PoolError::Timeout(deadpool::managed::TimeoutType::Wait),
+        ));
+        assert!(error.retryable());
+        assert_eq!(error.http_status(), 503);
+        let other =
+            SaveScannerResultsError::Database(Box::new(std::io::Error::other("database failure")));
+        assert!(!other.retryable());
+        assert_eq!(other.http_status(), 500);
+    }
 
     #[test]
     fn upload_identity_conflict_has_stable_diagnostics() {
@@ -3120,7 +3139,9 @@ pub async fn save_scanner_results(
     // Route DNS-only tasks by their persisted profile, not by this batch's
     // contents: a dns_full upload can start or end with a DNS-only batch.
     if is_typed && regular_upload.observations.is_empty() {
-        let client = pool.get().await.map_err(scanner_result_database_error)?;
+        let client = db::acquire_write_connection(pool, "classify_scan_profile")
+            .await
+            .map_err(scanner_result_database_error)?;
         let dns_only = client
             .query_opt(
                 "SELECT scan_profile FROM scan_task WHERE task_id = $1;",
@@ -3160,7 +3181,9 @@ pub async fn save_scanner_results(
         ));
     }
 
-    let mut client = pool.get().await.map_err(scanner_result_database_error)?;
+    let mut client = db::acquire_write_connection(pool, "reserve_scan_batch")
+        .await
+        .map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()
         .await
@@ -3529,10 +3552,6 @@ pub async fn save_scanner_results(
                     .await
                     .map_err(scanner_result_database_error)?;
                 drop(client);
-                if already_succeeded && is_final {
-                    elasticsearch.finalize_scan_projection(pool, execution_db_id, &batch_context)
-                        .await.map_err(SaveScannerResultsError::Storage)?;
-                }
                 return Ok(0);
             }
         } else {
@@ -3588,7 +3607,9 @@ pub async fn save_scanner_results(
         debug_assert_eq!(result.payload_checksum, es_checksum);
         let storage_references =
             Value::Array(result.indices.into_iter().map(Value::String).collect());
-        client = pool.get().await.map_err(scanner_result_database_error)?;
+        client = db::acquire_write_connection(pool, "confirm_scan_batch")
+            .await
+            .map_err(scanner_result_database_error)?;
         let transaction = client
             .transaction()
             .await
@@ -3723,8 +3744,7 @@ pub async fn save_scanner_results(
             transaction
                 .execute(
                     "INSERT INTO scan_projection_outbox (execution_id, attempts, available_at, processed_at, last_error) \
-                     VALUES ($1, 0, NOW(), NULL, NULL) ON CONFLICT (execution_id) DO UPDATE SET \
-                     attempts = 0, available_at = NOW(), processed_at = NULL, last_error = NULL;",
+                     VALUES ($1, 0, NOW(), NULL, NULL) ON CONFLICT (execution_id) DO NOTHING;",
                     &[&execution_db_id],
                 )
                 .await
@@ -3742,11 +3762,9 @@ pub async fn save_scanner_results(
         .commit()
         .await
         .map_err(scanner_result_database_error)?;
+    drop(client);
     if is_final {
-        elasticsearch
-            .finalize_scan_projection(pool, execution_db_id, &batch_context)
-            .await
-            .map_err(SaveScannerResultsError::Storage)?;
+        elasticsearch.notify_projection_worker();
     }
     Ok(saved)
 }
@@ -4010,7 +4028,7 @@ pub async fn recover_scanner_task_with_failure(
                  (e.execution_status = 'running' AND e.assigned_scanner_id = $1 \
                   AND ($2::TEXT IS NULL OR t.task_id = $2)) \
                  OR ($2::TEXT IS NOT NULL AND t.task_id = $2 AND e.execution_status = 'pending' \
-                     AND e.assigned_scanner_id IS NULL \
+                     AND e.assigned_scanner_id IS NULL AND s.accepting_tasks \
                      AND (e.requested_scanner_id IS NULL OR e.requested_scanner_id = $1) \
                      AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
                        OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
@@ -4148,7 +4166,7 @@ pub async fn apply_task(
          FROM scan_task_execution e \
          JOIN scan_task t ON t.id = e.task_id \
          JOIN scanner_info s ON s.scanner_id = $1 \
-         WHERE e.execution_status = 'pending' AND e.requested_scanner_id = $1 \
+         WHERE s.accepting_tasks AND e.execution_status = 'pending' AND e.requested_scanner_id = $1 \
            AND t.task_status IN ('pending', 'running') \
            AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
              OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
@@ -4185,7 +4203,7 @@ pub async fn apply_task(
                      ) \
                      ORDER BY candidate.id FOR UPDATE SKIP LOCKED LIMIT 1 \
                  ) e ON TRUE \
-                 WHERE t.task_status IN ('pending', 'running') \
+                 WHERE s.accepting_tasks AND t.task_status IN ('pending', 'running') \
                    AND ((t.address_family = 'ipv4' AND s.supports_ipv4 AND s.ipv4_ready) \
                      OR (t.address_family = 'ipv6' AND s.supports_ipv6 AND s.ipv6_ready)) \
                    AND (t.scan_profile = 'legacy' OR s.scan_capabilities->'profiles' ? t.scan_profile) \

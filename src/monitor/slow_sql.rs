@@ -1,7 +1,7 @@
 //! 慢 SQL 检测：轮询 `pg_stat_statements` 视图，按统计窗口内的平均耗时识别近期慢查询。
 //!
 //! 依赖 PostgreSQL 的 `pg_stat_statements` 扩展；未启用或无权读取时轮询失败，
-//! 首轮失败记录一次警告后不再重复告警，后续失败仅记录 error 日志。
+//! 首次扩展/权限故障记录警告；连接池等临时故障独立记录采样失败。
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -11,9 +11,11 @@ use deadpool_postgres::Pool;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
+use super::rules::MonitorService;
 use super::{HealthEvent, SlowSqlObservation};
 use crate::config::MonitorConfig;
 use crate::logs::write::error_diagnostics;
+use crate::runtime_config::Versioned;
 
 struct SlowQueryRow {
     queryid: Option<i64>,
@@ -85,23 +87,30 @@ impl StatementStats {
 pub async fn run_monitor(
     pool: Pool,
     tx: mpsc::Sender<HealthEvent>,
-    config: Arc<RwLock<MonitorConfig>>,
+    config: Arc<RwLock<Versioned<MonitorConfig>>>,
+    mut revisions: tokio::sync::watch::Receiver<i64>,
 ) {
     let mut baselines: HashMap<i64, StatementStats> = HashMap::new();
     let mut baseline_ready = false;
     let mut warned_unavailable = false;
 
     loop {
-        let settings = config
+        let snapshot = config
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let settings = snapshot.value;
         if !settings.enabled {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            baselines.clear();
+            baseline_ready = false;
+            if !wait_for_poll(5, &mut revisions).await {
+                return;
+            }
             continue;
         }
         match poll(&pool).await {
             Ok(rows) => {
+                warned_unavailable = false;
                 if !baseline_ready {
                     for row in rows {
                         if let Some(queryid) = row.queryid {
@@ -109,6 +118,11 @@ pub async fn run_monitor(
                         }
                     }
                     baseline_ready = true;
+                    if !wait_for_poll(settings.slow_sql_check_interval_seconds, &mut revisions)
+                        .await
+                    {
+                        return;
+                    }
                     continue;
                 }
                 for row in rows {
@@ -121,8 +135,13 @@ pub async fn run_monitor(
                     let Some(window) = row.stats.since(previous) else {
                         continue;
                     };
-                    if window.mean_exec_time_ms >= settings.slow_sql_threshold_ms as f64 {
-                        let event = HealthEvent::slow_sql(&SlowSqlObservation {
+                    let applied = settings.resolve_rule(
+                        MonitorService::Postgresql,
+                        &queryid.to_string(),
+                        snapshot.revision,
+                    );
+                    if let Some(severity) = applied.rule.severity(window.mean_exec_time_ms) {
+                        let mut event = HealthEvent::slow_sql(&SlowSqlObservation {
                             queryid,
                             query: &row.query,
                             mean_exec_time_ms: window.mean_exec_time_ms,
@@ -135,13 +154,18 @@ pub async fn run_monitor(
                             temp_blks_read_delta: window.temp_blks_read,
                             temp_blks_written_delta: window.temp_blks_written,
                         });
-                        let _ = tx.try_send(event);
+                        event.severity = severity;
+                        let _ = tx.try_send(event.with_rule(applied));
                     }
                 }
             }
             Err(error) => {
                 let diagnostics = error_diagnostics(error.as_ref());
-                if !warned_unavailable {
+                let unavailable = error
+                    .downcast_ref::<tokio_postgres::Error>()
+                    .and_then(|error| error.code())
+                    .is_some_and(|code| matches!(code.code(), "42P01" | "42501" | "55000"));
+                if unavailable && !warned_unavailable {
                     warn!(
                         event = "SlowSqlMonitorUnavailable",
                         operation = "query_pg_stat_statements",
@@ -170,10 +194,16 @@ pub async fn run_monitor(
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(
-            settings.slow_sql_check_interval_seconds,
-        ))
-        .await;
+        if !wait_for_poll(settings.slow_sql_check_interval_seconds, &mut revisions).await {
+            return;
+        }
+    }
+}
+
+async fn wait_for_poll(seconds: u64, revisions: &mut tokio::sync::watch::Receiver<i64>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(seconds)) => true,
+        result = revisions.changed() => result.is_ok(),
     }
 }
 

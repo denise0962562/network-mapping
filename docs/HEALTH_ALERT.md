@@ -50,11 +50,11 @@
    - 在「设置 → 邮件设置」填入 SMTP 主机、端口、发件人、发件邮箱密钥。
    - 给管理员账号（`role = 1`）填写邮箱，否则没有收件人、告警被静默跳过。
 
-2. **配置 `[monitor]`**（`config.toml`，见「配置」），按需调整阈值与冷却时间。
+2. **在「设置 → 运行时配置 → 健康监控」发布配置**，按需调整阈值与冷却时间。`config.toml` 的 `[monitor]` 只在数据库中缺少该配置域时用于初始化。
 
 3. **（慢 SQL 必需）启用 `pg_stat_statements`**（见「前提」）。
 
-4. **重启服务**生效。配置加载时 `monitor` 会做一次校验，阈值非法会 panic 并给出明确提示。
+4. **保存后在处理请求的服务进程内生效**，无需重启 Web 服务；慢 SQL 循环在下一轮读取新阈值和间隔。多实例部署的其他实例需重启加载数据库中的最新配置。发布时拒绝非法阈值；启动时仍会校验 TOML。
 
 5. **（可选）开关健康告警**：通知偏好新增 `health_alert_enabled`（默认 `true`），随邮件设置一起保存在 `setting` 表（`item_type = 'notification'`）。旧前端保存邮件设置时不带该字段，会自动按 `true` 处理，不影响既有保存流程。
 
@@ -80,7 +80,7 @@
 
 ## 配置
 
-`config.toml` 新增：
+以下是首次初始化使用的 TOML 配置示例。数据库已有 `monitor` 记录后，应通过管理页面或 `POST /api/config/runtime/monitor` 发布；修改 TOML 并重启不会覆盖数据库值。接口、版本冲突和多实例限制参见[服务端运行时配置](RUNTIME_CONFIGURATION.md)。
 
 ```toml
 [monitor]
@@ -96,40 +96,12 @@ elasticsearch_write_critical_threshold_ms = 15000
 alert_cooldown_seconds = 300        # 同一告警 key 的冷却时间（秒）
 ```
 
-字段均带默认值（`#[serde(default)]`），老配置不加 `[monitor]` 段也能启动，且**默认开启**监控。
+字段均带默认值（`#[serde(default)]`）。数据库没有 `monitor` 记录时，省略 TOML 段会使用默认开启的配置初始化；已有记录时沿用数据库中的开关和阈值。
 
 ## 注意事项
 
-- **升级后监控默认开启**：由于 `enabled` 默认 `true`，老配置升级后健康监控自动生效；若 SMTP 未配或没有管理员邮箱，告警会被静默跳过（不会报错刷日志）。
+- **首次初始化默认开启**：省略 TOML `[monitor]` 时 `enabled` 默认为 `true`；已有数据库配置不会因升级或重启被重新开启。若 SMTP 未配或没有管理员邮箱，告警会被静默跳过。
 - **慢 SQL 告警是「当前窗口确实慢」**：使用 `total_exec_time` 和 `calls` 的增量计算当前窗口平均值；停止执行、当前窗口恢复正常或统计计数重置后不会告警。
-- **冷却状态在内存中**：重启后去重窗口清零，重启后短时间内可能重复收到一批告警。告警事件已持久化到 `health_alert` 历史表，但冷却去重仍基于内存，尚未用历史表做跨重启去重（见「待定 / 后续」）。
+- **冷却状态在内存中**：重启后去重窗口清零，重启后短时间内可能重复收到一批告警。告警事件已持久化到 `health_alert` 历史表，但冷却去重仍基于内存，尚未用历史表做跨重启去重。
 - **每次告警给每位管理员各发一封**：管理员较多时一封事件对应多封邮件。
 - **告警邮件不记录 HTTP 请求体或 ES DSL/Bulk 正文**：慢请求与 5xx 只携带 method、path（不含 query）、状态码、耗时、请求 ID、来源 IP、操作者；ES 告警只携带脱敏的固定元数据。PostgreSQL 慢 SQL 仍携带查询文本（截断到 2000 字符），若文本不可见则回退为 `queryid`。
-
-## 涉及文件
-
-后端：
-
-- `src/config.rs`：`MonitorConfig` 及 `[monitor]` 校验；`NotificationPreferences.health_alert_enabled`。
-- `src/monitor/mod.rs`：`HealthEvent`、`MonitorHandle`、`run_notifier`（冷却去重）。
-- `src/monitor/slow_sql.rs`：`pg_stat_statements` 轮询与 calls 增量判定。
-- `src/mail_template.rs`：`health_alert` 模板定义、`send_health_alert`、`get_admin_recipients`。
-- `src/admin.rs`：邮件设置读写新增 `health_alert_enabled`。
-- `src/main.rs`：创建 `MonitorHandle`、中间件内实时判定慢请求 / 5xx。
-- `src/lib.rs`：模块声明。
-- `src/handlers/health.rs`：`GET /api/health/alerts` 告警历史查询接口（管理员）。
-- `src/frontend.rs`：SPA 路由白名单新增 `/health`。
-- `source/database/init.sql`：`health_alert` 历史表与索引。
-- `templates/mail/health_alert.html` / `.txt`：内置默认告警模板。
-
-前端：
-
-- `network-mapping-vue/src/views/Health.vue`：健康告警历史页（时间 / 类型 / 级别筛选 + 分页）。
-- `network-mapping-vue/src/router/index.js`、`src/App.vue`：`/health` 路由与侧边栏菜单项（管理员可见）。
-
-## 待定 / 后续
-
-- 跨重启冷却去重：利用 `health_alert` 表按 `alert_key` + `occurred_at` 判断，替代当前仅内存的冷却窗口。
-- 冷却 `HashMap` 清理：不同 path/queryid 会随运行缓慢增长，实际有界，暂未加淘汰。
-- Webhook 渠道（企业微信 / 钉钉 / 飞书 / 通用），作为邮件之外的可选实时推送。
-- 告警聚合摘要（冷却窗口内多事件合并为一封 digest）。
