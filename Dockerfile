@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Supply the separately checked-out frontend as --build-context frontend=PATH.
-FROM node:24.16.0-bookworm-slim@sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203 AS frontend-builder
+FROM node:26.11.1-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS frontend-builder
 WORKDIR /frontend
 RUN npm install --global pnpm@11.9.0
 COPY --from=frontend package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
@@ -11,8 +11,9 @@ COPY --from=frontend LICENSE ./LICENSE
 COPY --from=frontend index.html login.html search.html asset.html vite.config.js jsconfig.json tailwindcss.config.js ./
 RUN node --test src/utils/*.test.js && pnpm test:targets && pnpm build
 RUN test -f dist/index.html && test -f dist/login.html && test -f dist/search.html && test -f dist/asset.html && test -d dist/assets
+RUN printf 'node=%s\npnpm=%s\n' "$(node --version | sed 's/^v//')" "$(pnpm --version)" > /frontend/frontend-build-info
 
-FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS rust-chef
+FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS rust-chef
 WORKDIR /build
 # Keep checks/tests runnable without large debug and incremental caches.
 ENV CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
@@ -57,6 +58,7 @@ RUN cargo fmt --all --check
 RUN cargo clippy --locked --workspace --all-targets
 RUN cargo test --locked --workspace --all-targets
 RUN cargo build --locked --workspace --release && mkdir /out && install -m 0755 target/release/network_mapping_server /out/network_mapping_server
+RUN printf 'rust=%s\n' "$(rustc --version | cut -d ' ' -f 2)" > /out/rust-build-info
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/* \
@@ -71,6 +73,8 @@ COPY templates ./templates
 COPY LICENSE ./licenses/LICENSE
 COPY assets/fonts/Noto-LICENSE.txt assets/fonts/Apache-2.0.txt ./licenses/
 COPY --from=frontend-builder /frontend/LICENSE ./licenses/frontend-LICENSE
+COPY --from=rust-builder /out/rust-build-info ./rust-build-info
+COPY --from=frontend-builder /frontend/frontend-build-info ./frontend-build-info
 ARG VERSION=development
 ARG REVISION=unknown
 ARG FRONTEND_REVISION=unknown
@@ -82,7 +86,9 @@ LABEL org.opencontainers.image.title="network-mapping-server" \
       org.opencontainers.image.revision=$REVISION \
       io.network-mapping.frontend.revision=$FRONTEND_REVISION \
       io.network-mapping.frontend.version=$FRONTEND_VERSION
-RUN printf 'server-version=%s\nserver-commit=%s\nfrontend-version=%s\nfrontend-commit=%s\narchitecture=%s\nrust=1.98.0\nnode=24.16.0\npnpm=11.9.0\n' "$VERSION" "$REVISION" "$FRONTEND_VERSION" "$FRONTEND_REVISION" "$TARGETARCH" > BUILD-INFO
+RUN printf 'server-version=%s\nserver-commit=%s\nfrontend-version=%s\nfrontend-commit=%s\narchitecture=%s\n' "$VERSION" "$REVISION" "$FRONTEND_VERSION" "$FRONTEND_REVISION" "$TARGETARCH" > BUILD-INFO \
+    && cat rust-build-info frontend-build-info >> BUILD-INFO \
+    && rm rust-build-info frontend-build-info
 USER 10001:10001
 EXPOSE 9999
 ENV SERVER_TLS_NAME=localhost
