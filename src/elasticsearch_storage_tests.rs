@@ -2408,6 +2408,7 @@ async fn mixed_upload_resumes_dns_sidecar_left_by_previous_server() {
         "fixture-token",
         "fixture-pepper",
         upload.upload_id,
+        None,
     )
     .await
     .unwrap();
@@ -2535,6 +2536,7 @@ async fn mixed_upload_cannot_finish_with_an_unmatched_dns_child() {
         "fixture-token",
         "fixture-pepper",
         upload.upload_id,
+        None,
     )
     .await
     .unwrap();
