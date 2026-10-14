@@ -21,6 +21,7 @@ use crate::config::{ElasticsearchConfig, ScanStorageMode};
 use crate::dns::DnsObservation;
 use crate::handlers::tags::AssetTag;
 use crate::monitor::{ElasticsearchObservation, ElasticsearchOperationKind, MonitorHandle};
+use crate::result_ingest::telemetry::WriteStage;
 
 #[derive(Default)]
 struct BulkTiming {
@@ -35,6 +36,9 @@ struct BulkTiming {
 
 const OUTBOX_LOCK_TIMEOUT_MINUTES: i64 = 5;
 const SCAN_INDEX_SCHEMA_VERSION: &str = "5";
+// Leave headroom beneath Elasticsearch's default 4 KiB HTTP request-line limit.
+const SCAN_REQUEST_LINE_BUDGET: usize = 3 * 1024;
+const SCAN_INDEX_OPTIONS: &str = "allow_no_indices=true&ignore_unavailable=true";
 const DNS_INDEX_SCHEMA_VERSION: &str = "2";
 const MAX_DOMAIN_RECORDS: usize = 10_000;
 const MAX_DOMAIN_NAMES: usize = 1_000;
@@ -1181,15 +1185,32 @@ impl ElasticsearchService {
         .map(|_| ())
     }
 
-    pub(crate) async fn persist_scan_batch(
+    pub(crate) fn scan_batch_indices(&self, observations: &[Value]) -> Result<Vec<String>, String> {
+        observations
+            .iter()
+            .map(|observation| {
+                let observed_at = observation
+                    .get("observed_at")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "扫描观察缺少 observed_at".to_owned())?;
+                scan_observation_index(&self.inner.config.observation_index_prefix, observed_at)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map(|indices| indices.into_iter().collect())
+    }
+
+    // Some([]) is an execution with no endpoint observations. None is an explicit
+    // compatibility path for old receipts/migrations whose index manifest is absent.
+    pub(crate) async fn persist_scan_batch_scoped(
         &self,
         context: &ScanBatchContext,
         observations: &[Value],
+        observation_indices: Option<&[String]>,
     ) -> Result<ScanBatchWriteResult, String> {
         self.ensure_scan_indices().await?;
 
         let result = self
-            .persist_scan_batch_prepared(context, observations)
+            .persist_scan_batch_prepared(context, observations, observation_indices)
             .await;
         if result.is_err() {
             // The failure may be caused by an index being removed or replaced
@@ -1515,7 +1536,45 @@ impl ElasticsearchService {
         &self,
         context: &ScanBatchContext,
         observations: &[Value],
+        observation_indices: Option<&[String]>,
     ) -> Result<ScanBatchWriteResult, String> {
+        // Validate and plan all final URLs before issuing any Elasticsearch writes.
+        let final_plan = if context.is_final {
+            let targets = match observation_indices {
+                Some(indices) => validated_observation_indices(
+                    &self.inner.config.observation_index_prefix,
+                    indices,
+                )?
+                .into_iter()
+                .collect::<Vec<_>>(),
+                None => {
+                    warn!(event = "ScanSummaryLegacyIndexScope", execution_id = %context.execution_id,
+                        "旧回执或迁移缺少索引清单，使用兼容统计范围");
+                    Vec::new()
+                }
+            };
+            let legacy_target = format!("{}-*", self.inner.config.observation_index_prefix);
+            let targets = if observation_indices.is_none() {
+                vec![legacy_target.as_str()]
+            } else {
+                targets
+            };
+            let count_paths = bounded_scan_index_paths(&self.inner.config.url, &targets, "_count")?;
+            let mut refresh_targets = targets;
+            refresh_targets.push(&self.inner.config.execution_endpoint_index);
+            let refresh_paths =
+                bounded_scan_index_paths(&self.inner.config.url, &refresh_targets, "_refresh")?;
+            let summary_path = format!("/{}/_search", self.inner.config.execution_endpoint_index);
+            ensure_scan_request_line_fits(&self.inner.config.url, &summary_path)?;
+            info!(event = "ScanFinalRequestPlan", execution_id = %context.execution_id,
+                refresh_requests = refresh_paths.len(), count_requests = count_paths.len(),
+                max_request_line_bytes = refresh_paths.iter().chain(&count_paths)
+                    .map(|path| scan_request_line_length(&self.inner.config.url, path))
+                    .collect::<Result<Vec<_>, _>>()?.into_iter().max().unwrap_or(0));
+            Some((refresh_paths, count_paths))
+        } else {
+            None
+        };
         let payload_checksum = scan_batch_payload_checksum(context, observations)?;
         let mut body = String::new();
         let mut expected = Vec::with_capacity(observations.len());
@@ -1575,6 +1634,7 @@ impl ElasticsearchService {
         }
 
         if !body.is_empty() {
+            let stage = WriteStage::new("write_observation_bulk");
             let result = self
                 .send_bulk_with_retry(
                     &format!(
@@ -1586,28 +1646,36 @@ impl ElasticsearchService {
                 )
                 .await?;
             self.validate_scan_bulk_result(&result, &expected).await?;
+            stage.finish(true);
         }
 
+        let stage = WriteStage::new("write_execution_endpoints");
         self.update_scan_endpoint_projections(context, observations)
             .await?;
+        stage.finish(true);
         self.mark_success();
-        if context.is_final {
-            let refreshed = self
-                .send_json_request(
-                    ElasticsearchOperation::IndexAdmin,
-                    Method::POST,
-                    &format!(
-                        "/{}-*,{}/_refresh?allow_no_indices=true&ignore_unavailable=true",
-                        self.inner.config.observation_index_prefix,
-                        self.inner.config.execution_endpoint_index
-                    ),
-                    |request| request,
-                )
+        let execution_summary = if let Some((refresh_paths, count_paths)) = final_plan {
+            let stage = WriteStage::new("refresh_execution_indices");
+            for path in refresh_paths {
+                let chunk_stage = WriteStage::new("refresh_execution_index_chunk");
+                let refreshed = self
+                    .send_json_request(
+                        ElasticsearchOperation::IndexAdmin,
+                        Method::POST,
+                        &path,
+                        |request| request,
+                    )
+                    .await?;
+                validate_scan_search_response(&refreshed)?;
+                chunk_stage.finish(true);
+            }
+            stage.finish(true);
+            let stage = WriteStage::new("execution_summary");
+            let summary = self
+                .execution_summary(&context.execution_id, &count_paths)
                 .await?;
-            validate_scan_search_response(&refreshed)?;
-        }
-        let execution_summary = if context.is_final {
-            Some(self.execution_summary(&context.execution_id).await?)
+            stage.finish(true);
+            Some(summary)
         } else {
             None
         };
@@ -1618,11 +1686,16 @@ impl ElasticsearchService {
         })
     }
 
-    async fn execution_summary(&self, execution_id: &str) -> Result<ScanExecutionSummary, String> {
+    async fn execution_summary(
+        &self,
+        execution_id: &str,
+        observation_count_paths: &[String],
+    ) -> Result<ScanExecutionSummary, String> {
         let mut after = None;
         let mut ip_count = 0_i64;
         let mut port_count = 0_i64;
         loop {
+            let first_page = after.is_none();
             let mut composite = json!({
                 "size": 1000,
                 "sources": [{"ip": {"terms": {"field": "ip"}}}]
@@ -1640,7 +1713,7 @@ impl ElasticsearchService {
                     &format!("/{}/_search", self.inner.config.execution_endpoint_index),
                     |request| {
                         request.json(&json!({
-                            "size": 0, "track_total_hits": true,
+                            "size": 0, "track_total_hits": first_page,
                             "query": {"term": {"execution_id": execution_id}},
                             "aggs": {"ips": {"composite": composite}}
                         }))
@@ -1648,10 +1721,19 @@ impl ElasticsearchService {
                 )
                 .await?;
             validate_scan_search_response(&endpoints)?;
-            port_count = endpoints
-                .pointer("/hits/total/value")
-                .and_then(Value::as_i64)
-                .unwrap_or(port_count);
+            if first_page {
+                if endpoints
+                    .pointer("/hits/total/relation")
+                    .and_then(Value::as_str)
+                    != Some("eq")
+                {
+                    return Err("Elasticsearch 执行端点总数必须是精确值".into());
+                }
+                port_count = endpoints
+                    .pointer("/hits/total/value")
+                    .and_then(Value::as_i64)
+                    .ok_or("Elasticsearch 执行端点缺少总数")?;
+            }
             let buckets = endpoints
                 .pointer("/aggregations/ips/buckets")
                 .and_then(Value::as_array)
@@ -1662,25 +1744,34 @@ impl ElasticsearchService {
                 break;
             }
         }
-        let observations = self
-            .send_json_request(
-                ElasticsearchOperation::ExecutionSummary,
-                Method::POST,
-                &format!(
-                    "/{}-*/_count?allow_no_indices=true&ignore_unavailable=true",
-                    self.inner.config.observation_index_prefix
-                ),
-                |request| request.json(&json!({"query": {"term": {"execution_id": execution_id}}})),
-            )
-            .await?;
-        validate_scan_search_response(&observations)?;
+        let mut observation_count = 0_i64;
+        for path in observation_count_paths {
+            let stage = WriteStage::new("count_execution_observation_chunk");
+            let observations = self
+                .send_json_request(
+                    ElasticsearchOperation::ExecutionSummary,
+                    Method::POST,
+                    path,
+                    |request| {
+                        request.json(&json!({"query": {"term": {"execution_id": execution_id}}}))
+                    },
+                )
+                .await?;
+            validate_scan_search_response(&observations)?;
+            let count = observations
+                .get("count")
+                .and_then(Value::as_i64)
+                .filter(|count| *count >= 0)
+                .ok_or("Elasticsearch 执行观察缺少有效总数")?;
+            observation_count = observation_count
+                .checked_add(count)
+                .ok_or("Elasticsearch 执行观察总数溢出")?;
+            stage.finish(true);
+        }
         Ok(ScanExecutionSummary {
             ip_count,
             port_count,
-            observation_count: observations
-                .get("count")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
+            observation_count,
         })
     }
 
@@ -2610,7 +2701,7 @@ impl ElasticsearchService {
                 is_final: batch.get("is_final"),
             };
             let result = self
-                .persist_scan_batch_prepared(&context, &observations)
+                .persist_scan_batch_prepared(&context, &observations, None)
                 .await
                 .map_err(|error| {
                     format!(
@@ -3476,8 +3567,18 @@ fn observation_search_target(prefix: &str, indices: &[String]) -> Result<String,
     if indices.is_empty() {
         return Ok(format!("{prefix}-*"));
     }
+    Ok(validated_observation_indices(prefix, indices)?
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+fn validated_observation_indices<'a>(
+    prefix: &str,
+    indices: &'a [String],
+) -> Result<BTreeSet<&'a str>, String> {
     let expected_prefix = format!("{prefix}-");
-    let indices = indices.iter().collect::<BTreeSet<_>>();
+    let indices = indices.iter().map(String::as_str).collect::<BTreeSet<_>>();
     for index in &indices {
         if !index.starts_with(&expected_prefix)
             || !index.bytes().all(|value| {
@@ -3489,11 +3590,57 @@ fn observation_search_target(prefix: &str, indices: &[String]) -> Result<String,
             ));
         }
     }
-    Ok(indices
-        .into_iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(","))
+    Ok(indices)
+}
+
+fn scan_request_line_length(base_url: &str, path: &str) -> Result<usize, String> {
+    let url = reqwest::Url::parse(&format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ))
+    .map_err(|error| format!("无效 Elasticsearch 请求地址：{error}"))?;
+    // reqwest uses an encoded origin-form target. The hostname is not part of it.
+    Ok(b"POST  HTTP/1.1".len() + url.path().len() + url.query().map_or(0, |query| 1 + query.len()))
+}
+
+fn ensure_scan_request_line_fits(base_url: &str, path: &str) -> Result<(), String> {
+    if scan_request_line_length(base_url, path)? > SCAN_REQUEST_LINE_BUDGET {
+        return Err(format!(
+            "Elasticsearch 单个索引请求超过 {SCAN_REQUEST_LINE_BUDGET} 字节预算，请检查索引名称和 URL 路径前缀"
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_scan_index_paths(
+    base_url: &str,
+    indices: &[&str],
+    operation: &str,
+) -> Result<Vec<String>, String> {
+    let path = |target: &str| format!("/{target}/{operation}?{SCAN_INDEX_OPTIONS}");
+    let mut paths = Vec::new();
+    let mut target = String::new();
+    for index in indices {
+        let candidate = if target.is_empty() {
+            (*index).to_owned()
+        } else {
+            format!("{target},{index}")
+        };
+        if scan_request_line_length(base_url, &path(&candidate))? > SCAN_REQUEST_LINE_BUDGET {
+            ensure_scan_request_line_fits(base_url, &path(index))?;
+            if !target.is_empty() {
+                paths.push(path(&target));
+            }
+            target = (*index).to_owned();
+        } else {
+            target = candidate;
+        }
+    }
+    if !target.is_empty() {
+        paths.push(path(&target));
+    }
+    Ok(paths)
 }
 
 fn observation_progress(completed: u64, total: Option<u64>) -> String {
@@ -4146,6 +4293,52 @@ fn index_mapping_update() -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn scan_index_paths_split_at_encoded_request_line_budget() {
+        use super::*;
+        let base = "http://localhost:9200/代理/";
+        let overhead =
+            scan_request_line_length(base, &format!("/x/_count?{SCAN_INDEX_OPTIONS}")).unwrap() - 1;
+        let index = "a".repeat(SCAN_REQUEST_LINE_BUDGET - overhead);
+        let paths = bounded_scan_index_paths(base, &[&index], "_count").unwrap();
+        assert_eq!(
+            scan_request_line_length(base, &paths[0]).unwrap(),
+            SCAN_REQUEST_LINE_BUDGET
+        );
+        assert!(bounded_scan_index_paths(base, &[&format!("{index}a")], "_count").is_err());
+        let paths = bounded_scan_index_paths(base, &[&index, "b"], "_count").unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(
+            paths
+                .iter()
+                .all(|p| scan_request_line_length(base, p).unwrap() <= SCAN_REQUEST_LINE_BUDGET)
+        );
+    }
+
+    #[test]
+    fn scan_index_paths_keep_empty_and_legacy_scopes_distinct() {
+        use super::*;
+        assert!(
+            bounded_scan_index_paths("http://localhost", &[], "_count")
+                .unwrap()
+                .is_empty()
+        );
+        let legacy = bounded_scan_index_paths("http://localhost", &["scan-*"], "_count").unwrap();
+        assert_eq!(legacy, vec![format!("/scan-*/_count?{SCAN_INDEX_OPTIONS}")]);
+        let paths = bounded_scan_index_paths(
+            "http://localhost",
+            &["scan-2026.01", "execution"],
+            "_refresh",
+        )
+        .unwrap();
+        assert_eq!(
+            paths,
+            vec![format!(
+                "/scan-2026.01,execution/_refresh?{SCAN_INDEX_OPTIONS}"
+            )]
+        );
+    }
+
+    #[test]
     fn observation_search_uses_recorded_indices_and_validates_them() {
         let indices = vec![
             "scan-observations-2026.09".to_owned(),
@@ -4640,3 +4833,7 @@ mod tests {
 #[cfg(test)]
 #[path = "elasticsearch_storage_tests.rs"]
 mod storage_tests;
+
+#[cfg(test)]
+#[path = "elasticsearch/stress_tests.rs"]
+mod stress_tests;

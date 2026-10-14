@@ -7,8 +7,11 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub(super) struct FixtureState {
     pub(super) requests: Vec<String>,
+    pub(super) query_bodies: Vec<(String, Value)>,
     pub(super) documents: BTreeMap<(String, String), Value>,
     pub(super) fail_path: Option<String>,
+    pub(super) max_request_line_bytes: Option<usize>,
+    pub(super) count_responses: std::collections::VecDeque<Value>,
     pub(super) delay_path: Option<String>,
     pub(super) delay_ms: u64,
     pub(super) projection_bulk_sizes: Vec<usize>,
@@ -82,7 +85,10 @@ impl EsFixture {
                         state
                             .fail_path
                             .as_ref()
-                            .is_some_and(|needle| path.contains(needle)),
+                            .is_some_and(|needle| path.contains(needle))
+                            || state
+                                .max_request_line_bytes
+                                .is_some_and(|max| first.len() > max),
                         state
                             .delay_path
                             .as_ref()
@@ -161,7 +167,7 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
             }
         }
         let mut items = Vec::new();
-        for pair in lines.chunks_exact(2) {
+        for pair in lines.as_chunks::<2>().0 {
             let (operation, action) = pair[0].as_object().unwrap().iter().next().unwrap();
             let requested_index = action["_index"].as_str().unwrap();
             let backing_create = operation == "create" && requested_index.starts_with(".ds-");
@@ -218,11 +224,34 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
         }).collect::<Vec<_>>();
         return json!({"docs": docs});
     }
+    let matches_index = |index: &str| {
+        path.trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap()
+            .split(',')
+            .any(|target| {
+                target
+                    .strip_suffix('*')
+                    .map_or(index == target, |prefix| index.starts_with(prefix))
+            })
+    };
     if path.contains("_count") {
-        return json!({"count": state.documents.keys().filter(|(index, _)| index.contains("scan-observations")).count(), "_shards": {"failed":0}});
+        if let Some(response) = state.count_responses.pop_front() {
+            return response;
+        }
+        let request: Value = serde_json::from_str(body).unwrap();
+        state.query_bodies.push((path.into(), request.clone()));
+        let execution = request
+            .pointer("/query/term/execution_id")
+            .and_then(Value::as_str);
+        return json!({"count": state.documents.iter().filter(|((index, _), doc)| {
+            matches_index(index) && doc.get("execution_id").and_then(Value::as_str) == execution
+        }).count(), "_shards": {"failed":0}});
     }
     if path.contains("_search") {
         let request: Value = serde_json::from_str(body).unwrap();
+        state.query_bodies.push((path.into(), request.clone()));
         if path.contains("network-mapping-dns-observations/_search")
             && request.pointer("/query/bool/filter").is_some()
         {
@@ -275,15 +304,34 @@ fn fixture_response(state: &mut FixtureState, _method: &str, path: &str, body: &
         let hits: Vec<_> = state
             .documents
             .iter()
-            .filter(|((index, _), _)| path.contains(index))
+            .filter(|((index, _), doc)| {
+                matches_index(index)
+                    && request
+                        .pointer("/query/term/execution_id")
+                        .is_none_or(|id| doc.get("execution_id") == Some(id))
+            })
             .map(|((_, id), doc)| json!({"_source": doc, "sort": [id]}))
             .collect();
         let ips: std::collections::BTreeSet<_> = hits
             .iter()
             .filter_map(|hit| hit["_source"]["ip"].as_str())
             .collect();
-        return json!({"hits": {"total": {"value": hits.len()}, "hits": hits}, "_shards": {"failed":0},
-            "aggregations": {"ips": {"buckets": ips.iter().map(|ip| json!({"key": {"ip":ip}})).collect::<Vec<_>>()}}});
+        let size = request
+            .pointer("/aggs/ips/composite/size")
+            .and_then(Value::as_u64)
+            .unwrap_or(1000) as usize;
+        let after = request
+            .pointer("/aggs/ips/composite/after/ip")
+            .and_then(Value::as_str);
+        let buckets = ips
+            .iter()
+            .filter(|ip| after.is_none_or(|after| **ip > after))
+            .take(size)
+            .map(|ip| json!({"key": {"ip":ip}}))
+            .collect::<Vec<_>>();
+        let after_key = buckets.last().map(|bucket| bucket["key"].clone());
+        return json!({"hits": {"total": {"value": hits.len(), "relation": "eq"}, "hits": hits}, "_shards": {"failed":0},
+            "aggregations": {"ips": {"buckets": buckets, "after_key": after_key}}});
     }
     json!({"acknowledged": true, "_shards": {"failed":0}})
 }
@@ -366,7 +414,7 @@ async fn fresh_install_restart_pending_and_missing_index_gate() {
     pool.get()
         .await
         .unwrap()
-        .batch_execute("ALTER TABLE scan_result_batch DROP COLUMN storage_backend")
+        .batch_execute("DROP TRIGGER scan_upload_stream_receipt ON scan_result_batch; ALTER TABLE scan_result_batch DROP COLUMN storage_backend")
         .await
         .unwrap();
     // Upgrading a pre-backend-column schema must classify existing receipts as PG.
@@ -1567,15 +1615,9 @@ async fn uploads_recover_without_pg_facts_and_reject_changed_completed_batches()
         .await
         .is_err()
     );
-    assert!(
-        fixture
-            .state
-            .lock()
-            .unwrap()
-            .requests
-            .iter()
-            .any(|path| path.contains("scan-observations-v1-*,") && path.contains("_refresh"))
-    );
+    assert!(fixture.state.lock().unwrap().requests.iter().any(|path| {
+        path.contains("scan-observations-v1-") && !path.contains('*') && path.contains("_refresh")
+    }));
     pool.get()
         .await
         .unwrap()
@@ -1739,6 +1781,428 @@ async fn seed_mixed_upload(pool: &Pool) -> crate::result_ingest::model::ScannerR
     upload.protocol_version = 3;
     upload.observations.push(port_observation());
     upload
+}
+
+#[tokio::test]
+async fn execution_summary_only_counts_total_on_first_composite_page() {
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        for number in 0..1001 {
+            state.documents.insert(
+                (service.inner.config.execution_endpoint_index.clone(), number.to_string()),
+                json!({"execution_id":"execution", "ip":format!("192.0.{}.{}", number / 256, number % 256), "port":443}),
+            );
+        }
+    }
+    let summary = service.execution_summary("execution", &[]).await.unwrap();
+    assert_eq!(
+        (
+            summary.ip_count,
+            summary.port_count,
+            summary.observation_count
+        ),
+        (1001, 1001, 0)
+    );
+    let state = fixture.state.lock().unwrap();
+    let queries = state
+        .query_bodies
+        .iter()
+        .map(|(_, query)| query)
+        .collect::<Vec<_>>();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0]["track_total_hits"], true);
+    assert_eq!(queries[1]["track_total_hits"], false);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn many_month_final_is_bounded_and_recovers_from_later_chunk_failure() {
+    for empty_final in [false, true] {
+        for operation in ["_refresh", "_count"] {
+            let (pool, schema) = isolated_pool().await;
+            let fixture = EsFixture::start();
+            fixture.state.lock().unwrap().max_request_line_bytes = Some(4096);
+            let service = fixture.service();
+            let mut upload = seed_dns_upload(&pool).await;
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute(
+                    "UPDATE scan_task SET task_kind='ip',scan_profile='port_only' WHERE id=1",
+                )
+                .await
+                .unwrap();
+            upload.protocol_version = 3;
+            let indices = (0..500)
+                .map(|month| {
+                    format!(
+                        "{}-{}.{:02}",
+                        service.inner.config.observation_index_prefix,
+                        1970 + month / 12,
+                        month % 12 + 1
+                    )
+                })
+                .collect::<Vec<_>>();
+            upload.observations = (0..500)
+                .map(|month| {
+                    let date = chrono::NaiveDate::from_ymd_opt(
+                        1970 + month / 12,
+                        (month % 12 + 1) as u32,
+                        2,
+                    )
+                    .unwrap();
+                    serde_json::from_value(json!({"kind":"port",
+                        "ip":format!("192.0.{}.{}", month / 256, month % 256), "port":443,
+                        "protocol":"tcp", "state":"open", "source":"masscan",
+                        "observed_at":date.and_hms_opt(0,0,0).unwrap().and_utc().timestamp_millis(),
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            if empty_final {
+                assert_eq!(
+                    save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+                    500
+                );
+                upload.observations.clear();
+                upload.batch_index = Some(1);
+            }
+            upload.is_final = Some(true);
+            let mut targets = indices.iter().map(String::as_str).collect::<Vec<_>>();
+            if operation == "_refresh" {
+                targets.push(&service.inner.config.execution_endpoint_index);
+            }
+            let paths =
+                bounded_scan_index_paths(&service.inner.config.url, &targets, operation).unwrap();
+            assert!(paths.len() > 1);
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.fail_path = Some(paths[1].clone());
+                // Same execution in a different month must not enter the scoped count.
+                state.documents.insert(
+                    (
+                        format!("{}-1969.12", service.inner.config.observation_index_prefix),
+                        "unrelated-month".into(),
+                    ),
+                    json!({"execution_id":"execution"}),
+                );
+                // A different execution in a selected month must also be excluded.
+                state.documents.insert(
+                    (indices[0].clone(), "unrelated-execution".into()),
+                    json!({"execution_id":"other"}),
+                );
+            }
+            assert!(matches!(
+                save_upload_fixture(&pool, &service, &upload).await,
+                Err(crate::result_ingest::model::SaveScannerResultsError::Storage(_))
+            ));
+            let client = pool.get().await.unwrap();
+            let status: String = client
+                .query_one(
+                    "SELECT execution_status FROM scan_task_execution WHERE id=1",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(status, "running");
+            let pending: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM scan_result_batch WHERE storage_backend='pending'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(pending, 1);
+            let outbox: i64 = client
+                .query_one("SELECT COUNT(*) FROM scan_projection_outbox", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(outbox, 0);
+            fixture.state.lock().unwrap().fail_path = None;
+            let before = fixture.state.lock().unwrap().requests.len();
+            assert_eq!(
+                save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+                if empty_final { 0 } else { 500 }
+            );
+            assert_eq!(
+                save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+                0
+            );
+            let counters = client.query_one("SELECT execution_status,result_ip_count,result_port_count,result_observation_count FROM scan_task_execution WHERE id=1", &[]).await.unwrap();
+            assert_eq!(counters.get::<_, String>(0), "succeeded");
+            for column in 1..=3 {
+                assert_eq!(counters.get::<_, i64>(column), 500);
+            }
+            {
+                let state = fixture.state.lock().unwrap();
+                let final_requests = state.requests[before..]
+                    .iter()
+                    .filter(|request| request.contains("/_refresh") || request.contains("/_count"))
+                    .collect::<Vec<_>>();
+                assert!(final_requests.len() > 2);
+                assert!(
+                    final_requests
+                        .iter()
+                        .all(|request| request.len() + " HTTP/1.1".len()
+                            <= SCAN_REQUEST_LINE_BUDGET
+                            && !request.contains('*')
+                            && !request.contains("1969.12"))
+                );
+                let refresh = final_requests
+                    .iter()
+                    .filter(|request| request.contains("/_refresh"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    refresh
+                        .iter()
+                        .filter(|request| request
+                            .contains(&service.inner.config.execution_endpoint_index))
+                        .count(),
+                    1
+                );
+            }
+            client
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn execution_summary_rejects_invalid_partial_and_overflowed_chunk_counts() {
+    for responses in [
+        vec![json!({"count":-1})],
+        vec![json!({})],
+        vec![json!({"count":1,"_shards":{"failed":1}})],
+        vec![json!({"count":i64::MAX}), json!({"count":1})],
+    ] {
+        let fixture = EsFixture::start();
+        fixture.state.lock().unwrap().count_responses = responses.into();
+        let service = fixture.service();
+        assert!(
+            service
+                .execution_summary("execution", &["/a/_count".into(), "/b/_count".into()])
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn empty_final_uses_all_execution_months_and_excludes_unrelated_history() {
+    let (pool, schema) = isolated_pool().await;
+    let fixture = EsFixture::start();
+    let service = fixture.service();
+    let mut upload = seed_dns_upload(&pool).await;
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute("UPDATE scan_task SET task_kind='ip', scan_profile='port_only' WHERE id=1")
+        .await
+        .unwrap();
+    for (batch, observed_at) in [1767225600000_i64, 1769904000000_i64]
+        .into_iter()
+        .enumerate()
+    {
+        upload.batch_index = Some(batch as u32);
+        upload.observations = vec![
+            serde_json::from_value(json!({
+                "kind":"port", "ip":format!("192.0.2.{}", batch + 1), "port":443,
+                "protocol":"tcp", "state":"open", "source":"masscan", "observed_at":observed_at,
+            }))
+            .unwrap(),
+        ];
+        assert_eq!(
+            save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+            1
+        );
+    }
+    fixture.state.lock().unwrap().documents.insert(
+        (
+            format!("{}-2025.01", service.inner.config.observation_index_prefix),
+            "unrelated".into(),
+        ),
+        json!({"execution_id":"unrelated"}),
+    );
+    upload.batch_index = Some(2);
+    upload.is_final = Some(true);
+    upload.observations.clear();
+    save_upload_fixture(&pool, &service, &upload).await.unwrap();
+    assert_eq!(
+        save_upload_fixture(&pool, &service, &upload).await.unwrap(),
+        0
+    );
+    let counters = pool.get().await.unwrap().query_one("SELECT result_ip_count,result_port_count,result_observation_count FROM scan_task_execution WHERE id=1", &[]).await.unwrap();
+    assert_eq!(
+        (
+            counters.get::<_, i64>(0),
+            counters.get::<_, i64>(1),
+            counters.get::<_, i64>(2)
+        ),
+        (2, 2, 2)
+    );
+    {
+        let state = fixture.state.lock().unwrap();
+        let refresh = state
+            .requests
+            .iter()
+            .find(|path| path.contains("/_refresh"))
+            .unwrap();
+        assert!(refresh.contains("2026.01") && refresh.contains("2026.02"));
+        assert!(!refresh.contains('*') && !refresh.contains("2025.01"));
+        let count = state
+            .requests
+            .iter()
+            .find(|path| path.contains("/_count"))
+            .unwrap();
+        assert!(count.contains("2026.01") && count.contains("2026.02"));
+        assert!(!count.contains('*'));
+    }
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL"]
+async fn upload_stream_tracks_gaps_retries_deletions_and_final_boundary() {
+    use crate::result_ingest::upload_stream;
+    let (pool, schema) = isolated_pool().await;
+    seed_execution(&pool).await;
+    let mut client = pool.get().await.unwrap();
+    client.batch_execute("INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,storage_backend)
+        VALUES(1,'upload',2,false,5,'elasticsearch'),(1,'upload',0,false,3,'pending');").await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    assert!(
+        upload_stream::validate_final(&tx, 1, "upload", 3, "scan result", false)
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    client.batch_execute("UPDATE scan_result_batch SET storage_backend='elasticsearch' WHERE batch_index=0;
+        INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,storage_backend)
+        VALUES(1,'upload',1,false,4,'elasticsearch');").await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    upload_stream::validate_final(&tx, 1, "upload", 3, "scan result", false)
+        .await
+        .unwrap();
+    tx.execute("INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,storage_backend) VALUES(1,'upload',3,true,0,'pending')",&[]).await.unwrap();
+    assert!(
+        upload_stream::ensure_open(&tx, 1, "upload", 4, "scan result")
+            .await
+            .is_err()
+    );
+    assert!(
+        upload_stream::validate_final(&tx, 1, "upload", 3, "scan result", true)
+            .await
+            .is_err()
+    );
+    tx.execute(
+        "UPDATE scan_result_batch SET storage_backend='elasticsearch' WHERE batch_index=3",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE scan_result_batch SET storage_backend='elasticsearch' WHERE batch_index=3",
+        &[],
+    )
+    .await
+    .unwrap();
+    upload_stream::validate_final(&tx, 1, "upload", 3, "scan result", true)
+        .await
+        .unwrap();
+    let state = upload_stream::load(&tx, 1, "upload")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.get::<_, i64>("confirmed_count"), 4);
+    assert_eq!(state.get::<_, i64>("confirmed_observations"), 12);
+    tx.execute("DELETE FROM scan_result_batch WHERE batch_index=1", &[])
+        .await
+        .unwrap();
+    upload_stream::repair_deleted_receipts(&tx, 1)
+        .await
+        .unwrap();
+    assert!(
+        upload_stream::validate_final(&tx, 1, "upload", 3, "scan result", true)
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    client
+        .execute("DELETE FROM scan_task_execution WHERE id=1", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT COUNT(*) FROM scan_upload_stream", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL"]
+async fn upload_stream_migration_backfills_legacy_receipts_once_and_is_idempotent() {
+    let (pool, schema) = isolated_pool().await;
+    seed_execution(&pool).await;
+    let client = pool.get().await.unwrap();
+    client.batch_execute("DROP TRIGGER scan_upload_stream_receipt ON scan_result_batch;
+        DROP TABLE scan_upload_stream; DELETE FROM scan_storage_state WHERE state_key='upload_stream_schema_v1';
+        INSERT INTO scan_result_batch(execution_id,upload_id,batch_index,is_final,observation_count,storage_backend)
+        VALUES(1,'legacy',0,false,3,'elasticsearch'),(1,'legacy',1,true,4,'pending');").await.unwrap();
+    for _ in 0..2 {
+        client
+            .batch_execute(include_str!(
+                "../source/database/migrate_scan_upload_stream.sql"
+            ))
+            .await
+            .unwrap();
+    }
+    let state = client
+        .query_one("SELECT * FROM scan_upload_stream", &[])
+        .await
+        .unwrap();
+    assert_eq!(state.get::<_, i64>("batch_count"), 2);
+    assert_eq!(state.get::<_, i64>("confirmed_count"), 1);
+    assert_eq!(state.get::<_, i64>("pending_count"), 1);
+    assert_eq!(state.get::<_, i64>("confirmed_observations"), 3);
+    client
+        .execute(
+            "UPDATE scan_result_batch SET storage_backend='elasticsearch' WHERE batch_index=1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT confirmed_observations FROM scan_upload_stream", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        7
+    );
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

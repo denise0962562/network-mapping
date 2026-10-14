@@ -88,3 +88,63 @@ STORAGE_TEST_DATABASE_URL=postgresql://test@127.0.0.1:5432/disposable \
 覆盖单连接池释放、慢 ES 期间续租、并发领取、过期令牌拒绝、重启续传、错误 bulk 不推进
 游标、刷新失败单独重试、最终上传和重复上传不等待资产发布。真实 ES 压测需要独立测试
 集群，分别测 1 万、10 万、100 万端点的上传延迟、后台吞吐、心跳和连接池等待。
+
+## 上传分段耗时
+
+`ScanResultUpload` span 关联 HTTP request_id、scanner_id、task_id、upload_id、batch_index、is_final、
+protocol_version 和 observation_count。所有同步写入阶段的 `ScanWriteStageCompleted`
+继承同一 span，记录 stage、duration_us 和 success；提前错误或取消的未完成阶段记录
+success=false。日志不记录 Token、checksum 或 observation 内容。
+
+普通批、final、已确认批重试和 DNS/混合上传应分别比较 p50/p95/p99。阶段覆盖认证与执行
+锁、上传身份、final 连续性、观察 enrichment、标签、回执预约/确认/提交、ES 事实与执行
+端点 bulk、refresh、执行统计、任务聚合与目标新鲜度；DNS 路径另记录子任务生成。
+连接等待与持有时间沿用 ScanWriteConnectionAcquired/Released，bulk 排队/请求/退避时间
+沿用 ElasticsearchBulkCompleted。不要把 bulk 排队时间误判为扫描耗时。
+
+## Final 索引范围
+
+新上传在预约 final 的短事务中收集同一 execution/upload 已确认回执的索引清单，并加入
+当前批次按 observed_at 推导的索引。ES refresh 与 observation count 只访问该清单，
+跨月、空 final 和 pending 重试仍覆盖整个执行。空执行不发送 observation count。
+执行端点索引仍是共享索引，refresh 作用于该索引。精确端点总数只在 IP composite 的
+第一页计算，后续页关闭 track_total_hits；IP 数仍保持精确分页统计。
+
+索引清单排序去重后，refresh 和 count 各自按 HTTP 请求行 3 KiB 预算分块，包含实际 URL
+编码后的路径前缀、查询参数和 HTTP 方法/版本。各块顺序执行，执行端点索引仅刷新一次；
+少月份时仍合并为一次刷新。count 使用相同 execution_id 条件并检查非负计数及累加溢出，
+任一块失败均保留 pending，重试重新刷新和计数全部块，只有完整成功才确认 final。
+超长的单个目标在批次事实写入前报错；不通过扩大 ES 请求行限制处理。
+
+ScanFinalRequestPlan 记录 refresh_requests、count_requests 和 max_request_line_bytes。
+refresh_execution_index_chunk、count_execution_observation_chunk 阶段记录单块耗时。
+
+旧回执有观察却没有 storage_references，以及历史 PG → ES 迁移，显式走全历史索引
+兼容范围，记录 ScanSummaryLegacyIndexScope。新上传不依赖该兼容路径。
+
+## 上传会话与增量回执状态
+
+scan_upload_stream 按 (execution_id, upload_id) 保存批次数、确认数、pending 数、最小/最大
+批号、final 数/批号与已确认观察数。上传身份检查只读取本执行的上传流；普通批次不再扫描
+历史回执。final 结合唯一批号、连续区间、确认数和 pending 数验证完成，预约 final 后拒绝
+新批次。DNS sidecar 允许稀疏批号，但必须全部确认、没有 final，且批号落入已连续确认的
+主上传区间。ES 文档/IP/端点统计仍沿用 ES 的精确口径，不以回执观察数替代。
+
+数据库触发器与回执 INSERT/确认 UPDATE 同事务维护派生状态；重复确认不加计数，迁移及
+旧写入者也遵循此规则。身份、批号、final 标志与观察数不可修改。删除回执标记 dirty，
+下次上传只修复受影响流；删除执行通过外键清理流。
+
+内嵌 migrate_scan_upload_stream.sql 在首次升级时锁住回执写入并回填历史分组，后续启动
+通过 schema marker 跳过回填。大回执库应安排维护窗口；该一次性回填会增加升级时间。
+回滚应用可保留新表/触发器，旧代码仍从回执读取，新表继续跟随旧写入。
+
+## 可索引的目标新鲜度更新
+
+上传确认事务先选出本任务及相关 DNS 父任务的成功执行，再分别匹配单 IP、CIDR 和域名。
+单 IP/域名使用 owner/kind/key 主键；CIDR 使用生成列 target_ip INET 的部分 GiST 索引。
+域名不会转为 INET，IPv4/IPv6 仍分别匹配；更新只作用于同一 owner 的已有搜索目标，
+较旧执行不会覆盖较新时间。DNS 父任务仍等待全部后续执行成功，普通手动扫描仍更新其
+覆盖范围内的目标。
+
+首次增加存储生成列和 GiST 索引会改写/扫描目标表，应与上传流回填一起安排维护窗口。
+回滚应用可保留列和索引。压力测试方法见 [扫描写入压力测试](SCAN_WRITE_STRESS.md)。

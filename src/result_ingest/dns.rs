@@ -1,6 +1,8 @@
 //! result_ingest / dns domain implementation, migrated from the library root.
 
 use super::storage::dns_sidecar_upload_id;
+use super::telemetry::WriteStage;
+use super::upload_stream;
 use crate::target_generated;
 
 use deadpool_postgres::GenericClient;
@@ -129,7 +131,9 @@ pub(crate) async fn save_dns_scanner_results(
     let is_final = upload
         .is_final
         .expect("protocol v2 final flag was validated");
-    let mut client = pool.get().await.map_err(scanner_result_database_error)?;
+    let mut client = crate::db::acquire_write_connection(pool, "reserve_dns_batch")
+        .await
+        .map_err(scanner_result_database_error)?;
     let transaction = client
         .transaction()
         .await
@@ -141,6 +145,7 @@ pub(crate) async fn save_dns_scanner_results(
     let token_hash =
         hash_scanner_token(token, token_pepper).map_err(scanner_result_database_error)?;
     let scanner_id = upload.scanner_id.to_string();
+    let stage = WriteStage::new("authenticate_dns_execution");
     let scanner = transaction
         .query_opt(
             "SELECT id FROM scanner_info WHERE scanner_id = $1 AND runtime_token_hash = $2 AND is_enable = true;",
@@ -167,6 +172,7 @@ pub(crate) async fn save_dns_scanner_results(
     let Some(task) = task else {
         return Err(SaveScannerResultsError::TaskNotFound);
     };
+    stage.finish(true);
     let already_succeeded = task.get::<_, String>("execution_status") == "succeeded";
 
     let task_db_id: i32 = task.get("task_id");
@@ -177,7 +183,9 @@ pub(crate) async fn save_dns_scanner_results(
         debug_assert!(!is_final);
         allowed_upload_ids.push(parent.to_string());
     }
+    let stage = WriteStage::new("dns_upload_identity");
     validate_execution_upload_ids(&transaction, execution_db_id, &allowed_upload_ids).await?;
+    stage.finish(true);
     let context = ScanBatchContext {
         task_id: upload.task_id.to_string(),
         execution_id: task.get("public_execution_id"),
@@ -203,48 +211,19 @@ pub(crate) async fn save_dns_scanner_results(
         &observations.iter().collect::<Vec<_>>(),
     )?;
     if is_final {
-        let sequence = transaction
-            .query_one(
-                "SELECT COUNT(*) FILTER (WHERE batch_index < $3 AND storage_backend <> 'pending')::BIGINT AS prior_count, \
-                 MIN(batch_index) FILTER (WHERE batch_index < $3) AS first_prior, \
-                 MAX(batch_index) FILTER (WHERE batch_index < $3) AS last_prior, \
-                 COUNT(*) FILTER (WHERE batch_index > $3)::BIGINT AS later_count, \
-                 COUNT(*) FILTER (WHERE is_final)::BIGINT AS final_count, \
-                 BOOL_OR(is_final) FILTER (WHERE batch_index = $3) AS current_is_final \
-                 FROM scan_result_batch WHERE execution_id = $1 AND upload_id = $2;",
-                &[&execution_db_id, &upload_id, &batch_index],
-            )
-            .await
-            .map_err(scanner_result_database_error)?;
-        let prior_count: i64 = sequence.get("prior_count");
-        let first_prior: Option<i32> = sequence.get("first_prior");
-        let last_prior: Option<i32> = sequence.get("last_prior");
-        let complete_prior_sequence = if batch_index == 0 {
-            prior_count == 0 && first_prior.is_none() && last_prior.is_none()
-        } else {
-            prior_count == i64::from(batch_index)
-                && first_prior == Some(0)
-                && last_prior == Some(batch_index - 1)
-        };
-        let final_count: i64 = sequence.get("final_count");
-        let current_is_final: Option<bool> = sequence.get("current_is_final");
-        let existing_final_valid = match current_is_final {
-            Some(true) => final_count == 1,
-            Some(false) => false,
-            None => final_count == 0,
-        };
-        if !complete_prior_sequence
-            || sequence.get::<_, i64>("later_count") != 0
-            || !existing_final_valid
-        {
-            return Err(SaveScannerResultsError::NonContiguousFinalBatch {
-                execution_id: execution_db_id,
-                upload_id: upload_id.clone(),
-                batch_index,
-                content_kind: "DNS",
-            });
-        }
+        let stage = WriteStage::new("validate_dns_final_sequence");
+        upload_stream::validate_final(
+            &transaction,
+            execution_db_id,
+            &upload_id,
+            batch_index,
+            "DNS",
+            false,
+        )
+        .await?;
+        stage.finish(true);
     }
+    let stage = WriteStage::new("reserve_dns_receipt");
     let write_token = Uuid::new_v4();
     let (write_attempts, write_mode) = if let Some(existing) = transaction
         .query_opt(
@@ -274,6 +253,7 @@ pub(crate) async fn save_dns_scanner_results(
                 .commit()
                 .await
                 .map_err(scanner_result_database_error)?;
+            stage.finish(true);
             return Ok(0);
         }
         let claimed = transaction
@@ -318,6 +298,7 @@ pub(crate) async fn save_dns_scanner_results(
             DnsWriteMode::Reconcile,
         )
     } else {
+        upload_stream::ensure_open(&transaction, execution_db_id, &upload_id, batch_index, "DNS").await?;
         if already_succeeded {
             return Err(SaveScannerResultsError::CompletedExecutionNewBatch {
                 execution_id: execution_db_id,
@@ -356,6 +337,7 @@ pub(crate) async fn save_dns_scanner_results(
         .await
         .map_err(scanner_result_database_error)?;
     drop(client);
+    stage.finish(true);
     info!(
         event = "DnsBatchWriteClaimed",
         execution_id = execution_db_id,
@@ -365,6 +347,7 @@ pub(crate) async fn save_dns_scanner_results(
         mode = ?write_mode,
         "DNS 批次写入租约已领取"
     );
+    let stage = WriteStage::new("write_dns_elasticsearch");
     let dns_references = match tokio::time::timeout(
         DNS_BATCH_WRITE_TIMEOUT,
         elasticsearch.persist_dns_observations(&context, "default", &observations, write_mode),
@@ -398,7 +381,11 @@ pub(crate) async fn save_dns_scanner_results(
             return Err(SaveScannerResultsError::Storage(message));
         }
     };
-    let mut client = pool.get().await.map_err(scanner_result_database_error)?;
+    stage.finish(true);
+    let mut client = crate::db::acquire_write_connection(pool, "confirm_dns_batch")
+        .await
+        .map_err(scanner_result_database_error)?;
+    let stage = WriteStage::new("confirm_dns_receipt");
     let transaction = client
         .transaction()
         .await
@@ -450,6 +437,7 @@ pub(crate) async fn save_dns_scanner_results(
             .await
             .map_err(scanner_result_database_error)?;
         if receipt.get::<_, String>("storage_backend") != "pending" {
+            stage.finish(true);
             transaction
                 .commit()
                 .await
@@ -461,6 +449,7 @@ pub(crate) async fn save_dns_scanner_results(
             retry_after_seconds: u64::try_from(retry_after).unwrap_or(1),
         });
     }
+    stage.finish(true);
     if follow_up_enabled {
         let resolved_ips = resolved_dns_answer_ips(&observations);
         if !resolved_ips.is_empty() {
@@ -480,20 +469,32 @@ pub(crate) async fn save_dns_scanner_results(
         }
     }
     if is_final {
+        upload_stream::validate_final(
+            &transaction,
+            execution_db_id,
+            &upload_id,
+            batch_index,
+            "DNS",
+            true,
+        )
+        .await?;
         transaction
             .execute(
                 "UPDATE scan_task_execution SET execution_status = 'succeeded', task_end_time = $1, \
                  lease_expires_at = NULL, failure_reason = NULL, cancel_requested = false, \
                  maintenance_hold = FALSE, maintenance_hold_until = NULL, \
-                 result_ip_count = 0, result_port_count = 0, result_observation_count = (SELECT COALESCE(SUM(observation_count), 0) FROM scan_result_batch WHERE execution_id = $2) WHERE id = $2;",
-                &[&get_unix_epoch_ms(), &execution_db_id],
+                 result_ip_count = 0, result_port_count = 0, result_observation_count = (SELECT confirmed_observations FROM scan_upload_stream WHERE execution_id = $2 AND upload_id = $3) WHERE id = $2;",
+                &[&get_unix_epoch_ms(), &execution_db_id, &upload_id],
             )
             .await
             .map_err(scanner_result_database_error)?;
+        let stage = WriteStage::new("refresh_dns_task_aggregate");
         refresh_task_aggregate(&transaction, task_db_id)
             .await
             .map_err(scanner_result_database_error)?;
+        stage.finish(true);
         if follow_up_enabled {
+            let stage = WriteStage::new("create_dns_follow_up_tasks");
             create_dns_follow_up_tasks(
                 &transaction,
                 &task,
@@ -503,15 +504,20 @@ pub(crate) async fn save_dns_scanner_results(
             )
             .await
             .map_err(scanner_result_database_error)?;
+            stage.finish(true);
         }
+        let stage = WriteStage::new("update_dns_target_freshness");
         target_generated::search::record_success(&transaction, task_db_id)
             .await
             .map_err(scanner_result_database_error)?;
+        stage.finish(true);
     }
+    let stage = WriteStage::new("commit_dns_receipt");
     transaction
         .commit()
         .await
         .map_err(scanner_result_database_error)?;
+    stage.finish(true);
     Ok(usize::try_from(observation_count).expect("non-negative observation count"))
 }
 
