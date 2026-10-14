@@ -128,7 +128,11 @@ pub fn error_response(
 }
 
 fn is_api_path(path: &str) -> bool {
-    path == "/api" || path.starts_with("/api/") || path == "/logout"
+    path == "/api"
+        || path.starts_with("/api/")
+        || path == "/logout"
+        || path == "/open-api/v1"
+        || path.starts_with("/open-api/v1/")
 }
 
 fn normalize_error_body(
@@ -138,6 +142,37 @@ fn normalize_error_body(
     request_id: Uuid,
 ) -> Bytes {
     let parsed = serde_json::from_slice::<Value>(original).ok();
+    if path.starts_with("/open-api/v1") || path.starts_with("/api/open-platform/") {
+        let object = parsed.as_ref();
+        let source = object
+            .and_then(|v| v.get("error"))
+            .unwrap_or(object.unwrap_or(&Value::Null));
+        let candidate = source.get("code").and_then(Value::as_str).filter(|s| {
+            s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+        let code = if status.is_server_error() {
+            match candidate {
+                Some("statistics_timeout") => "statistics_timeout",
+                Some("dependency_unavailable") => "dependency_unavailable",
+                Some("system_maintenance") => "system_maintenance",
+                _ => default_code(status),
+            }
+        } else {
+            candidate.unwrap_or(default_code(status))
+        };
+        let message = if status.is_server_error() {
+            default_message(status).to_string()
+        } else {
+            source
+                .get("message")
+                .and_then(Value::as_str)
+                .map(bound_public_message)
+                .unwrap_or_else(|| default_message(status).into())
+        };
+        return Bytes::from(
+            json!({"error":{"code":code,"message":message},"request_id":request_id}).to_string(),
+        );
+    }
     let totp_required = status == StatusCode::UNAUTHORIZED
         && path == "/api/login"
         && parsed

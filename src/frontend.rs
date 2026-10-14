@@ -32,6 +32,18 @@ const SPA_ROUTES: &[&str] = &[
     "/setting/mail-templates",
     "/user/info",
     "/user/security",
+    "/open-platform",
+    "/open-platform/apps",
+    "/open-platform/approvals",
+    "/open-platform/catalog",
+    "/open-platform/logs",
+    "/open-platform/audit",
+    "/open-platform/jobs",
+    "/open-platform/deliveries",
+    "/open-platform/settings",
+    "/open-platform/roles",
+    "/open-platform/docs",
+    "/developer/open-api",
 ];
 
 const REQUIRED_FRONTEND_FILES: &[&str] = &["index.html", "login.html", "search.html", "asset.html"];

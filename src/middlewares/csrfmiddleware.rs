@@ -72,6 +72,9 @@ where
         );
         let safe_method = matches!(req.method().as_str(), "GET" | "HEAD") && !csrf_protected_get;
         let pass = is_scanner_api_request(req.method(), &path)
+            // This namespace is exclusively mounted to the independently authenticated
+            // open API dispatcher. It never accepts a session as an API credential.
+            || path == "/open-api/v1" || path.starts_with("/open-api/v1/")
             || is_frontend_resource_path(&path)
             || safe_method;
 

@@ -358,6 +358,10 @@ pub(super) async fn isolated_pool_with_size(max_size: usize) -> (Pool, String) {
         .batch_execute(include_str!("../source/database/init.sql"))
         .await
         .unwrap();
+    client
+        .batch_execute(include_str!("../source/database/migrate_open_api.sql"))
+        .await
+        .unwrap();
     // Match startup: task claims also read the scanner admission/health fields.
     client
         .batch_execute(include_str!(

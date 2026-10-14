@@ -543,6 +543,11 @@ async fn create_dns_follow_up_tasks(
     let Some(follow_up) = metadata.get("dns_follow_up") else {
         return Ok(());
     };
+    let api_scope = crate::open_api::follow_up_scope(transaction, &metadata).await?;
+    if metadata.get("open_api").is_some() && api_scope.is_none() {
+        transaction.execute("INSERT INTO dns_follow_up_generation(execution_id,status,eligible_ip_count,created_task_count) VALUES($1,'blocked_policy',0,0) ON CONFLICT(execution_id) DO NOTHING", &[&parent_execution_id]).await?;
+        return Ok(());
+    }
     if follow_up.get("enabled").and_then(Value::as_bool) != Some(true) {
         return Ok(());
     }
@@ -562,7 +567,12 @@ async fn create_dns_follow_up_tasks(
         let Ok(parsed) = ip.parse::<IpAddr>() else {
             continue;
         };
-        if policy.enabled && policy.allows(parsed) {
+        if policy.enabled
+            && policy.allows(parsed)
+            && api_scope
+                .as_ref()
+                .is_none_or(|p| p.policy.allows_ip(parsed) && !p.policy.cidrs.is_empty())
+        {
             targets
                 .entry(if parsed.is_ipv4() { "ipv4" } else { "ipv6" })
                 .or_default()
@@ -570,6 +580,13 @@ async fn create_dns_follow_up_tasks(
         }
     }
     let eligible_ip_count = targets.values().map(Vec::len).sum::<usize>();
+    if api_scope
+        .as_ref()
+        .is_some_and(|p| eligible_ip_count > p.policy.max_targets)
+    {
+        transaction.execute("INSERT INTO dns_follow_up_generation(execution_id,status,eligible_ip_count,created_task_count) VALUES($1,'blocked_policy',$2,0) ON CONFLICT(execution_id) DO NOTHING", &[&parent_execution_id,&(eligible_ip_count as i32)]).await?;
+        return Ok(());
+    }
     if !policy.enabled {
         transaction
             .execute(
@@ -600,6 +617,16 @@ async fn create_dns_follow_up_tasks(
     if claimed == 0 {
         return Ok(());
     }
+    if let Some(p) = &api_scope {
+        let children = targets
+            .values()
+            .map(|ips| ips.len().div_ceil(usize::from(policy.max_targets_per_task)))
+            .sum::<usize>() as i64;
+        if !crate::open_api::reserve_follow_up(transaction, p, children).await? {
+            transaction.execute("UPDATE dns_follow_up_generation SET status='blocked_policy' WHERE execution_id=$1", &[&parent_execution_id]).await?;
+            return Ok(());
+        }
+    }
 
     let user_id: i32 = parent.get("user_id");
     let port: String = parent.get("task_port");
@@ -614,13 +641,16 @@ async fn create_dns_follow_up_tasks(
             .enumerate()
         {
             let task_id = Uuid::now_v7().to_string();
-            let metadata = serde_json::json!({
+            let mut child_metadata = serde_json::json!({
                 "dns_follow_up": {
                     "parent_task_id": parent_task_id,
                     "parent_execution_id": parent_public_execution_id,
                     "source": "dns_a_aaaa_answer",
                 }
             });
+            if let Some(context) = metadata.get("open_api") {
+                child_metadata["open_api"] = context.clone();
+            }
             let task_pk: i32 = transaction
                 .query_one(
                     "INSERT INTO scan_task (user_id, task_id, task_initiator, task_target, task_port, task_level, remarks, \
@@ -635,7 +665,7 @@ async fn create_dns_follow_up_tasks(
                         &port,
                         &level,
                         &format!("dns:{parent_public_execution_id}:{family}:{chunk_index}"),
-                        &metadata,
+                        &child_metadata,
                         &family,
                         &scan_profile,
                         &scan_plan,
@@ -643,6 +673,14 @@ async fn create_dns_follow_up_tasks(
                 )
                 .await?
                 .get("id");
+            if let Some(p) = &api_scope {
+                transaction
+                    .execute(
+                        "UPDATE scan_task SET api_client_id=$2,api_credential_id=$3 WHERE id=$1",
+                        &[&task_pk, &p.client_pk, &p.credential_id],
+                    )
+                    .await?;
+            }
             transaction
                 .execute(
                     "INSERT INTO scan_task_execution (execution_id, task_id, requested_scanner_id) VALUES ($1, $2, NULL);",

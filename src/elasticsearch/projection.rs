@@ -11,6 +11,7 @@ struct ProjectionJob {
     cursor: Option<Value>,
     phase: String,
     context: ScanBatchContext,
+    api_client_id: Option<i32>,
 }
 
 struct ProjectionPage {
@@ -61,6 +62,7 @@ impl ElasticsearchService {
                 cursor: row.get("cursor"),
                 phase: row.get("phase"),
                 context: load_scan_batch_context(&transaction, database_id).await?,
+                api_client_id: transaction.query_one("SELECT t.api_client_id FROM scan_task t JOIN scan_task_execution e ON e.task_id=t.id WHERE e.id=$1", &[&database_id]).await.map_err(|e|e.to_string())?.get(0),
             })
         } else {
             None
@@ -185,7 +187,7 @@ impl ElasticsearchService {
                     return Ok(());
                 }
                 let page = self.with_projection_lease(pool, &job,
-                    self.promote_execution_page(&job.context, job.cursor.as_ref())).await?;
+                    self.promote_execution_page(&job.context, job.cursor.as_ref(), job.api_client_id)).await?;
                 self.checkpoint_projection(pool, &job, &page).await?;
                 info!(event = "ScanProjectionPageCompleted", execution_id = %job.context.execution_id,
                     endpoints = page.endpoints, final_page = page.done,
@@ -218,7 +220,7 @@ impl ElasticsearchService {
         let mut cursor = None;
         loop {
             let page = self
-                .promote_execution_page(context, cursor.as_ref())
+                .promote_execution_page(context, cursor.as_ref(), None)
                 .await?;
             cursor = page.cursor;
             if page.done {
@@ -244,6 +246,7 @@ impl ElasticsearchService {
         &self,
         context: &ScanBatchContext,
         cursor: Option<&Value>,
+        api_client_id: Option<i32>,
     ) -> Result<ProjectionPage, String> {
         let page_size = self.inner.config.projection_page_size;
         let mut query = json!({"size": page_size, "track_total_hits": false,
@@ -291,7 +294,11 @@ impl ElasticsearchService {
                 .get("port")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| "端点缺少 port".to_owned())?;
-            for (scope_type, scope_id) in [("global", 0), ("user", context.user_id)] {
+            let mut scopes = vec![("global", 0), ("user", context.user_id)];
+            if let Some(id) = api_client_id {
+                scopes.push(("api_client", id));
+            }
+            for (scope_type, scope_id) in scopes {
                 let mut scoped = source.clone();
                 scoped["scope_type"] = json!(scope_type);
                 scoped["scope_id"] = json!(scope_id);

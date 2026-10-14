@@ -380,6 +380,32 @@ impl ElasticsearchOperation {
 }
 
 impl ElasticsearchService {
+    /// External DNS queries use immutable observations and server-authorized task IDs,
+    /// never the shared current DNS index (whose tenant is currently `default`).
+    pub(crate) async fn open_api_dns_query(&self, body: &Value) -> Result<Value, String> {
+        if !self.can_read() {
+            return Err("DNS read path unavailable".into());
+        }
+        let result = self
+            .send_json_request(
+                ElasticsearchOperation::DomainFilter,
+                Method::POST,
+                &format!("/{}/_search", self.inner.config.dns_observation_data_stream),
+                |r| r.json(body),
+            )
+            .await?;
+        validate_scan_search_response(&result)?;
+        Ok(result)
+    }
+    pub(crate) async fn open_api_endpoint_filter(
+        &self,
+        scope_type: &str,
+        scope_id: i32,
+        filter: Value,
+    ) -> Result<Value, String> {
+        self.resolve_has_endpoint_filters(scope_type, scope_id, filter)
+            .await
+    }
     pub fn new(config: ElasticsearchConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let mut builder =
             reqwest::Client::builder().timeout(Duration::from_secs(config.request_timeout_seconds));
@@ -415,6 +441,11 @@ impl ElasticsearchService {
 
     pub fn enabled(&self) -> bool {
         self.inner.config.enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_api_test_ready(&self) {
+        self.inner.runtime.write().unwrap().read_ready = true;
     }
 
     pub fn can_read(&self) -> bool {
@@ -3417,7 +3448,7 @@ fn collect_has_endpoint_filters(value: &Value, filters: &mut Vec<Value>) {
     }
 }
 
-fn collect_domain_filters(value: &Value, filters: &mut Vec<Value>) {
+pub(crate) fn collect_domain_filters(value: &Value, filters: &mut Vec<Value>) {
     match value {
         Value::Object(object) => {
             if let Some(filter) = object.get("network_mapping_domain") {
@@ -3461,7 +3492,10 @@ fn replace_has_endpoint_filters(
     }
 }
 
-fn replace_domain_filters(value: Value, filters: &mut impl Iterator<Item = Value>) -> Value {
+pub(crate) fn replace_domain_filters(
+    value: Value,
+    filters: &mut impl Iterator<Item = Value>,
+) -> Value {
     match value {
         Value::Object(mut object) => {
             if object.contains_key("network_mapping_domain") {

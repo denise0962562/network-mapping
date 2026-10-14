@@ -14,6 +14,16 @@
 | [用户管理 CLI](USER_MANAGEMENT_CLI.md) | 用户、凭据、会话和登录限制的本地管理 |
 | [资产搜索语法与 API](SEARCH_SYNTAX.md) | 搜索字段、表达式语法与 API 契约 |
 
+## 外部 API 与开放平台
+
+| 文档 | 内容 |
+| --- | --- |
+| [外部 API v1](OPEN_API.md) | 80 项接口、授权、请求参数、数据口径与示例 |
+| [管理与上线](OPEN_API_MANAGEMENT.md) | 管理 Web、审批、密钥、回调、部署和停用 |
+| [实现与回归](OPEN_API_IMPLEMENTATION.md) | 模块、数据模型、事务边界和检查 |
+| [OpenAPI 3.1](open-api/openapi.json) | 可导入工具的机器可读规范 |
+| [实施验证记录](open-api/verification.md) | 构建、隔离回归、浏览器交互及尚需上线验收的内容 |
+
 ## 扫描与资产
 
 | 文档 | 内容 |
