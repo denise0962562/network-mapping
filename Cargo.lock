@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "network_mapping_server"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "actix-files",
  "actix-session",
