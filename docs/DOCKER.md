@@ -3,6 +3,7 @@
 [项目首页](../README.md) · [文档中心](README.md) · [常规部署](DEPLOYMENT.md)
 
 服务端镜像包含 Rust 后端、固定提交的 Vue 前端 dist、SQL 和模板；PostgreSQL、Elasticsearch 独立运行。
+全部环境变量、类型、容器默认值、生效规则和 Compose 设置见 [Docker 完整配置参考](DOCKER_CONFIGURATION.md)。
 镜像地址为 `ghcr.io/wshijiang/network-mapping-server`，支持 Linux AMD64/ARM64。
 Rust 使用 1.99.0、Node 26.11.1、pnpm 11.9.0；构建与运行环境采用 Debian 12，基础镜像固定多架构 digest。
 真实配置、TLS、日志、数据库、本机二进制和 Git 目录通过构建上下文允许清单排除，最终镜像没有编译器或源代码。
@@ -78,6 +79,9 @@ openssl rand -hex 24
 `NM__SECURITY__SCANNER_TOKEN_PEPPER`、`NM__DATABASE__PASSWORD`。Compose 将数据库密码同时
 传给服务端和 PostgreSQL；已有 PG 数据卷的角色密码不会随 env 修改自动改变。
 `.env` 不提交到仓库，建议权限 0600。
+
+`.env.example` 已列出全部支持的基础环境变量；可选项、互斥认证及废弃字段默认注释，
+按需启用。仅支持文件模式的字段另列在 `docker/config.example.toml` 的注释示例中。
 
 Docker 的默认入口为 `--config-source env`，Compose 使用 `env_file: ./.env` 注入参数，
 无需挂载 TOML。`--env-file` 负责 Compose 插值，不能单独代替服务级 `env_file`。

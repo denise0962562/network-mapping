@@ -110,3 +110,4 @@ cargo build --locked --release
 
 支持 AMD64/ARM64 镜像自动构建，分支与 PR 验证不发布，正式版本经具体授权后推送 GHCR。
 镜像内容、配置、持久化、GitHub 设置及验收见 [Docker 部署指南](docs/DOCKER.md)。
+全部环境变量及 Compose 设置见 [Docker 完整配置参考](docs/DOCKER_CONFIGURATION.md)。

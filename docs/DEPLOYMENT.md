@@ -5,6 +5,7 @@
 [项目首页](../README.md) · [文档中心](README.md)
 
 容器镜像、Compose 与 GitHub 自动构建见 [Docker 部署指南](DOCKER.md)。
+Docker 环境变量的全部字段、默认值及 Compose 设置见 [完整配置参考](DOCKER_CONFIGURATION.md)。
 
 本文面向 Linux 部署，覆盖首次安装、启动验收和服务托管。已有 PG 扫描结果的升级必须先阅读[Elasticsearch 存储与迁移](ELASTICSEARCH.md)，不能按空库流程直接切换。
 

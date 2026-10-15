@@ -1,8 +1,14 @@
-# Embedded public container defaults; deployment secrets come from env.
-# Docker uses docker/.env. This example also documents TOML equivalents.
+# Docker 服务端完整 TOML 示例。参数说明：../docs/DOCKER_CONFIGURATION.md
+# 本文件同时作为程序内嵌的容器默认配置；未注释项不要加入真实凭据。
+# Docker 默认使用 .env；文件模式请复制到 runtime/config.toml，填写三个必填密钥，
+# 只读挂载后显式使用 --config-source file --config /etc/network-mapping/config.toml。
+# 注释项为可选配置；注明“仅 TOML”的字段目前不能转换为 NM__ 环境变量。
+# 可选凭据没有默认值，示例占位符不表示已配置；ES 认证方式只能选择一种。
+
 [server]
 host = "0.0.0.0"
 port = 9999
+# 必填：openssl rand -base64 32；不要将真实值写入仓库。
 encrypt_key = ""
 max_body_size = 67108864
 
@@ -11,12 +17,15 @@ certificate_chain_file = "/etc/network-mapping/tls/cert.pem"
 private_key_file = "/etc/network-mapping/tls/key.pem"
 
 [security]
+# 必填：openssl rand -hex 32；长期固定，变更使已有扫描器令牌失效。
 scanner_token_pepper = ""
 
 [log]
 directory = "/var/log/network-mapping"
 file_name = "server.json"
+# 0=按天，1=按小时，2=按分钟，其他 u8 值=不滚动；不自动删除旧文件。
 file_rolling = 0
+# 系统资源采样间隔，秒，必须大于 0。
 status_duration = 5
 
 [templates]
@@ -31,11 +40,28 @@ directory = "/var/lib/network-mapping/maxmind"
 
 [scanner_diagnostics]
 directory = "/var/lib/network-mapping/scanner-diagnostics"
+# 以下诊断策略仅 TOML；directory 同时支持 env。
+# enabled = true
+# log_retention_days = 30
+# error_retention_days = 90
+# max_storage_bytes = 10737418240
+# auto_collect = false
 
 [backup]
 enabled = false
+# 默认镜像没有 pgBackRest/sudo；需独立准备二进制、配置、账户与访问权限。
+# binary = "/usr/bin/pgbackrest"
+# stanza = "network_mapping"
+# 可选路径，无默认值；省略时采用 pgBackRest 的默认配置查找规则。
+# config_file = "/etc/pgbackrest/pgbackrest.conf"
+# 可选账户，无默认值；省略时以服务进程用户运行；指定时使用 sudo，不能为 root。
+# run_as_user = "postgres"
+# sudo_binary = "/usr/bin/sudo"
+# command_timeout_seconds = 21600
+# max_output_bytes = 1048576
 
 [elasticsearch]
+# 必须启用 ES 与读取，scan_storage 只接受 elasticsearch，不能启用 PG 回退。
 enabled = true
 read_enabled = true
 scan_storage = "elasticsearch"
@@ -44,25 +70,144 @@ url = "http://elasticsearch:9200"
 expected_version = "9.5.x"
 scan_number_of_replicas = 0
 write_wait_for_active_shards = "1"
+# 可选认证：API Key 或用户名+密码二选一，不要同时取消这两组的注释。
+# api_key = "replace-with-api-key"
+# username = "network_mapping"
+# password = "replace-with-password"
+# 可选私有 CA 文件路径，无默认值；省略时使用系统 CA。
+# ca_certificate_file = "/etc/network-mapping/tls/elasticsearch-ca.pem"
+# observation_index_prefix = "network-mapping-scan-observations-v1"
+# execution_endpoint_index = "network-mapping-execution-endpoints-v1"
+# current_endpoint_index = "network-mapping-endpoints-current-v2"
+# dns_observation_data_stream = "network-mapping-dns-observations"
+# dns_record_index = "network-mapping-dns-records-v1"
+# dns_observation_retention_days = 180
+# request_timeout_seconds = 30
+# poll_interval_ms = 500
+# bulk_batch_size = 500
+# bulk_max_concurrency = 2
+# bulk_max_retries = 4
+# bulk_retry_initial_ms = 200
+# bulk_total_timeout_seconds = 25
+# 以下参数仅在显式运行 PG→ES 历史迁移命令时使用。
+# scan_migration_concurrency = 4
+# scan_migration_page_size = 100
+# scan_migration_checkpoint_batches = 100
+# 以下投影参数仅 TOML，单位为条数、字节或秒；续租周期不能超过租约的三分之一。
+# projection_page_size = 1000
+# projection_bulk_max_bytes = 5242880
+# projection_pages_per_tick = 4
+# projection_lease_seconds = 120
+# projection_heartbeat_seconds = 20
+# 废弃字段：名称仍兼容但已经不生效，保留注释仅供识别旧配置。
+# index = "network-mapping-assets-v1"
 
 [database]
 host = "postgres"
 port = 5432
 username = "network_mapping"
+# 必填；已有数据库的角色密码不会因修改配置自动改变。
 password = ""
 db_name = "network_mapping"
 pool_max_size = 10
 pool_wait_timeout_ms = 2000
 pool_create_timeout_ms = 5000
 pool_recycle_timeout_ms = 3000
+# 兼容字段：当前连接实现为 NoTls，true 也不会启用 PostgreSQL TLS。
 tls = false
-# Built-in SQL is present in the image; no external SQL mount is required.
-# Optional custom files: enable compose.sql.example.yml and override these
-# paths using NM__DATABASE__INIT_DATABASE_FILE / NM__DATABASE__SQL_FILE_PATH.
+# 默认使用镜像内 SQL。自定义 SQL 需使用 compose.sql.example.yml 挂载，
+# 再将所需路径改为 /etc/network-mapping/sql/init.sql 和/或 /etc/network-mapping/sql/。
 init_database_file = "/opt/network-mapping/source/database/init.sql"
 sql_file_path = "/opt/network-mapping/source/database/"
 
 [pwd_hash]
+# Argon2id：m 的单位为 MiB，t 为迭代次数，p 为并行度。
 m = 64
 t = 2
 p = 2
+
+# ---- 数据库初始运行策略 ----
+# 以下配置只在对应数据库记录缺失时初始化；不能覆盖 Web 已发布的策略。
+# 默认保持自动生成关闭；启用前配置并检查授权范围。
+
+# [requests]
+# enabled = true
+# retention_days = 30
+
+# [monitor]
+# enabled = true
+# slow_request_threshold_ms = 3000
+# server_error_enabled = true
+# slow_sql_threshold_ms = 3000
+# slow_sql_check_interval_seconds = 60
+# elasticsearch_query_warning_threshold_ms = 1000
+# elasticsearch_query_critical_threshold_ms = 3000
+# elasticsearch_write_warning_threshold_ms = 5000
+# elasticsearch_write_critical_threshold_ms = 15000
+# alert_cooldown_seconds = 300
+# 以下两个结构化字段仅 TOML 或 Web，默认分别为 {} 和 []。
+# 服务名接受 web_api、postgresql、elasticsearch_query、elasticsearch_write。
+# 每条 rule 需 enabled、warning_threshold_ms、cooldown_seconds；critical_threshold_ms 可省略。
+# service_defaults = { web_api = { enabled = true, warning_threshold_ms = 3000, critical_threshold_ms = 5000, cooldown_seconds = 300 } }
+# operation_rules = [{ service = "web_api", operation = "GET /api/task/{task_id}", rule = { enabled = true, warning_threshold_ms = 3000, critical_threshold_ms = 5000, cooldown_seconds = 300 } }]
+
+# [automatic_target]
+# enabled = false
+# strategy = "sequential_subnet"
+# interval_seconds = 30
+# pending_low_watermark = 2
+# pending_high_watermark = 5
+# priority = 0
+# 授权/排除数组默认为空；开启前按实际授权范围填写，例如 ["192.0.2.0/24"]。
+# authorized_cidrs = []
+# excluded_cidrs = []
+# ipv4_task_prefix = 24
+# ipv6_enabled = false
+# IPv6 授权数组同样默认为空，例如 ["2001:db8::/120"]。
+# ipv6_authorized_cidrs = []
+# ipv6_excluded_cidrs = []
+# ipv6_task_prefix = 120
+# ipv6_pending_low_watermark = 1
+# ipv6_pending_high_watermark = 2
+# common_ports = "21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5432,5900,6379,8080,8443,9200,11211,27017"
+# repeat_after_seconds = 604800
+# failure_backoff_seconds = 300
+# change_refresh_seconds = 3600
+
+# 搜索触发策略仅 TOML 或 Web。
+# [automatic_target.search_generation]
+# enabled = false
+# stale_after_days = 7
+# cooldown_minutes = 1440
+# max_pending_tasks = 100
+# per_user_hourly_limit = 20
+# domain_enabled = false
+# authorized_domains = []
+
+# [dns_follow_up]
+# enabled = false
+# authorized_cidrs = []
+# excluded_cidrs = []
+# max_targets_per_task = 100
+
+# [analytics_snapshot]
+# mode = "realtime"
+# interval_minutes = 30
+
+# 报告邮件策略仅 TOML 或 Web；启用远程图片需先填写外部 HTTPS 地址。
+# [report_mail]
+# public_base_url = ""
+# remote_images_enabled = false
+# image_lifetime_days = 365
+# scanner_row_limit = 20
+
+# ---- 仅 TOML 的可选部署配置 ----
+# 整个段默认未设置。启用时需同时准备制品目录和只读挂载。
+# [report_renderer]
+# releases_directory = "/var/lib/network-mapping/report-render-releases"
+
+# 整个 SMTP 段默认未设置，也可通过 Web 邮件设置管理；使用此段时三项需一起提供。
+# [email_config]
+# host = "smtp.example.com"
+# account_username = "no-reply@example.com"
+# account_password = "replace-with-smtp-password"

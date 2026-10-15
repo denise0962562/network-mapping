@@ -1,4 +1,5 @@
 # Optional override: the normal compose file always uses the bundled SQL.
+# Settings and path rules: ../docs/DOCKER_CONFIGURATION.md
 # Set SERVER_SQL_DIRECTORY to an existing directory containing reviewed SQL,
 # then set NM__DATABASE__INIT_DATABASE_FILE / NM__DATABASE__SQL_FILE_PATH in .env.
 services:
