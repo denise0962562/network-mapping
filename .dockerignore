@@ -14,6 +14,14 @@
 !docker/config.example.toml
 !LICENSE
 
+# Only public documents embedded by Rust; never include arbitrary local docs.
+!docs/
+!docs/OPEN_API.md
+!docs/OPEN_API_MANAGEMENT.md
+!docs/OPEN_API_IMPLEMENTATION.md
+!docs/open-api/
+!docs/open-api/openapi.json
+
 !source/
 !source/database/
 !source/database/**

@@ -249,6 +249,9 @@ pub async fn init_database_table(
             "../../source/database/migrate_smart_scanning.sql"
         ))
         .await?;
+    transaction
+        .batch_execute(include_str!("../../source/database/migrate_open_api.sql"))
+        .await?;
     transaction.commit().await?;
 
     Ok(())

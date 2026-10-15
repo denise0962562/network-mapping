@@ -52,6 +52,8 @@ COPY source/database ./source/database
 COPY source/open_source_projects.json ./source/open_source_projects.json
 COPY templates ./templates
 COPY assets/fonts ./assets/fonts
+COPY docs/OPEN_API.md docs/OPEN_API_MANAGEMENT.md docs/OPEN_API_IMPLEMENTATION.md ./docs/
+COPY docs/open-api/openapi.json ./docs/open-api/openapi.json
 
 # Always validate the real sources; correctness never depends on a warm cache.
 RUN cargo fmt --all --check

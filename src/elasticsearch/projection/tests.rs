@@ -49,6 +49,39 @@ async fn clean(pool: &Pool, schema: &str) {
 
 #[tokio::test]
 #[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
+async fn api_task_projection_publishes_an_independent_application_scope() {
+    let (pool, schema) = isolated_pool_with_size(2).await;
+    let fixture = EsFixture::start();
+    seed(&pool, &fixture, 1).await;
+    let c = pool.get().await.unwrap();
+    let id:i32=c.query_one("INSERT INTO api_client(client_id,owner_user_id,name,kind,policy,requested_policy) VALUES($1,1,'projection','personal','{}','{}') RETURNING id",&[&Uuid::new_v4()]).await.unwrap().get(0);
+    c.execute("UPDATE scan_task SET api_client_id=$1 WHERE id=1", &[&id])
+        .await
+        .unwrap();
+    drop(c);
+    let service = service(&fixture);
+    for _ in 0..5 {
+        if !service.process_scan_projection_outbox(&pool).await.unwrap() {
+            break;
+        }
+    }
+    let documents = fixture
+        .state
+        .lock()
+        .unwrap()
+        .documents
+        .values()
+        .filter(|v| v["scope_type"] == "api_client" && v["scope_id"] == id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0]["ip"], "192.0.2.1");
+    assert_eq!(documents[0]["port"], 1);
+    clean(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable STORAGE_TEST_DATABASE_URL and local HTTP sockets"]
 async fn projection_claim_is_atomic_and_expired_owner_cannot_commit() {
     let (pool, schema) = isolated_pool_with_size(2).await;
     let fixture = EsFixture::start();
@@ -357,7 +390,7 @@ async fn projection_recovers_a_partially_written_page_after_process_loss() {
     fixture.state.lock().unwrap().projection_fail_after = Some(1);
     assert!(
         service
-            .promote_execution_page(&abandoned.context, None)
+            .promote_execution_page(&abandoned.context, None, None)
             .await
             .is_err()
     );

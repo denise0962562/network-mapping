@@ -123,6 +123,13 @@ where
 }
 
 fn policy_for_path(path: &str) -> Option<RateLimitPolicy> {
+    if path.starts_with("/open-api/v1/") {
+        return Some(RateLimitPolicy {
+            max_requests: 600,
+            window: Duration::from_secs(60),
+            message: "开放接口请求过于频繁",
+        });
+    }
     if path.starts_with(crate::reports::assets::IMAGE_PREFIX) {
         return Some(RateLimitPolicy {
             max_requests: 600,

@@ -433,6 +433,14 @@ pub async fn run(args: Clis) -> io::Result<()> {
         }
     });
     let rate_limiter = RateLimitMiddleware::default();
+    background.spawn(
+        "open-api",
+        crate::open_api::run_worker(
+            db_pool.clone(),
+            elasticsearch_service.clone(),
+            ser_con.encrypt_key.as_bytes().to_vec(),
+        ),
+    );
     let open_source_catalog = web::Data::new(
         OpenSourceCatalog::from_embedded()
             .map_err(|error| io::Error::other(format!("开源项目清单格式错误: {error}")))?,
