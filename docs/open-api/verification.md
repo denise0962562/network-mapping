@@ -18,6 +18,25 @@
 
 浏览器检查包括申请/审批表单、凭据生成与二次验证重试、密钥关闭后清除且不写 localStorage、平台设置版本提交、角色按钮限制、接口目录和文档。浏览器使用 HTTP 模拟响应；业务数据边界由 PostgreSQL 与 ES HTTP 协议 fixture 的后端测试验证。
 
-没有配置真实 Elasticsearch 测试集群，因此两项 `live_elasticsearch` 用例和大数据压力用例未执行，也未向实际合作方发送回调或下发生产扫描。上线前按 `OPEN_API_MANAGEMENT.md` 验收真实 ES、扫描器取消、可信代理来源 IP 和 Webhook 接收方。这些检查不由模拟测试替代。
+没有配置真实 Elasticsearch 测试集群，因此两项 `live_elasticsearch` 用例未执行，也未向实际合作方发送回调或下发生产扫描。上线前按 `OPEN_API_MANAGEMENT.md` 验收真实 ES、扫描器取消、可信代理来源 IP 和 Webhook 接收方。这些检查不由模拟测试替代。
 
 检查命令与数据库隔离要求见 `OPEN_API_IMPLEMENTATION.md`。所有真实数据库测试只使用临时专用容器和随机 schema。
+
+## 2026-10-15 Codex review 修复
+
+以下 8 条意见均沿实际代码路径确认，修复后更新原服务端 PR #98 与前端 PR #3。
+
+| Review | 修复与验证 |
+| --- | --- |
+| [统计明细字段授权](https://github.com/wshijiang/network-mapping/pull/98#discussion_r4272194684) | 端口/服务明细和聚合共用字段授权检查；无字段授权时返回 403，测试确认不向 ES 发查询，恢复授权后可查询。 |
+| [任务漏洞筛选](https://github.com/wshijiang/network-mapping/pull/98#discussion_r4272194711) | 任务路径复用漏洞查询与 severity/template_id 筛选，保留任务约束；验证组合筛选、无效 severity 和过滤后空页的后续游标。 |
+| [Webhook 测试事件 ID](https://github.com/wshijiang/network-mapping/pull/98#discussion_r4272194728) | 返回 outbox 中持久化的公共事件 UUID；与投递记录、事件列表保持一致。 |
+| [导出与报告共享额度](https://github.com/wshijiang/network-mapping/pull/98#discussion_r4272194743) | 共用原子 `generation.day` 计数；限额为 1 时导出成功、相同幂等重放不重复扣费，随后报告返回 429。 |
+| [调试输出密钥残留](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4272168308) | 调试结果递归遮盖一次性密钥；浏览器确认关闭弹窗后，弹窗与结果区均无密钥。 |
+| [应用订阅串用](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4272168321) | 切换应用/凭据清空并重载订阅，按身份与请求序号丢弃过时响应；浏览器验证 A 的慢响应不会覆盖 B。 |
+| [审批草稿干扰授权对比](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4272168331) | 主页面对比只读取应用草稿；审批弹窗关闭时清除独立状态，浏览器验证重新编辑应用后显示正确差异。 |
+| [审计角色停用按钮](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4272168345) | 审计角色不渲染订阅写操作，停用按钮补齐调用条件，处理函数也检查角色；浏览器验证只读行没有写按钮。 |
+
+同步服务端与前端最新 `main`，保留智能扫描路由和 API 授权两项调度条件，并将数据库测试 fixture 补齐两项迁移。Docker 构建上下文精确放行并复制 Rust 内嵌的 3 份公开文档与 OpenAPI，避免容器编译缺少 `include_str!` 输入；新增契约测试同时确认任意本地文档和配置仍被排除。
+
+本轮已通过 Rust workspace 408 项、开放平台专项 13 项、扫描存储与独立应用投影 31 项（含 20 万任务领取查询计划检查）、智能调度 PostgreSQL 回归 15 项、Docker 契约测试 29 项、前端 13 个工具测试文件（开放平台辅助函数 8 项）、生产构建、上述 4 项 Chromium review 场景，以及 Rust 格式和 Clippy 检查。浏览器使用模拟 API；Webhook 测试只验证事件身份，不访问实际接收方。

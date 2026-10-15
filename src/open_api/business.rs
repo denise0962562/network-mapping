@@ -408,6 +408,9 @@ pub(crate) async fn vulnerabilities(
     if let Some(ip) = ip {
         filters.push(json!({"term":{"ip_address":ip}}));
     }
+    if e.path == "/tasks/{task_id}/vulnerabilities" {
+        filters.push(json!({"term":{"task_id":parts[1]}}));
+    }
     if let Some(severity) = &s.severity
         && !["info", "low", "medium", "high", "critical"].contains(&severity.as_str())
     {

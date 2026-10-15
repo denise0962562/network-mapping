@@ -369,6 +369,12 @@ pub(super) async fn isolated_pool_with_size(max_size: usize) -> (Pool, String) {
         ))
         .await
         .unwrap();
+    client
+        .batch_execute(include_str!(
+            "../source/database/migrate_smart_scanning.sql"
+        ))
+        .await
+        .unwrap();
     (pool, schema)
 }
 

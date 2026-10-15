@@ -334,6 +334,9 @@ impl Fixture {
         ))
         .await
         .unwrap();
+        c.batch_execute(include_str!("../../source/database/migrate_open_api.sql"))
+            .await
+            .unwrap();
         let owner=c.query_one("INSERT INTO users(username,password,role) VALUES('routing','unused',0) RETURNING id", &[]).await.unwrap().get("id");
         drop(c);
         Self {

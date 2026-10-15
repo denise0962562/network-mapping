@@ -227,6 +227,11 @@ async fn database() -> (Pool, String) {
     c.batch_execute(include_str!("../../source/database/init.sql"))
         .await
         .unwrap();
+    c.batch_execute(include_str!(
+        "../../source/database/migrate_smart_scanning.sql"
+    ))
+    .await
+    .unwrap();
     for _ in 0..2 {
         c.batch_execute(include_str!("../../source/database/migrate_open_api.sql"))
             .await
@@ -642,6 +647,219 @@ async fn fixture_search(
     let mut fixture = data.lock().unwrap();
     fixture.queries.push(body.into_inner());
     HttpResponse::Ok().json(fixture.body.clone())
+}
+
+async fn search_server(
+    fixture: Arc<Mutex<SearchFixture>>,
+) -> (
+    crate::elasticsearch::ElasticsearchService,
+    actix_web::dev::ServerHandle,
+) {
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(fixture.clone()))
+            .default_service(web::to(fixture_search))
+    })
+    .bind(("127.0.0.1", 0))
+    .unwrap();
+    let address = server.addrs()[0];
+    let server = server.run();
+    let handle = server.handle();
+    tokio::spawn(server);
+    let es = crate::elasticsearch::ElasticsearchService::new(crate::config::ElasticsearchConfig {
+        url: format!("http://{address}"),
+        ..Default::default()
+    })
+    .unwrap();
+    es.open_api_test_ready();
+    (es, handle)
+}
+
+#[actix_web::test]
+#[ignore = "requires disposable OPEN_API_TEST_DATABASE_URL and local HTTP sockets"]
+async fn review_field_guards_and_task_vulnerability_filters() {
+    let (pool, schema) = database().await;
+    let (p, token) = seed_client(&pool, 2).await;
+    let fixture = Arc::new(Mutex::new(SearchFixture::default()));
+    let (es, server) = search_server(fixture.clone()).await;
+    let app = http_test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(es))
+            .configure(configure),
+    )
+    .await;
+    let mut restricted = p.policy.clone();
+    restricted.fields.retain(|f| f != "port" && f != "service");
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE api_client SET policy=$2 WHERE id=$1",
+            &[&p.client_pk, &json!(restricted)],
+        )
+        .await
+        .unwrap();
+    for (kind, category) in [("port", "443"), ("service", "https")] {
+        let request = http_test::TestRequest::post()
+            .uri("/open-api/v1/analytics/statistics/details")
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .set_json(json!({"data_type":kind,"group_by":kind,"category":category}))
+            .to_request();
+        assert_eq!(
+            http_test::call_service(&app, request).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert!(
+        fixture.lock().unwrap().queries.is_empty(),
+        "denied fields must not reach ES"
+    );
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE api_client SET policy=$2 WHERE id=$1",
+            &[&p.client_pk, &json!(p.policy)],
+        )
+        .await
+        .unwrap();
+    fixture.lock().unwrap().body = json!({"_shards":{"failed":0},"hits":{"hits":[]}});
+    let request = http_test::TestRequest::post()
+        .uri("/open-api/v1/analytics/statistics/details")
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .set_json(json!({"data_type":"port","group_by":"port","category":"443"}))
+        .to_request();
+    assert_eq!(
+        http_test::call_service(&app, request).await.status(),
+        StatusCode::OK
+    );
+    let request = http_test::TestRequest::post()
+        .insert_header(("Idempotency-Key", "review-task"))
+        .to_http_request();
+    let task = tasks::create(
+        &request,
+        &pool,
+        &p,
+        &json!({"targets":["192.0.2.1"],"ports":"443"}),
+        None,
+    )
+    .await
+    .unwrap();
+    let task_id = task["task_id"].as_str().unwrap();
+    let c = pool.get().await.unwrap();
+    c.execute(
+        "UPDATE scan_task SET task_status='succeeded',task_end_time=$2 WHERE task_id=$1",
+        &[&task_id, &Utc::now().timestamp_millis()],
+    )
+    .await
+    .unwrap();
+    let execution:String=c.query_one("UPDATE scan_task_execution SET execution_status='succeeded',task_end_time=$2 WHERE task_id=(SELECT id FROM scan_task WHERE task_id=$1) RETURNING execution_id",&[&task_id,&Utc::now().timestamp_millis()]).await.unwrap().get(0);
+    drop(c);
+    let hits=[("critical","match"),("low","match"),("critical","other")].iter().enumerate().map(|(n,(severity,template))|json!({"_source":{"kind":"vulnerability","ip_address":"192.0.2.1","task_id":task_id,"execution_id":execution,"observation_key":format!("finding-{n}"),"data":{"severity":severity,"template_id":template}},"sort":[n]})).collect::<Vec<_>>();
+    fixture.lock().unwrap().body = json!({"_shards":{"failed":0},"hits":{"hits":hits}});
+    let path =
+        format!("/open-api/v1/tasks/{task_id}/vulnerabilities?severity=critical&template_id=match");
+    let request = http_test::TestRequest::get()
+        .uri(&path)
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .to_request();
+    let result: Value = http_test::call_and_read_body_json(&app, request).await;
+    assert_eq!(result["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["data"]["items"][0]["severity"], "critical");
+    assert_eq!(result["data"]["items"][0]["template_id"], "match");
+    let query = fixture.lock().unwrap().queries.last().unwrap().to_string();
+    assert!(query.contains(task_id));
+    let request = http_test::TestRequest::get()
+        .uri(&format!(
+            "/open-api/v1/tasks/{task_id}/vulnerabilities?severity=invalid"
+        ))
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .to_request();
+    assert_eq!(
+        http_test::call_service(&app, request).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let request = http_test::TestRequest::get()
+        .uri(&format!("{path}&page_size=1"))
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .to_request();
+    let mut body = fixture.lock().unwrap().body.clone();
+    body["hits"]["hits"] = json!([hits[1], hits[0]]);
+    fixture.lock().unwrap().body = body;
+    let page: Value = http_test::call_and_read_body_json(&app, request).await;
+    assert_eq!(page["data"]["items"], json!([]));
+    assert!(page["data"]["next_cursor"].is_string());
+    server.stop(true).await;
+    cleanup(pool, schema).await;
+}
+
+#[actix_web::test]
+#[ignore = "requires disposable OPEN_API_TEST_DATABASE_URL"]
+async fn review_generation_quota_and_webhook_event_identity() {
+    let (pool, schema) = database().await;
+    let (p, token) = seed_client(&pool, 2).await;
+    let mut policy = p.policy.clone();
+    policy.exports_per_day = 1;
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE api_client SET policy=$2 WHERE id=$1",
+            &[&p.client_pk, &json!(policy)],
+        )
+        .await
+        .unwrap();
+    let es = crate::elasticsearch::ElasticsearchService::new(Default::default()).unwrap();
+    let app = http_test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(es))
+            .configure(configure),
+    )
+    .await;
+    for _ in 0..2 {
+        let request = http_test::TestRequest::post()
+            .uri("/open-api/v1/exports")
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .insert_header(("Idempotency-Key", "shared-generation"))
+            .set_json(json!({"format":"json"}))
+            .to_request();
+        assert_eq!(
+            http_test::call_service(&app, request).await.status(),
+            StatusCode::ACCEPTED
+        );
+    }
+    let request = http_test::TestRequest::post()
+        .uri("/open-api/v1/reports")
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .insert_header(("Idempotency-Key", "report-limit"))
+        .set_json(json!({"start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-08T00:00:00Z"}))
+        .to_request();
+    let response = http_test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: Value = http_test::read_body_json(response).await;
+    assert_eq!(error["error"]["code"], "quota_exceeded");
+    let hook = Uuid::new_v4();
+    let c = pool.get().await.unwrap();
+    c.execute("INSERT INTO api_webhook(id,client_id,credential_id,url,event_types,signing_secret) VALUES($1,$2,$3,'https://hooks.example.com/events',ARRAY['webhook.test'],$4)",&[&hook,&p.client_pk,&p.credential_id,&vec![0u8;32]]).await.unwrap();
+    drop(c);
+    let request = http_test::TestRequest::post()
+        .uri(&format!("/open-api/v1/webhooks/{hook}/test"))
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .set_json(json!({}))
+        .to_request();
+    let result: Value = http_test::call_and_read_body_json(&app, request).await;
+    let event = result["data"]["event_id"].as_str().unwrap();
+    let stored:Uuid=pool.get().await.unwrap().query_one("SELECT o.event_id FROM api_webhook_delivery d JOIN api_event_outbox o ON o.id=d.event_id WHERE d.webhook_id=$1",&[&hook]).await.unwrap().get(0);
+    assert_eq!(stored.to_string(), event);
+    let request = http_test::TestRequest::get()
+        .uri("/open-api/v1/events")
+        .insert_header(("Authorization", format!("Bearer {token}")))
+        .to_request();
+    let events: Value = http_test::call_and_read_body_json(&app, request).await;
+    assert_eq!(events["data"]["items"][0]["id"], event);
+    cleanup(pool, schema).await;
 }
 
 #[actix_web::test]

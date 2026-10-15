@@ -176,7 +176,7 @@ async fn jobs(
         auth::consume(
             &tx,
             p.client_pk,
-            &format!("{kind}.day"),
+            "generation.day",
             p.policy.exports_per_day,
             1,
             true,
@@ -561,8 +561,15 @@ async fn webhooks(
         )
         .await?;
         tx.execute("INSERT INTO api_webhook_delivery(id,webhook_id,event_id) SELECT $1,$2,id FROM api_event_outbox WHERE dedup_key=$3",&[&Uuid::now_v7(),&id,&event_id.to_string()]).await?;
+        let persisted: Uuid = tx
+            .query_one(
+                "SELECT event_id FROM api_event_outbox WHERE client_id=$1 AND dedup_key=$2",
+                &[&p.client_pk, &event_id.to_string()],
+            )
+            .await?
+            .get(0);
         tx.commit().await?;
-        return Ok(json!({"event_id":event_id,"status":"pending"}));
+        return Ok(json!({"event_id":persisted,"status":"pending"}));
     }
     let mut secret = None;
     let mutation = if e.method == "DELETE" {

@@ -91,6 +91,7 @@ pub(crate) async fn dispatch(
         ) {
             return Err(ApiError::bad("data_type 无效"));
         }
+        require_metric_field(p, kind)?;
         if matches!(kind, "tasks" | "scanners") {
             if v.get("category").is_some_and(|v| !v.is_null()) {
                 return Err(ApiError::bad(
@@ -240,11 +241,7 @@ pub(crate) async fn scan_statistics_from_inputs(
     group: &str,
     frozen: Option<&[String]>,
 ) -> Result<Value> {
-    if kind == "port" && !p.policy.fields.iter().any(|f| f == "port")
-        || kind == "service" && !p.policy.fields.iter().any(|f| f == "service")
-    {
-        return Err(ApiError::forbidden());
-    }
+    require_metric_field(p, kind)?;
     let mut filters = query::fact_filters(pool, p, s).await?;
     if let Some(ids) = frozen {
         filters.push(json!({"terms":{"execution_id":ids}}));
@@ -332,6 +329,12 @@ pub(crate) async fn scan_statistics_from_inputs(
     Ok(
         json!({"data_type":kind,"group_by":group,"rows":counts.into_iter().map(|(category,count)|json!({"category":category,"count":count,"percentage":if total>0{Some(count as f64/total as f64*100.0)}else{None}})).collect::<Vec<_>>(),"summary":{"count":if kind=="discovery"{total_ips.len() as u64}else{total},"distinct_ips":total_ips.len()},"notes":["发现按每组独立去重 IP，总体 IP 直接去重，不能累加各组。端口/服务按执行、IP、端点计数。"]}),
     )
+}
+fn require_metric_field(p: &Principal, kind: &str) -> Result<()> {
+    if matches!(kind, "port" | "service") && !p.policy.fields.iter().any(|f| f == kind) {
+        return Err(ApiError::forbidden());
+    }
+    Ok(())
 }
 #[derive(Default)]
 struct TaskMetrics {

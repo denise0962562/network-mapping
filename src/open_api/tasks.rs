@@ -469,18 +469,19 @@ pub(crate) async fn dispatch(
             Ok(json!({"items":rows.iter().map(execution).collect::<Vec<_>>()}))
         }
         "/tasks/{task_id}/results" | "/tasks/{task_id}/vulnerabilities" => {
-            let s = business::search(req, v)?;
-            let vuln = e.path.ends_with("/vulnerabilities");
-            let mut filters = vec![json!({"term":{"task_id":id}})];
-            if vuln {
-                filters.push(json!({"term":{"kind":"vulnerability"}}));
-            } else {
-                filters.push(json!({"terms":{"kind":if p.has("vulnerabilities:read"){vec!["port","service","vulnerability"]}else{vec!["port","service"]}}}));
+            drop(c);
+            if e.path.ends_with("/vulnerabilities") {
+                return business::vulnerabilities(req, pool, es, p, e, None, parts, v).await;
             }
+            let s = business::search(req, v)?;
+            let filters = vec![
+                json!({"term":{"task_id":id}}),
+                json!({"terms":{"kind":if p.has("vulnerabilities:read"){vec!["port","service","vulnerability"]}else{vec!["port","service"]}}}),
+            ];
             Ok(business::project_facts(
                 p,
                 query::facts(pool, es, p, &s, filters).await?,
-                vuln,
+                false,
             ))
         }
         "/tasks/{task_id}/dns-comparison" => {
