@@ -40,3 +40,18 @@
 同步服务端与前端最新 `main`，保留智能扫描路由和 API 授权两项调度条件，并将数据库测试 fixture 补齐两项迁移。Docker 构建上下文精确放行并复制 Rust 内嵌的 3 份公开文档与 OpenAPI，避免容器编译缺少 `include_str!` 输入；新增契约测试同时确认任意本地文档和配置仍被排除。
 
 本轮已通过 Rust workspace 408 项、开放平台专项 13 项、扫描存储与独立应用投影 31 项（含 20 万任务领取查询计划检查）、智能调度 PostgreSQL 回归 15 项、Docker 契约测试 29 项、前端 13 个工具测试文件（开放平台辅助函数 8 项）、生产构建、上述 4 项 Chromium review 场景，以及 Rust 格式和 Clippy 检查。浏览器使用模拟 API；Webhook 测试只验证事件身份，不访问实际接收方。
+
+## 2026-10-15 第二轮新增意见
+
+新增 6 条均已确认并修复。前端原 PR #3 已合并，因此前端修复从最新 main 建立补充 PR，后端继续更新 #98，并同步固定前端引用。
+
+| Review | 修复与验证 |
+| --- | --- |
+| [任务统计授权时间](https://github.com/wshijiang/network-mapping/pull/98#discussion_r4277667524) | SQL 与逐事件计数共用请求/策略的有效交集；验证窗口前创建、窗口内结束，以及窗口内创建、结束恰好位于排除上界的对称情况，只有授权事件计数。 |
+| [漏洞摘要检查预算](https://github.com/wshijiang/network-mapping/pull/98#discussion_r4277667528) | 分开记录检查数和匹配数，在 severity/template_id 筛选前累计预算；10,000 条未匹配观察可返回 count=0，第 10,001 条触发 422，避免继续遍历。 |
+| [凭据刷新失败丢失密钥](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4277670660) | 创建/轮换成功后先显示密钥；浏览器覆盖详情、用量、日志、任务 4 类后续刷新失败及轮换刷新失败，关闭弹窗仍清除密钥。 |
+| [订阅刷新失败丢失签名密钥](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4277670665) | 创建 Webhook 后先显示签名密钥再刷新列表；模拟刷新 503 仍可保存，调试结果不留密钥。 |
+| [过时页面响应](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4277670672) | 页面、筛选、文档、应用上下文与请求序号共同约束回写；浏览器延迟返回旧任务及旧应用日志，确认不覆盖投递、当前行或游标。 |
+| [夏令时重复时间](https://github.com/wshijiang/network-mapping-vue/pull/3#discussion_r4277670680) | 保留原始当地时间直到选择偏移，合法后才更新策略；浏览器验证纽约重复小时 UTC-04:00/UTC-05:00 对应不同的正确毫秒值，无效/未选择偏移时禁止提交，春季不存在时间同样阻止发布。 |
+
+本轮 Rust workspace 408 项、开放平台专项 15 项、格式和 Clippy 检查通过。前端 13 个工具测试文件、生产构建及新增 9 个 Chromium 场景通过，上一轮 4 个浏览器 review 场景也通过。使用隔离 PostgreSQL 和本地 HTTP fixture，浏览器模拟管理接口，没有部署、生产扫描或实际对外回调。

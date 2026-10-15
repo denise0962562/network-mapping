@@ -397,8 +397,11 @@ async fn task_statistics(
     if details {
         return task_details(pool, p, s, kind, group).await;
     }
-    let start = s.start_at.unwrap();
-    let end = s.end_at.unwrap();
+    let start = s
+        .start_at
+        .unwrap()
+        .max(p.policy.from_at.unwrap_or(i64::MIN));
+    let end = s.end_at.unwrap().min(p.policy.to_at.unwrap_or(i64::MAX));
     let c = pool.get().await?;
     let sql = if kind == "scanners" {
         "SELECT t.*,t.task_target::TEXT[] AS targets,e.execution_status,e.task_start_time AS execution_started,e.task_end_time AS execution_ended,e.assigned_scanner_id,e.execution_id FROM scan_task t JOIN scan_task_execution e ON e.task_id=t.id WHERE t.user_id=$1 AND ($2 OR t.api_client_id=$3) AND e.task_end_time >= $4 AND e.task_end_time<$5 AND e.execution_status IN ('succeeded','failed','partial','cancelled') ORDER BY t.id LIMIT 10001"
@@ -412,8 +415,8 @@ async fn task_statistics(
                 &p.owner_id,
                 &(p.policy.data_mode == "owner"),
                 &p.client_pk,
-                &start.max(p.policy.from_at.unwrap_or(start)),
-                &end.min(p.policy.to_at.unwrap_or(end)),
+                &start,
+                &end,
             ],
         )
         .await?;
@@ -567,6 +570,7 @@ pub(crate) async fn vulnerability_summary(
     let mut severities = BTreeMap::<String, u64>::new();
     let mut templates = BTreeMap::<String, u64>::new();
     let mut count = 0usize;
+    let mut examined = 0usize;
     let started = std::time::Instant::now();
     loop {
         if started.elapsed() > std::time::Duration::from_secs(12) {
@@ -581,6 +585,10 @@ pub(crate) async fn vulnerability_summary(
         )
         .await?;
         for value in page["items"].as_array().into_iter().flatten() {
+            examined += 1;
+            if examined > 10000 {
+                return Err(ApiError::bad("漏洞摘要超过 10000 条预算，请缩小范围"));
+            }
             let severity = value
                 .pointer("/data/severity")
                 .and_then(Value::as_str)
@@ -597,9 +605,6 @@ pub(crate) async fn vulnerability_summary(
             *severities.entry(severity.to_owned()).or_default() += 1;
             *templates.entry(template.to_owned()).or_default() += 1;
             count += 1;
-        }
-        if count > 10000 {
-            return Err(ApiError::bad("漏洞摘要超过 10000 条预算，请缩小范围"));
         }
         query.cursor = page["next_cursor"]
             .as_str()

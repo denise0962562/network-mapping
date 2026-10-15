@@ -639,6 +639,7 @@ async fn console_approval_key_and_metadata_version_lifecycle() {
 struct SearchFixture {
     body: Value,
     queries: Vec<Value>,
+    pages: std::collections::VecDeque<Value>,
 }
 async fn fixture_search(
     data: web::Data<Arc<Mutex<SearchFixture>>>,
@@ -646,7 +647,11 @@ async fn fixture_search(
 ) -> HttpResponse {
     let mut fixture = data.lock().unwrap();
     fixture.queries.push(body.into_inner());
-    HttpResponse::Ok().json(fixture.body.clone())
+    let response = fixture
+        .pages
+        .pop_front()
+        .unwrap_or_else(|| fixture.body.clone());
+    HttpResponse::Ok().json(response)
 }
 
 async fn search_server(
@@ -673,6 +678,90 @@ async fn search_server(
     .unwrap();
     es.open_api_test_ready();
     (es, handle)
+}
+
+#[actix_web::test]
+#[ignore = "requires disposable OPEN_API_TEST_DATABASE_URL and local HTTP sockets"]
+async fn review_task_metrics_clamp_each_event_to_policy_time() {
+    let (pool, schema) = database().await;
+    let (mut p, _) = seed_client(&pool, 2).await;
+    let from = query::instant(&json!("2026-10-04T00:00:00Z"))
+        .unwrap()
+        .unwrap();
+    let to = query::instant(&json!("2026-10-06T00:00:00Z"))
+        .unwrap()
+        .unwrap();
+    p.policy.from_at = Some(from);
+    p.policy.to_at = Some(to);
+    let c = pool.get().await.unwrap();
+    for (created, ended) in [
+        (from - 86400000, from),
+        (from + 86400000, to),
+        (from, from + 86400000),
+    ] {
+        c.execute("INSERT INTO scan_task(user_id,api_client_id,task_id,task_initiator,task_target,task_status,task_create_time,task_start_time,task_end_time) VALUES($1,$2,$3,'fixture',ARRAY['192.0.2.1'::inet],'succeeded',$4,$4,$5)", &[&p.owner_id,&p.client_pk,&Uuid::new_v4().to_string(),&created,&ended]).await.unwrap();
+    }
+    drop(c);
+    let fixture = Arc::new(Mutex::new(SearchFixture::default()));
+    let (es, server) = search_server(fixture.clone()).await;
+    let request = http_test::TestRequest::post().to_http_request();
+    let endpoint = catalog::resolve("POST", "/analytics/statistics/query").unwrap();
+    let value = analytics::dispatch(&request, &pool, &es, &p, &endpoint, &json!({"data_type":"tasks","group_by":"day","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-10T00:00:00Z"})).await.unwrap();
+    assert_eq!(value["summary"]["created"], 2);
+    assert_eq!(value["summary"]["completed"], 2);
+    assert_eq!(value["summary"]["succeeded"], 2);
+    assert_eq!(value["rows"].as_array().unwrap().len(), 2);
+    assert!(fixture.lock().unwrap().queries.is_empty());
+    server.stop(true).await;
+    cleanup(pool, schema).await;
+}
+
+#[actix_web::test]
+#[ignore = "requires disposable OPEN_API_TEST_DATABASE_URL and local HTTP sockets"]
+async fn review_vulnerability_budget_counts_filtered_observations() {
+    let (pool, schema) = database().await;
+    let (p, _) = seed_client(&pool, 2).await;
+    let hits = (0..101).map(|n| json!({"_source":{"kind":"vulnerability","data":{"severity":"low","template_id":"other"}},"sort":[n]})).collect::<Vec<_>>();
+    let full = json!({"_shards":{"failed":0},"hits":{"hits":hits}});
+    let last = json!({"_shards":{"failed":0},"hits":{"hits":&hits[..100]}});
+    let fixture = Arc::new(Mutex::new(SearchFixture::default()));
+    {
+        let mut f = fixture.lock().unwrap();
+        f.body = full.clone();
+        f.pages.extend(std::iter::repeat_n(full, 99));
+        f.pages.push_back(last);
+    }
+    let (es, server) = search_server(fixture.clone()).await;
+    let search = query::Search {
+        severity: Some("critical".into()),
+        template_id: Some("match".into()),
+        ..Default::default()
+    };
+    let value = analytics::vulnerability_summary(&pool, &es, &p, &search)
+        .await
+        .unwrap();
+    assert_eq!(
+        value["count"], 0,
+        "matching count is independent of examined count"
+    );
+    assert_eq!(
+        fixture.lock().unwrap().queries.len(),
+        100,
+        "exactly 10000 observations remain within budget"
+    );
+    fixture.lock().unwrap().queries.clear();
+    let error = analytics::vulnerability_summary(&pool, &es, &p, &search)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(error.message.contains("10000"));
+    assert_eq!(
+        fixture.lock().unwrap().queries.len(),
+        101,
+        "nonmatching observations still exhaust the scan budget"
+    );
+    server.stop(true).await;
+    cleanup(pool, schema).await;
 }
 
 #[actix_web::test]
