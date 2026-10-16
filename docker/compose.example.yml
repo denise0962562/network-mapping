@@ -1,3 +1,4 @@
+# Settings, defaults and env support: ../docs/DOCKER_CONFIGURATION.md
 name: network-mapping
 services:
   server:
@@ -8,6 +9,13 @@ services:
     user: "10001:10001"
     environment:
       SERVER_TLS_NAME: ${SERVER_TLS_NAME:?Set SERVER_TLS_NAME to a certificate DNS name}
+    # 可选：完整终端日志；自定义 command 时保留配置来源。
+    # command: ["--config-source", "env", "--verbose"]
+    # 文件模式改为 ["--config-source", "file", "--config", "/etc/network-mapping/config.toml"]，
+    # 并启用下面的 runtime/config.toml 挂载，填写 TOML 中的三个必填密钥。
+    # 可选资源限制，根据实际容量调整；默认不显式限制。
+    # cpus: 2.0
+    # mem_limit: 2g
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -16,6 +24,11 @@ services:
       - ./runtime/tls:/etc/network-mapping/tls:ro
       - server-data:/var/lib/network-mapping
       - server-logs:/var/log/network-mapping
+      # 仅文件配置模式使用；将 config.example.toml 复制到 runtime/config.toml 后填写。
+      # - ./runtime/config.toml:/etc/network-mapping/config.toml:ro
+    # 可选文件密钥：在 .env 中启用对应 _FILE 并删除直接值行，先准备可被 UID 10001 读取的文件。
+    # secrets: [server-encrypt-key, scanner-token-pepper, database-password]
+    # ES API Key 可加入 elasticsearch-api-key；用户认证改用 elasticsearch-username、elasticsearch-password。
     tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
     stop_grace_period: 60s
     depends_on:
@@ -28,6 +41,18 @@ services:
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+    # 可选探针覆盖，以下与镜像默认行为一致；变更证书目录或检查方式时同步调整。
+    # healthcheck:
+    #   test:
+    #     - CMD-SHELL
+    #     - >-
+    #       curl --fail --silent --show-error --cacert /etc/network-mapping/tls/ca.pem
+    #       --resolve "$$SERVER_TLS_NAME:$${NM__SERVER__PORT:-9999}:127.0.0.1"
+    #       "https://$$SERVER_TLS_NAME:$${NM__SERVER__PORT:-9999}/login" > /dev/null
+    #   interval: 30s
+    #   timeout: 5s
+    #   start_period: 120s
+    #   retries: 3
 
   postgres:
     profiles: [local-postgres]
@@ -37,6 +62,9 @@ services:
       POSTGRES_USER: ${NM__DATABASE__USERNAME:-network_mapping}
       POSTGRES_DB: ${NM__DATABASE__DB_NAME:-network_mapping}
       POSTGRES_PASSWORD: ${NM__DATABASE__PASSWORD:?Set NM__DATABASE__PASSWORD in docker/.env}
+      # 文件密钥模式需注释上一行，启用下一行及 secrets，并同步服务端的 _FILE 配置。
+      # POSTGRES_PASSWORD_FILE: /run/secrets/database-password
+    # secrets: [database-password]
     volumes: ["postgres-data:/var/lib/postgresql"]
     healthcheck:
       test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -t 3 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
@@ -73,3 +101,18 @@ volumes:
   server-logs:
   postgres-data:
   elasticsearch-data:
+
+# 可选文件密钥来源；仅为实际启用的项取消注释，文件需预先创建且不要提交到仓库。
+# secrets:
+#   server-encrypt-key:
+#     file: ./runtime/secrets/server-encrypt-key
+#   scanner-token-pepper:
+#     file: ./runtime/secrets/scanner-token-pepper
+#   database-password:
+#     file: ./runtime/secrets/database-password
+#   elasticsearch-api-key:
+#     file: ./runtime/secrets/elasticsearch-api-key
+#   elasticsearch-username:
+#     file: ./runtime/secrets/elasticsearch-username
+#   elasticsearch-password:
+#     file: ./runtime/secrets/elasticsearch-password

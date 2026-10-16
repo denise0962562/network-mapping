@@ -1,13 +1,13 @@
 # 启动配置检查
 
-服务端启动时检查 `--config` 指定的 TOML 原始字段，再使用程序原有的默认值加载配置。按字段路径比较，而不是按参数数量比较；TOML 点分键和内联表均受支持。
+文件模式下，服务端启动时检查 `--config` 指定的 TOML 原始字段，再使用程序原有的默认值加载配置。按字段路径比较，而不是按参数数量比较；TOML 点分键和内联表均受支持。Docker 默认 env 模式检查合并后的内置配置和环境变量，全部参数见 [Docker 完整配置参考](DOCKER_CONFIGURATION.md)。
 
 允许提示的字段以本版本仓库根目录追踪的 `config.toml` 为准。代码内部默认字段、未公开的配置段以及仅出现在 Docker 示例中的字段不生成提示，再排除下述数据库管理参数。缺省值取自程序本身，不使用仓库配置中的实际值。
 
 ## 文件与 Docker 部署
 
 - 文件部署继续使用原配置路径，例如 `network_mapping_server --config /srv/network-mapping/config.toml`。
-- 标准 Docker/Compose 使用镜像默认 `--config-source env`，从内置默认值和 `NM__…` 环境变量生成同一检查快照，无需挂载 TOML；详见 [Docker 部署指南](DOCKER.md)。兼容旧文件挂载时显式使用 `--config-source file --config /etc/network-mapping/config.toml`，检查不写回、不补写或替换文件。
+- 标准 Docker/Compose 使用镜像默认 `--config-source env`，从内置默认值和 Compose `env_file` 注入的 `NM__…` 环境变量生成同一检查快照，无需挂载 TOML；详见 [Docker 部署指南](DOCKER.md)。兼容旧文件挂载时显式使用 `--config-source file --config /etc/network-mapping/config.toml` 并只读挂载文件，检查不写回、不补写或替换文件，也不要求增加可写配置卷。
 - 路径默认值沿用程序既有行为。文件与 Docker 部署的资源目录可能不同，应按检查详情核对路径和挂载；不会把新版示例中的路径自动覆盖到用户配置。
 - 修改 TOML 后重启对应进程；修改 Compose `.env` 后使用 `up -d --force-recreate` 重新注入环境，单纯 restart 不更新环境。Web 的“重新读取”只重新获取启动快照，不重新加载启动配置。
 
