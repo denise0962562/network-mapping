@@ -7,6 +7,15 @@
 本文是服务端部署入口，面向 Linux，覆盖部署选型、安装顺序、原生服务托管和升级。容器的具体命令见 [Docker 部署指南](DOCKER.md)；扫描节点见[扫描端部署指南](https://github.com/wshijiang/Network-Mapping-Scanner/blob/main/docs/DEPLOYMENT.md)。已有 PG 扫描结果的升级必须先阅读[Elasticsearch 存储与迁移](ELASTICSEARCH.md)，不能按空库流程直接切换。
 Docker 环境变量的全部字段、默认值及 Compose 设置见 [完整配置参考](DOCKER_CONFIGURATION.md)。
 
+可信 IOC 自动标记和 AI 审核通过数据库与 Web 管理，无需修改扫描器。部署时可配置
+`NM_INTEL_LOCAL_ROOT`、只读来源文件挂载，并在 Web 保存数据库加密凭据或配置服务端凭据
+环境变量；数据库凭据复用长期保留的 `server.encrypt_key`。默认来源会定时同步，AI
+默认关闭。迁移、网络白名单和配套前端要求见[威胁情报部署说明](THREAT_INTELLIGENCE.md)。
+ThreatFox 持续更新使用 API；JSON/CSV/ZIP 历史文件由管理员离线上传。
+导入需将 `NM_INTEL_CACHE_ROOT`（默认 `/var/lib/network-mapping/intel-cache`）配置为服务账户
+可写的持久化目录，多实例共享；本地手动导入的输入目录 `NM_INTEL_LOCAL_ROOT` 可只读挂载。
+代理上传限制应允许所需文件大小（服务端上限 512 MiB）。自动情报默认六个月过期并保留历史。
+
 [部署方式与安装顺序](#部署方式与安装顺序) · [准备环境](#准备环境) · [文件布局](#文件布局) · [数据库](#数据库) · [配置](#配置) · [首次启动](#首次启动) · [服务托管](#服务托管) · [升级与恢复](#升级与恢复) · [验收与排障](#验收与排障)
 
 ## 部署方式与安装顺序
@@ -79,7 +88,7 @@ pnpm build
 ```sh
 sudo useradd --system --user-group --home-dir /var/lib/network-mapping --no-create-home --shell /usr/sbin/nologin network-mapping
 sudo install -d -o root -g network-mapping -m 0750 /etc/network-mapping /etc/network-mapping/ssl
-sudo install -d -o network-mapping -g network-mapping -m 0750 /var/log/network-mapping /var/lib/network-mapping/scanner-diagnostics
+sudo install -d -o network-mapping -g network-mapping -m 0750 /var/log/network-mapping /var/lib/network-mapping/scanner-diagnostics /var/lib/network-mapping/intel-cache
 sudo install -d -o root -g root -m 0755 /opt/network-mapping/network-mapping /opt/network-mapping/network-mapping-vue
 ```
 
@@ -232,6 +241,22 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-For $remote_addr;
 }
+
+# 离线 IOC 大文件上传；与上面的普通路由放在同一 server 块。
+location ~ ^/api/intel/sources/[^/]+/import$ {
+    client_max_body_size 512m;
+    client_body_timeout 60s;
+    proxy_request_buffering off;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_read_timeout 120s;
+    proxy_send_timeout 60s;
+    proxy_pass http://127.0.0.1:9999;
+    proxy_set_header Host $host;
+    proxy_set_header Forwarded "";
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
 ```
 
 来源 IP 仍需在 Web 的可信代理设置中信任实际回环代理。跨主机代理不能连接此 HTTP 监听，应继续使用服务端 TLS。修改这些启动参数需要重启进程；切换协议后同步修改代理上游和本地探针的 URL。
@@ -330,6 +355,9 @@ sudo -u network-mapping ./network_mapping_server --config /etc/network-mapping/c
 ```
 
 密码交互输入。若自动管理员名称不同，替换最后一个用户名。CLI 同样加载并校验配置，详见[用户管理](USER_MANAGEMENT_CLI.md)。
+
+历史情报的大文件可使用 `intel import --fast` 直接从本地快速导入，支持进度、作业租约和
+断点恢复，审核与过期规则保持执行，详见[CLI 快速导入](THREAT_INTELLIGENCE.md#cli-快速导入)。
 
 管理员登录控制台后创建扫描器，保存一次性注册 ID 和 Token。节点配置服务端主机、端口和可信 TLS 后注册，确认心跳在线，再对一个已授权的小范围目标执行首个任务。节点部署与持久化目录见[扫描器项目](https://github.com/wshijiang/Network-Mapping-Scanner)。
 

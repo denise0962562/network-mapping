@@ -52,7 +52,7 @@ pub async fn run(args: Clis) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "用户管理子命令不能与旧维护参数同时使用",
+            "管理子命令不能与旧维护参数同时使用",
         ));
     }
 
@@ -185,7 +185,7 @@ pub async fn run(args: Clis) -> io::Result<()> {
     if let Some(command) = args.command.as_ref() {
         cli_user::execute(command, &db_pool, config.pwd_hash.clone())
             .await
-            .map_err(|error| io::Error::other(format!("用户管理命令失败：{error}")))?;
+            .map_err(|error| io::Error::other(format!("管理命令失败：{error}")))?;
         return Ok(());
     }
     let elasticsearch_service = ElasticsearchService::new(elasticsearch_config)
@@ -595,6 +595,14 @@ pub async fn run(args: Clis) -> io::Result<()> {
         ),
     );
     let scanner_diagnostics_data = web::Data::new(scanner_diagnostics);
+    background.spawn(
+        "threat-intelligence",
+        crate::threat_intel::run(
+            pool.clone(),
+            system_maintenance_state.clone(),
+            ser_con.encrypt_key.clone(),
+        ),
+    );
 
     let renderer_shutdown = report_renderer.clone();
     let http_server = HttpServer::new(move || {
