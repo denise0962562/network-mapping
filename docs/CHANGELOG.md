@@ -2,21 +2,6 @@
 
 [文档中心](README.md) · [部署与升级](DEPLOYMENT.md) · [扫描端更新日志](https://github.com/wshijiang/Network-Mapping-Scanner/blob/main/docs/CHANGELOG.md)
 
-## 待发布开发变更
-
-- 新增可选 IOC 提取与调试对话历史，默认关闭；按请求加密保留输入、输出、供应商思考、参数及 session，支持管理员历史选择、复用 session、重放和删除。调试历史按原管理员隔离，删除不会被异步完成写入恢复。
-- 配套控制台新增历史 modal、类型标签、历史提示词查看与每用户 7 天未发送草稿缓存；发送或删空立即清理。数据库迁移幂等增加留存开关与历史表。
-
-- 修复备用环境变量未设置时有效自定义 Authorization 仍被凭据错误阻断的问题，统一在线调试、模型刷新及 IOC 提取的认证回退；数据库密钥解密失败和非法环境变量引用仍会报错。同步更新 frontend-ref，包含供应商清除密钥优先于替换密钥的控制台修复。
-- 修复模型刷新接口遗漏已保存但不在远端目录中的模型：保留原模型信息并标记不可用，重新出现的模型恢复可用，现有手工协议选择继续保留。同步修复来源详情弹窗的配套控制台并更新 frontend-ref。
-- 新增独立 LLM 管理 API、DeepSeek / OpenCode Go / CommandCode GOAT 预设及供应商、模型管理；IOC 提取使用唯一供应商与模型组合。
-- 支持全局与供应商局部的代理、自定义头、session 头名称及流式传输；敏感配置加密保存，局部关闭与继承具有独立语义。
-- 扩展 async-openai 的自定义有界传输，支持 Chat / Responses 流式输出、正常结束检查和可取消的在线对话调试。IOC 流完整结束后才执行原文证据校验与人工审核。
-- 幂等迁移旧 AI 设置；保留运行配置投影及入库版本锁。迁移后旧 AI 设置写接口返回已迁移错误，发布所用 frontend-ref 已固定配套 LLM 控制台提交，需一同部署。
-- 补充 [LLM 配置与升级文档](LLM.md)、模型发现和配置继承测试、真实 PostgreSQL 迁移与单选约束测试、SDK 流式与取消测试。
-
-本节为当前工作区开发变更，未计入下方主分支历史截止快照。升级前备份数据库并停止旧服务实例，保留加密主密钥；回滚需同步恢复对应备份与前端。
-
 ## 未发布（自 v0.1.29 以来）
 
 截至 **2026-10-21（北京时间）**，以最新已发布 tag [v0.1.29](https://github.com/wshijiang/network-mapping/releases/tag/v0.1.29) 为基线，汇总主分支已合入的服务端变动，不包含尚未合入的开发分支或前端独立变动。
@@ -28,7 +13,9 @@
 | 变动范围 | 32 个提交（含合并提交）；[查看完整比较](https://github.com/wshijiang/network-mapping/compare/v0.1.29...919cecb2151ee5612c4cbf2d03d2e20d4c87e6e6) |
 
 ### 新增
-
+- **HTTP/HTTPS 被动识别 Elasticsearch**：产品响应头及完整根 JSON，支持明确版本、OpenSearch 排除、冲突和截断状态。service 继续保留 http/https，不增加目标请求。
+- Web 规则修订 6，88 条规则覆盖 53 种技术；现有队列按新修订回填保留的历史证据。查询使用 tech = elasticsearch，外部 API 沿用 web 字段授权。
+- 新增[服务探测分批交付计划](SERVICE_DETECTION_ROADMAP.md)，区分 UDP 库内核、后续任务/端点迁移、原生 Transport 和扩展协议；本批尚未开放 UDP 任务。
 - **统一通知渠道**：邮件、飞书和 Telegram 支持同级订阅与多渠道独立投递，覆盖健康告警、扫描器掉线/恢复、登录、周报和月报；支持启停、最低级别、连通性测试、投递历史及失败重试。通知使用持久化队列、租约和有限重试；停用通知不影响报告归档。见[通知渠道](NOTIFICATIONS.md)。
 - **分渠道通知模板**：新增飞书、Telegram 按事件管理的模板 API，支持纯文本/受限 HTML、草稿、发布、历史恢复、变量目录和在线预览。测试发送可以使用未保存模板，返回投递 ID 并查询状态；入队不等于发送成功。补充邮件模板通知状态的预览和测试。见[通知模板](NOTIFICATION_TEMPLATES.md)，相关 [#113](https://github.com/wshijiang/network-mapping/pull/113)、[#115](https://github.com/wshijiang/network-mapping/pull/115)。
 - **每渠道通知代理**：邮件、飞书和 Telegram 可独立选择系统默认、直连或自定义 HTTP/HTTPS/SOCKS5/SOCKS5H 代理，代理凭据加密存储；邮件支持代理隧道内的 SMTPS，连接失败不回退直连。见[通知代理](NOTIFICATIONS.md#每渠道投递代理)，相关 [#116](https://github.com/wshijiang/network-mapping/pull/116)。
