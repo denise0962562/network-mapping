@@ -4,53 +4,18 @@ pub(super) const STATE_KEY: &str = "transport_endpoints_rebuild";
 pub(super) const FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct Batch {
-    pub upload_id: String,
-    pub batch_index: i32,
-    pub is_final: bool,
-    pub observation_count: u64,
-    pub checksum: Option<String>,
-    pub indices: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Execution {
     pub id: i32,
     pub context: ScanBatchContext,
     pub succeeded: bool,
     pub api_client_id: Option<i32>,
-    pub batches: Vec<Batch>,
+    #[serde(skip)]
+    pub source_count: Option<u64>,
 }
 
 impl Execution {
     pub fn expected(&self) -> u64 {
-        self.batches.iter().map(|b| b.observation_count).sum()
-    }
-
-    pub fn indices(&self) -> Vec<String> {
-        self.batches
-            .iter()
-            .flat_map(|b| b.indices.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    pub fn batch(&self, source: &Value) -> Result<&Batch, String> {
-        let upload = source
-            .get("upload_id")
-            .and_then(Value::as_str)
-            .ok_or("事实缺少 upload_id")?;
-        let batch = source
-            .get("batch_index")
-            .and_then(Value::as_i64)
-            .ok_or("事实缺少 batch_index")?;
-        self.batches
-            .binary_search_by(|b| {
-                (b.upload_id.as_str(), i64::from(b.batch_index)).cmp(&(upload, batch))
-            })
-            .map(|index| &self.batches[index])
-            .map_err(|_| format!("执行 {} 存在无对应 PG 回执的扫描事实", self.id))
+        self.source_count.unwrap_or(0)
     }
 }
 
@@ -72,17 +37,31 @@ pub(super) enum Phase {
 pub(super) struct Run {
     pub format_version: u32,
     pub run_id: Uuid,
+    // Only deserializing an older checkpoint defaults to new-index; CLI has no default.
+    #[serde(default)]
+    pub mode: TransportRebuildMode,
+    #[serde(default)]
+    pub original_target_uuids: BTreeMap<String, String>,
+    /// UUIDs of read-only clones of the old projections. Persisted before either old target is removed.
+    #[serde(default)]
+    pub backup_uuids: BTreeMap<String, String>,
     pub target: Value,
     pub previous_runtime: Option<Value>,
-    pub receipts_hash: String,
     pub source: Value,
+    // Recomputed on resume. Persisting this map made every tag page rewrite a
+    // payload proportional to the number of executions.
+    #[serde(skip)]
+    pub source_counts: Option<BTreeMap<i32, u64>>,
     pub target_uuids: BTreeMap<String, String>,
     pub phase: Phase,
     pub tag_cursor: Option<Value>,
+    #[serde(default)]
+    pub tag_pit_id: Option<String>,
     pub tagged: u64,
     pub tag_changes: u64,
     pub tag_total: Option<u64>,
-    pub tags_hash: String,
+    #[serde(default)]
+    pub tag_complete: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -121,6 +100,7 @@ pub(super) async fn save<T: Serialize>(pool: &Pool, key: &str, value: &T) -> Res
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn checkpoint(pool: &Pool, run: &Run, id: i32) -> Result<Checkpoint, String> {
     load(pool, &checkpoint_key(run, id))
         .await?
@@ -130,53 +110,69 @@ pub(super) async fn checkpoint(pool: &Pool, run: &Run, id: i32) -> Result<Checkp
         .map_err(|e| format!("执行 {id} 重建断点损坏：{e}"))
 }
 
+/// Load every execution checkpoint for a run with one round trip.
+///
+/// Phase totals and cutover previously issued one `checkpoint()` call per
+/// execution, each acquiring a pool connection. That made startup and resume
+/// O(executions) database round trips.
+pub(super) async fn checkpoints(
+    pool: &Pool,
+    run: &Run,
+) -> Result<BTreeMap<i32, Checkpoint>, String> {
+    let prefix = format!("transport_rebuild:{}:", run.run_id);
+    let connection = pool.get().await.map_err(|e| e.to_string())?;
+    let rows = connection
+        .query(
+            "SELECT state_key,state_value FROM scan_storage_state \
+             WHERE left(state_key,length($1))=$1",
+            &[&prefix],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    rows.into_iter()
+        .map(|row| {
+            let key: String = row.get(0);
+            let id = key
+                .strip_prefix(&prefix)
+                .and_then(|suffix| suffix.parse::<i32>().ok())
+                .ok_or_else(|| format!("重建断点键无效：{key}"))?;
+            let value: Value = row.get(1);
+            serde_json::from_value(value)
+                .map(|checkpoint| (id, checkpoint))
+                .map_err(|e| format!("执行 {id} 重建断点损坏：{e}"))
+        })
+        .collect()
+}
+
 pub(super) async fn executions(pool: &Pool) -> Result<Vec<Execution>, String> {
     let connection = pool.get().await.map_err(|e| e.to_string())?;
-    let pending: i64 = connection.query_one("SELECT COUNT(*) FROM scan_result_batch WHERE storage_backend NOT IN ('elasticsearch','dual')", &[])
-        .await.map_err(|e|e.to_string())?.get(0);
-    if pending != 0 {
-        return Err("请先完成扫描上传对账和 PG→ES 迁移，再重建端点投影".into());
-    }
     let rows = connection.query(
         "SELECT jsonb_build_object('id',e.id,'succeeded',e.execution_status='succeeded',
            'api_client_id',t.api_client_id,'context',jsonb_build_object(
              'task_id',t.task_id,'execution_id',e.execution_id,'user_id',t.user_id,
              'task_source',t.task_source,'scanner_id',COALESCE(e.assigned_scanner_id,e.requested_scanner_id,'unknown'),
-             'scanner_name',s.name,'upload_id','','batch_index',0,'is_final',false),
-           'batches',(SELECT jsonb_agg(jsonb_build_object('upload_id',b.upload_id,'batch_index',b.batch_index,
-             'is_final',b.is_final,'observation_count',b.observation_count,'checksum',b.payload_checksum,
-             'indices',b.storage_references) ORDER BY b.upload_id,b.batch_index) FROM scan_result_batch b WHERE b.execution_id=e.id))
+             'scanner_name',s.name,'upload_id','','batch_index',0,'is_final',false))
          FROM scan_task_execution e JOIN scan_task t ON t.id=e.task_id
          LEFT JOIN scanner_info s ON s.scanner_id=COALESCE(e.assigned_scanner_id,e.requested_scanner_id)
-         WHERE t.task_kind='ip' AND EXISTS(SELECT 1 FROM scan_result_batch b WHERE b.execution_id=e.id)
+         WHERE t.task_kind='ip'
          ORDER BY e.id", &[]).await.map_err(|e|e.to_string())?;
     rows.into_iter()
-        .map(|row| {
-            let mut execution: Execution =
-                serde_json::from_value(row.get(0)).map_err(|e| format!("扫描回执无效：{e}"))?;
-            execution
-                .batches
-                .sort_by(|a, b| (&a.upload_id, a.batch_index).cmp(&(&b.upload_id, b.batch_index)));
-            Ok(execution)
-        })
+        .map(|row| serde_json::from_value(row.get(0)).map_err(|e| format!("执行元数据无效：{e}")))
         .collect()
 }
 
-pub(super) fn receipts_hash(executions: &[Execution]) -> Result<String, String> {
-    serde_json::to_vec(executions)
-        .map(|bytes| sha256_hex(&bytes))
-        .map_err(|e| e.to_string())
-}
-
-pub(super) async fn tags_hash(pool: &Pool) -> Result<String, String> {
-    let connection = pool.get().await.map_err(|e| e.to_string())?;
-    let value: Value = connection.query_one(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_array(host(a.ip_address),to_jsonb(t),to_jsonb(c)) ORDER BY a.ip_address,t.id),'[]'::jsonb)
-         FROM asset_ip_tag a JOIN asset_tag t ON t.id=a.tag_id AND t.is_active
-         JOIN asset_tag_category c ON c.id=t.category_id AND c.is_active", &[]).await.map_err(|e|e.to_string())?.get(0);
-    Ok(sha256_hex(
-        &serde_json::to_vec(&value).map_err(|e| e.to_string())?,
-    ))
+/// Old checkpoints may also contain sequence numbers; these are not data audits.
+pub(super) fn source_identity(source: &Value) -> Value {
+    let indices = source
+        .get("indices")
+        .and_then(Value::as_object)
+        .map(|v| {
+            v.iter()
+                .map(|(k, v)| (k.clone(), json!({"uuid":v["uuid"]})))
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .unwrap_or_default();
+    json!({"cluster_uuid":source["cluster_uuid"],"indices":indices})
 }
 
 pub(super) fn cancelled(stop: &AtomicBool) -> Result<(), String> {
@@ -188,6 +184,143 @@ pub(super) fn cancelled(stop: &AtomicBool) -> Result<(), String> {
 }
 
 impl ElasticsearchService {
+    pub(super) fn rebuild_backup_name(&self, run_id: Uuid, target: &str) -> String {
+        let role = if target == self.inner.config.execution_endpoint_index {
+            "execution"
+        } else {
+            "current"
+        };
+        format!("transport-rebuild-backup-{}-{role}", run_id.simple())
+    }
+
+    async fn wait_for_rebuild_backup(&self, backup: &str) -> Result<(), String> {
+        let health = self
+            .send_json_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::GET,
+                &format!("/_cluster/health/{backup}?wait_for_status=yellow&timeout=60s"),
+                |r| r.timeout(Duration::from_secs(75)),
+            )
+            .await?;
+        if health.get("timed_out") == Some(&json!(true))
+            || !matches!(
+                health.get("status").and_then(Value::as_str),
+                Some("yellow" | "green")
+            )
+        {
+            return Err(format!(
+                "备份索引 {backup} 的主分片尚未可用；旧投影不会删除"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn block_rebuild_index_writes(
+        &self,
+        name: &str,
+        require_shard_ack: bool,
+    ) -> Result<(), String> {
+        let blocked = self
+            .send_json_request(
+                ElasticsearchOperation::IndexAdmin,
+                Method::PUT,
+                &format!("/{name}/_block/write"),
+                |r| r,
+            )
+            .await?;
+        if blocked.get("acknowledged") != Some(&json!(true))
+            || (require_shard_ack && blocked.get("shards_acknowledged") != Some(&json!(true)))
+        {
+            return Err(format!("索引 {name} 写入冻结未获确认，拒绝删除旧投影"));
+        }
+        Ok(())
+    }
+
+    async fn ensure_rebuild_backups(&self, pool: &Pool, run: &mut Run) -> Result<(), String> {
+        for name in [
+            &self.inner.config.execution_endpoint_index,
+            &self.inner.config.current_endpoint_index,
+        ] {
+            let Some(original_uuid) = run.original_target_uuids.get(name) else {
+                continue;
+            };
+            let backup = self.rebuild_backup_name(run.run_id, name);
+            if backup.starts_with(&format!("{}-", self.inner.config.observation_index_prefix))
+                || backup == self.inner.config.dns_record_index
+                || backup == self.inner.config.dns_observation_data_stream
+            {
+                return Err("备份索引名称与扫描事实或 DNS 命名空间冲突，旧投影未删除".into());
+            }
+            if let Some(saved_uuid) = run.backup_uuids.get(name) {
+                let metadata = self
+                    .rebuild_index(&backup)
+                    .await?
+                    .ok_or_else(|| format!("备份索引 {backup} 已丢失，拒绝继续重建"))?;
+                if metadata
+                    .pointer("/settings/index/uuid")
+                    .and_then(Value::as_str)
+                    != Some(saved_uuid)
+                {
+                    return Err(format!("备份索引 {backup} 身份已变化，拒绝继续重建"));
+                }
+                self.wait_for_rebuild_backup(&backup).await?;
+                self.block_rebuild_index_writes(&backup, false).await?;
+                continue;
+            }
+            let original = self
+                .rebuild_index(name)
+                .await?
+                .ok_or_else(|| format!("旧投影 {name} 已消失且没有可信备份，拒绝继续重建"))?;
+            if original
+                .pointer("/settings/index/uuid")
+                .and_then(Value::as_str)
+                != Some(original_uuid)
+            {
+                return Err(format!("旧投影 {name} 身份已变化，拒绝为其他索引建立备份"));
+            }
+            if self.rebuild_index(&backup).await?.is_none() {
+                let health = self
+                    .send_json_request(
+                        ElasticsearchOperation::IndexAdmin,
+                        Method::GET,
+                        &format!("/_cluster/health/{name}?timeout=5s"),
+                        |r| r.timeout(Duration::from_secs(10)),
+                    )
+                    .await?;
+                if health.get("timed_out") == Some(&json!(true))
+                    || health.get("status").and_then(Value::as_str) != Some("green")
+                {
+                    return Err(format!(
+                        "旧投影 {name} 不是 green，无法安全克隆；旧投影未删除"
+                    ));
+                }
+                self.block_rebuild_index_writes(name, true).await?;
+                self.send_json_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::POST,
+                    &format!("/{name}/_clone/{backup}"),
+                    |r| r.json(&json!({"settings":{"index.number_of_replicas":0}})),
+                )
+                .await
+                .map_err(|error| format!("备份旧投影 {name} 失败；旧投影未删除：{error}"))?;
+            }
+            self.wait_for_rebuild_backup(&backup).await?;
+            self.block_rebuild_index_writes(&backup, false).await?;
+            let metadata = self
+                .rebuild_index(&backup)
+                .await?
+                .ok_or_else(|| format!("备份索引 {backup} 未建立，旧投影不会删除"))?;
+            let uuid = metadata
+                .pointer("/settings/index/uuid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("备份索引 {backup} 缺少 UUID，旧投影不会删除"))?;
+            run.backup_uuids.insert(name.clone(), uuid.to_owned());
+            save(pool, STATE_KEY, run).await?;
+            eprintln!("[端点投影重建] 已保留旧投影备份：{name} -> {backup}");
+        }
+        Ok(())
+    }
+
     pub(super) fn rebuild_target(&self) -> Value {
         json!({"execution_endpoint_index":self.inner.config.execution_endpoint_index,
                "current_endpoint_index":self.inner.config.current_endpoint_index})
@@ -201,7 +334,7 @@ impl ElasticsearchService {
           "dns_record_index":self.inner.config.dns_record_index,"endpoint_identity_version":2})
     }
 
-    /// UUID and primary sequence numbers detect source replacement, retention and writes.
+    /// Inspect index identity only; do not compare source document contents or counts.
     pub(super) async fn rebuild_source(&self) -> Result<Value, String> {
         let root = self
             .send_json_request(ElasticsearchOperation::ClusterInfo, Method::GET, "/", |r| r)
@@ -217,7 +350,7 @@ impl ElasticsearchService {
             .filter(|v| !v.is_empty() && *v != "_na_")
             .ok_or("ES 缺少可信 cluster_uuid")?;
         let stats = self.send_json_request(ElasticsearchOperation::IndexAdmin, Method::GET,
-            &format!("/{}-*/_stats?level=shards&allow_no_indices=true&ignore_unavailable=false&filter_path=indices.*.uuid,indices.*.shards.*.routing.primary,indices.*.shards.*.seq_no",self.inner.config.observation_index_prefix), |r|r).await?;
+            &format!("/{}-*/_stats?allow_no_indices=true&ignore_unavailable=false&filter_path=indices.*.uuid",self.inner.config.observation_index_prefix), |r|r).await?;
         let mut indices = BTreeMap::new();
         if let Some(values) = stats.get("indices").and_then(Value::as_object) {
             for (index, value) in values {
@@ -229,38 +362,7 @@ impl ElasticsearchService {
                     .get("uuid")
                     .and_then(Value::as_str)
                     .ok_or("源索引缺少 UUID")?;
-                let mut sequences = BTreeMap::new();
-                for (shard, copies) in value
-                    .get("shards")
-                    .and_then(Value::as_object)
-                    .ok_or("源索引缺少分片状态")?
-                {
-                    let primary = copies
-                        .as_array()
-                        .and_then(|a| {
-                            a.iter()
-                                .find(|s| s.pointer("/routing/primary") == Some(&json!(true)))
-                        })
-                        .ok_or("源主分片不可用")?;
-                    let sequence = primary
-                        .pointer("/seq_no/max_seq_no")
-                        .and_then(Value::as_i64)
-                        .ok_or("源主分片缺少序号")?;
-                    if primary
-                        .pointer("/seq_no/global_checkpoint")
-                        .and_then(Value::as_i64)
-                        != Some(sequence)
-                    {
-                        return Err(
-                            "源扫描索引仍有未完成写入，请先停止扫描接入并等待分片同步".into()
-                        );
-                    }
-                    sequences.insert(shard, sequence);
-                }
-                if sequences.is_empty() {
-                    return Err("源索引没有可验证主分片".into());
-                }
-                indices.insert(index, json!({"uuid":uuid,"sequences":sequences}));
+                indices.insert(index, json!({"uuid":uuid}));
             }
         }
         Ok(json!({"cluster_uuid":cluster,"indices":indices}))
@@ -284,16 +386,79 @@ impl ElasticsearchService {
         ))
     }
 
+    pub(super) async fn restore_rebuild_refresh(&self) -> Result<(), String> {
+        for name in [
+            &self.inner.config.execution_endpoint_index,
+            &self.inner.config.current_endpoint_index,
+        ] {
+            let result = self
+                .send_json_request(
+                    ElasticsearchOperation::IndexAdmin,
+                    Method::PUT,
+                    &format!("/{name}/_settings"),
+                    |r| r.json(&json!({"index":{"refresh_interval":"1s"}})),
+                )
+                .await?;
+            if result.get("acknowledged") != Some(&json!(true)) {
+                return Err(format!(
+                    "目标 {name} 恢复自动刷新未获确认；重跑将继续完成切换"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn prepare_rebuild_targets(
         &self,
         pool: &Pool,
         run: &mut Run,
     ) -> Result<(), String> {
+        if run.mode == TransportRebuildMode::InPlace {
+            self.ensure_rebuild_backups(pool, run).await?;
+        }
         for name in [
             &self.inner.config.execution_endpoint_index,
             &self.inner.config.current_endpoint_index,
         ] {
-            let metadata = match self.rebuild_index(name).await? {
+            let mut existing = self.rebuild_index(name).await?;
+            if run.mode == TransportRebuildMode::InPlace
+                && run.phase == Phase::Initializing
+                && !run.target_uuids.contains_key(name)
+                && let Some(metadata) = existing.as_ref()
+                && metadata.pointer("/mappings/_meta/rebuild_run_id") != Some(&json!(run.run_id))
+            {
+                let original = run
+                    .original_target_uuids
+                    .get(name)
+                    .ok_or("原地重建目标并非启动时记录的索引，拒绝删除")?;
+                if metadata
+                    .pointer("/settings/index/uuid")
+                    .and_then(Value::as_str)
+                    != Some(original)
+                {
+                    return Err(format!(
+                        "原地重建目标 {name} 已被替换，拒绝删除不同 UUID 的索引"
+                    ));
+                }
+                let response = self
+                    .send_request(
+                        ElasticsearchOperation::IndexAdmin,
+                        Method::DELETE,
+                        &format!("/{name}"),
+                        |r| r,
+                    )
+                    .await?;
+                if response.status() != StatusCode::NOT_FOUND {
+                    let result = response_json(response).await?;
+                    if result.get("acknowledged") != Some(&json!(true)) {
+                        return Err(format!(
+                            "原地重建删除 {name} 尚未确认，重新运行将恢复初始化"
+                        ));
+                    }
+                }
+                existing = None;
+            }
+            let metadata = match existing {
                 Some(value) => value,
                 None if run.phase == Phase::Initializing
                     && !run.target_uuids.contains_key(name) =>
@@ -301,6 +466,7 @@ impl ElasticsearchService {
                     let mut definition =
                         scan_endpoint_index_definition(self.inner.config.scan_number_of_replicas);
                     definition["mappings"]["_meta"]["rebuild_run_id"] = json!(run.run_id);
+                    definition["settings"]["refresh_interval"] = json!("-1");
                     self.send_json_request(
                         ElasticsearchOperation::IndexAdmin,
                         Method::PUT,

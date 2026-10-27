@@ -82,20 +82,39 @@ Worker IPC 升为 **3**。升级时先暂停分配并排空旧 generation 的任
 
 端点身份改为 IP + 端口 + `tcp`/`udp`/`unknown`，执行和用户/global/API client 范围均包含传输协议；分页、OS/Web 补全及历史查询同步处理。历史缺失或无法确定的传输保持 `unknown`，不补猜 TCP。不可变扫描事实和上传校验和不重写。
 
-默认执行投影改为 `network-mapping-execution-endpoints-v2`，当前投影改为 `network-mapping-endpoints-current-v3`。既有部署必须停服、完成待上传对账并备份 PG 状态与 ES 事实，保持 observation/DNS 索引名不变，配置全新的 execution/current 索引名后运行：
+默认执行投影为 `network-mapping-execution-endpoints-v2`，当前投影为 `network-mapping-endpoints-current-v3`。执行重建前停服，保持 observation/DNS 索引名不变。**必须显式指定 `--rebuild-transport-mode`，没有默认模式**；遗漏、无效或重复指定模式会在连接数据库之前由 CLI 拒绝。
+
+迁移到新索引：在配置中填写全新的 execution/current 索引名，保留旧索引供回滚。
 
 ```sh
-network_mapping_server --config config.toml --rebuild-transport-endpoints
+network_mapping_server --config config.toml --rebuild-transport-endpoints --rebuild-transport-mode new-index
+```
+
+原地重建：使用配置中的 execution/current 索引名称。对已存在的两个旧投影先添加写入块并分别克隆到 `transport-rebuild-backup-<运行 ID>-execution`、`transport-rebuild-backup-<运行 ID>-current`，等待备份主分片可用、冻结备份写入并持久化备份 UUID，**两个备份均完成后才删除旧投影**，再以相同名称创建并重建。备份失败时旧投影不会删除；只读备份索引不会自动删除，保留供人工检查或恢复。克隆要求源索引为 green 且有足够磁盘空间，不满足时命令会失败。原始 observation/DNS 索引不删除。中断期间需要继续停服，用同一模式续跑。存在未完成的原地重建时，普通服务启动会提示续跑并退出，避免使用半成品投影。
+
+```sh
+network_mapping_server --config config.toml --rebuild-transport-endpoints --rebuild-transport-mode in-place
+```
+
+两种模式重建的内容相同。能修改配置并接受新索引名时优先用 `new-index`：旧索引原样保留，也无需克隆备份。`in-place` 只用于必须维持原配置名称的情况；它需要额外克隆和磁盘空间，随后会删除原名索引，旧数据保存在备份索引中。
+
+完成后按需重建分析快照：
+
+```sh
 network_mapping_server --config config.toml --rebuild-analytics-snapshots
 ```
 
-重建持有与服务互斥的存储锁。创建目标前先核对 PG 回执与 ES 事实的精确总量及各执行/上传/批次数量；不配套时立即失败，不创建目标、不改写计数、不推进断点。需要保留 ES 完整数据集时，应先找到并验证配套 PG 备份，不能把另一份较小 PG 的投影当作恢复结果。
+重建持有与服务互斥的存储锁，按 PG 中的 IP 执行读取 ES 现存事实并重建 execution/current 投影，PG 提供任务归属、执行状态和当前标签。**不做 PG/ES 数据对账**：不读取上传回执，不比较 PG/ES 总数、批次数量、事实校验和或数据指纹。历史回执、附带 DNS 批次、过期回执引用和校验和差异不会阻断重建。ES 数量仅用于进度显示，实际重放持续到分页结束，不以预计数量作为停止或失败条件。若原始事实缺失，新投影可能少于旧投影；`in-place` 的旧投影仍保存在备份索引中，可用于人工检查或回退。
 
-断点记录运行 ID、源集群/索引 UUID 与主分片序号、PG 回执指纹、目标 UUID，以及各执行重放/发布页和标签页游标。**中断后重新运行相同配置和命令即可自动恢复**，无需手动指定游标。Bulk 全部动作确认后才保存页断点；确认前中断的页会幂等重放。恢复时先等待同一运行遗留的 ES 写请求结束；源数据或目标身份改变会拒绝续跑。旧版仅含 `last_execution_id` 的断点无法验证，必须重新选择全新目标索引，不得直接沿用旧索引。已完成运行重复执行不再切换或重排 outbox。
+断点记录重建模式、运行 ID、原地重建前的目标 UUID、备份 UUID、源集群/索引 UUID、进度参考数量、目标 UUID，以及各执行重放/发布页和标签页游标。**中断后重新运行相同配置和命令即可自动恢复**，无需手动指定游标。Bulk 全部动作确认后才保存页断点；确认前中断的页会幂等重放。恢复时先等待同一运行遗留的 ES 写请求结束；源索引、备份或目标身份改变会拒绝续跑。未完成运行必须使用原模式续跑，不能在迁移和原地重建之间切换。原地模式先持久化旧目标身份和备份身份再删除，删除/创建之间中断仍可恢复，已创建的新目标不会在续跑时再次清空。旧版仅含 `last_execution_id` 的断点不能续用：可以选择 `new-index` 使用全新目标，或显式选择 `in-place` 从头重建配置中的目标。`new-index` 已完成运行重复执行不再切换或重排 outbox；`in-place` 已完成后再次显式执行会启动一次新的原地重建。
 
-事实重放按页合并 Bulk，独立执行的并发数取 `scan_migration_concurrency`、`bulk_max_concurrency` 和 2 中的最小值；共享当前投影按执行 ID 顺序发布。`projection_page_size` 控制分页（事实页最多 1000 条），`bulk_batch_size` 与 `projection_bulk_max_bytes` 限制批量动作数及字节数。标签每页一次 PG 查询，仅对变化文档发 Bulk，不逐 IP 执行带刷新操作的 update-by-query。每个阶段完成后统一刷新。
+重建命令默认使用 32 个独立执行并发、每页 10000 条；可用 `--rebuild-transport-concurrency 50` 调整并发（1–50），用 `--rebuild-transport-page-size 10000` 调整分页（1–10000）。启动时显示实际模式、并发和分页。每批最多 2000 个动作或 16 MiB；不修改正常服务的配置文件或默认参数。进度计数使用 composite 聚合成批统计各执行事实数，执行汇总也并发执行。
 
-终端每 5 秒显示阶段、已确认量/总量、执行信息、速度和有足够采样时的阶段 ETA；续跑前的历史数量不计入本次速度。Ctrl-C/SIGTERM 会等待当前页确认（最多 60 秒），存储锁连接丢失则停止。完成全部重放、发布、标签同步及校验后，在同一 PG 事务中更新计数、处理投影 outbox、排队 OS/Web 补全并切换运行标记。失败期间保留旧运行配置和计数；旧索引不删除，纯漏洞观察不生成端点 Bulk。重建期间须停止扫描写入、事实保留期清理及 DNS/observation 位置变更。
+当前投影在同一页内对不同端点并发提交 Bulk，单执行内最多保留 4 页待确认（包含已写完但尚未保存断点的页）。等待下一页查询时会持续轮询在途 Bulk，使查询、写入和重试能够重叠；整页成功后按页序推进断点，后页先写完也不能越过前页失败的断点。跨执行仍按执行 ID 顺序发布，保持历史覆盖顺序。
+
+标签扫描使用 PIT 和 `_shard_doc` 顺序读取当前投影，每页一次 PG 查询，仅对变化文档发 Bulk，不逐 IP 执行带刷新的 update-by-query。ES 返回新的 PIT ID 后，后续查询及最终关闭都使用最新 ID；页断点同时保存该 ID，重启后沿用它。PIT 失效或旧版标签游标无法续用时会自动从头重扫（标签补丁幂等），完成标记持久化以避免重复扫描。新目标索引创建时关闭自动刷新（`refresh_interval=-1`），阶段结束显式刷新，切换前恢复 `1s`；全量刷新使用独立的 300 秒请求预算，恢复自动刷新失败可原命令续跑。
+
+终端每 5 秒显示阶段、已确认量/总量、执行信息、速度和有足够采样时的阶段 ETA（参考数量）；续跑前的历史数量不计入本次速度。Ctrl-C/SIGTERM 会等待当前页确认（最多 60 秒），存储锁连接丢失则停止。完成全部重放、发布、标签同步和刷新后，在同一 PG 事务中更新计数、处理投影 outbox、排队 OS/Web 补全并切换运行标记。失败期间保留原运行配置和计数；`new-index` 保留旧索引，`in-place` 保留旧端点投影的独立备份，纯漏洞观察不生成端点 Bulk。重建期间须停止扫描写入、事实保留期清理及 DNS/observation 位置变更。
 
 ### 刷新失败与超时排查
 
@@ -123,7 +142,7 @@ request_timeout_seconds = 180
 
 若手动 GET 刷新约 1 分钟后返回零成功分片，而程序使用默认 30 秒请求期限，程序可能在 ES 等待分片期间提前超时。GET 与 POST 都受刷新语义约束；应先确认分片状态，不能仅改用 GET 或延长等待便认定迁移成功。
 
-回滚需停服并恢复配套旧程序、旧 execution/current 配置和迁移前 PG 运行标记；重建保存的 `transport_endpoints_previous_runtime` 可供核对，但生产回滚以备份及部署变更记录为准。启用 UDP 后产生的新结果须保留，旧程序不能完整展示这些结果，不应回滚后删除新事实。
+`new-index` 模式回滚需停服并恢复配套旧程序、旧 execution/current 配置和迁移前 PG 运行标记；重建保存的 `transport_endpoints_previous_runtime` 可供核对，但生产回滚以备份及部署变更记录为准。启用 UDP 后产生的新结果须保留，旧程序不能完整展示这些结果，不应回滚后删除新事实。
 
 ## 验证范围
 

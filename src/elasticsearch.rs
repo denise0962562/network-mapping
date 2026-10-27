@@ -1763,13 +1763,14 @@ impl ElasticsearchService {
         execution_id: &str,
         observation_count_paths: &[String],
     ) -> Result<ScanExecutionSummary, String> {
+        const IP_PAGE_SIZE: usize = 10_000;
         let mut after = None;
         let mut ip_count = 0_i64;
         let mut port_count = 0_i64;
         loop {
             let first_page = after.is_none();
             let mut composite = json!({
-                "size": 1000,
+                "size": IP_PAGE_SIZE,
                 "sources": [{"ip": {"terms": {"field": "ip"}}}]
             });
             if let Some(after) = after.take() {
@@ -1812,7 +1813,7 @@ impl ElasticsearchService {
                 .ok_or_else(|| "Elasticsearch 执行 IP 聚合缺少 buckets".to_owned())?;
             ip_count += i64::try_from(buckets.len()).map_err(|error| error.to_string())?;
             after = endpoints.pointer("/aggregations/ips/after_key").cloned();
-            if buckets.len() < 1000 || after.is_none() {
+            if buckets.len() < IP_PAGE_SIZE || after.is_none() {
                 break;
             }
         }
@@ -2863,6 +2864,13 @@ impl ElasticsearchService {
     /// ordinary restarts must allow pending ES receipts and outbox retries to recover.
     pub async fn validate_scan_cutover(&self, pool: &Pool) -> Result<(), String> {
         let connection = pool.get().await.map_err(|error| error.to_string())?;
+        let rebuild:Option<Value>=connection.query_opt("SELECT state_value FROM scan_storage_state WHERE state_key='transport_endpoints_rebuild'",&[]).await.map_err(|e|e.to_string())?.map(|row|row.get(0));
+        if rebuild.as_ref().is_some_and(|run| {
+            run.get("mode") == Some(&json!("in_place"))
+                && run.get("phase") != Some(&json!("complete"))
+        }) {
+            return Err("原地端点重建尚未完成，请先运行 --rebuild-transport-endpoints --rebuild-transport-mode in-place 续跑，完成后再启动服务".into());
+        }
         let runtime = connection.query_opt(
             "SELECT state_value FROM scan_storage_state WHERE state_key = 'elasticsearch_runtime'", &[]
         ).await.map_err(|error| error.to_string())?.map(|row| row.get::<_, Value>(0));
