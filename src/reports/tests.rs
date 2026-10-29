@@ -102,6 +102,8 @@ async fn deferred_legacy_reports_wait_for_transfer_while_manual_mail_still_runs(
             webhook_url: String::new(),
             bot_token: String::new(),
             signing_secret: String::new(),
+            feishu_app_secret: String::new(),
+            clear_feishu_app_secret: false,
             clear_signing_secret: false,
             settings: crate::notification::ChannelSettings {
                 smtp_host: "smtp.example.com".into(),
@@ -479,6 +481,68 @@ async fn subscribe_report_notifications(pool: &Pool) {
 
 #[actix_web::test]
 #[ignore = "requires disposable REPORT_TEST_DATABASE_URL"]
+async fn manual_report_sends_only_to_selected_bot_channels_without_mail_recipients() {
+    use actix_web::{App, HttpMessage, dev::Service, test, web};
+    let (pool, schema) = isolated_pool().await;
+    let id = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let c = pool.get().await.unwrap();
+    c.execute("INSERT INTO report_run(id,period_type,period_start,period_end,source,status,task_snapshot,payload) VALUES($1,'weekly',NOW()-INTERVAL '10 days',NOW()-INTERVAL '3 days','manual','ready','{}','{}')", &[&id]).await.unwrap();
+    c.execute("INSERT INTO notification_channel(id,provider,name,enabled,event_types,minimum_severity,webhook_ciphertext,settings) VALUES($1,'telegram','Manual',TRUE,ARRAY['user.login'],'critical',''::BYTEA,'{}')", &[&channel]).await.unwrap();
+    drop(c);
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .wrap_fn(|req, srv| {
+                req.extensions_mut().insert(crate::admin::UserBaseI {
+                    id: 1,
+                    username: "admin".into(),
+                    role: 1,
+                    email: None,
+                    limit_login: false,
+                    enable_2fa: false,
+                });
+                srv.call(req)
+            })
+            .service(crate::handlers::reports::send)
+            .service(crate::handlers::reports::deliveries),
+    )
+    .await;
+    let uri = format!("/api/reports/{id}/deliveries");
+    let send = || {
+        test::TestRequest::post()
+            .uri(&uri)
+            .set_json(json!({"channel_ids":[channel]}))
+            .to_request()
+    };
+    assert_eq!(test::call_service(&app, send()).await.status(), 202);
+    assert_eq!(test::call_service(&app, send()).await.status(), 202);
+    let invalid = test::TestRequest::post()
+        .uri(&uri)
+        .set_json(json!({"channel_ids":[channel, Uuid::new_v4()]}))
+        .to_request();
+    assert_eq!(test::call_service(&app, invalid).await.status(), 400);
+    let c = pool.get().await.unwrap();
+    let n: i64 = c.query_one("SELECT COUNT(*) FROM notification_delivery d JOIN notification_event e ON e.id=d.event_id WHERE e.context->>'report_id'=$1 AND e.context->>'manual_report'='true'", &[&id.to_string()]).await.unwrap().get(0);
+    assert_eq!(n, 2);
+    let n: i64 = c
+        .query_one(
+            "SELECT COUNT(*) FROM report_delivery WHERE report_id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0);
+    drop(c);
+    let response = test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    cleanup(&pool, schema).await;
+}
+
+#[actix_web::test]
+#[ignore = "requires disposable REPORT_TEST_DATABASE_URL"]
 async fn report_plans_can_be_enabled_without_mailboxes_and_use_channel_subscriptions() {
     use actix_web::{App, HttpMessage, dev::Service, test, web};
     let (pool, schema) = isolated_pool().await;
@@ -543,6 +607,133 @@ async fn report_plans_can_be_enabled_without_mailboxes_and_use_channel_subscript
     let body: Value = test::read_body_json(response).await;
     assert_eq!(body["data"]["notifications"]["monthly"], false);
     assert_eq!(body["data"]["notifications"]["weekly"], true);
+    cleanup(&pool, schema).await;
+}
+
+#[actix_web::test]
+#[ignore = "requires disposable REPORT_TEST_DATABASE_URL"]
+async fn report_plan_edits_bot_subscriptions_atomically_and_preserves_other_events() {
+    use actix_web::{App, HttpMessage, dev::Service, test, web};
+    let (pool, schema) = isolated_pool().await;
+    let feishu = Uuid::new_v4();
+    let telegram = Uuid::new_v4();
+    let c = pool.get().await.unwrap();
+    c.execute("INSERT INTO notification_channel(id,provider,name,enabled,event_types,minimum_severity,webhook_ciphertext) VALUES($1,'feishu','F',TRUE,ARRAY['user.login'],'warning',''::BYTEA),($2,'telegram','T',TRUE,ARRAY['report.monthly'],'warning',''::BYTEA)", &[&feishu,&telegram]).await.unwrap();
+    drop(c);
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(config()))
+            .wrap_fn(|req, srv| {
+                req.extensions_mut().insert(crate::admin::UserBaseI {
+                    id: 1,
+                    username: "admin".into(),
+                    role: 1,
+                    email: None,
+                    limit_login: false,
+                    enable_2fa: false,
+                });
+                srv.call(req)
+            })
+            .service(crate::handlers::reports::save_schedule)
+            .service(crate::handlers::reports::schedules),
+    )
+    .await;
+    let request = |revision, f_revision, t_revision| {
+        test::TestRequest::put().uri("/api/report-schedules/weekly").set_json(json!({"enabled":true,"send_hour":9,"send_minute":0,"recipient_ids":[],"expected_revision":revision,"bot_channels":[{"id":feishu,"revision":f_revision,"selected":true},{"id":telegram,"revision":t_revision,"selected":true}]})).to_request()
+    };
+    assert_eq!(
+        test::call_service(&app, request(0, 1, 1)).await.status(),
+        200
+    );
+    let c = pool.get().await.unwrap();
+    let rows = c
+        .query(
+            "SELECT id,event_types,revision FROM notification_channel WHERE id=ANY($1)",
+            &[&vec![feishu, telegram]],
+        )
+        .await
+        .unwrap();
+    for row in rows {
+        let events: Vec<String> = row.get("event_types");
+        assert!(events.contains(&"report.weekly".to_owned()));
+        assert_eq!(row.get::<_, i64>("revision"), 2);
+    }
+    drop(c);
+    assert_eq!(
+        test::call_service(&app, request(1, 2, 1)).await.status(),
+        409
+    );
+    let c = pool.get().await.unwrap();
+    let revision: i64 = c
+        .query_one(
+            "SELECT revision FROM report_schedule WHERE period_type='weekly'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(revision, 1);
+    drop(c);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/report-schedules")
+            .to_request(),
+    )
+    .await;
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(body["data"]["bot_channels"].as_array().unwrap().len(), 2);
+    let unselect = test::TestRequest::put().uri("/api/report-schedules/monthly").set_json(json!({"enabled":false,"send_hour":9,"send_minute":0,"recipient_ids":[],"expected_revision":0,"bot_channels":[{"id":telegram,"revision":2,"selected":false}]})).to_request();
+    assert_eq!(test::call_service(&app, unselect).await.status(), 200);
+    let c = pool.get().await.unwrap();
+    let events: Vec<String> = c
+        .query_one(
+            "SELECT event_types FROM notification_channel WHERE id=$1",
+            &[&telegram],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(events, vec!["report.weekly"]);
+    let automatic = Uuid::new_v4();
+    let manual = Uuid::new_v4();
+    let auto_delivery = Uuid::new_v4();
+    let manual_delivery = Uuid::new_v4();
+    c.execute("INSERT INTO notification_event(id,dedup_key,event_type,severity,title,body,context) VALUES($1,$3,'report.weekly','warning','automatic','report','{}'),($2,$4,'report.weekly','warning','manual','report',$5)", &[&automatic,&manual,&automatic.to_string(),&manual.to_string(),&json!({"manual_report":true})]).await.unwrap();
+    c.execute("INSERT INTO notification_delivery(id,event_id,channel_id,destination_revision) VALUES($1,$3,$5,1),($2,$4,$5,1)", &[&auto_delivery,&manual_delivery,&automatic,&manual,&telegram]).await.unwrap();
+    drop(c);
+    let remove_last = test::TestRequest::put().uri("/api/report-schedules/weekly").set_json(json!({"enabled":true,"send_hour":9,"send_minute":0,"recipient_ids":[],"expected_revision":1,"bot_channels":[{"id":telegram,"revision":3,"selected":false}]})).to_request();
+    assert_eq!(test::call_service(&app, remove_last).await.status(), 200);
+    let c = pool.get().await.unwrap();
+    let events: Vec<String> = c
+        .query_one(
+            "SELECT event_types FROM notification_channel WHERE id=$1",
+            &[&telegram],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(events.is_empty());
+    let automatic_status: String = c
+        .query_one(
+            "SELECT status FROM notification_delivery WHERE id=$1",
+            &[&auto_delivery],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let manual_status: String = c
+        .query_one(
+            "SELECT status FROM notification_delivery WHERE id=$1",
+            &[&manual_delivery],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(automatic_status, "cancelled");
+    assert_eq!(manual_status, "pending");
+    drop(c);
     cleanup(&pool, schema).await;
 }
 
@@ -956,6 +1147,7 @@ async fn concurrent_creators_return_one_canonical_period_and_distinct_revisions(
 async fn automatic_schedule_catches_up_once_and_does_not_send_before_activation() {
     let (pool, schema) = isolated_pool().await;
     subscribe_report_notifications(&pool).await;
+    pool.get().await.unwrap().execute("INSERT INTO notification_channel(id,provider,name,enabled,event_types,minimum_severity,webhook_ciphertext,settings) VALUES($1,'feishu','报告群',TRUE,ARRAY['report.weekly','report.monthly'],'warning',''::BYTEA,'{}')", &[&Uuid::new_v4()]).await.unwrap();
     let period = Period::last_closed(PeriodType::Weekly, Utc::now()).expect("period");
     let client = pool.get().await.expect("client");
     client
@@ -1009,8 +1201,22 @@ async fn automatic_schedule_catches_up_once_and_does_not_send_before_activation(
             .await
             .expect("count")
             .get::<_, i64>("n"),
-        1
+        2
     );
+    let monthly = Period::last_closed(PeriodType::Monthly, Utc::now()).unwrap();
+    client
+        .execute(
+            "UPDATE report_schedule SET enabled=TRUE, enabled_at=$1 WHERE period_type='monthly'",
+            &[&monthly.start],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    worker::schedule(&pool).await.unwrap();
+    worker::process_one(&pool, &config()).await.unwrap();
+    let client = pool.get().await.unwrap();
+    let count: i64 = client.query_one("SELECT COUNT(*) FROM notification_delivery d JOIN notification_event e ON e.id=d.event_id WHERE e.event_type='report.monthly'", &[]).await.unwrap().get(0);
+    assert_eq!(count, 2);
     drop(client);
     cleanup(&pool, schema).await;
 }
