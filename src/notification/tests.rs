@@ -939,6 +939,10 @@ async fn notification_mutations_use_the_existing_csrf_middleware() {
 }
 
 async fn database() -> (Pool, String) {
+    database_with_max_size(8).await
+}
+
+async fn database_with_max_size(max_size: usize) -> (Pool, String) {
     let mut config: tokio_postgres::Config = std::env::var("NOTIFICATION_TEST_DATABASE_URL")
         .expect("NOTIFICATION_TEST_DATABASE_URL must point to a disposable database")
         .parse()
@@ -946,7 +950,7 @@ async fn database() -> (Pool, String) {
     let schema = format!("notification_{}", Uuid::new_v4().simple());
     config.options(format!("-c search_path={schema} -c timezone=UTC"));
     let pool = Pool::builder(Manager::new(config, NoTls))
-        .max_size(8)
+        .max_size(max_size)
         .build()
         .unwrap();
     let c = pool.get().await.unwrap();
@@ -974,6 +978,72 @@ async fn database() -> (Pool, String) {
         .unwrap();
     drop(c);
     (pool, schema)
+}
+
+#[tokio::test]
+#[ignore = "requires disposable NOTIFICATION_TEST_DATABASE_URL"]
+async fn feishu_binding_reply_releases_single_database_connection() {
+    let (pool, schema) = database_with_max_size(1).await;
+    let audit = AuditContext::cli("notification-test");
+    let mut create = input();
+    create.webhook_url.clear();
+    create.signing_secret.clear();
+    create.settings.feishu_bot_type = "app".into();
+    create.settings.feishu_app_id = "cli_test".into();
+    create.settings.feishu_target_type = Some(FeishuTargetType::User);
+    create.settings.feishu_open_id = "ou_test".into();
+    create.feishu_app_secret = "app-secret".into();
+    let channel = save(&pool, &key(), None, create, &user(1), &audit)
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    let c = pool.get().await.unwrap();
+    c.execute("INSERT INTO feishu_binding_reply(id,app_id,channel_id,target_open_id) VALUES($1,'cli_test',$2,'ou_test')", &[&id,&channel.id]).await.unwrap();
+    // Force a deterministic local send failure without contacting Feishu.
+    c.execute(
+        "UPDATE notification_channel SET feishu_app_secret_ciphertext=NULL WHERE id=$1",
+        &[&channel.id],
+    )
+    .await
+    .unwrap();
+    drop(c);
+    let mut config: tokio_postgres::Config = std::env::var("NOTIFICATION_TEST_DATABASE_URL")
+        .unwrap()
+        .parse()
+        .unwrap();
+    config.options(format!("-c search_path={schema} -c timezone=UTC"));
+    let observer = Pool::builder(Manager::new(config, NoTls))
+        .max_size(1)
+        .build()
+        .unwrap();
+    let worker = tokio::spawn(feishu_ws::run_replies(pool.clone(), key()));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let c = observer.get().await.unwrap();
+            let status: String = c
+                .query_one(
+                    "SELECT status FROM feishu_binding_reply WHERE id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if status == "failed" {
+                break;
+            }
+            drop(c);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    let _ = worker.await;
+    drop(observer);
+    assert!(
+        result.is_ok(),
+        "reply remained stuck in sending with a single-connection pool"
+    );
+    cleanup(pool, schema).await;
 }
 async fn cleanup(pool: Pool, schema: String) {
     pool.get()
@@ -1030,6 +1100,323 @@ async fn feishu_image_credentials_are_encrypted_preserved_and_cleared() {
         .await
         .unwrap();
     assert!(!cleared.feishu_app_secret_configured);
+    cleanup(pool, schema).await;
+}
+
+#[test]
+fn application_bot_validation_requires_target_and_credentials() {
+    let mut value = input();
+    value.webhook_url.clear();
+    value.signing_secret.clear();
+    value.settings.feishu_bot_type = "app".into();
+    assert!(value.validate(true).is_err());
+    value.settings.feishu_app_id = "cli_example".into();
+    value.settings.feishu_chat_id = "oc_example".into();
+    value.feishu_app_secret = "secret".into();
+    assert!(value.validate(true).is_ok());
+    value.settings.feishu_chat_id = "bad target".into();
+    assert!(value.validate(true).is_err());
+    value.settings.feishu_target_type = Some(FeishuTargetType::User);
+    value.settings.feishu_chat_id.clear();
+    value.settings.feishu_open_id = "ou_example".into();
+    assert!(value.validate(true).is_ok());
+    value.settings.feishu_open_id = "oc_not_a_user".into();
+    assert!(value.validate(true).is_err());
+    value.settings.feishu_open_id = "ou_example".into();
+    value.settings.feishu_chat_id = "oc_example".into();
+    assert!(value.validate(true).is_err());
+}
+
+#[test]
+fn feishu_target_compatibility_fences_legacy_updates_and_recipient_changes() {
+    let group = ChannelSettings {
+        feishu_bot_type: "app".into(),
+        feishu_app_id: "cli_one".into(),
+        feishu_chat_id: "oc_group".into(),
+        ..ChannelSettings::default()
+    };
+    let mut user = group.clone();
+    user.feishu_target_type = Some(FeishuTargetType::User);
+    user.feishu_chat_id.clear();
+    user.feishu_open_id = "ou_person".into();
+    assert!(user.feishu_destination_changed(&group));
+    assert!(user.validate_feishu_target_update(&group).is_ok());
+    assert!(group.validate_feishu_target_update(&user).is_err());
+    let mut explicit_group = group.clone();
+    explicit_group.feishu_target_type = Some(FeishuTargetType::Group);
+    assert!(explicit_group.validate_feishu_target_update(&user).is_ok());
+    assert!(!explicit_group.feishu_destination_changed(&group));
+    let mut other_app = user.clone();
+    other_app.feishu_app_id = "cli_other".into();
+    assert!(other_app.validate_feishu_target_update(&user).is_err());
+    other_app.feishu_open_id = "ou_other".into();
+    assert!(other_app.validate_feishu_target_update(&user).is_ok());
+    assert!(other_app.feishu_destination_changed(&user));
+}
+
+#[tokio::test]
+#[ignore = "requires disposable NOTIFICATION_TEST_DATABASE_URL"]
+async fn feishu_binding_consumes_code_once_and_fences_stale_workers() {
+    let (pool, schema) = database().await;
+    let audit = AuditContext::cli("notification-test");
+    let mut create = input();
+    create.webhook_url.clear();
+    create.signing_secret.clear();
+    create.settings.feishu_bot_type = "app".into();
+    create.settings.feishu_app_id = "cli_test".into();
+    create.settings.feishu_chat_id = "oc_original".into();
+    create.feishu_app_secret = "app-secret".into();
+    let channel = save(&pool, &key(), None, create, &user(1), &audit)
+        .await
+        .unwrap();
+    let binding = feishu_binding::issue(
+        &pool,
+        &key(),
+        channel.id,
+        channel.revision,
+        &user(1),
+        &audit,
+    )
+    .await
+    .unwrap();
+    let c = pool.get().await.unwrap();
+    let digest: Vec<u8> = c
+        .query_one(
+            "SELECT code_digest FROM feishu_binding_request WHERE channel_id=$1",
+            &[&channel.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_ne!(digest, binding.code.as_bytes());
+    let owner = Uuid::new_v4();
+    c.execute("INSERT INTO feishu_binding_connection(app_id,owner,generation,lease_until) VALUES('cli_test',$1,1,NOW()+INTERVAL '1 minute')", &[&owner]).await.unwrap();
+    drop(c);
+    assert!(
+        feishu_binding::consume(
+            &pool,
+            &key(),
+            "cli_test",
+            (Uuid::new_v4(), 1),
+            "event-1",
+            "ou_first",
+            &binding.code
+        )
+        .await
+        .is_err()
+    );
+    let app = feishu_ws::AppConfig {
+        app_id: "cli_test".into(),
+        secret: "app-secret".into(),
+        proxy_mode: crate::outbound_proxy::ProxyMode::Direct,
+        proxy_url: String::new(),
+    };
+    let mut event = serde_json::json!({"header":{"event_type":"im.message.receive_v1","app_id":"cli_test","event_id":"event-1","tenant_key":"tenant"},"event":{"sender":{"sender_type":"user","tenant_key":"tenant","sender_id":{"open_id":"ou_first"}},"message":{"chat_type":"group","message_type":"text","content":serde_json::json!({"text":format!("/bind {}",binding.code)}).to_string()}}});
+    feishu_ws::handle_event(
+        &pool,
+        &key(),
+        &app,
+        owner,
+        1,
+        &serde_json::to_vec(&event).unwrap(),
+    )
+    .await
+    .unwrap();
+    let c = pool.get().await.unwrap();
+    let status: String = c
+        .query_one(
+            "SELECT status FROM feishu_binding_request WHERE channel_id=$1",
+            &[&channel.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "pending");
+    drop(c);
+    event["event"]["message"]["chat_type"] = "p2p".into();
+    feishu_ws::handle_event(
+        &pool,
+        &key(),
+        &app,
+        owner,
+        1,
+        &serde_json::to_vec(&event).unwrap(),
+    )
+    .await
+    .unwrap();
+    feishu_binding::consume(
+        &pool,
+        &key(),
+        "cli_test",
+        (owner, 1),
+        "event-1",
+        "ou_other",
+        &binding.code,
+    )
+    .await
+    .unwrap();
+    feishu_binding::consume(
+        &pool,
+        &key(),
+        "cli_test",
+        (owner, 1),
+        "event-2",
+        "ou_other",
+        &binding.code,
+    )
+    .await
+    .unwrap();
+    let c = pool.get().await.unwrap();
+    let row = c.query_one("SELECT c.settings,c.revision,c.destination_revision,b.status FROM notification_channel c JOIN feishu_binding_request b ON b.channel_id=c.id WHERE c.id=$1", &[&channel.id]).await.unwrap();
+    let settings: Value = row.get(0);
+    assert_eq!(settings["feishu_target_type"], "user");
+    assert_eq!(settings["feishu_open_id"], "ou_first");
+    assert_eq!(row.get::<_, i64>(1), 2);
+    assert_eq!(row.get::<_, i64>(2), 2);
+    assert_eq!(row.get::<_, String>(3), "bound");
+    let replies: i64 = c
+        .query_one(
+            "SELECT COUNT(*) FROM feishu_binding_reply WHERE channel_id=$1",
+            &[&channel.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(replies, 1);
+    drop(c);
+    assert!(
+        feishu_binding::unbind(&pool, channel.id, 1, &user(1), &audit)
+            .await
+            .is_err()
+    );
+    feishu_binding::unbind(&pool, channel.id, 2, &user(1), &audit)
+        .await
+        .unwrap();
+    let c = pool.get().await.unwrap();
+    let row = c.query_one("SELECT enabled,settings,revision,destination_revision FROM notification_channel WHERE id=$1", &[&channel.id]).await.unwrap();
+    assert!(!row.get::<_, bool>(0));
+    assert!(row.get::<_, Value>(1).get("feishu_open_id").is_none());
+    assert_eq!(row.get::<_, i64>(2), 3);
+    assert_eq!(row.get::<_, i64>(3), 3);
+    drop(c);
+    assert_eq!(
+        feishu_binding::status(&pool, channel.id).await.unwrap()["binding_status"],
+        "unbound"
+    );
+    cleanup(pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable NOTIFICATION_TEST_DATABASE_URL"]
+async fn feishu_user_target_edits_cancel_old_work_and_reject_legacy_updates() {
+    let (pool, schema) = database().await;
+    let audit = AuditContext::cli("notification-test");
+    let mut create = input();
+    create.webhook_url.clear();
+    create.signing_secret.clear();
+    create.settings.feishu_bot_type = "app".into();
+    create.settings.feishu_app_id = "cli_example".into();
+    create.settings.feishu_chat_id = "oc_first".into();
+    create.feishu_app_secret = "private-secret".into();
+    let channel = save(&pool, &key(), None, create, &user(1), &audit)
+        .await
+        .unwrap();
+    let event = Uuid::new_v4();
+    let delivery = Uuid::new_v4();
+    let c = pool.get().await.unwrap();
+    c.execute("INSERT INTO notification_event(id,dedup_key,event_type,severity,title,body) VALUES($1,$2,'user.login','warning','test','test')", &[&event,&event.to_string()]).await.unwrap();
+    c.execute("INSERT INTO notification_delivery(id,event_id,channel_id,destination_revision) VALUES($1,$2,$3,1)", &[&delivery,&event,&channel.id]).await.unwrap();
+    drop(c);
+    let mut edit = input();
+    edit.webhook_url.clear();
+    edit.signing_secret.clear();
+    edit.settings.feishu_bot_type = "app".into();
+    edit.settings.feishu_app_id = "cli_example".into();
+    edit.settings.feishu_target_type = Some(FeishuTargetType::User);
+    edit.settings.feishu_open_id = "ou_first".into();
+    edit.expected_revision = Some(channel.revision);
+    let updated = save(&pool, &key(), Some(channel.id), edit, &user(1), &audit)
+        .await
+        .unwrap();
+    assert_eq!(updated.settings.feishu_target(), FeishuTargetType::User);
+    assert!(updated.feishu_app_secret_configured);
+    let c = pool.get().await.unwrap();
+    let row = c.query_one("SELECT c.destination_revision,d.status FROM notification_channel c JOIN notification_delivery d ON d.channel_id=c.id WHERE c.id=$1 AND d.id=$2", &[&channel.id,&delivery]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 2);
+    assert_eq!(row.get::<_, String>(1), "cancelled");
+    drop(c);
+    let mut legacy = input();
+    legacy.webhook_url.clear();
+    legacy.signing_secret.clear();
+    legacy.settings.feishu_bot_type = "app".into();
+    legacy.settings.feishu_app_id = "cli_example".into();
+    legacy.settings.feishu_chat_id = "oc_wrong".into();
+    legacy.expected_revision = Some(updated.revision);
+    assert!(
+        save(&pool, &key(), Some(channel.id), legacy, &user(1), &audit)
+            .await
+            .is_err()
+    );
+    let mut group = input();
+    group.webhook_url.clear();
+    group.signing_secret.clear();
+    group.settings.feishu_bot_type = "app".into();
+    group.settings.feishu_app_id = "cli_example".into();
+    group.settings.feishu_target_type = Some(FeishuTargetType::Group);
+    group.settings.feishu_chat_id = "oc_second".into();
+    group.expected_revision = Some(updated.revision);
+    let switched = save(&pool, &key(), Some(channel.id), group, &user(1), &audit)
+        .await
+        .unwrap();
+    assert_eq!(switched.settings.feishu_target(), FeishuTargetType::Group);
+    assert!(switched.settings.feishu_open_id.is_empty());
+    cleanup(pool, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable NOTIFICATION_TEST_DATABASE_URL"]
+async fn application_bot_preserves_secret_and_fences_destination_changes() {
+    let (pool, schema) = database().await;
+    let audit = AuditContext::cli("notification-test");
+    let mut create = input();
+    create.webhook_url.clear();
+    create.signing_secret.clear();
+    create.settings.feishu_bot_type = "app".into();
+    create.settings.feishu_app_id = "cli_example".into();
+    create.settings.feishu_chat_id = "oc_first".into();
+    create.feishu_app_secret = "private-secret".into();
+    let channel = save(&pool, &key(), None, create, &user(1), &audit)
+        .await
+        .unwrap();
+    assert!(!channel.webhook_configured);
+    assert!(channel.feishu_app_secret_configured);
+    assert!(
+        !serde_json::to_string(&channel)
+            .unwrap()
+            .contains("private-secret")
+    );
+    let mut edit = input();
+    edit.webhook_url.clear();
+    edit.signing_secret.clear();
+    edit.settings.feishu_bot_type = "app".into();
+    edit.settings.feishu_app_id = "cli_example".into();
+    edit.settings.feishu_chat_id = "oc_second".into();
+    edit.expected_revision = Some(channel.revision);
+    let updated = save(&pool, &key(), Some(channel.id), edit, &user(1), &audit)
+        .await
+        .unwrap();
+    assert!(updated.feishu_app_secret_configured);
+    let conn = pool.get().await.unwrap();
+    let revision: i64 = conn
+        .query_one(
+            "SELECT destination_revision FROM notification_channel WHERE id=$1",
+            &[&channel.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(revision, 2);
+    drop(conn);
     cleanup(pool, schema).await;
 }
 
